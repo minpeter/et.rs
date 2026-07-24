@@ -3,7 +3,9 @@ use std::net::TcpStream;
 
 use et_core::backed_reader::{BackedReader, ReadError, ReadItem};
 use et_core::backed_writer::{BackedWriter, RecoverError, WriterOutcome};
-use et_core::crypto::{CryptoHandler, DIR_CLIENT_TO_SERVER, DIR_SERVER_TO_CLIENT, KEY_LEN};
+use et_core::crypto::{
+    CryptoHandler, EncryptError, DIR_CLIENT_TO_SERVER, DIR_SERVER_TO_CLIENT, KEY_LEN,
+};
 use et_core::proto::{CatchupBuffer, SequenceHeader};
 
 use crate::framing_io::{read_proto, write_proto};
@@ -13,6 +15,8 @@ pub enum ConnError {
     Io(io::Error),
     Read(ReadError),
     Recover(RecoverError),
+    Encrypt(EncryptError),
+    Backpressure,
     SequenceOutOfRange(i64),
 }
 
@@ -31,12 +35,19 @@ impl From<RecoverError> for ConnError {
         Self::Recover(e)
     }
 }
+impl From<EncryptError> for ConnError {
+    fn from(e: EncryptError) -> Self {
+        Self::Encrypt(e)
+    }
+}
 impl std::fmt::Display for ConnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Read(e) => write!(f, "read: {e}"),
             Self::Recover(e) => write!(f, "recover: {e}"),
+            Self::Encrypt(e) => write!(f, "encrypt: {e}"),
+            Self::Backpressure => write!(f, "disconnected write buffer is full"),
             Self::SequenceOutOfRange(sequence) => {
                 write!(f, "sequence number {sequence} exceeds the wire format")
             }
@@ -73,32 +84,29 @@ impl Connection {
     }
 
     pub fn write_terminal(&mut self, bytes: &[u8]) -> Result<(), ConnError> {
-        match self.writer.write_packet(0, bytes) {
+        match self.writer.write_packet(0, bytes)? {
             WriterOutcome::Send(frame) => {
                 self.stream.write_all(&frame)?;
                 Ok(())
             }
-            WriterOutcome::BufferedOnly | WriterOutcome::Skipped => Ok(()),
+            WriterOutcome::BufferedOnly => Ok(()),
+            WriterOutcome::Skipped => Err(ConnError::Backpressure),
         }
     }
 
-    pub fn read_terminal(&mut self) -> Result<Option<Vec<u8>>, ConnError> {
-        match self.reader.pop()? {
-            ReadItem::Packet(packet) => return Ok(Some(packet.payload().to_vec())),
-            ReadItem::NeedMore => {}
-        }
-
-        let mut buf = [0u8; 8192];
-        match self.stream.read(&mut buf) {
-            Ok(0) => Err(ConnError::Io(io::ErrorKind::UnexpectedEof.into())),
-            Ok(n) => {
-                self.reader.feed(&buf[..n]);
-                match self.reader.pop()? {
-                    ReadItem::Packet(p) => Ok(Some(p.payload().to_vec())),
-                    ReadItem::NeedMore => Ok(None),
-                }
+    pub fn read_terminal(&mut self) -> Result<Vec<u8>, ConnError> {
+        loop {
+            match self.reader.pop()? {
+                ReadItem::Packet(packet) => return Ok(packet.payload().to_vec()),
+                ReadItem::NeedMore => {}
             }
-            Err(e) => Err(ConnError::Io(e)),
+
+            let mut buf = [0u8; 8192];
+            match self.stream.read(&mut buf) {
+                Ok(0) => return Err(ConnError::Io(io::ErrorKind::UnexpectedEof.into())),
+                Ok(n) => self.reader.feed(&buf[..n]),
+                Err(e) => return Err(ConnError::Io(e)),
+            }
         }
     }
 

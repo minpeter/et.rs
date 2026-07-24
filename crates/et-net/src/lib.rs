@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! TCP transport for et.rs: SocketHandler framing, Connect handshake, and a
 //! blocking [`connection::Connection`] over `TcpStream`.
 

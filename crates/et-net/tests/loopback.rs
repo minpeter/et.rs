@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 
@@ -30,14 +32,7 @@ fn handshake_and_encrypted_roundtrip() {
         assert_eq!(resp.status, Some(ConnectStatus::NewClient as i32));
         let mut conn = Connection::new_client(client_stream, &key);
         conn.write_terminal(b"hello server").unwrap();
-        let mut got = Vec::new();
-        for _ in 0..50 {
-            if let Some(data) = conn.read_terminal().unwrap() {
-                got = data;
-                break;
-            }
-        }
-        got
+        conn.read_terminal().unwrap()
     });
 
     let server_thread = thread::spawn(move || {
@@ -46,13 +41,7 @@ fn handshake_and_encrypted_roundtrip() {
         let resp = response_status(ConnectStatus::NewClient);
         write_response(&mut server_stream, &resp).unwrap();
         let mut conn = Connection::new_server(server_stream, &key);
-        let mut got = Vec::new();
-        for _ in 0..50 {
-            if let Some(data) = conn.read_terminal().unwrap() {
-                got = data;
-                break;
-            }
-        }
+        let got = conn.read_terminal().unwrap();
         conn.write_terminal(b"hello client").unwrap();
         got
     });
@@ -89,9 +78,8 @@ fn multiple_packets_in_order() {
         let mut conn = Connection::new_server(server_stream, &key);
         let mut got = Vec::new();
         while got.len() < 5 {
-            if let Some(data) = conn.read_terminal().unwrap() {
-                got.push(data[0]);
-            }
+            let data = conn.read_terminal().unwrap();
+            got.push(data[0]);
         }
         got
     });

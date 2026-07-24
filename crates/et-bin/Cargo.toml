@@ -12,6 +12,9 @@ repository.workspace = true
 name = "et"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 et-cli = { path = "../et-cli" }
 et-core = { path = "../et-core" }

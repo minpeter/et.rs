@@ -11,8 +11,11 @@ repository.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
-xsalsa20poly1305 = "0.9"
+crypto_secretbox = "0.1.1"
 prost = "0.13"
 rand = "0.8"
 

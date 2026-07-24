@@ -6,8 +6,8 @@
 //! This is the highest-risk interop point; parity is pinned by
 //! `fixtures/wire.json` (generated from upstream `CryptoHandler.cpp`).
 
-use xsalsa20poly1305::aead::{Aead, KeyInit};
-use xsalsa20poly1305::{Nonce, XSalsa20Poly1305};
+use crypto_secretbox::aead::{Aead, KeyInit};
+use crypto_secretbox::{Nonce, XSalsa20Poly1305};
 
 pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 24;
@@ -21,6 +21,17 @@ pub enum DecryptError {
     Short,
     BadMac,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncryptError;
+
+impl std::fmt::Display for EncryptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "plaintext exceeds the cipher message limit")
+    }
+}
+
+impl std::error::Error for EncryptError {}
 
 impl std::fmt::Display for DecryptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -47,11 +58,11 @@ impl CryptoHandler {
         Self { cipher, nonce }
     }
 
-    pub fn encrypt(&mut self, plaintext: &[u8]) -> Vec<u8> {
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, EncryptError> {
         self.bump();
         self.cipher
             .encrypt(Nonce::from_slice(&self.nonce), plaintext)
-            .expect("xsalsa20poly1305 encrypt is infallible for a 24-byte nonce")
+            .map_err(|_| EncryptError)
     }
 
     pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, DecryptError> {
@@ -84,9 +95,9 @@ mod tests {
         let pt = b"the quick brown fox";
         let mut enc = CryptoHandler::new(&key, DIR_CLIENT_TO_SERVER);
         let mut dec = CryptoHandler::new(&key, DIR_CLIENT_TO_SERVER);
-        assert_eq!(dec.decrypt(&enc.encrypt(pt)).unwrap(), pt);
-        assert_eq!(dec.decrypt(&enc.encrypt(b"")).unwrap(), b"");
-        assert_eq!(dec.decrypt(&enc.encrypt(pt)).unwrap(), pt);
+        assert_eq!(dec.decrypt(&enc.encrypt(pt).unwrap()).unwrap(), pt);
+        assert_eq!(dec.decrypt(&enc.encrypt(b"").unwrap()).unwrap(), b"");
+        assert_eq!(dec.decrypt(&enc.encrypt(pt).unwrap()).unwrap(), pt);
     }
 
     #[test]
@@ -94,7 +105,7 @@ mod tests {
         let key = [7u8; KEY_LEN];
         let mut enc = CryptoHandler::new(&key, DIR_CLIENT_TO_SERVER);
         let mut dec = CryptoHandler::new(&key, DIR_SERVER_TO_CLIENT);
-        let ct = enc.encrypt(b"x");
+        let ct = enc.encrypt(b"x").unwrap();
         assert_eq!(dec.decrypt(&ct), Err(DecryptError::BadMac));
     }
 
@@ -102,9 +113,9 @@ mod tests {
     fn nonce_advances_every_call() {
         let key = [1u8; KEY_LEN];
         let mut h = CryptoHandler::new(&key, DIR_CLIENT_TO_SERVER);
-        let a = h.encrypt(b"x");
-        let b = h.encrypt(b"x");
-        let c = h.encrypt(b"x");
+        let a = h.encrypt(b"x").unwrap();
+        let b = h.encrypt(b"x").unwrap();
+        let c = h.encrypt(b"x").unwrap();
         assert_ne!(a, b);
         assert_ne!(b, c);
     }

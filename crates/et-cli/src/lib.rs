@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Command-line argument and host-string parsing for et.rs.
 //!
 //! Two host-string grammars exist, matching upstream exactly:

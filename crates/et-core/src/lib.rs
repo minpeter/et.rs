@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Protocol primitives for et.rs: crypto, packet framing, and protobuf codec.
 //!
 //! Mirrors the EternalTerminal wire contract (protocol version 6) byte-for-byte.

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Golden compatibility test: every value is the exact byte output of the
 //! pinned upstream C++ implementation (`/tmp/et-fixture-oracle/gen.cpp` linked
 //! against the real `CryptoHandler.cpp` + protobufs). These are the source of
@@ -29,7 +31,7 @@ fn key() -> [u8; KEY_LEN] {
 fn crypto_dir0_hello_matches_oracle() {
     let f = fixtures();
     let mut enc = CryptoHandler::new(&key(), DIR_CLIENT_TO_SERVER);
-    let out = enc.encrypt(b"hello");
+    let out = enc.encrypt(b"hello").unwrap();
     assert_eq!(
         out,
         *f.get("crypto_dir0_msg_hello").unwrap(),
@@ -41,7 +43,7 @@ fn crypto_dir0_hello_matches_oracle() {
 fn crypto_dir1_hello_matches_oracle() {
     let f = fixtures();
     let mut enc = CryptoHandler::new(&key(), DIR_SERVER_TO_CLIENT);
-    let out = enc.encrypt(b"hello");
+    let out = enc.encrypt(b"hello").unwrap();
     assert_eq!(out, *f.get("crypto_dir1_msg_hello").unwrap());
 }
 
@@ -49,7 +51,7 @@ fn crypto_dir1_hello_matches_oracle() {
 fn crypto_dir0_empty_matches_oracle() {
     let f = fixtures();
     let mut enc = CryptoHandler::new(&key(), DIR_CLIENT_TO_SERVER);
-    let out = enc.encrypt(b"");
+    let out = enc.encrypt(b"").unwrap();
     assert_eq!(out, *f.get("crypto_dir0_empty").unwrap());
 }
 
@@ -61,7 +63,7 @@ fn crypto_dir0_twoheader_body_matches_oracle() {
     msg.push(0);
     msg.push(0);
     msg.extend_from_slice(b"body");
-    let out = enc.encrypt(&msg);
+    let out = enc.encrypt(&msg).unwrap();
     assert_eq!(out, *f.get("crypto_dir0_twoheader_body").unwrap());
 }
 
@@ -78,7 +80,7 @@ fn crypto_nonce_sequence_matches_oracle() {
     .enumerate()
     {
         assert_eq!(
-            enc.encrypt(b"x"),
+            enc.encrypt(b"x").unwrap(),
             *f.get(*key).unwrap(),
             "nonce step {} mismatch",
             i
@@ -90,8 +92,14 @@ fn crypto_nonce_sequence_matches_oracle() {
 fn crypto_dir1_sequence_matches_oracle() {
     let f = fixtures();
     let mut enc = CryptoHandler::new(&key(), DIR_SERVER_TO_CLIENT);
-    assert_eq!(enc.encrypt(b"x"), *f.get("crypto_dir1_seq0_x").unwrap());
-    assert_eq!(enc.encrypt(b"x"), *f.get("crypto_dir1_seq1_x").unwrap());
+    assert_eq!(
+        enc.encrypt(b"x").unwrap(),
+        *f.get("crypto_dir1_seq0_x").unwrap()
+    );
+    assert_eq!(
+        enc.encrypt(b"x").unwrap(),
+        *f.get("crypto_dir1_seq1_x").unwrap()
+    );
 }
 
 #[test]

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Single-binary entry point with role dispatch by `argv[0]`.
 //!
 //! One compiled binary serves all three EternalTerminal roles:
@@ -24,14 +26,11 @@ fn main() {
 
     match dispatch(prog, &argv[1..]) {
         Ok(code) => std::process::exit(code),
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
+        Err(error) => error.exit(),
     }
 }
 
-fn dispatch(prog: &str, args: &[OsString]) -> Result<i32, Box<dyn std::error::Error>> {
+fn dispatch(prog: &str, args: &[OsString]) -> Result<i32, clap::Error> {
     if prog == "etserver" {
         return crate::server::run(args);
     }

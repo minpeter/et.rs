@@ -7,7 +7,9 @@ use std::io;
 use et_core::proto::{ConnectRequest, ConnectResponse, ConnectStatus};
 use et_core::PROTOCOL_VERSION;
 
-use crate::framing_io::{read_proto, write_proto};
+use crate::framing_io::{read_proto_limited, write_proto};
+
+const MAX_HANDSHAKE_PROTO_LEN: i64 = 64 * 1024;
 
 pub fn client_request(client_id: &str) -> ConnectRequest {
     ConnectRequest {
@@ -17,7 +19,7 @@ pub fn client_request(client_id: &str) -> ConnectRequest {
 }
 
 pub fn read_request<R: io::Read>(r: &mut R) -> io::Result<ConnectRequest> {
-    read_proto(r)
+    read_proto_limited(r, MAX_HANDSHAKE_PROTO_LEN)
 }
 
 pub fn write_response<W: io::Write>(w: &mut W, response: &ConnectResponse) -> io::Result<()> {
@@ -38,6 +40,7 @@ pub fn response_status(status: ConnectStatus) -> ConnectResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::framing_io::{read_proto, write_proto};
     use std::io::Cursor;
 
     #[test]
@@ -70,6 +73,13 @@ mod tests {
             version: None,
         };
         assert!(!protocol_matches(&unset));
+    }
+
+    #[test]
+    fn oversized_request_is_rejected_before_allocation() {
+        let frame = (65_537i64).to_le_bytes();
+        let error = read_request(&mut Cursor::new(frame)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

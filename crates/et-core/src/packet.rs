@@ -41,10 +41,14 @@ impl Packet {
         })
     }
 
-    pub fn encrypt(&mut self, crypto: &mut CryptoHandler) {
+    pub fn encrypt(
+        &mut self,
+        crypto: &mut CryptoHandler,
+    ) -> Result<(), crate::crypto::EncryptError> {
         debug_assert!(!self.encrypted, "encrypting an already-encrypted packet");
-        self.payload = crypto.encrypt(&self.payload);
+        self.payload = crypto.encrypt(&self.payload)?;
         self.encrypted = true;
+        Ok(())
     }
 
     pub fn decrypt(

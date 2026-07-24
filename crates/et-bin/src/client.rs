@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use clap::Parser;
 use et_cli::client::ClientArgs;
 
-pub fn run(args: &[OsString]) -> Result<i32, Box<dyn std::error::Error>> {
+pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
     let parsed = ClientArgs::try_parse_from(
         ["et"]
             .iter()
@@ -17,5 +17,5 @@ pub fn run(args: &[OsString]) -> Result<i32, Box<dyn std::error::Error>> {
         "et: connecting to {}:{} is not yet implemented (transport layer WIP)",
         parsed.host, parsed.port
     );
-    Ok(0)
+    Ok(2)
 }

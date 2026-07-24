@@ -20,6 +20,7 @@ pub enum ReadError {
     Frame(crate::framing::FrameError),
     Packet(PacketError),
     Crypto(DecryptError),
+    Unencrypted,
 }
 
 impl std::fmt::Display for ReadError {
@@ -28,6 +29,7 @@ impl std::fmt::Display for ReadError {
             Self::Frame(e) => write!(f, "frame: {e}"),
             Self::Packet(e) => write!(f, "packet: {e}"),
             Self::Crypto(e) => write!(f, "crypto: {e}"),
+            Self::Unencrypted => write!(f, "unencrypted packet on encrypted stream"),
         }
     }
 }
@@ -62,10 +64,7 @@ impl BackedReader {
             return Ok(ReadItem::NeedMore);
         }
         if let Some(serialized) = self.replay.pop_front() {
-            let mut packet = Packet::from_serialized(&serialized).map_err(ReadError::Packet)?;
-            packet
-                .decrypt(&mut self.crypto)
-                .map_err(ReadError::Crypto)?;
+            let packet = self.decode_packet(&serialized)?;
             return Ok(ReadItem::Packet(packet));
         }
         if self.partial.len() < 4 {
@@ -77,12 +76,20 @@ impl BackedReader {
         }
         let serialized = self.partial[4..4 + len].to_vec();
         self.partial.drain(0..4 + len);
-        let mut packet = Packet::from_serialized(&serialized).map_err(ReadError::Packet)?;
+        let packet = self.decode_packet(&serialized)?;
+        self.sequence += 1;
+        Ok(ReadItem::Packet(packet))
+    }
+
+    fn decode_packet(&mut self, serialized: &[u8]) -> Result<Packet, ReadError> {
+        let mut packet = Packet::from_serialized(serialized).map_err(ReadError::Packet)?;
+        if !packet.is_encrypted() {
+            return Err(ReadError::Unencrypted);
+        }
         packet
             .decrypt(&mut self.crypto)
             .map_err(ReadError::Crypto)?;
-        self.sequence += 1;
-        Ok(ReadItem::Packet(packet))
+        Ok(packet)
     }
 
     pub fn revive(&mut self, catchup: Vec<Vec<u8>>) {
@@ -124,7 +131,7 @@ mod tests {
     #[test]
     fn reader_parses_writer_frame() {
         let (mut w, mut r) = pair();
-        let WriterOutcome::Send(frame) = w.write_packet(7, b"payload") else {
+        let WriterOutcome::Send(frame) = w.write_packet(7, b"payload").unwrap() else {
             panic!();
         };
         r.feed(&frame);
@@ -140,7 +147,7 @@ mod tests {
     #[test]
     fn partial_frame_needs_more() {
         let (mut w, mut r) = pair();
-        let WriterOutcome::Send(frame) = w.write_packet(0, b"ab") else {
+        let WriterOutcome::Send(frame) = w.write_packet(0, b"ab").unwrap() else {
             panic!();
         };
         r.feed(&frame[..3]);
@@ -154,7 +161,7 @@ mod tests {
         let (mut w, mut r) = pair();
         let mut combined = Vec::new();
         for i in 0..5u8 {
-            let WriterOutcome::Send(f) = w.write_packet(i, &[i]) else {
+            let WriterOutcome::Send(f) = w.write_packet(i, &[i]).unwrap() else {
                 panic!();
             };
             combined.extend_from_slice(&f);
@@ -173,12 +180,20 @@ mod tests {
     }
 
     #[test]
+    fn unencrypted_live_packet_is_rejected() {
+        let (_, mut reader) = pair();
+        let packet = Packet::raw(false, 0, b"plaintext");
+        reader.feed(&crate::framing::frame_be_u32(&packet.serialize()));
+        assert_eq!(reader.pop(), Err(ReadError::Unencrypted));
+    }
+
+    #[test]
     fn replay_catchup_before_live_reads() {
         let key = [5u8; KEY_LEN];
         let mut w = BackedWriter::new(CryptoHandler::new(&key, DIR_CLIENT_TO_SERVER), false);
         let mut r = BackedReader::new(CryptoHandler::new(&key, DIR_CLIENT_TO_SERVER), true);
         for i in 0..3u8 {
-            let WriterOutcome::BufferedOnly = w.write_packet(i, &[i]) else {
+            let WriterOutcome::BufferedOnly = w.write_packet(i, &[i]).unwrap() else {
                 panic!();
             };
         }

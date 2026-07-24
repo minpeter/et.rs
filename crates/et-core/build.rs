@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::io::Result;
 
 fn main() -> Result<()> {

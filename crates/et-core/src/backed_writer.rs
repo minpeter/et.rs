@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 
-use crate::crypto::CryptoHandler;
+use crate::crypto::{CryptoHandler, EncryptError};
 use crate::framing::frame_be_u32;
 use crate::packet::Packet;
 
@@ -60,14 +60,18 @@ impl BackedWriter {
         }
     }
 
-    pub fn write_packet(&mut self, header: u8, payload: &[u8]) -> WriterOutcome {
+    pub fn write_packet(
+        &mut self,
+        header: u8,
+        payload: &[u8],
+    ) -> Result<WriterOutcome, EncryptError> {
         let mut packet = Packet::new(header, payload);
         let packet_len = 2 + payload.len();
         if !self.connected && self.disconnected_bytes + packet_len as i64 > DISCONNECT_BUFFER_BYTES
         {
-            return WriterOutcome::Skipped;
+            return Ok(WriterOutcome::Skipped);
         }
-        packet.encrypt(&mut self.crypto);
+        packet.encrypt(&mut self.crypto)?;
         self.backup.push_front(packet.clone());
         self.backup_size += packet.wire_len() as i64;
         self.sequence += 1;
@@ -78,9 +82,9 @@ impl BackedWriter {
         }
         if !self.connected {
             self.disconnected_bytes += packet.wire_len() as i64;
-            return WriterOutcome::BufferedOnly;
+            return Ok(WriterOutcome::BufferedOnly);
         }
-        WriterOutcome::Send(frame_be_u32(&packet.serialize()))
+        Ok(WriterOutcome::Send(frame_be_u32(&packet.serialize())))
     }
 
     pub fn recover(&self, last_valid_sequence: i64) -> Result<Vec<Vec<u8>>, RecoverError> {
@@ -91,17 +95,13 @@ impl BackedWriter {
         if messages_to_recover == 0 {
             return Ok(Vec::new());
         }
-        let mut out: Vec<Vec<u8>> = Vec::with_capacity(messages_to_recover as usize);
-        let mut seen = 0;
-        for packet in &self.backup {
-            out.push(packet.serialize());
-            seen += 1;
-            if seen == messages_to_recover {
-                break;
-            }
-        }
-        if seen < messages_to_recover {
+        let count = usize::try_from(messages_to_recover).map_err(|_| RecoverError::TooFarBehind)?;
+        if count > self.backup.len() {
             return Err(RecoverError::TooFarBehind);
+        }
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(count);
+        for packet in self.backup.iter().take(count) {
+            out.push(packet.serialize());
         }
         out.reverse();
         Ok(out)
@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn connected_write_emits_frame_and_advances_sequence() {
         let mut w = writer(true);
-        let WriterOutcome::Send(frame) = w.write_packet(0, b"hi") else {
+        let WriterOutcome::Send(frame) = w.write_packet(0, b"hi").unwrap() else {
             panic!("expected Send");
         };
         assert!(frame.len() >= 8 && frame.len() <= 8 + 2 + 16 + 2);
@@ -154,7 +154,10 @@ mod tests {
     #[test]
     fn disconnected_write_buffers_and_advances_sequence() {
         let mut w = writer(false);
-        assert_eq!(w.write_packet(0, b"x"), WriterOutcome::BufferedOnly);
+        assert_eq!(
+            w.write_packet(0, b"x").unwrap(),
+            WriterOutcome::BufferedOnly
+        );
         assert_eq!(w.sequence(), 1);
     }
 
@@ -162,7 +165,7 @@ mod tests {
     fn disconnected_buffer_overflow_is_skipped_without_advancing() {
         let mut w = writer(false);
         let huge = vec![0u8; (DISCONNECT_BUFFER_BYTES + 1) as usize];
-        assert_eq!(w.write_packet(0, &huge), WriterOutcome::Skipped);
+        assert_eq!(w.write_packet(0, &huge).unwrap(), WriterOutcome::Skipped);
         assert_eq!(w.sequence(), 0);
     }
 
@@ -174,7 +177,7 @@ mod tests {
             (2, b"bb".as_slice()),
             (3, b"ccc".as_slice()),
         ] {
-            w.write_packet(h, p);
+            w.write_packet(h, p).unwrap();
         }
         assert_eq!(w.sequence(), 3);
         let recovered = w.recover(1).unwrap();
@@ -185,7 +188,7 @@ mod tests {
     #[test]
     fn recover_detects_too_far_behind() {
         let mut w = writer(false);
-        w.write_packet(0, b"x");
+        w.write_packet(0, b"x").unwrap();
         let recovered = w.recover(0).unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(w.recover(2), Err(RecoverError::AheadOfServer));
@@ -194,8 +197,11 @@ mod tests {
     #[test]
     fn revive_allows_sending_again() {
         let mut w = writer(false);
-        w.write_packet(0, b"x");
+        w.write_packet(0, b"x").unwrap();
         w.revive();
-        assert!(matches!(w.write_packet(0, b"y"), WriterOutcome::Send(_)));
+        assert!(matches!(
+            w.write_packet(0, b"y").unwrap(),
+            WriterOutcome::Send(_)
+        ));
     }
 }

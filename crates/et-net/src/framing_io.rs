@@ -14,10 +14,14 @@ pub fn write_proto<W: Write, M: Message>(w: &mut W, msg: &M) -> io::Result<()> {
 }
 
 pub fn read_proto<R: Read, M: Message + Default>(r: &mut R) -> io::Result<M> {
+    read_proto_limited(r, MAX_PROTO_LEN)
+}
+
+pub fn read_proto_limited<R: Read, M: Message + Default>(r: &mut R, max_len: i64) -> io::Result<M> {
     let mut len_buf = [0u8; 8];
     r.read_exact(&mut len_buf)?;
     let len = i64::from_le_bytes(len_buf);
-    if !(0..=MAX_PROTO_LEN).contains(&len) {
+    if !(0..=max_len).contains(&len) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "frame length out of bounds",

@@ -137,6 +137,17 @@ impl Registry {
         Ok(matches)
     }
 
+    pub(crate) fn contains(
+        &self,
+        identity: &RegistrationIdentity,
+    ) -> Result<bool, RegistrationError> {
+        let state = self.lock()?;
+        Ok(state
+            .registrations
+            .get(identity.id())
+            .is_some_and(|stored| identity.matches(&stored.info)))
+    }
+
     pub(crate) fn clear(&self) -> Result<(), RegistrationError> {
         let mut state = self.lock()?;
         state.registrations.clear();

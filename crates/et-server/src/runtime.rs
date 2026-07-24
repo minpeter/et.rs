@@ -210,3 +210,137 @@ fn remember(first: &mut Option<RuntimeError>, error: RuntimeError) {
         *first = Some(error);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::io::Read;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use et_core::packet::Packet;
+    use et_core::proto::{ConnectResponse, ConnectStatus, TerminalPacketType, TerminalUserInfo};
+    use et_net::framing_io::{read_proto_limited, write_proto};
+    use et_net::handshake::client_request;
+    use et_net::local_packet::write_local_packet;
+    use prost::Message;
+
+    use super::Runtime;
+    use crate::path::select_router_path_for;
+    use crate::session_table::SessionState;
+
+    const ID: &str = "aaaaaaaaaaaaaaaa";
+    const KEY: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
+    const TIMEOUT: Duration = Duration::from_secs(3);
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let serial = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "et-rs-stale-waiter-test-{}-{serial}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            Self(path)
+        }
+
+        fn socket(&self) -> PathBuf {
+            self.0.join("router.sock")
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support networking")]
+    fn terminal_eof_does_not_resurrect_a_starting_session_from_a_stale_waiter() {
+        let directory = TestDirectory::new();
+        let router_path =
+            select_router_path_for(1000, Some(&directory.socket()), None, None).unwrap();
+        let mut runtime = Runtime::start(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, router_path).unwrap();
+        let handle = runtime.handle();
+        let address = runtime.tcp_addresses()[0];
+        let terminal = register(&directory.socket(), &handle);
+
+        let (mut client_a, response) = handshake(address);
+        assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+        handle
+            .wait_for_state(ID, SessionState::Starting, TIMEOUT)
+            .unwrap();
+
+        let mut client_b = connect_request(address);
+        runtime
+            .core
+            .sessions
+            .wait_for_claim_waiters(ID, 1, TIMEOUT)
+            .unwrap();
+
+        drop(terminal);
+        runtime
+            .core
+            .sessions
+            .wait_for_claim_waiters(ID, 0, TIMEOUT)
+            .unwrap();
+        handle.wait_disconnected(ID, TIMEOUT).unwrap();
+        assert_closed(&mut client_a);
+        assert_closed(&mut client_b);
+        assert_eq!(handle.session_state(ID).unwrap(), None);
+
+        let (_unregistered, response) = handshake(address);
+        assert_eq!(response.status, Some(ConnectStatus::InvalidKey as i32));
+
+        let _fresh_terminal = register(&directory.socket(), &handle);
+        let (_fresh_client, response) = handshake(address);
+        assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+        runtime.shutdown().unwrap();
+    }
+
+    fn register(path: &Path, handle: &crate::runtime_handle::RuntimeHandle) -> UnixStream {
+        let mut stream = UnixStream::connect(path).unwrap();
+        let packet = Packet::new(
+            TerminalPacketType::TerminalUserInfo as u8,
+            TerminalUserInfo {
+                id: Some(ID.to_owned()),
+                passkey: Some(KEY.to_owned()),
+                uid: Some(501),
+                gid: Some(20),
+                fd: None,
+            }
+            .encode_to_vec(),
+        );
+        write_local_packet(&mut stream, &packet).unwrap();
+        handle.wait_registered(ID, TIMEOUT).unwrap();
+        stream
+    }
+
+    fn handshake(address: SocketAddr) -> (TcpStream, ConnectResponse) {
+        let mut stream = connect_request(address);
+        let response = read_proto_limited(&mut stream, 64 * 1024).unwrap();
+        (stream, response)
+    }
+
+    fn connect_request(address: SocketAddr) -> TcpStream {
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+        stream.set_write_timeout(Some(TIMEOUT)).unwrap();
+        write_proto(&mut stream, &client_request(ID)).unwrap();
+        stream
+    }
+
+    fn assert_closed(stream: &mut TcpStream) {
+        let mut byte = [0; 1];
+        assert_eq!(stream.read(&mut byte).unwrap_or(0), 0);
+    }
+}

@@ -28,9 +28,6 @@ pub(crate) fn run(
                                 first_error.get_or_insert(RuntimeError::Session(error));
                             }
                         }
-                        if let Err(error) = core.sessions.finish_registration_removal(&identity) {
-                            first_error.get_or_insert(RuntimeError::SessionTable(error));
-                        }
                     }
                     Ok(None) => {}
                     Err(error) => {

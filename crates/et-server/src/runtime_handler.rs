@@ -51,8 +51,16 @@ pub(crate) fn handle(stream: TcpStream, core: Arc<RuntimeCore>, mut guard: RawSo
     if guard.assign(registration.identity()).is_err() {
         return;
     }
-    let claim = match core.sessions.claim(registration, &stream) {
+    let claim = match core.sessions.claim(registration, &stream, &core.registry) {
         Ok(claim) => claim,
+        Err(crate::session_table::SessionTableError::ObsoleteRegistration) => {
+            reject(
+                &mut stream,
+                ConnectStatus::InvalidKey,
+                "client registration disconnected",
+            );
+            return;
+        }
         Err(_) => return,
     };
     match claim {

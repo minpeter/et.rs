@@ -3,7 +3,7 @@ use std::io;
 use std::net::TcpStream;
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::registry::{Registration, RegistrationIdentity};
+use crate::registry::{Registration, RegistrationIdentity, Registry};
 use crate::session::{ActiveSession, SessionConnection};
 use crate::session_slot::{SessionStart, Slot};
 
@@ -18,6 +18,7 @@ pub enum SessionState {
 pub enum SessionTableError {
     Unavailable,
     ShuttingDown,
+    ObsoleteRegistration,
     Timeout,
     InvalidTransition,
     Io(io::Error),
@@ -28,6 +29,7 @@ impl std::fmt::Display for SessionTableError {
         match self {
             Self::Unavailable => write!(f, "session table is unavailable"),
             Self::ShuttingDown => write!(f, "session table is shutting down"),
+            Self::ObsoleteRegistration => write!(f, "terminal registration is obsolete"),
             Self::Timeout => write!(f, "timed out waiting for session state"),
             Self::InvalidTransition => write!(f, "invalid session state transition"),
             Self::Io(error) => write!(f, "session socket: {error}"),
@@ -47,7 +49,8 @@ impl std::error::Error for SessionTableError {
 #[derive(Default)]
 pub(crate) struct TableState {
     pub(crate) slots: HashMap<String, Slot>,
-    pub(crate) disconnecting: HashMap<String, RegistrationIdentity>,
+    #[cfg(test)]
+    pub(crate) claim_waiters: HashMap<String, usize>,
     pub(crate) shutdown: bool,
 }
 
@@ -83,14 +86,22 @@ impl SessionTable {
         &self,
         registration: Registration,
         stream: &TcpStream,
+        registry: &Registry,
     ) -> Result<SessionClaim, SessionTableError> {
         let id = registration.id.clone();
+        let identity = registration.identity();
         let mut starting_socket = Some(stream.try_clone().map_err(SessionTableError::Io)?);
         let mut replaced = None;
         let mut state = self.lock()?;
         loop {
             if state.shutdown {
                 return Err(SessionTableError::ShuttingDown);
+            }
+            if !registry
+                .contains(&identity)
+                .map_err(|_| SessionTableError::Unavailable)?
+            {
+                return Err(SessionTableError::ObsoleteRegistration);
             }
             if state
                 .slots
@@ -134,11 +145,27 @@ impl SessionTable {
                     });
                 }
                 Some(Slot::Starting { .. }) => {
+                    #[cfg(test)]
+                    {
+                        *state.claim_waiters.entry(id.clone()).or_default() += 1;
+                        self.inner.changed.notify_all();
+                    }
                     state = self
                         .inner
                         .changed
                         .wait(state)
                         .map_err(|_| SessionTableError::Unavailable)?;
+                    #[cfg(test)]
+                    {
+                        let remove = state.claim_waiters.get_mut(&id).is_some_and(|waiters| {
+                            *waiters -= 1;
+                            *waiters == 0
+                        });
+                        if remove {
+                            state.claim_waiters.remove(&id);
+                        }
+                        self.inner.changed.notify_all();
+                    }
                 }
                 Some(Slot::Active { session, .. }) => {
                     return Ok(SessionClaim::Returning(session.clone()));
@@ -174,33 +201,13 @@ impl SessionTable {
             .slots
             .remove(identity.id())
             .and_then(Slot::into_connection);
-        state
-            .disconnecting
-            .insert(identity.id().to_owned(), identity.clone());
         self.inner.changed.notify_all();
         Ok(Some(RemovedRegistration { connection }))
-    }
-
-    pub(crate) fn finish_registration_removal(
-        &self,
-        identity: &RegistrationIdentity,
-    ) -> Result<(), SessionTableError> {
-        let mut state = self.lock()?;
-        let matches = state
-            .disconnecting
-            .get(identity.id())
-            .is_some_and(|current| current.same_generation(identity));
-        if matches {
-            state.disconnecting.remove(identity.id());
-            self.inner.changed.notify_all();
-        }
-        Ok(())
     }
 
     pub(crate) fn begin_shutdown(&self) -> Result<Vec<SessionConnection>, SessionTableError> {
         let mut state = self.lock()?;
         state.shutdown = true;
-        state.disconnecting.clear();
         let connections = std::mem::take(&mut state.slots)
             .into_values()
             .filter_map(Slot::into_connection)

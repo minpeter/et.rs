@@ -1,0 +1,18 @@
+[package]
+name = "et"
+description = "Single telemetry-free EternalTerminal binary (Rust port)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "et"
+path = "src/main.rs"
+
+[dependencies]
+et-cli = { path = "../et-cli" }
+et-core = { path = "../et-core" }
+clap = { version = "4", features = ["derive"] }

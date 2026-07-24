@@ -195,6 +195,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "et"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "et-cli",
+ "et-core",
+]
+
+[[package]]
 name = "et-cli"
 version = "0.1.0"
 dependencies = [

@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/et-core", "crates/et-cli", "crates/et-net", "crates/et-bin"]
+members = [
+    "crates/et-core",
+    "crates/et-cli",
+    "crates/et-net",
+    "crates/et-server",
+    "crates/et-bin",
+]
 
 [workspace.package]
 version = "0.1.0"

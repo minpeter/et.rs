@@ -1,6 +1,6 @@
 [package]
-name = "et-net"
-description = "TCP transport, handshake, and connection orchestration for et.rs."
+name = "et-server"
+description = "Internal server listener, router, and terminal registry for et.rs."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,5 +13,6 @@ workspace = true
 
 [dependencies]
 et-core = { path = "../et-core" }
+et-net = { path = "../et-net" }
 prost = "0.13"
-socket2 = "0.6.1"
+rustix = { version = "1.1.4", features = ["event", "process"] }

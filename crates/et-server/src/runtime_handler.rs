@@ -2,10 +2,12 @@ use std::net::TcpStream;
 use std::sync::Arc;
 
 use et_core::proto::{
-    ConnectResponse, ConnectStatus, EtPacketType, InitialPayload, InitialResponse,
+    ConnectResponse, ConnectStatus, EtPacketType, InitialPayload, InitialResponse, TermInit,
+    TerminalPacketType,
 };
 use et_net::connection::Connection;
 use et_net::handshake::{protocol_matches, read_request, write_response};
+use et_net::local_packet::write_local_packet;
 use prost::Message;
 
 use crate::runtime_state::{RawSocketGuard, RuntimeCore};
@@ -68,7 +70,7 @@ pub(crate) fn handle(stream: TcpStream, core: Arc<RuntimeCore>, mut guard: RawSo
             if replaced.is_some_and(|connection| connection.shutdown().is_err()) {
                 return;
             }
-            handle_new(stream, start);
+            handle_new(stream, start, &core);
         }
         SessionClaim::Returning(session) => {
             if send_status(&mut stream, ConnectStatus::ReturningClient).is_ok() {
@@ -78,7 +80,7 @@ pub(crate) fn handle(stream: TcpStream, core: Arc<RuntimeCore>, mut guard: RawSo
     }
 }
 
-fn handle_new(mut stream: TcpStream, start: crate::session_slot::SessionStart) {
+fn handle_new(mut stream: TcpStream, start: crate::session_slot::SessionStart, core: &RuntimeCore) {
     if send_status(&mut stream, ConnectStatus::NewClient).is_err() {
         return;
     }
@@ -116,11 +118,31 @@ fn handle_new(mut stream: TcpStream, start: crate::session_slot::SessionStart) {
     {
         return;
     }
-    let active = match ActiveSession::new(connection) {
+    let mut terminal = match core.registry.clone_stream(start.registration()) {
+        Ok(terminal) => terminal,
+        Err(_) => return,
+    };
+    let term_init = TermInit {
+        environmentnames: payload.environmentvariables.keys().cloned().collect(),
+        environmentvalues: payload.environmentvariables.values().cloned().collect(),
+    };
+    let init_packet = et_core::packet::Packet::new(
+        TerminalPacketType::TerminalInit as u8,
+        term_init.encode_to_vec(),
+    );
+    if write_local_packet(&mut terminal, &init_packet).is_err() {
+        return;
+    }
+    let active = match ActiveSession::new(connection, &terminal) {
         Ok(active) => active,
         Err(_) => return,
     };
-    let _ = start.activate(active);
+    let active = Arc::new(active);
+    if start.activate(active.clone()).is_err() {
+        return;
+    }
+    let _ = crate::terminal_bridge::run(active.clone(), terminal);
+    let _ = active.shutdown();
 }
 
 fn send_initial_error(connection: &mut Connection, message: &str) {

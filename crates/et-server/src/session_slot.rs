@@ -28,7 +28,7 @@ impl SessionStart {
         &self.registration
     }
 
-    pub(crate) fn activate(mut self, session: ActiveSession) -> Result<(), SessionTableError> {
+    pub(crate) fn activate(mut self, session: Arc<ActiveSession>) -> Result<(), SessionTableError> {
         let mut state = self.table.lock()?;
         if state.shutdown {
             return Err(SessionTableError::ShuttingDown);
@@ -44,7 +44,7 @@ impl SessionStart {
             self.registration.id.clone(),
             Slot::Active {
                 registration: self.registration.clone(),
-                session: Arc::new(session),
+                session,
             },
         );
         self.committed = true;

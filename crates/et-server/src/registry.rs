@@ -45,7 +45,7 @@ pub(crate) struct RegisteredTerminal {
 
 struct StoredRegistration {
     info: Registration,
-    _stream: UnixStream,
+    stream: UnixStream,
 }
 
 #[derive(Default)]
@@ -112,7 +112,7 @@ impl Registry {
             Entry::Vacant(entry) => {
                 entry.insert(StoredRegistration {
                     info: registration,
-                    _stream: stream,
+                    stream,
                 });
                 self.inner.changed.notify_all();
                 Ok(RegisteredTerminal { identity, watcher })
@@ -161,6 +161,23 @@ impl Registry {
             .registrations
             .get(id)
             .map(|stored| stored.info.clone()))
+    }
+
+    pub(crate) fn clone_stream(
+        &self,
+        registration: &Registration,
+    ) -> Result<UnixStream, RegistrationError> {
+        let registrations = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| RegistrationError::Unavailable)?;
+        let stored = registrations
+            .registrations
+            .get(&registration.id)
+            .filter(|stored| stored.info.same_generation(registration))
+            .ok_or(RegistrationError::Unavailable)?;
+        stored.stream.try_clone().map_err(RegistrationError::Io)
     }
 
     pub fn wait_for(&self, id: &str, timeout: Duration) -> Result<Registration, RegistrationError> {

@@ -4,6 +4,8 @@
 //! blocking [`connection::Connection`] over `TcpStream`.
 
 pub mod connection;
+mod connection_error;
+mod connection_nonblocking;
 pub mod framing_io;
 pub mod handshake;
 pub mod listener;

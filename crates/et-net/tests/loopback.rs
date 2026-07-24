@@ -2,6 +2,7 @@
 
 use std::net::{TcpListener, TcpStream};
 use std::thread;
+use std::time::Duration;
 
 use et_core::crypto::KEY_LEN;
 use et_core::keys::passkey_to_key;
@@ -16,7 +17,16 @@ fn loopback() -> (TcpStream, TcpStream) {
     let addr = listener.local_addr().unwrap();
     let server = thread::spawn(move || listener.accept().unwrap().0);
     let client = TcpStream::connect(addr).unwrap();
-    (client, server.join().unwrap())
+    let server = server.join().unwrap();
+    for stream in [&client, &server] {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+    }
+    (client, server)
 }
 
 #[test]

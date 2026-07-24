@@ -1,0 +1,77 @@
+{"type":"transition_applied","payload":{"type":"transition_applied","status":"running","residency_state":"resident"}}
+{"type":"assistant_message","payload":{"text":"I read this as research/investigation - gather primary-source evidence on EternalTerminal's security history, telemetry/privacy, protocol compatibility, and packaging constraints, then synthesize implications for a telemetry-free Rust port. No repo modifications.\n\nLet me start by identifying the canonical repository and resolving an immutable SHA, plus searching security databases in parallel.\n\n"}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":true}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"assistant_message","payload":{"text":"Canonical repo confirmed: `MisterTea/EternalTerminal`, HEAD SHA `90711ad421264db30dc5d05df4a37452b41a7667`. OSV requires a POST body (not permitted), so I'll use the GitHub Advisory Database API and repo searches instead.\n\n"}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":true}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":true}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"assistant_message","payload":{"text":"Strong leads. Now let me pull the key issues and query the GitHub Advisory Database in parallel.\n\n"}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":true}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":true}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"assistant_message","payload":{"text":"`gh issue view` is broken (GraphQL deprecation), so I'll use the REST API for issue bodies. CVE-2023-23558 confirmed: TelemetryService fixed paths in /tmp. Now fetching the telemetry issues and searching protocol/packaging angles.\n\n"}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"assistant_message","payload":{"text":"Now let me examine the actual telemetry source, protocol versioning, and the remaining issues in parallel.\n\n"}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"assistant_message","payload":{"text":"The telemetry source decodes to significant findings (hardcoded Sentry DSN + Datadog API key, opt-out via environment variable only). v7.0.0 was just released on 2026-07-07. Next, I'll check the NVD for the full list of CVEs, the protocol version mechanism, the v7.0.0 release notes, and the security discussion issues.\n\n"}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"assistant_message","payload":{"text":"NVD needs the spaced name. Also grabbing the protocol version check details, older tag's version, and the security-story issue.\n\n"}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"assistant_message","payload":{"text":"The NVD confirms 7 CVEs. The protocol version is 6 on both v6.2.11 and HEAD (v7.0.0), and since it's a strict equality check, 7.x remains wire-compatible with 6.x. Next, I'll verify the exact line numbers via raw files, and grab the README, server main, and packaging issues.\n\n"}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"assistant_message","payload":{"text":"I've confirmed the exact contents. Next, I need the line numbers in Headers.hpp, the telemetry wiring in TerminalServerMain (the default log directory related to CVE-2023-23558), the README for the platform support description, and how issue #504 was resolved.\n\n"}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"assistant_message","payload":{"text":"Important finding: `etserver` defaults to `enableTelemetry = false` (opt-in via config/CLI), but the sentry DB path still defaults to `/tmp/.sentry-native-etserver` (the CVE-2023-23558 condition). Need to check the client-side defaults, crypto primitives, and the line number in Headers.hpp.\n\n"}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":true}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"assistant_message","payload":{"text":"Major discovery: **the client's telemetry is enabled by default** (`default_value(\"true\")`), and on every connection a \"Session Started\" event is sent to Datadog. Next up: the crypto internals (essential for wire compatibility), the proto schema, and the line numbers in Headers.hpp.\n\n"}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"assistant_message","payload":{"text":"I've completely understood the crypto design: XSalsa20-Poly1305 secretbox, 32-byte passkey used as-is, direction byte at the end of the nonce + little-endian counter. What I need next is the wire framing, the SSH bootstrap (etterminal invocation), the passkey generation, and the line numbers in Headers.hpp.\n\n"}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"assistant_message","payload":{"text":"All the line anchors have been calculated. Final evidence batch: client connection handshake sequence, packet framing, terminal proto schema, and confirmation of the cpp-httplib fix in the 6.2.9 release notes.\n\n"}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"assistant_message","payload":{"text":"Almost done. Final verification round: status of comments on issue #778 (whether the CVE is still unfixed), the Debian key issue #702, and the submodule bump of cpp-httplib between 6.2.8 and 6.2.9.\n\n"}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":true}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":true}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"assistant_message","payload":{"text":"cpp-httplib is a vendored file, not a submodule. Checking the version macro directly in both tags.\n\n"}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"tool_execution","payload":{"tool":"bash","is_error":false}}
+{"type":"assistant_message","payload":{"text":"Confirmed the last open item: `et-v6.2.8` vendors cpp-httplib `0.10.7` and `et-v6.2.9` vendors `0.15.3`, so the CVE-2023-26130 fix shipped in 6.2.9. Research complete; nothing was modified.\n\n---\n\n# EternalTerminal: security, telemetry, protocol, and packaging research\n\nCanonical repo: `MisterTea/EternalTerminal` — HEAD `90711ad`, latest release **et-v7.0.0** (2026-07-07).\n\n## 1. Security advisories / CVEs\n\n| CVE | Issue | Fixed in | Notes |\n|---|---|---|---|\n| CVE-2022-24949 | Uncontrolled search path / privilege escalation | before 6.2.0 | NVD: https://nvd.nist.gov/vuln/detail/CVE-2022-24949 |\n| CVE-2022-24950 | Use of predictable temp names | before 6.2.0 | https://nvd.nist.gov/vuln/detail/CVE-2022-24950 |\n| CVE-2022-24951 | Insecure permissions on `et.json` | before 6.2.0 | https://nvd.nist.gov/vuln/detail/CVE-2022-24951 |\n| CVE-2022-24952 | Sensitive info in `et.json` | before 6.2.0 | https://nvd.nist.gov/vuln/detail/CVE-2022-24952 |\n| CVE-2022-48257 / CVE-2022-48258 | World-readable log files; symlink/log injection | 6.2.4 (PR #556) | https://github.com/MisterTea/EternalTerminal/pull/556 |\n| CVE-2023-23558 | Telemetry/Sentry used insecure `/tmp` paths | fixed in 6.2.1+ (per advisory); issue #778 still open in 2026 — maintainer disputes severity | https://github.com/MisterTea/EternalTerminal/issues/778 |\n| CVE-2023-26130 | Bundled cpp-httplib < 0.14.0 (header-injection / DoS class) | **6.2.9** — verified: 6.2.8 ships `0.10.7`, 6.2.9 ships `0.15.3` | Requested in issue #630 (2024-04-26, closed 2024-05-07) |\n\nImplications for a Rust port:\n- The CVE cluster is dominated by **file hygiene** (temp files, log perms, config perms, `/tmp` usage), not wire-protocol flaws. A Rust port must create config/log/terminal files with `0600`, use `O_NOFOLLOW`/`mkstemp` semantics, and never write secrets or telemetry artifacts to world-readable `/tmp`.\n- Do not vendor an HTTP client into the binary at all if telemetry is removed — that deletes the entire CVE-2023-26130 class.\n\n## 2. Telemetry behavior / privacy\n\n- Client telemetry **defaults ON**; server telemetry defaults OFF. Sends to **Sentry** (crashes) and **Datadog** (a \"Session Started\" event) using a hardcoded DSN/API key, with a persistent UUID stored in the config file. Opt-out: `ET_NO_TELEMETRY` env var or a build flag.\n- Issue #778 (open, 2026) documents the Sentry `/tmp` path problem and the maintainer's \"not a concern\" stance: https://github.com/MisterTea/EternalTerminal/issues/778\n\nImplications:\n- Telemetry-free is the correct default for a port, and it is a genuine differentiator — upstream will not change this.\n- Keep the `ET_NO_TELEMETRY`-style contract trivially satisfiable by having no telemetry code path at all. No persistent UUID, no outbound HTTP from the client.\n\n## 3. Protocol compatibility\n\n- `PROTOCOL_VERSION = 6` in both 6.2.11 and v7.0.0, with a **strict equality** check — a Rust implementation must send exactly `6` or be rejected.\n- Wire format: length-prefixed protobuf; `ConnectRequest`/`ConnectResponse` exchanged in plaintext, then session traffic under **XSalsa20-Poly1305 (`crypto_secretbox`)** with a 32-byte passkey and a direction-byte-in-nonce counter scheme.\n- Bootstrap is via SSH: `etterminal` generates a one-time `id/passkey_TERM` pair.\n\nImplications:\n- Interop with stock `et` 6.2.x/7.x servers is achievable: pin protocol version 6, reuse the `.proto` definitions verbatim, and replicate the exact nonce construction (direction byte + counter) — this is the single most likely interop-breakage point.\n- `sodiumoxide`/`crypto_secretbox` in Rust maps 1:1 to the C++ usage. The SSH bootstrap (`etterminal` invocation, `id/passkey` parsing) must be replicated exactly, including the `_TERM` suffix convention.\n\n## 4. Packaging / platform constraints\n\n- Ubuntu 26.04 PPA missing suite — issue #744: https://github.com/MisterTea/EternalTerminal/issues/744\n- RPM builds fail with executable-stack errors from bundled crashpad/Sentry binaries — issue #677: https://github.com/MisterTea/EternalTerminal/issues/677\n- Debian repo SHA1/signature policy warning — issue #702 (closed): https://github.com/MisterTea/EternalTerminal/issues/702\n\nImplications:\n- The executable-stack RPM failure is caused directly by the Sentry/crashpad binaries. Removing telemetry removes the blocker — a Rust port can ship clean RPM/DEB packages for current distros (including Ubuntu 26.04) where upstream cannot.\n- Use a signed repo with SHA256+ metadata from day one to avoid the #702 class of problem.\n\n## Bottom line for the port\n\n1. **Security posture**: replicate the post-6.2.4 file-permission fixes as defaults; the protocol itself has no published wire-level CVEs.\n2. **Telemetry**: omit entirely (Sentry + Datadog, persistent UUID, `/tmp` artifacts) — upstream keeps it client-default-on.\n3. **Compat**: protocol version 6, verbatim protobufs, exact `crypto_secretbox` nonce layout, exact `etterminal` bootstrap contract.\n4. **Packaging**: dropping the Sentry/crashpad binaries unblocks clean RPM packaging and current-Ubuntu PPA coverage.\n\nOne caveat worth flagging: issue #778 remains open with the maintainer disputing the telemetry CVE's severity, so treat CVE-2023-23558 as \"fixed per advisory but contested\" rather than fully resolved upstream."}}
+{"type":"transition_applied","payload":{"type":"transition_applied","status":"completed","residency_state":"resident"}}
+{"type":"transition_applied","payload":{"type":"transition_applied","status":"completed","residency_state":"disposed"}}
+{"type":"destroyed","payload":{"cause":"shutdown"}}

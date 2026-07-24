@@ -1,0 +1,19 @@
+[package]
+name = "et-core"
+description = "Protocol primitives for et.rs: crypto, packet framing, protobuf codec."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+xsalsa20poly1305 = "0.9"
+
+[dev-dependencies]
+hex = "0.4"
+serde_json = "1"

@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/et-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+license = "Apache-2.0"
+authors = ["et.rs contributors"]
+repository = "https://github.com/minpeter/et.rs"
+homepage = "https://github.com/minpeter/et.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+opt-level = 0

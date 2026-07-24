@@ -1,0 +1,13 @@
+[package]
+name = "et-cli"
+description = "Command-line argument and host parsing for et.rs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+et-core = { path = "../et-core" }
+clap = { version = "4", features = ["derive"] }

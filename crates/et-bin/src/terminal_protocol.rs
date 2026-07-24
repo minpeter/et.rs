@@ -107,16 +107,63 @@ fn valid_size(info: TerminalInfo) -> Result<PtySize, String> {
         }
         Ok(value)
     }
+    fn pixels(value: Option<i32>, name: &str) -> Result<u16, String> {
+        let value = value.unwrap_or(0);
+        let value = u16::try_from(value).map_err(|_| format!("invalid terminal {name}"))?;
+        if value > 10_000 {
+            return Err(format!("invalid terminal {name}"));
+        }
+        Ok(value)
+    }
     Ok(PtySize {
         rows: dimension(info.row, 1000, "rows")?,
         cols: dimension(info.column, 1000, "columns")?,
-        pixel_width: info
-            .width
-            .and_then(|value| u16::try_from(value).ok())
-            .unwrap_or(0),
-        pixel_height: info
-            .height
-            .and_then(|value| u16::try_from(value).ok())
-            .unwrap_or(0),
+        pixel_width: pixels(info.width, "pixel width")?,
+        pixel_height: pixels(info.height, "pixel height")?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_rejects_zero_negative_and_oversized_dimensions() {
+        for info in [
+            TerminalInfo {
+                row: Some(0),
+                column: Some(80),
+                ..Default::default()
+            },
+            TerminalInfo {
+                row: Some(24),
+                column: Some(-1),
+                ..Default::default()
+            },
+            TerminalInfo {
+                row: Some(24),
+                column: Some(80),
+                width: Some(10_001),
+                ..Default::default()
+            },
+        ] {
+            assert!(valid_size(info).is_err());
+        }
+    }
+
+    #[test]
+    fn resize_accepts_upstream_terminal_geometry() {
+        let size = valid_size(TerminalInfo {
+            row: Some(40),
+            column: Some(100),
+            width: Some(800),
+            height: Some(600),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(size.rows, 40);
+        assert_eq!(size.cols, 100);
+        assert_eq!(size.pixel_width, 800);
+        assert_eq!(size.pixel_height, 600);
+    }
 }

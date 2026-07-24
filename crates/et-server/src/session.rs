@@ -150,6 +150,14 @@ impl ActiveSession {
             .connected())
     }
 
+    pub(crate) fn can_buffer_write(&self, bytes: i64) -> Result<bool, SessionError> {
+        Ok(self
+            .connection
+            .lock()
+            .map_err(|_| SessionError::Unavailable)?
+            .can_buffer_write(bytes))
+    }
+
     pub(crate) fn is_shutting_down(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
     }

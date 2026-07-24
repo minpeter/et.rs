@@ -82,18 +82,17 @@ fn pump(
             drain(wake)?;
             send_size(connection)?;
         }
-        if network.intersects(PollFlags::HUP | PollFlags::ERR) {
-            return Ok(());
-        }
         if network.contains(PollFlags::IN) {
-            match connection.try_read_packet() {
-                Ok(Some(packet)) => display_packet(packet)?,
-                Ok(None) => {}
-                Err(error) if connection_ended(&error) => return Ok(()),
-                Err(error) => return Err(terminal_error(error)),
+            loop {
+                match connection.try_read_packet() {
+                    Ok(Some(packet)) => display_packet(packet)?,
+                    Ok(None) => break,
+                    Err(error) if connection_ended(&error) => return Ok(()),
+                    Err(error) => return Err(terminal_error(error)),
+                }
             }
         }
-        if input.intersects(PollFlags::HUP | PollFlags::ERR) {
+        if network.intersects(PollFlags::HUP | PollFlags::ERR) {
             return Ok(());
         }
         if input.contains(PollFlags::IN) {
@@ -106,6 +105,9 @@ fn pump(
                 return Ok(());
             }
             send_buffer(connection, &bytes[..count])?;
+        }
+        if input.intersects(PollFlags::HUP | PollFlags::ERR) {
+            return Ok(());
         }
     }
 }

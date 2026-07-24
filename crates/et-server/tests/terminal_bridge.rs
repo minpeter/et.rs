@@ -35,6 +35,15 @@ fn encrypted_client_and_registered_terminal_exchange_packets() {
             &input.encode_to_vec(),
         )
         .unwrap();
+    let second_input = TerminalBuffer {
+        buffer: Some(b"second-input".to_vec()),
+    };
+    client
+        .write_packet(
+            TerminalPacketType::TerminalBuffer as u8,
+            &second_input.encode_to_vec(),
+        )
+        .unwrap();
     let local_input = read_local_packet(&mut terminal).unwrap();
     assert_eq!(
         TerminalBuffer::decode(local_input.payload())
@@ -42,6 +51,14 @@ fn encrypted_client_and_registered_terminal_exchange_packets() {
             .buffer
             .as_deref(),
         Some(b"client-input".as_slice())
+    );
+    let local_second = read_local_packet(&mut terminal).unwrap();
+    assert_eq!(
+        TerminalBuffer::decode(local_second.payload())
+            .unwrap()
+            .buffer
+            .as_deref(),
+        Some(b"second-input".as_slice())
     );
 
     let output = TerminalBuffer {

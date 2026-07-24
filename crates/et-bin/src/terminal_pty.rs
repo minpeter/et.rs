@@ -6,9 +6,12 @@ use std::thread;
 use et_core::packet::Packet;
 use et_core::proto::{TerminalBuffer, TerminalPacketType};
 use et_net::local_packet::{write_local_packet, LocalPacketDecoder};
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use prost::Message;
 use rustix::event::{poll, PollFd, PollFlags};
+use sysinfo::{Pid as SystemPid, ProcessesToUpdate, Signal as SystemSignal, System};
 
 const MAX_OUTPUT_CHUNK: usize = 16 * 1024;
 
@@ -42,6 +45,7 @@ pub fn run(mut router: UnixStream, term: &str) -> Result<i32, String> {
         .slave
         .spawn_command(command)
         .map_err(|error| format!("could not spawn terminal shell: {error}"))?;
+    let child_pid = child.process_id();
     drop(pair.slave);
     let mut killer = child.clone_killer();
     let mut pty_reader = pair
@@ -95,6 +99,7 @@ pub fn run(mut router: UnixStream, term: &str) -> Result<i32, String> {
         &mut pty_writer,
         &events_rx,
     );
+    kill_process_group(child_pid);
     if result.is_err() {
         let _ = killer.kill();
     }
@@ -189,4 +194,21 @@ fn drain_wakeup(wake_reader: &mut UnixStream) -> Result<(), String> {
 
 fn signal(mut wake: UnixStream) {
     let _ = wake.write_all(&[1]);
+}
+
+fn kill_process_group(process_id: Option<u32>) {
+    let Some(process_id) = process_id.and_then(|value| i32::try_from(value).ok()) else {
+        return;
+    };
+    let _ = kill(Pid::from_raw(-process_id), Signal::SIGKILL);
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    let session = SystemPid::from_u32(process_id.cast_unsigned());
+    for process in system
+        .processes()
+        .values()
+        .filter(|process| process.session_id() == Some(session))
+    {
+        let _ = process.kill_with(SystemSignal::Kill);
+    }
 }

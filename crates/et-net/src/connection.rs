@@ -147,6 +147,10 @@ impl Connection {
         self.writer.connected()
     }
 
+    pub fn can_buffer_write(&self, bytes: i64) -> bool {
+        self.writer.has_capacity(bytes)
+    }
+
     pub fn writer_sequence(&self) -> i64 {
         self.writer.sequence()
     }

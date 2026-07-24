@@ -71,8 +71,15 @@ fn print_marker(input: &CredentialInput) -> Result<i32, clap::Error> {
 
 fn load_credentials(args: &TerminalArgs) -> Result<CredentialInput, String> {
     if let Some(path) = args.idpasskeyfile.as_deref() {
-        let value = fs::read_to_string(path)
+        let mut value = String::new();
+        fs::File::open(path)
+            .map_err(|error| format!("could not open id/passkey file: {error}"))?
+            .take(MAX_CREDENTIAL_INPUT + 1)
+            .read_to_string(&mut value)
             .map_err(|error| format!("could not read id/passkey file: {error}"))?;
+        if value.len() > MAX_CREDENTIAL_INPUT as usize {
+            return Err("id/passkey file exceeds 4096 bytes".to_owned());
+        }
         let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_owned());
         return parse_credential_input(&format!("{}_{}", value.trim(), term));
     }

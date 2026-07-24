@@ -25,8 +25,9 @@ pub(crate) fn run(
             return Ok(());
         }
         let client = connected.then(|| session.try_clone_stream()).transpose()?;
+        let accept_terminal = session.can_buffer_write((READ_BUFFER * 2) as i64)?;
         let (terminal_events, wake_events, client_events) =
-            wait(&terminal, &wake, client.as_ref())?;
+            wait(&terminal, &wake, client.as_ref(), accept_terminal)?;
         if wake_events.intersects(PollFlags::IN | PollFlags::HUP) {
             drain(&mut wake)?;
             if session.is_shutting_down() {
@@ -44,15 +45,21 @@ pub(crate) fn run(
                 decoder = LocalPacketDecoder::new();
             }
         }
+        if client_events.contains(PollFlags::IN) {
+            loop {
+                match session.try_read_packet() {
+                    Ok(Some(packet)) => forward_client_packet(&session, &mut terminal, packet)?,
+                    Ok(None) => break,
+                    Err(SessionError::Connection(_)) => {
+                        connected = false;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
         if client_events.intersects(PollFlags::HUP | PollFlags::ERR) {
             connected = false;
-        } else if client_events.contains(PollFlags::IN) {
-            match session.try_read_packet() {
-                Ok(Some(packet)) => forward_client_packet(&session, &mut terminal, packet)?,
-                Ok(None) => {}
-                Err(SessionError::Connection(_)) => connected = false,
-                Err(error) => return Err(error),
-            }
         }
     }
 }
@@ -61,9 +68,15 @@ fn wait(
     terminal: &UnixStream,
     wake: &UnixStream,
     client: Option<&std::net::TcpStream>,
+    accept_terminal: bool,
 ) -> Result<(PollFlags, PollFlags, PollFlags), SessionError> {
+    let terminal_flags = if accept_terminal {
+        PollFlags::IN | PollFlags::HUP | PollFlags::ERR
+    } else {
+        PollFlags::HUP | PollFlags::ERR
+    };
     let mut descriptors = vec![
-        PollFd::new(terminal, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
+        PollFd::new(terminal, terminal_flags),
         PollFd::new(wake, PollFlags::IN | PollFlags::HUP),
     ];
     if let Some(client) = client {

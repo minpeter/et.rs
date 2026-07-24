@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use wait_timeout::ChildExt;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
 #[test]
 fn real_tty_restores_termios_and_propagates_resize() {
@@ -57,10 +59,101 @@ fn real_tty_restores_termios_and_propagates_resize() {
         .unwrap()
         .read_to_string(&mut output)
         .unwrap();
-    assert!(child.wait().unwrap().success());
+    let status = child.wait().unwrap();
+    assert!(status.success(), "status={status:?} output={output:?}");
     assert!(output.contains("TTY-G004"), "{output:?}");
     assert!(output.contains("30 90"), "{output:?}");
     assert!(output.contains("TERMIOS-RESTORED:yes:CODE:0"), "{output:?}");
+}
+
+#[test]
+fn real_tty_forwards_input_control_bytes_and_live_resize() {
+    let stack = Stack::start();
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 30,
+            cols: 90,
+            pixel_width: 900,
+            pixel_height: 600,
+        })
+        .unwrap();
+    let mut client = CommandBuilder::new(env!("CARGO_BIN_EXE_et"));
+    client.args([
+        "--terminal-path",
+        stack.terminal.to_str().unwrap(),
+        "--serverfifo",
+        stack.router.to_str().unwrap(),
+        "-p",
+        &stack.port.to_string(),
+        "127.0.0.1",
+    ]);
+    client.env(
+        "PATH",
+        format!(
+            "{}:{}",
+            stack.directory.display(),
+            std::env::var("PATH").unwrap()
+        ),
+    );
+    client.env("TERM", "xterm-256color");
+    let mut child = pair.slave.spawn_command(client).unwrap();
+    drop(pair.slave);
+    let mut writer = pair.master.take_writer().unwrap();
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let (sender, receiver) = mpsc::sync_channel(32);
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => {
+                    if sender.send(chunk[..count].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    writer.write_all(b"printf 'FIRST\\n'\n").unwrap();
+    let mut output = receive_until(&receiver, Vec::new(), b"FIRST\r\n");
+    pair.master
+        .resize(PtySize {
+            rows: 40,
+            cols: 100,
+            pixel_width: 1000,
+            pixel_height: 800,
+        })
+        .unwrap();
+    writer
+        .write_all(
+            b"printf 'LIVE:%s\\n' \"$(stty size)\"; printf 'BIN:\\001\\177\\n'; \
+              printf 'READY\\n'; sleep 30\n",
+        )
+        .unwrap();
+    output = receive_until(&receiver, output, b"READY\r\n");
+    writer.write_all(b"\x03printf 'CTRL\\n'; exit\n").unwrap();
+    while let Ok(chunk) = receiver.recv_timeout(TIMEOUT) {
+        output.extend(chunk);
+    }
+    let status = child.wait().unwrap();
+    assert!(status.success(), "status={status:?} output={output:?}");
+    assert!(output.windows(11).any(|window| window == b"LIVE:40 100"));
+    assert!(output.windows(6).any(|window| window == b"BIN:\x01\x7f"));
+    assert!(output.windows(4).any(|window| window == b"CTRL"));
+}
+
+fn receive_until(
+    receiver: &mpsc::Receiver<Vec<u8>>,
+    mut output: Vec<u8>,
+    marker: &[u8],
+) -> Vec<u8> {
+    while !output.windows(marker.len()).any(|window| window == marker) {
+        match receiver.recv_timeout(TIMEOUT) {
+            Ok(chunk) => output.extend(chunk),
+            Err(error) => panic!("waiting for marker {marker:?}: {error}; output={output:?}"),
+        }
+    }
+    output
 }
 
 struct Stack {
@@ -73,7 +166,9 @@ struct Stack {
 
 impl Stack {
     fn start() -> Self {
-        let directory = std::env::temp_dir().join(format!("et-rs-tty-qa-{}", std::process::id()));
+        let fixture = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("et-rs-tty-qa-{}-{fixture}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();

@@ -8,7 +8,8 @@ pub mod backed_reader;
 pub mod backed_writer;
 pub mod crypto;
 pub mod framing;
+pub mod keys;
 pub mod packet;
 pub mod proto;
 
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: i32 = 6;

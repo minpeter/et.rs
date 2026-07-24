@@ -1,0 +1,13 @@
+[package]
+name = "et-net"
+description = "TCP transport, handshake, and connection orchestration for et.rs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+et-core = { path = "../et-core" }
+prost = "0.13"

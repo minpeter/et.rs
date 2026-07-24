@@ -173,6 +173,10 @@ impl Connection {
         }
     }
 
+    pub fn try_clone_stream(&self) -> Result<TcpStream, ConnError> {
+        self.stream.try_clone().map_err(ConnError::Io)
+    }
+
     pub fn writer_sequence(&self) -> i64 {
         self.writer.sequence()
     }

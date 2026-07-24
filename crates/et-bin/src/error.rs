@@ -34,6 +34,7 @@ pub enum ClientError {
     },
     ServerInvalidKey(Option<String>),
     ProtocolMismatch(Option<String>),
+    ReturningSessionRequiresRecovery,
     ServerRejected {
         status: Option<i32>,
         message: Option<String>,
@@ -110,6 +111,10 @@ impl std::fmt::Display for ClientError {
                 write!(f, "ET server rejected protocol version 6")?;
                 write_message(f, message)
             }
+            Self::ReturningSessionRequiresRecovery => write!(
+                f,
+                "server reported a returning session; returning recovery belongs to a live reconnect"
+            ),
             Self::ServerRejected { status, message } => {
                 write!(f, "ET server rejected the connection")?;
                 if let Some(status) = status {

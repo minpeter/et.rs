@@ -12,7 +12,7 @@ use crate::runtime_state::{RawSocketGuard, RuntimeCore};
 use crate::session::ActiveSession;
 use crate::session_table::SessionClaim;
 
-pub(crate) fn handle(stream: TcpStream, core: Arc<RuntimeCore>, _guard: RawSocketGuard) {
+pub(crate) fn handle(stream: TcpStream, core: Arc<RuntimeCore>, mut guard: RawSocketGuard) {
     let mut stream = stream;
     let request = match read_request(&mut stream) {
         Ok(request) => request,
@@ -48,12 +48,20 @@ pub(crate) fn handle(stream: TcpStream, core: Arc<RuntimeCore>, _guard: RawSocke
             return;
         }
     };
-    let claim = match core.sessions.claim(registration) {
+    if guard.assign(registration.identity()).is_err() {
+        return;
+    }
+    let claim = match core.sessions.claim(registration, &stream) {
         Ok(claim) => claim,
         Err(_) => return,
     };
     match claim {
-        SessionClaim::New(start) => handle_new(stream, start),
+        SessionClaim::New { start, replaced } => {
+            if replaced.is_some_and(|connection| connection.shutdown().is_err()) {
+                return;
+            }
+            handle_new(stream, start);
+        }
         SessionClaim::Returning(session) => {
             if send_status(&mut stream, ConnectStatus::ReturningClient).is_ok() {
                 let _ = session.recover(stream);
@@ -62,7 +70,7 @@ pub(crate) fn handle(stream: TcpStream, core: Arc<RuntimeCore>, _guard: RawSocke
     }
 }
 
-fn handle_new(mut stream: TcpStream, start: crate::session_table::SessionStart) {
+fn handle_new(mut stream: TcpStream, start: crate::session_slot::SessionStart) {
     if send_status(&mut stream, ConnectStatus::NewClient).is_err() {
         return;
     }
@@ -100,7 +108,11 @@ fn handle_new(mut stream: TcpStream, start: crate::session_table::SessionStart) 
     {
         return;
     }
-    let _ = start.activate(ActiveSession::new(connection));
+    let active = match ActiveSession::new(connection) {
+        Ok(active) => active,
+        Err(_) => return,
+    };
+    let _ = start.activate(active);
 }
 
 fn send_initial_error(connection: &mut Connection, message: &str) {

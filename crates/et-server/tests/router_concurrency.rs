@@ -17,7 +17,7 @@ use support::TestDir;
 
 const KEY: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
 
-fn register(path: &std::path::Path, id: String, uid: i64, barrier: Arc<Barrier>) {
+fn register(path: &std::path::Path, id: String, uid: i64, barrier: Arc<Barrier>) -> UnixStream {
     let mut stream = UnixStream::connect(path).unwrap();
     let info = TerminalUserInfo {
         id: Some(id),
@@ -32,6 +32,7 @@ fn register(path: &std::path::Path, id: String, uid: i64, barrier: Arc<Barrier>)
     );
     barrier.wait();
     write_local_packet(&mut stream, &packet).unwrap();
+    stream
 }
 
 #[test]
@@ -54,9 +55,10 @@ fn concurrent_distinct_registrations_are_all_retained() {
             thread::spawn(move || register(&path, id, index as i64, barrier))
         })
         .collect();
-    for worker in workers {
-        worker.join().unwrap();
-    }
+    let terminals: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
     for _ in &ids {
         assert!(matches!(
             router.recv_event_timeout(Duration::from_secs(2)).unwrap(),
@@ -65,6 +67,7 @@ fn concurrent_distinct_registrations_are_all_retained() {
     }
     assert_eq!(registry.len().unwrap(), ids.len());
     router.shutdown().unwrap();
+    drop(terminals);
 }
 
 #[test]
@@ -85,9 +88,10 @@ fn concurrent_same_id_has_one_winner_and_never_overwrites_it() {
             register(&path, id.to_owned(), uid, barrier)
         }));
     }
-    for worker in workers {
-        worker.join().unwrap();
-    }
+    let terminals: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
 
     let events = [
         router.recv_event_timeout(Duration::from_secs(2)).unwrap(),
@@ -111,6 +115,7 @@ fn concurrent_same_id_has_one_winner_and_never_overwrites_it() {
     assert!(winner == 101 || winner == 202);
     assert_eq!(registry.len().unwrap(), 1);
     router.shutdown().unwrap();
+    drop(terminals);
 }
 
 #[test]

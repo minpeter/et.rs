@@ -18,6 +18,7 @@ pub struct RouterPath {
 #[derive(Clone, Debug)]
 enum DirectoryPlan {
     Existing,
+    RootDefault,
     Xdg { base: PathBuf },
     Home { home: PathBuf },
 }
@@ -39,6 +40,18 @@ impl RouterPath {
                     .parent()
                     .ok_or_else(|| PathError::UnsafeDirectory(self.path.clone()))?;
                 validate_directory(parent, false)
+            }
+            DirectoryPlan::RootDefault => {
+                let parent = self
+                    .path
+                    .parent()
+                    .ok_or_else(|| PathError::UnsafeDirectory(self.path.clone()))?;
+                let target = fs::canonicalize(parent).map_err(|source| PathError::Io {
+                    operation: "resolve trusted root router directory",
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+                validate_directory(&target, false)
             }
             DirectoryPlan::Xdg { base } => {
                 validate_directory(base, true)?;
@@ -149,7 +162,7 @@ pub fn select_router_path_for(
         return Ok(RouterPath {
             path: PathBuf::from(ROOT_FIFO),
             socket_mode,
-            plan: DirectoryPlan::Existing,
+            plan: DirectoryPlan::RootDefault,
         });
     }
     if let Some(base) = xdg_runtime_dir.filter(|path| path.is_absolute()) {
@@ -219,3 +232,7 @@ fn validate_directory(path: &Path, private: bool) -> Result<(), PathError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "path_tests.rs"]
+mod path_tests;

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
+use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -234,6 +235,33 @@ fn marker_id_and_key_errors_are_distinct() {
         assert_eq!(output.status.code(), Some(1));
         assert!(stderr(&output).contains(message), "{}", stderr(&output));
     }
+}
+
+#[test]
+fn fresh_bootstrap_rejects_returning_without_sending_initial_payload() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        bound(&stream);
+        assert_eq!(read_request(&mut stream).unwrap().version, Some(6));
+        write_response(
+            &mut stream,
+            &response_status(ConnectStatus::ReturningClient),
+        )
+        .unwrap();
+        let mut byte = [0u8; 1];
+        assert_eq!(stream.read(&mut byte).unwrap(), 0);
+    });
+    let fake = FakeSsh::new();
+    let output = fake
+        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
+        .args(["-N".to_string(), address.to_string()])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("returning recovery belongs to a live reconnect"));
 }
 
 #[test]

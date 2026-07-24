@@ -5,18 +5,23 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use et_core::packet::Packet;
-use et_core::proto::{TerminalPacketType, TerminalUserInfo};
 use et_net::local_packet::LocalPacketDecoder;
-use prost::Message;
 use rustix::event::{poll, PollFd, PollFlags};
 
-use crate::registry::{RegistrationError, Registry};
+use crate::registry::{RegistrationIdentity, Registry};
 use crate::router::{RouterError, RouterEvent, RouterReject};
+use crate::router_registration;
+use crate::runtime_lifecycle::LifecycleEvent;
 use crate::socket_path::OwnedRouterListener;
 
 struct PendingConnection {
     stream: UnixStream,
     decoder: LocalPacketDecoder,
+}
+
+struct WatchedRegistration {
+    stream: UnixStream,
+    identity: RegistrationIdentity,
 }
 
 enum ReadOutcome {
@@ -30,17 +35,27 @@ pub(crate) fn run(
     mut wake_reader: UnixStream,
     registry: Registry,
     events: Sender<RouterEvent>,
+    lifecycle: Option<Sender<LifecycleEvent>>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), RouterError> {
     let mut pending = Vec::<PendingConnection>::new();
+    let mut watched = Vec::<WatchedRegistration>::new();
     loop {
-        let mut poll_fds = Vec::with_capacity(pending.len() + 2);
+        let pending_start = 2;
+        let watched_start = pending_start + pending.len();
+        let mut poll_fds = Vec::with_capacity(watched_start + watched.len());
         poll_fds.push(PollFd::new(listener.listener(), PollFlags::IN));
         poll_fds.push(PollFd::new(&wake_reader, PollFlags::IN));
         for connection in &pending {
             poll_fds.push(PollFd::new(
                 &connection.stream,
                 PollFlags::IN | PollFlags::HUP | PollFlags::ERR,
+            ));
+        }
+        for registration in &watched {
+            poll_fds.push(PollFd::new(
+                &registration.stream,
+                PollFlags::HUP | PollFlags::ERR,
             ));
         }
         match poll(&mut poll_fds, None) {
@@ -50,7 +65,6 @@ pub(crate) fn run(
         }
         let readiness: Vec<PollFlags> = poll_fds.iter().map(PollFd::revents).collect();
         drop(poll_fds);
-
         if readiness
             .get(1)
             .is_some_and(|flags| flags.intersects(PollFlags::IN | PollFlags::HUP))
@@ -60,32 +74,47 @@ pub(crate) fn run(
                 return Ok(());
             }
         }
+        disconnect_ready(
+            &readiness[watched_start..],
+            &mut watched,
+            &registry,
+            &events,
+            lifecycle.as_ref(),
+        )?;
         if readiness
             .first()
             .is_some_and(|flags| flags.contains(PollFlags::IN))
         {
             accept_ready(&listener, &mut pending)?;
         }
-        let mut ready_indices: Vec<usize> = readiness
+        let ready_pending: Vec<usize> = readiness[pending_start..watched_start]
             .iter()
-            .skip(2)
             .enumerate()
             .filter_map(|(index, flags)| {
                 flags
                     .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
                     .then_some(index)
             })
+            .rev()
             .collect();
-        ready_indices.reverse();
-        for index in ready_indices {
-            if index >= pending.len() {
-                continue;
-            }
+        for index in ready_pending {
             match read_ready(&mut pending[index])? {
                 ReadOutcome::Pending => {}
                 ReadOutcome::Packet(packet) => {
                     let connection = pending.swap_remove(index);
-                    process_registration(packet, connection.stream, &registry, &events);
+                    match router_registration::process(packet, connection.stream, &registry) {
+                        Ok(terminal) => {
+                            let id = terminal.identity.id().to_owned();
+                            watched.push(WatchedRegistration {
+                                stream: terminal.watcher,
+                                identity: terminal.identity,
+                            });
+                            let _ = events.send(RouterEvent::Registered { id });
+                        }
+                        Err(error) => {
+                            let _ = events.send(RouterEvent::Rejected(error));
+                        }
+                    }
                 }
                 ReadOutcome::Reject => {
                     pending.swap_remove(index);
@@ -94,6 +123,39 @@ pub(crate) fn run(
             }
         }
     }
+}
+
+fn disconnect_ready(
+    readiness: &[PollFlags],
+    watched: &mut Vec<WatchedRegistration>,
+    registry: &Registry,
+    events: &Sender<RouterEvent>,
+    lifecycle: Option<&Sender<LifecycleEvent>>,
+) -> Result<(), RouterError> {
+    let ready: Vec<usize> = readiness
+        .iter()
+        .enumerate()
+        .filter_map(|(index, flags)| {
+            flags
+                .intersects(PollFlags::HUP | PollFlags::ERR)
+                .then_some(index)
+        })
+        .rev()
+        .collect();
+    for index in ready {
+        let registration = watched.swap_remove(index);
+        if registry
+            .remove_if_current(&registration.identity)
+            .map_err(|error| RouterError::Io(io::Error::other(error)))?
+        {
+            let id = registration.identity.id().to_owned();
+            let _ = events.send(RouterEvent::Disconnected { id });
+            if let Some(sender) = lifecycle {
+                let _ = sender.send(LifecycleEvent::TerminalDisconnected(registration.identity));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn accept_ready(
@@ -143,38 +205,6 @@ fn read_ready(connection: &mut PendingConnection) -> Result<ReadOutcome, RouterE
             Err(_) => return Ok(ReadOutcome::Reject),
         }
     }
-}
-
-fn process_registration(
-    packet: Packet,
-    stream: UnixStream,
-    registry: &Registry,
-    events: &Sender<RouterEvent>,
-) {
-    let result = if packet.is_encrypted() {
-        Err(RouterReject::Encrypted)
-    } else if packet.header() != TerminalPacketType::TerminalUserInfo as u8 {
-        Err(RouterReject::WrongPacketType)
-    } else {
-        TerminalUserInfo::decode(packet.payload())
-            .map_err(|_| RouterReject::MalformedUserInfo)
-            .and_then(|info| {
-                registry
-                    .register(info, stream)
-                    .map_err(|error| match error {
-                        RegistrationError::Invalid => RouterReject::InvalidRegistration,
-                        RegistrationError::Duplicate => RouterReject::Duplicate,
-                        RegistrationError::Unavailable | RegistrationError::Timeout => {
-                            RouterReject::RegistryUnavailable
-                        }
-                    })
-            })
-    };
-    let event = match result {
-        Ok(id) => RouterEvent::Registered { id },
-        Err(error) => RouterEvent::Rejected(error),
-    };
-    let _ = events.send(event);
 }
 
 fn drain_waker(wake_reader: &mut UnixStream) -> Result<(), RouterError> {

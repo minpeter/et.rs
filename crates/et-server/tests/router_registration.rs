@@ -33,9 +33,14 @@ fn info(
     }
 }
 
-fn send_packet(path: &std::path::Path, packet: &Packet) {
+fn connect_packet(path: &std::path::Path, packet: &Packet) -> UnixStream {
     let mut stream = UnixStream::connect(path).unwrap();
     write_local_packet(&mut stream, packet).unwrap();
+    stream
+}
+
+fn send_packet(path: &std::path::Path, packet: &Packet) {
+    drop(connect_packet(path, packet));
 }
 
 fn expect_rejected(router: &Router, expected: RouterReject) {
@@ -57,7 +62,7 @@ fn valid_plaintext_registration_is_retained() {
         TerminalPacketType::TerminalUserInfo as u8,
         info(Some(ID), Some(KEY), Some(501), Some(20)).encode_to_vec(),
     );
-    send_packet(&path, &packet);
+    let _terminal = connect_packet(&path, &packet);
     assert_eq!(
         router.recv_event_timeout(Duration::from_secs(2)).unwrap(),
         RouterEvent::Registered { id: ID.to_owned() }
@@ -152,7 +157,7 @@ fn duplicate_rejection_preserves_the_original_registration() {
         TerminalPacketType::TerminalUserInfo as u8,
         info(Some(ID), Some(KEY), Some(10), Some(1)).encode_to_vec(),
     );
-    send_packet(&path, &first);
+    let _terminal = connect_packet(&path, &first);
     assert_eq!(
         router.recv_event_timeout(Duration::from_secs(2)).unwrap(),
         RouterEvent::Registered { id: ID.to_owned() }
@@ -165,6 +170,41 @@ fn duplicate_rejection_preserves_the_original_registration() {
     send_packet(&path, &duplicate);
     expect_rejected(&router, RouterReject::Duplicate);
     assert_eq!(registry.get(ID).unwrap().unwrap().uid, 10);
+    assert_eq!(registry.len().unwrap(), 1);
+    router.shutdown().unwrap();
+}
+
+#[test]
+fn terminal_disconnect_is_typed_and_same_id_can_register_again() {
+    let dir = TestDir::new();
+    let path = dir.socket();
+    let registry = Registry::new();
+    let selected = select_router_path_for(1000, Some(&path), None, None).unwrap();
+    let mut router = Router::start(selected, registry.clone()).unwrap();
+    let packet = Packet::new(
+        TerminalPacketType::TerminalUserInfo as u8,
+        info(Some(ID), Some(KEY), Some(501), Some(20)).encode_to_vec(),
+    );
+
+    let terminal = connect_packet(&path, &packet);
+    assert_eq!(
+        router.recv_event_timeout(Duration::from_secs(2)).unwrap(),
+        RouterEvent::Registered { id: ID.to_owned() }
+    );
+    drop(terminal);
+    assert_eq!(
+        router.recv_event_timeout(Duration::from_secs(2)).unwrap(),
+        RouterEvent::Disconnected { id: ID.to_owned() }
+    );
+    registry
+        .wait_until_absent(ID, Duration::from_secs(2))
+        .unwrap();
+
+    let _fresh_terminal = connect_packet(&path, &packet);
+    assert_eq!(
+        router.recv_event_timeout(Duration::from_secs(2)).unwrap(),
+        RouterEvent::Registered { id: ID.to_owned() }
+    );
     assert_eq!(registry.len().unwrap(), 1);
     router.shutdown().unwrap();
 }

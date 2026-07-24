@@ -3,6 +3,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -14,12 +15,15 @@ use crate::router::Router;
 use crate::runtime_accept;
 use crate::runtime_error::RuntimeError;
 use crate::runtime_handle::RuntimeHandle;
+use crate::runtime_lifecycle::{self, LifecycleEvent};
 use crate::runtime_state::{HandlerThreads, RawSockets, RuntimeCore};
 use crate::session_table::SessionTable;
 
 pub struct Runtime {
     core: Arc<RuntimeCore>,
     router: Option<Router>,
+    lifecycle_sender: Option<Sender<LifecycleEvent>>,
+    lifecycle_worker: Option<JoinHandle<Result<(), RuntimeError>>>,
     accept_wakers: Vec<UnixStream>,
     accept_workers: Vec<JoinHandle<Result<(), RuntimeError>>>,
     tcp_addresses: Vec<SocketAddr>,
@@ -41,18 +45,33 @@ impl Runtime {
             })?);
         }
         let registry = Registry::new();
-        let router_name = router_path.path().to_path_buf();
-        let router = Router::start(router_path, registry.clone())?;
         let core = Arc::new(RuntimeCore {
-            registry,
+            registry: registry.clone(),
             sessions: SessionTable::new(),
             raw_sockets: Arc::new(RawSockets::new()),
             handlers: HandlerThreads::new(),
             shutdown: AtomicBool::new(false),
         });
+        let router_name = router_path.path().to_path_buf();
+        let (lifecycle_sender, lifecycle_events) = mpsc::channel();
+        let mut router =
+            Router::start_with_lifecycle(router_path, registry, Some(lifecycle_sender.clone()))?;
+        let lifecycle_core = core.clone();
+        let lifecycle_worker = match thread::Builder::new()
+            .name("et-terminal-lifecycle".to_owned())
+            .spawn(move || runtime_lifecycle::run(lifecycle_events, lifecycle_core))
+        {
+            Ok(worker) => worker,
+            Err(source) => {
+                let _ = router.shutdown();
+                return Err(RuntimeError::Spawn(source));
+            }
+        };
         let mut runtime = Self {
             core,
             router: Some(router),
+            lifecycle_sender: Some(lifecycle_sender),
+            lifecycle_worker: Some(lifecycle_worker),
             accept_wakers: Vec::new(),
             accept_workers: Vec::new(),
             tcp_addresses,
@@ -103,8 +122,8 @@ impl Runtime {
     pub fn shutdown(&mut self) -> Result<(), RuntimeError> {
         self.core.shutdown.store(true, Ordering::Release);
         let mut first_error = None;
-        let sessions = match self.core.sessions.begin_shutdown() {
-            Ok(sessions) => sessions,
+        let connections = match self.core.sessions.begin_shutdown() {
+            Ok(connections) => connections,
             Err(error) => {
                 remember(&mut first_error, RuntimeError::SessionTable(error));
                 Vec::new()
@@ -124,14 +143,30 @@ impl Runtime {
         if let Err(error) = self.core.raw_sockets.shutdown_all() {
             remember(&mut first_error, error);
         }
-        for session in sessions {
-            if let Err(error) = session.shutdown() {
+        for connection in connections {
+            if let Err(error) = connection.shutdown() {
                 remember(&mut first_error, RuntimeError::Session(error));
             }
         }
         if let Some(mut router) = self.router.take() {
             if let Err(error) = router.shutdown() {
                 remember(&mut first_error, RuntimeError::Router(error));
+            }
+        }
+        if let Err(error) = self.core.registry.clear() {
+            remember(&mut first_error, RuntimeError::Registration(error));
+        }
+        if let Some(sender) = self.lifecycle_sender.take() {
+            let _ = sender.send(LifecycleEvent::Shutdown);
+        }
+        if let Some(worker) = self.lifecycle_worker.take() {
+            match worker.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => remember(&mut first_error, error),
+                Err(_) => remember(
+                    &mut first_error,
+                    RuntimeError::WorkerPanicked("terminal lifecycle"),
+                ),
             }
         }
         for worker in self.accept_workers.drain(..) {

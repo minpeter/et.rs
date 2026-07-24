@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::io;
+use std::net::TcpStream;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
 
-use crate::registry::Registration;
-use crate::session::ActiveSession;
+use crate::registry::{Registration, RegistrationIdentity};
+use crate::session::{ActiveSession, SessionConnection};
+use crate::session_slot::{SessionStart, Slot};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionState {
@@ -18,6 +20,7 @@ pub enum SessionTableError {
     ShuttingDown,
     Timeout,
     InvalidTransition,
+    Io(io::Error),
 }
 
 impl std::fmt::Display for SessionTableError {
@@ -27,44 +30,48 @@ impl std::fmt::Display for SessionTableError {
             Self::ShuttingDown => write!(f, "session table is shutting down"),
             Self::Timeout => write!(f, "timed out waiting for session state"),
             Self::InvalidTransition => write!(f, "invalid session state transition"),
+            Self::Io(error) => write!(f, "session socket: {error}"),
         }
     }
 }
 
-impl std::error::Error for SessionTableError {}
-
-enum Slot {
-    Registered(Registration),
-    Starting(Registration),
-    Active(Arc<ActiveSession>),
+impl std::error::Error for SessionTableError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Default)]
-struct TableState {
-    slots: HashMap<String, Slot>,
-    shutdown: bool,
+pub(crate) struct TableState {
+    pub(crate) slots: HashMap<String, Slot>,
+    pub(crate) disconnecting: HashMap<String, RegistrationIdentity>,
+    pub(crate) shutdown: bool,
 }
 
 #[derive(Default)]
-struct TableInner {
-    state: Mutex<TableState>,
-    changed: Condvar,
+pub(crate) struct TableInner {
+    pub(crate) state: Mutex<TableState>,
+    pub(crate) changed: Condvar,
 }
 
 #[derive(Clone, Default)]
 pub struct SessionTable {
-    inner: Arc<TableInner>,
+    pub(crate) inner: Arc<TableInner>,
+}
+
+pub(crate) struct RemovedRegistration {
+    pub(crate) connection: Option<SessionConnection>,
 }
 
 pub(crate) enum SessionClaim {
-    New(SessionStart),
+    New {
+        start: SessionStart,
+        replaced: Option<SessionConnection>,
+    },
     Returning(Arc<ActiveSession>),
-}
-
-pub(crate) struct SessionStart {
-    table: SessionTable,
-    registration: Registration,
-    committed: bool,
 }
 
 impl SessionTable {
@@ -75,12 +82,27 @@ impl SessionTable {
     pub(crate) fn claim(
         &self,
         registration: Registration,
+        stream: &TcpStream,
     ) -> Result<SessionClaim, SessionTableError> {
         let id = registration.id.clone();
+        let mut starting_socket = Some(stream.try_clone().map_err(SessionTableError::Io)?);
+        let mut replaced = None;
         let mut state = self.lock()?;
         loop {
             if state.shutdown {
                 return Err(SessionTableError::ShuttingDown);
+            }
+            if state
+                .slots
+                .get(&id)
+                .is_some_and(|slot| !slot.registration().same_generation(&registration))
+            {
+                replaced = state.slots.remove(&id).and_then(Slot::into_connection);
+                state
+                    .slots
+                    .insert(id.clone(), Slot::Registered(registration.clone()));
+                self.inner.changed.notify_all();
+                continue;
             }
             match state.slots.get(&id) {
                 None => {
@@ -91,24 +113,34 @@ impl SessionTable {
                 }
                 Some(Slot::Registered(stored)) => {
                     let stored = stored.clone();
-                    state
-                        .slots
-                        .insert(id.clone(), Slot::Starting(stored.clone()));
+                    let socket = starting_socket
+                        .take()
+                        .ok_or(SessionTableError::InvalidTransition)?;
+                    state.slots.insert(
+                        id.clone(),
+                        Slot::Starting {
+                            registration: stored.clone(),
+                            socket,
+                        },
+                    );
                     self.inner.changed.notify_all();
-                    return Ok(SessionClaim::New(SessionStart {
-                        table: self.clone(),
-                        registration: stored,
-                        committed: false,
-                    }));
+                    return Ok(SessionClaim::New {
+                        start: SessionStart {
+                            table: self.clone(),
+                            registration: stored,
+                            committed: false,
+                        },
+                        replaced,
+                    });
                 }
-                Some(Slot::Starting(_)) => {
+                Some(Slot::Starting { .. }) => {
                     state = self
                         .inner
                         .changed
                         .wait(state)
                         .map_err(|_| SessionTableError::Unavailable)?;
                 }
-                Some(Slot::Active(session)) => {
+                Some(Slot::Active { session, .. }) => {
                     return Ok(SessionClaim::Returning(session.clone()));
                 }
             }
@@ -116,119 +148,71 @@ impl SessionTable {
     }
 
     pub fn state(&self, id: &str) -> Result<Option<SessionState>, SessionTableError> {
-        let state = self.lock()?;
-        Ok(state.slots.get(id).map(slot_state))
+        Ok(self.lock()?.slots.get(id).map(Slot::state))
     }
 
     pub(crate) fn active(&self, id: &str) -> Result<Option<Arc<ActiveSession>>, SessionTableError> {
-        let state = self.lock()?;
-        Ok(match state.slots.get(id) {
-            Some(Slot::Active(session)) => Some(session.clone()),
+        Ok(match self.lock()?.slots.get(id) {
+            Some(Slot::Active { session, .. }) => Some(session.clone()),
             _ => None,
         })
     }
 
-    pub fn wait_for_state(
+    pub(crate) fn remove_registration(
         &self,
-        id: &str,
-        expected: SessionState,
-        timeout: Duration,
-    ) -> Result<(), SessionTableError> {
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or(SessionTableError::Timeout)?;
+        identity: &RegistrationIdentity,
+    ) -> Result<Option<RemovedRegistration>, SessionTableError> {
         let mut state = self.lock()?;
-        loop {
-            if state.slots.get(id).map(slot_state) == Some(expected) {
-                return Ok(());
-            }
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return Err(SessionTableError::Timeout);
-            };
-            let (next, wait) = self
-                .inner
-                .changed
-                .wait_timeout(state, remaining)
-                .map_err(|_| SessionTableError::Unavailable)?;
-            state = next;
-            if wait.timed_out() && state.slots.get(id).map(slot_state) != Some(expected) {
-                return Err(SessionTableError::Timeout);
-            }
+        let matches = state
+            .slots
+            .get(identity.id())
+            .is_some_and(|slot| identity.matches(slot.registration()));
+        if !matches {
+            return Ok(None);
         }
+        let connection = state
+            .slots
+            .remove(identity.id())
+            .and_then(Slot::into_connection);
+        state
+            .disconnecting
+            .insert(identity.id().to_owned(), identity.clone());
+        self.inner.changed.notify_all();
+        Ok(Some(RemovedRegistration { connection }))
     }
 
-    pub(crate) fn begin_shutdown(&self) -> Result<Vec<Arc<ActiveSession>>, SessionTableError> {
+    pub(crate) fn finish_registration_removal(
+        &self,
+        identity: &RegistrationIdentity,
+    ) -> Result<(), SessionTableError> {
+        let mut state = self.lock()?;
+        let matches = state
+            .disconnecting
+            .get(identity.id())
+            .is_some_and(|current| current.same_generation(identity));
+        if matches {
+            state.disconnecting.remove(identity.id());
+            self.inner.changed.notify_all();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_shutdown(&self) -> Result<Vec<SessionConnection>, SessionTableError> {
         let mut state = self.lock()?;
         state.shutdown = true;
-        let sessions = state
-            .slots
-            .values()
-            .filter_map(|slot| match slot {
-                Slot::Active(session) => Some(session.clone()),
-                _ => None,
-            })
+        state.disconnecting.clear();
+        let connections = std::mem::take(&mut state.slots)
+            .into_values()
+            .filter_map(Slot::into_connection)
             .collect();
         self.inner.changed.notify_all();
-        Ok(sessions)
+        Ok(connections)
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, TableState>, SessionTableError> {
+    pub(crate) fn lock(&self) -> Result<std::sync::MutexGuard<'_, TableState>, SessionTableError> {
         self.inner
             .state
             .lock()
             .map_err(|_| SessionTableError::Unavailable)
-    }
-}
-
-impl SessionStart {
-    pub(crate) fn registration(&self) -> &Registration {
-        &self.registration
-    }
-
-    pub(crate) fn activate(mut self, session: ActiveSession) -> Result<(), SessionTableError> {
-        let mut state = self.table.lock()?;
-        if state.shutdown {
-            return Err(SessionTableError::ShuttingDown);
-        }
-        match state.slots.get(&self.registration.id) {
-            Some(Slot::Starting(starting)) if starting.id == self.registration.id => {
-                state.slots.insert(
-                    self.registration.id.clone(),
-                    Slot::Active(Arc::new(session)),
-                );
-                self.committed = true;
-                self.table.inner.changed.notify_all();
-                Ok(())
-            }
-            _ => Err(SessionTableError::InvalidTransition),
-        }
-    }
-}
-
-impl Drop for SessionStart {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-        if let Ok(mut state) = self.table.inner.state.lock() {
-            if matches!(
-                state.slots.get(&self.registration.id),
-                Some(Slot::Starting(_))
-            ) {
-                state.slots.insert(
-                    self.registration.id.clone(),
-                    Slot::Registered(self.registration.clone()),
-                );
-                self.table.inner.changed.notify_all();
-            }
-        }
-    }
-}
-
-fn slot_state(slot: &Slot) -> SessionState {
-    match slot {
-        Slot::Registered(_) => SessionState::Registered,
-        Slot::Starting(_) => SessionState::Starting,
-        Slot::Active(_) => SessionState::Active,
     }
 }

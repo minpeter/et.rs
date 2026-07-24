@@ -2,22 +2,45 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::io;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use et_core::crypto::KEY_LEN;
-use et_core::keys::passkey_to_key;
 use et_core::proto::TerminalUserInfo;
 
-const ID_LEN: usize = 16;
+use crate::registry_validation::validate;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Registration {
     pub id: String,
     pub key: [u8; KEY_LEN],
     pub uid: u32,
     pub gid: u32,
+    pub(crate) identity: Arc<()>,
+}
+
+impl PartialEq for Registration {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.key == other.key
+            && self.uid == other.uid
+            && self.gid == other.gid
+    }
+}
+
+impl Eq for Registration {}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RegistrationIdentity {
+    id: String,
+    identity: Arc<()>,
+}
+
+pub(crate) struct RegisteredTerminal {
+    pub(crate) identity: RegistrationIdentity,
+    pub(crate) watcher: UnixStream,
 }
 
 struct StoredRegistration {
@@ -41,12 +64,13 @@ pub struct Registry {
     inner: Arc<RegistryInner>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum RegistrationError {
     Invalid,
     Duplicate,
     Unavailable,
     Timeout,
+    Io(io::Error),
 }
 
 impl std::fmt::Display for RegistrationError {
@@ -56,48 +80,72 @@ impl std::fmt::Display for RegistrationError {
             Self::Duplicate => write!(f, "terminal id is already registered"),
             Self::Unavailable => write!(f, "terminal registry is unavailable"),
             Self::Timeout => write!(f, "timed out waiting for terminal registration"),
+            Self::Io(error) => write!(f, "terminal registration stream: {error}"),
         }
     }
 }
 
-impl std::error::Error for RegistrationError {}
+impl std::error::Error for RegistrationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl Registry {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn register(
+    pub(crate) fn register(
         &self,
         user_info: TerminalUserInfo,
         stream: UnixStream,
-    ) -> Result<String, RegistrationError> {
+    ) -> Result<RegisteredTerminal, RegistrationError> {
         let registration = validate(user_info)?;
-        let id = registration.id.clone();
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| RegistrationError::Unavailable)?;
-        match state.registrations.entry(id.clone()) {
+        let watcher = stream.try_clone().map_err(RegistrationError::Io)?;
+        let identity = registration.identity();
+        let mut state = self.lock()?;
+        match state.registrations.entry(registration.id.clone()) {
             Entry::Vacant(entry) => {
                 entry.insert(StoredRegistration {
                     info: registration,
                     _stream: stream,
                 });
                 self.inner.changed.notify_all();
-                Ok(id)
+                Ok(RegisteredTerminal { identity, watcher })
             }
             Entry::Occupied(_) => Err(RegistrationError::Duplicate),
         }
     }
 
+    pub(crate) fn remove_if_current(
+        &self,
+        identity: &RegistrationIdentity,
+    ) -> Result<bool, RegistrationError> {
+        let mut state = self.lock()?;
+        let matches = state
+            .registrations
+            .get(identity.id())
+            .is_some_and(|stored| identity.matches(&stored.info));
+        if matches {
+            state.registrations.remove(identity.id());
+            self.inner.changed.notify_all();
+        }
+        Ok(matches)
+    }
+
+    pub(crate) fn clear(&self) -> Result<(), RegistrationError> {
+        let mut state = self.lock()?;
+        state.registrations.clear();
+        self.inner.changed.notify_all();
+        Ok(())
+    }
+
     pub fn get(&self, id: &str) -> Result<Option<Registration>, RegistrationError> {
-        let state = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| RegistrationError::Unavailable)?;
+        let state = self.lock()?;
         Ok(state
             .registrations
             .get(id)
@@ -105,61 +153,89 @@ impl Registry {
     }
 
     pub fn wait_for(&self, id: &str, timeout: Duration) -> Result<Registration, RegistrationError> {
+        self.wait_for_condition(id, timeout, true)?
+            .ok_or(RegistrationError::Timeout)
+    }
+
+    pub fn wait_until_absent(&self, id: &str, timeout: Duration) -> Result<(), RegistrationError> {
+        self.wait_for_condition(id, timeout, false).map(|_| ())
+    }
+
+    pub fn len(&self) -> Result<usize, RegistrationError> {
+        Ok(self.lock()?.registrations.len())
+    }
+
+    pub fn is_empty(&self) -> Result<bool, RegistrationError> {
+        self.len().map(|length| length == 0)
+    }
+
+    fn wait_for_condition(
+        &self,
+        id: &str,
+        timeout: Duration,
+        present: bool,
+    ) -> Result<Option<Registration>, RegistrationError> {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or(RegistrationError::Timeout)?;
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| RegistrationError::Unavailable)?;
+        let mut state = self.lock()?;
         loop {
-            if let Some(stored) = state.registrations.get(id) {
-                return Ok(stored.info.clone());
+            let registration = state
+                .registrations
+                .get(id)
+                .map(|stored| stored.info.clone());
+            if registration.is_some() == present {
+                return Ok(registration);
             }
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return Err(RegistrationError::Timeout);
-            };
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(RegistrationError::Timeout)?;
             let (next, wait) = self
                 .inner
                 .changed
                 .wait_timeout(state, remaining)
                 .map_err(|_| RegistrationError::Unavailable)?;
             state = next;
-            if wait.timed_out() && !state.registrations.contains_key(id) {
-                return Err(RegistrationError::Timeout);
+            if wait.timed_out() {
+                let exists = state.registrations.contains_key(id);
+                if exists != present {
+                    return Err(RegistrationError::Timeout);
+                }
             }
         }
     }
 
-    pub fn len(&self) -> Result<usize, RegistrationError> {
-        let state = self
-            .inner
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, RegistryState>, RegistrationError> {
+        self.inner
             .state
             .lock()
-            .map_err(|_| RegistrationError::Unavailable)?;
-        Ok(state.registrations.len())
-    }
-
-    pub fn is_empty(&self) -> Result<bool, RegistrationError> {
-        self.len().map(|length| length == 0)
+            .map_err(|_| RegistrationError::Unavailable)
     }
 }
 
-fn validate(user_info: TerminalUserInfo) -> Result<Registration, RegistrationError> {
-    let id = user_info.id.ok_or(RegistrationError::Invalid)?;
-    if id.len() != ID_LEN || !id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
-        return Err(RegistrationError::Invalid);
+impl Registration {
+    pub(crate) fn same_generation(&self, other: &Self) -> bool {
+        self.id == other.id && Arc::ptr_eq(&self.identity, &other.identity)
     }
-    let passkey = user_info.passkey.ok_or(RegistrationError::Invalid)?;
-    let key = passkey_to_key(&passkey).ok_or(RegistrationError::Invalid)?;
-    let uid = user_info
-        .uid
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or(RegistrationError::Invalid)?;
-    let gid = user_info
-        .gid
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or(RegistrationError::Invalid)?;
-    Ok(Registration { id, key, uid, gid })
+
+    pub(crate) fn identity(&self) -> RegistrationIdentity {
+        RegistrationIdentity {
+            id: self.id.clone(),
+            identity: self.identity.clone(),
+        }
+    }
+}
+
+impl RegistrationIdentity {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(crate) fn matches(&self, registration: &Registration) -> bool {
+        self.id == registration.id && Arc::ptr_eq(&self.identity, &registration.identity)
+    }
+
+    pub(crate) fn same_generation(&self, other: &Self) -> bool {
+        self.id == other.id && Arc::ptr_eq(&self.identity, &other.identity)
+    }
 }

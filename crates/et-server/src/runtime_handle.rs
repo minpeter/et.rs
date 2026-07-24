@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::registry::{Registration, RegistrationError};
 use crate::runtime_state::RuntimeCore;
@@ -79,5 +79,22 @@ impl RuntimeHandle {
             .registry
             .wait_for(id, timeout)
             .map_err(HandleError::Registration)
+    }
+
+    pub fn wait_disconnected(&self, id: &str, timeout: Duration) -> Result<(), HandleError> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(HandleError::Registration(RegistrationError::Timeout))?;
+        self.core
+            .registry
+            .wait_until_absent(id, timeout)
+            .map_err(HandleError::Registration)?;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(HandleError::SessionTable(SessionTableError::Timeout))?;
+        self.core
+            .sessions
+            .wait_until_absent(id, remaining)
+            .map_err(HandleError::SessionTable)
     }
 }

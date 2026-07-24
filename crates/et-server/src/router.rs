@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -9,11 +9,13 @@ use std::time::Duration;
 use crate::path::{PathError, RouterPath};
 use crate::registry::Registry;
 use crate::router_loop;
+use crate::runtime_lifecycle::LifecycleEvent;
 use crate::socket_path::OwnedRouterListener;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RouterEvent {
     Registered { id: String },
+    Disconnected { id: String },
     Rejected(RouterReject),
 }
 
@@ -72,6 +74,14 @@ pub struct Router {
 
 impl Router {
     pub fn start(path: RouterPath, registry: Registry) -> Result<Self, RouterError> {
+        Self::start_with_lifecycle(path, registry, None)
+    }
+
+    pub(crate) fn start_with_lifecycle(
+        path: RouterPath,
+        registry: Registry,
+        lifecycle: Option<Sender<LifecycleEvent>>,
+    ) -> Result<Self, RouterError> {
         let listener = OwnedRouterListener::bind(&path)?;
         let (wake_reader, wake_writer) = UnixStream::pair().map_err(RouterError::Io)?;
         wake_reader.set_nonblocking(true).map_err(RouterError::Io)?;
@@ -86,6 +96,7 @@ impl Router {
                     wake_reader,
                     registry,
                     event_sender,
+                    lifecycle,
                     worker_shutdown,
                 )
             })

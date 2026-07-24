@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use crate::registry::Registry;
+use crate::registry::{RegistrationIdentity, Registry};
 use crate::runtime_error::RuntimeError;
 use crate::session_table::SessionTable;
 
@@ -16,9 +16,14 @@ pub(crate) struct RuntimeCore {
     pub(crate) shutdown: AtomicBool,
 }
 
+struct TrackedSocket {
+    stream: TcpStream,
+    registration: Option<RegistrationIdentity>,
+}
+
 pub(crate) struct RawSockets {
     next_id: AtomicU64,
-    streams: Mutex<HashMap<u64, TcpStream>>,
+    streams: Mutex<HashMap<u64, TrackedSocket>>,
 }
 
 pub(crate) struct RawSocketGuard {
@@ -47,7 +52,13 @@ impl RawSockets {
             .streams
             .lock()
             .map_err(|_| RuntimeError::WorkerUnavailable)?;
-        streams.insert(id, clone);
+        streams.insert(
+            id,
+            TrackedSocket {
+                stream: clone,
+                registration: None,
+            },
+        );
         Ok(RawSocketGuard {
             id,
             sockets: self.clone(),
@@ -59,9 +70,47 @@ impl RawSockets {
             .streams
             .lock()
             .map_err(|_| RuntimeError::WorkerUnavailable)?;
-        for stream in streams.values() {
-            let _ = stream.shutdown(Shutdown::Both);
+        for tracked in streams.values() {
+            let _ = tracked.stream.shutdown(Shutdown::Both);
         }
+        Ok(())
+    }
+
+    pub(crate) fn shutdown_registration(
+        &self,
+        identity: &RegistrationIdentity,
+    ) -> Result<(), RuntimeError> {
+        let streams = self
+            .streams
+            .lock()
+            .map_err(|_| RuntimeError::WorkerUnavailable)?;
+        for tracked in streams.values() {
+            if tracked
+                .registration
+                .as_ref()
+                .is_some_and(|current| current.same_generation(identity))
+            {
+                let _ = tracked.stream.shutdown(Shutdown::Both);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl RawSocketGuard {
+    pub(crate) fn assign(
+        &mut self,
+        registration: RegistrationIdentity,
+    ) -> Result<(), RuntimeError> {
+        let mut streams = self
+            .sockets
+            .streams
+            .lock()
+            .map_err(|_| RuntimeError::WorkerUnavailable)?;
+        let tracked = streams
+            .get_mut(&self.id)
+            .ok_or(RuntimeError::WorkerUnavailable)?;
+        tracked.registration = Some(registration);
         Ok(())
     }
 }

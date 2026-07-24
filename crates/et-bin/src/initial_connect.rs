@@ -158,7 +158,8 @@ fn accept_response(response: ConnectResponse) -> Result<(), ClientError> {
         .status
         .and_then(|raw| ConnectStatus::try_from(raw).ok());
     match status {
-        Some(ConnectStatus::NewClient | ConnectStatus::ReturningClient) => Ok(()),
+        Some(ConnectStatus::NewClient) => Ok(()),
+        Some(ConnectStatus::ReturningClient) => Err(ClientError::ReturningSessionRequiresRecovery),
         Some(ConnectStatus::InvalidKey) => Err(ClientError::ServerInvalidKey(response.error)),
         Some(ConnectStatus::MismatchedProtocol) => {
             Err(ClientError::ProtocolMismatch(response.error))
@@ -167,5 +168,22 @@ fn accept_response(response: ConnectResponse) -> Result<(), ClientError> {
             status: response.status,
             message: response.error,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_bootstrap_rejects_returning_status() {
+        let response = ConnectResponse {
+            status: Some(ConnectStatus::ReturningClient as i32),
+            error: None,
+        };
+        assert!(matches!(
+            accept_response(response),
+            Err(ClientError::ReturningSessionRequiresRecovery)
+        ));
     }
 }

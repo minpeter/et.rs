@@ -48,6 +48,10 @@ fn dispatch(prog: &str, args: &[OsString]) -> Result<i32, clap::Error> {
     crate::client::run(args)
 }
 
+mod bootstrap;
 mod client;
+mod error;
+mod initial_connect;
 mod server;
+mod ssh_process;
 mod terminal;

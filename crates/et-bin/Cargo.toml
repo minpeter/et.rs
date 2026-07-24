@@ -18,4 +18,6 @@ workspace = true
 [dependencies]
 et-cli = { path = "../et-cli" }
 et-core = { path = "../et-core" }
+et-net = { path = "../et-net" }
 clap = { version = "4", features = ["derive"] }
+prost = "0.13"

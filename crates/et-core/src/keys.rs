@@ -21,7 +21,7 @@ pub fn gen_id_passkey() -> (String, String) {
 }
 
 pub fn passkey_to_key(passkey: &str) -> Option<[u8; crate::crypto::KEY_LEN]> {
-    if passkey.len() != PASSKEY_LEN {
+    if passkey.len() != PASSKEY_LEN || !passkey.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
         return None;
     }
     let mut key = [0u8; crate::crypto::KEY_LEN];
@@ -31,7 +31,10 @@ pub fn passkey_to_key(passkey: &str) -> Option<[u8; crate::crypto::KEY_LEN]> {
 
 pub fn parse_id_passkey(s: &str) -> Option<(String, String)> {
     let (id, passkey) = s.split_once('/')?;
-    if id.is_empty() || passkey.len() != PASSKEY_LEN {
+    if id.len() != ID_LEN
+        || !id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        || passkey_to_key(passkey).is_none()
+    {
         return None;
     }
     Some((id.to_string(), passkey.to_string()))
@@ -68,6 +71,13 @@ mod tests {
     #[test]
     fn bad_passkey_length_rejected() {
         assert!(passkey_to_key("short").is_none());
+        assert!(passkey_to_key("ABCDEFGHIJKLMNOPQRSTUVWXYZabcde!").is_none());
+    }
+
+    #[test]
+    fn invalid_id_material_rejected() {
+        assert!(parse_id_passkey("short/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef").is_none());
+        assert!(parse_id_passkey("abcdefghijklmno!/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef").is_none());
     }
 
     #[test]

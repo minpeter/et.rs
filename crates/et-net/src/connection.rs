@@ -6,6 +6,7 @@ use et_core::backed_writer::{BackedWriter, RecoverError, WriterOutcome};
 use et_core::crypto::{
     CryptoHandler, EncryptError, DIR_CLIENT_TO_SERVER, DIR_SERVER_TO_CLIENT, KEY_LEN,
 };
+use et_core::packet::Packet;
 use et_core::proto::{CatchupBuffer, SequenceHeader};
 
 use crate::framing_io::{read_proto, write_proto};
@@ -83,8 +84,8 @@ impl Connection {
         }
     }
 
-    pub fn write_terminal(&mut self, bytes: &[u8]) -> Result<(), ConnError> {
-        match self.writer.write_packet(0, bytes)? {
+    pub fn write_packet(&mut self, header: u8, payload: &[u8]) -> Result<(), ConnError> {
+        match self.writer.write_packet(header, payload)? {
             WriterOutcome::Send(frame) => {
                 self.stream.write_all(&frame)?;
                 Ok(())
@@ -94,10 +95,10 @@ impl Connection {
         }
     }
 
-    pub fn read_terminal(&mut self) -> Result<Vec<u8>, ConnError> {
+    pub fn read_packet(&mut self) -> Result<Packet, ConnError> {
         loop {
             match self.reader.pop()? {
-                ReadItem::Packet(packet) => return Ok(packet.payload().to_vec()),
+                ReadItem::Packet(packet) => return Ok(packet),
                 ReadItem::NeedMore => {}
             }
 
@@ -108,6 +109,14 @@ impl Connection {
                 Err(e) => return Err(ConnError::Io(e)),
             }
         }
+    }
+
+    pub fn write_terminal(&mut self, bytes: &[u8]) -> Result<(), ConnError> {
+        self.write_packet(0, bytes)
+    }
+
+    pub fn read_terminal(&mut self) -> Result<Vec<u8>, ConnError> {
+        self.read_packet().map(|packet| packet.payload().to_vec())
     }
 
     pub fn disconnect(&mut self) {

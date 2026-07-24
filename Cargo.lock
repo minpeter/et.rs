@@ -216,6 +216,8 @@ dependencies = [
  "clap",
  "et-cli",
  "et-core",
+ "et-net",
+ "prost",
 ]
 
 [[package]]

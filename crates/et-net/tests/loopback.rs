@@ -63,6 +63,26 @@ fn handshake_and_encrypted_roundtrip() {
 }
 
 #[test]
+fn generic_packets_preserve_header_and_payload() {
+    let (client_stream, server_stream) = loopback();
+    let key: [u8; KEY_LEN] = [0x17; KEY_LEN];
+
+    let client = thread::spawn(move || {
+        let mut conn = Connection::new_client(client_stream, &key);
+        conn.write_packet(253, b"initial payload").unwrap();
+    });
+    let server = thread::spawn(move || {
+        let mut conn = Connection::new_server(server_stream, &key);
+        conn.read_packet().unwrap()
+    });
+
+    client.join().unwrap();
+    let packet = server.join().unwrap();
+    assert_eq!(packet.header(), 253);
+    assert_eq!(packet.payload(), b"initial payload");
+}
+
+#[test]
 fn multiple_packets_in_order() {
     let (mut client_stream, mut server_stream) = loopback();
     let key: [u8; KEY_LEN] = [0xAB; KEY_LEN];

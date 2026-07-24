@@ -21,3 +21,4 @@ et-core = { path = "../et-core" }
 et-net = { path = "../et-net" }
 clap = { version = "4", features = ["derive"] }
 prost = "0.13"
+wait-timeout = "0.2.1"

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io;
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::time::Duration;
 
 use et_core::keys::passkey_to_key;
@@ -13,10 +13,12 @@ use et_net::handshake::client_request;
 use prost::Message;
 
 use crate::bootstrap::Credentials;
+use crate::deadline::Deadline;
 use crate::error::ClientError;
+use crate::resolver::EndpointResolver;
 
 const MAX_HANDSHAKE_PROTO_LEN: i64 = 64 * 1024;
-const MAX_RESOLVED_ADDRESSES: usize = 16;
+const MAX_ENDPOINT_ADDRESSES: usize = 16;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -36,33 +38,22 @@ impl std::fmt::Display for Endpoint {
     }
 }
 
-pub fn connect_initial(endpoint: &Endpoint, credentials: &Credentials) -> Result<(), ClientError> {
+pub fn connect_initial(
+    endpoint: &Endpoint,
+    credentials: &Credentials,
+    resolver: &dyn EndpointResolver,
+    deadline: Deadline,
+) -> Result<(), ClientError> {
     let key = passkey_to_key(&credentials.passkey).ok_or(ClientError::InvalidPasskey)?;
-    let mut stream = connect_endpoint(endpoint)?;
-    stream
-        .set_read_timeout(Some(IO_TIMEOUT))
-        .map_err(|source| ClientError::ConnectIo {
-            operation: "setting the read timeout",
-            source,
-        })?;
-    stream
-        .set_write_timeout(Some(IO_TIMEOUT))
-        .map_err(|source| ClientError::ConnectIo {
-            operation: "setting the write timeout",
-            source,
-        })?;
+    let mut stream = connect_endpoint(endpoint, resolver, deadline)?;
+    set_stream_timeout(&stream, deadline)?;
 
-    write_proto(&mut stream, &client_request(&credentials.id)).map_err(|source| {
-        ClientError::ConnectIo {
-            operation: "sending ConnectRequest",
-            source,
-        }
-    })?;
+    ensure_deadline(deadline, "sending ConnectRequest")?;
+    write_proto(&mut stream, &client_request(&credentials.id))
+        .map_err(|source| connect_error(deadline, "sending ConnectRequest", source))?;
+    set_stream_timeout(&stream, deadline)?;
     let response: ConnectResponse = read_proto_limited(&mut stream, MAX_HANDSHAKE_PROTO_LEN)
-        .map_err(|source| ClientError::ConnectIo {
-            operation: "reading ConnectResponse",
-            source,
-        })?;
+        .map_err(|source| connect_error(deadline, "reading ConnectResponse", source))?;
     accept_response(response)?;
 
     let payload = InitialPayload {
@@ -70,11 +61,15 @@ pub fn connect_initial(endpoint: &Endpoint, credentials: &Credentials) -> Result
         reversetunnels: Vec::new(),
         environmentvariables: HashMap::new(),
     };
+    ensure_deadline(deadline, "sending INITIAL_PAYLOAD")?;
     let mut connection = Connection::new_client(stream, &key);
     connection
         .write_packet(EtPacketType::InitialPayload as u8, &payload.encode_to_vec())
-        .map_err(ClientError::Transport)?;
-    let packet = connection.read_packet().map_err(ClientError::Transport)?;
+        .map_err(|error| transport_error(deadline, "sending INITIAL_PAYLOAD", error))?;
+    ensure_deadline(deadline, "reading INITIAL_RESPONSE")?;
+    let packet = connection
+        .read_packet()
+        .map_err(|error| transport_error(deadline, "reading INITIAL_RESPONSE", error))?;
     if packet.header() != EtPacketType::InitialResponse as u8 {
         return Err(ClientError::UnexpectedInitialPacket(packet.header()));
     }
@@ -86,17 +81,19 @@ pub fn connect_initial(endpoint: &Endpoint, credentials: &Credentials) -> Result
     Ok(())
 }
 
-fn connect_endpoint(endpoint: &Endpoint) -> Result<TcpStream, ClientError> {
+fn connect_endpoint(
+    endpoint: &Endpoint,
+    resolver: &dyn EndpointResolver,
+    deadline: Deadline,
+) -> Result<TcpStream, ClientError> {
     let display = endpoint.to_string();
-    let addresses = (endpoint.host.as_str(), endpoint.port)
-        .to_socket_addrs()
-        .map_err(|source| ClientError::UnreachableEndpoint {
-            endpoint: display.clone(),
-            source,
-        })?;
+    let addresses = resolver.resolve(endpoint, deadline)?;
     let mut last_error = None;
-    for address in addresses.take(MAX_RESOLVED_ADDRESSES) {
-        match TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) {
+    for address in addresses.into_iter().take(MAX_ENDPOINT_ADDRESSES) {
+        let remaining = deadline.remaining().ok_or(ClientError::BootstrapTimeout(
+            "connecting to the ET endpoint",
+        ))?;
+        match TcpStream::connect_timeout(&address, remaining.min(CONNECT_TIMEOUT)) {
             Ok(stream) => return Ok(stream),
             Err(error) => last_error = Some(error),
         }
@@ -110,6 +107,50 @@ fn connect_endpoint(endpoint: &Endpoint) -> Result<TcpStream, ClientError> {
             )
         }),
     })
+}
+
+fn set_stream_timeout(stream: &TcpStream, deadline: Deadline) -> Result<(), ClientError> {
+    let remaining = deadline.remaining().ok_or(ClientError::BootstrapTimeout(
+        "configuring the ET connection",
+    ))?;
+    let timeout = Some(remaining.min(IO_TIMEOUT));
+    stream
+        .set_read_timeout(timeout)
+        .map_err(|source| ClientError::ConnectIo {
+            operation: "setting the read timeout",
+            source,
+        })?;
+    stream
+        .set_write_timeout(timeout)
+        .map_err(|source| ClientError::ConnectIo {
+            operation: "setting the write timeout",
+            source,
+        })
+}
+
+fn ensure_deadline(deadline: Deadline, operation: &'static str) -> Result<(), ClientError> {
+    match deadline.remaining() {
+        Some(_) => Ok(()),
+        None => Err(ClientError::BootstrapTimeout(operation)),
+    }
+}
+
+fn connect_error(deadline: Deadline, operation: &'static str, source: io::Error) -> ClientError {
+    match deadline.remaining() {
+        Some(_) => ClientError::ConnectIo { operation, source },
+        None => ClientError::BootstrapTimeout(operation),
+    }
+}
+
+fn transport_error(
+    deadline: Deadline,
+    operation: &'static str,
+    error: et_net::connection::ConnError,
+) -> ClientError {
+    match deadline.remaining() {
+        Some(_) => ClientError::Transport(error),
+        None => ClientError::BootstrapTimeout(operation),
+    }
 }
 
 fn accept_response(response: ConnectResponse) -> Result<(), ClientError> {

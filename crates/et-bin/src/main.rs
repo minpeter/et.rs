@@ -50,8 +50,11 @@ fn dispatch(prog: &str, args: &[OsString]) -> Result<i32, clap::Error> {
 
 mod bootstrap;
 mod client;
+mod deadline;
 mod error;
 mod initial_connect;
+mod resolver;
 mod server;
+mod ssh_config;
 mod ssh_process;
 mod terminal;

@@ -4,9 +4,14 @@ use clap::Parser;
 use et_cli::client::ClientArgs;
 use et_cli::host::parse_positional_host;
 
-use crate::bootstrap::{build_invocation, provisional_credentials, BootstrapRequest};
+use crate::bootstrap::{
+    build_invocation, provisional_credentials, validate_ssh_destination, BootstrapRequest,
+};
+use crate::deadline::Deadline;
 use crate::error::ClientError;
 use crate::initial_connect::{connect_initial, Endpoint};
+use crate::resolver::{EndpointResolver, SystemResolver};
+use crate::ssh_config::resolve_ssh_config;
 use crate::ssh_process::{run_bootstrap, SshRunner, SystemSsh};
 
 pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
@@ -19,7 +24,10 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
     if parsed.telemetry {
         eprintln!("note: et.rs never collects telemetry; --telemetry is a no-op.");
     }
-    match run_client(&parsed, &SystemSsh) {
+    let runner = SystemSsh::default();
+    let resolver = SystemResolver;
+    let deadline = runner.deadline();
+    match run_client(&parsed, &runner, &resolver, deadline) {
         Ok(()) => Ok(0),
         Err(error) => {
             eprintln!("et: {error}");
@@ -28,15 +36,31 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
     }
 }
 
-fn run_client(args: &ClientArgs, runner: &dyn SshRunner) -> Result<(), ClientError> {
+fn run_client(
+    args: &ClientArgs,
+    runner: &dyn SshRunner,
+    resolver: &dyn EndpointResolver,
+    deadline: Deadline,
+) -> Result<(), ClientError> {
     let destination = parse_positional_host(&args.host, args.port)?;
     validate_bootstrap_mode(args)?;
 
-    let user = args.username.clone().or(destination.user);
+    let requested_user = command_user(destination.user, args.username.clone());
+    validate_ssh_destination(&destination.host, requested_user.as_deref())?;
+    let resolved = resolve_ssh_config(
+        runner,
+        &destination.host,
+        requested_user.as_deref(),
+        &args.ssh_option,
+        deadline,
+    )?;
+    let user = requested_user.or(resolved.user);
+    validate_ssh_destination(&destination.host, user.as_deref())?;
+
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
     let request = BootstrapRequest {
         user,
-        host_alias: destination.host.clone(),
+        host_alias: destination.host,
         jumphost: args.jumphost.clone(),
         terminal_path: args.terminal_path.clone(),
         server_fifo: args.serverfifo.clone(),
@@ -47,14 +71,33 @@ fn run_client(args: &ClientArgs, runner: &dyn SshRunner) -> Result<(), ClientErr
     };
     let provisional = provisional_credentials()?;
     let invocation = build_invocation(&request, &provisional);
-    let credentials = run_bootstrap(runner, &invocation)?;
+    let credentials = run_bootstrap(runner, &invocation, deadline)?;
     connect_initial(
         &Endpoint {
-            host: destination.host,
+            host: resolved.hostname,
             port: destination.port,
         },
         &credentials,
+        resolver,
+        deadline,
     )
+}
+
+fn command_user(positional: Option<String>, option: Option<String>) -> Option<String> {
+    match positional {
+        Some(user) if user.is_empty() => None,
+        Some(user) => Some(user),
+        None => option,
+    }
+}
+
+#[cfg(test)]
+fn effective_user(
+    positional: Option<String>,
+    option: Option<String>,
+    ssh_config: Option<String>,
+) -> Option<String> {
+    command_user(positional, option).or(ssh_config)
 }
 
 fn validate_bootstrap_mode(args: &ClientArgs) -> Result<(), ClientError> {
@@ -83,4 +126,33 @@ fn validate_bootstrap_mode(args: &ClientArgs) -> Result<(), ClientError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn username_precedence_matches_upstream() {
+        assert_eq!(
+            effective_user(
+                Some("positional".to_string()),
+                Some("option".to_string()),
+                Some("config".to_string()),
+            ),
+            Some("positional".to_string())
+        );
+        assert_eq!(
+            effective_user(None, Some("option".to_string()), Some("config".to_string()),),
+            Some("option".to_string())
+        );
+        assert_eq!(
+            effective_user(
+                Some(String::new()),
+                Some("option".to_string()),
+                Some("config".to_string()),
+            ),
+            Some("config".to_string())
+        );
+    }
 }

@@ -28,6 +28,7 @@ pub struct BootstrapRequest {
 pub struct SshInvocation {
     pub program: String,
     pub args: Vec<String>,
+    pub operation: &'static str,
 }
 
 pub fn provisional_credentials() -> Result<Credentials, ClientError> {
@@ -62,7 +63,18 @@ pub fn build_invocation(request: &BootstrapRequest, credentials: &Credentials) -
     SshInvocation {
         program: "ssh".to_string(),
         args,
+        operation: "starting the remote etterminal",
     }
+}
+
+pub fn validate_ssh_destination(host: &str, user: Option<&str>) -> Result<(), ClientError> {
+    if host.starts_with('-') {
+        return Err(ClientError::InvalidSshComponent("host"));
+    }
+    if user.is_some_and(|user| user.starts_with('-')) {
+        return Err(ClientError::InvalidSshComponent("user"));
+    }
+    Ok(())
 }
 
 pub fn parse_id_passkey(stdout: &[u8]) -> Result<Credentials, ClientError> {
@@ -238,5 +250,17 @@ mod tests {
         assert_eq!(credentials.id.len(), 16);
         assert!(credentials.id.starts_with("XXX"));
         assert_eq!(credentials.passkey.len(), 32);
+    }
+
+    #[test]
+    fn leading_hyphen_cannot_become_an_ssh_option() {
+        assert!(matches!(
+            validate_ssh_destination("-oProxyCommand=bad", None),
+            Err(ClientError::InvalidSshComponent("host"))
+        ));
+        assert!(matches!(
+            validate_ssh_destination("host", Some("-oProxyCommand=bad")),
+            Err(ClientError::InvalidSshComponent("user"))
+        ));
     }
 }

@@ -18,6 +18,7 @@ use prost::Message;
 const SERVER_ID: &str = "abcdefghijklmnop";
 const SERVER_KEY: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
 const VALID_MARKER: &str = "IDPASSKEY:abcdefghijklmnop/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef\n";
+const RESOLVED_CONFIG: &str = "host server-alias\nuser config-user\nhostname 127.0.0.1\nport 22\n";
 
 struct TestDir(PathBuf);
 
@@ -52,8 +53,12 @@ impl FakeSsh {
         fs::write(
             &script,
             r#"#!/bin/sh
-: > "$ET_FAKE_ARGV"
 for arg in "$@"; do printf "%s\0" "$arg" >> "$ET_FAKE_ARGV"; done
+printf "\0" >> "$ET_FAKE_ARGV"
+if [ "$1" = "-G" ]; then
+  printf "%s" "$ET_FAKE_CONFIG"
+  exit 0
+fi
 /bin/cat > "$ET_FAKE_STDIN"
 printf "%s" "$ET_FAKE_STDOUT"
 printf "%s" "$ET_FAKE_STDERR" >&2
@@ -64,15 +69,17 @@ exit "$ET_FAKE_EXIT"
         let mut permissions = fs::metadata(&script).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(script, permissions).unwrap();
+        fs::write(&argv, []).unwrap();
         Self { dir, argv, stdin }
     }
 
-    fn command(&self, stdout: &str, exit: i32, stderr: &str) -> Command {
+    fn command(&self, config: &str, stdout: &str, exit: i32, stderr: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_et"));
         command
             .env("PATH", &self.dir.0)
             .env("ET_FAKE_ARGV", &self.argv)
             .env("ET_FAKE_STDIN", &self.stdin)
+            .env("ET_FAKE_CONFIG", config)
             .env("ET_FAKE_STDOUT", stdout)
             .env("ET_FAKE_STDERR", stderr)
             .env("ET_FAKE_EXIT", exit.to_string())
@@ -80,13 +87,20 @@ exit "$ET_FAKE_EXIT"
         command
     }
 
-    fn args(&self) -> Vec<String> {
-        fs::read(&self.argv)
-            .unwrap()
-            .split(|byte| *byte == 0)
-            .filter(|field| !field.is_empty())
-            .map(|field| String::from_utf8(field.to_vec()).unwrap())
-            .collect()
+    fn invocations(&self) -> Vec<Vec<String>> {
+        let bytes = fs::read(&self.argv).unwrap();
+        let mut invocations = Vec::new();
+        let mut invocation = Vec::new();
+        for field in bytes.split(|byte| *byte == 0) {
+            if field.is_empty() {
+                if !invocation.is_empty() {
+                    invocations.push(std::mem::take(&mut invocation));
+                }
+            } else {
+                invocation.push(String::from_utf8(field.to_vec()).unwrap());
+            }
+        }
+        invocations
     }
 }
 
@@ -129,7 +143,7 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
 
     let fake = FakeSsh::new();
     let output = fake
-        .command(VALID_MARKER, 0, "")
+        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
         .env("TERM", "xterm-test")
         .args([
             "-N",
@@ -140,7 +154,7 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
             "/tmp/server fifo",
             "--ssh-option",
             "StrictHostKeyChecking=no",
-            &format!("test-user@{address}"),
+            &format!("test-user@server-alias:{}", address.port()),
         ])
         .output()
         .unwrap();
@@ -149,10 +163,16 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
     assert!(output.stdout.is_empty() && output.stderr.is_empty());
     assert!(fs::read(&fake.stdin).unwrap().is_empty());
 
-    let argv = fake.args();
+    let invocations = fake.invocations();
+    assert_eq!(invocations.len(), 2);
+    assert_eq!(
+        invocations[0],
+        ["-G", "-oStrictHostKeyChecking=no", "test-user@server-alias"]
+    );
+    let argv = &invocations[1];
     assert_eq!(
         &argv[..2],
-        ["test-user@127.0.0.1", "-oStrictHostKeyChecking=no"]
+        ["test-user@server-alias", "-oStrictHostKeyChecking=no"]
     );
     let prefix = "printf '%s\\n' '";
     let value = argv[2].strip_prefix(prefix).unwrap();
@@ -182,7 +202,7 @@ fn ssh_process_failures_are_typed() {
 
     let fake = FakeSsh::new();
     let output = fake
-        .command("", 42, "fake ssh failure\n")
+        .command(RESOLVED_CONFIG, "", 42, "fake ssh failure\n")
         .args(["-N", "127.0.0.1:1"])
         .output()
         .unwrap();
@@ -207,7 +227,7 @@ fn marker_id_and_key_errors_are_distinct() {
     for (stdout, message) in cases {
         let fake = FakeSsh::new();
         let output = fake
-            .command(stdout, 0, "")
+            .command(RESOLVED_CONFIG, stdout, 0, "")
             .args(["-N", "127.0.0.1:1"])
             .output()
             .unwrap();
@@ -232,7 +252,7 @@ fn protocol_rejection_and_unreachable_endpoint_are_typed() {
     });
     let fake = FakeSsh::new();
     let rejected = fake
-        .command(VALID_MARKER, 0, "")
+        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
         .args(["-N".to_string(), address.to_string()])
         .output()
         .unwrap();
@@ -244,11 +264,28 @@ fn protocol_rejection_and_unreachable_endpoint_are_typed() {
     drop(closed);
     let fake = FakeSsh::new();
     let unreachable = fake
-        .command(VALID_MARKER, 0, "")
+        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
         .args(["-N".to_string(), address.to_string()])
         .output()
         .unwrap();
     assert!(stderr(&unreachable).contains("could not reach the ET server"));
+}
+
+#[test]
+fn leading_hyphen_destination_components_are_rejected_before_spawn() {
+    let no_ssh = TestDir::new("invalid-destination");
+    for args in [
+        vec!["-N", "--", "-oProxyCommand=bad"],
+        vec!["-N", "--username=-oProxyCommand=bad", "server-alias"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_et"))
+            .env("PATH", &no_ssh.0)
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(stderr(&output).contains("must not begin with a hyphen"));
+    }
 }
 
 #[test]

@@ -7,19 +7,27 @@ use et_net::connection::ConnError;
 pub enum ClientError {
     Host(HostError),
     Unsupported(&'static str),
+    InvalidSshComponent(&'static str),
     SshSpawn(io::Error),
     SshStdout(io::Error),
     SshWait(io::Error),
+    SshTerminate(io::Error),
+    SshTimeout(&'static str),
     SshNonZero(Option<i32>),
     SshOutputTooLarge(usize),
+    SshConfigMalformed(&'static str),
     MissingIdPasskeyMarker,
     MalformedIdPasskeyMarker,
     InvalidSessionId,
     InvalidPasskey,
+    DnsTimeout(String),
+    DnsWorker(io::Error),
+    DnsWorkerPanicked,
     UnreachableEndpoint {
         endpoint: String,
         source: io::Error,
     },
+    BootstrapTimeout(&'static str),
     ConnectIo {
         operation: &'static str,
         source: io::Error,
@@ -47,13 +55,25 @@ impl std::fmt::Display for ClientError {
         match self {
             Self::Host(error) => write!(f, "{error}"),
             Self::Unsupported(message) => write!(f, "{message}"),
+            Self::InvalidSshComponent(component) => {
+                write!(f, "SSH {component} must not begin with a hyphen")
+            }
             Self::SshSpawn(error) => write!(f, "could not start system ssh: {error}"),
             Self::SshStdout(error) => write!(f, "could not read system ssh stdout: {error}"),
             Self::SshWait(error) => write!(f, "could not wait for system ssh: {error}"),
+            Self::SshTerminate(error) => {
+                write!(f, "could not terminate timed-out system ssh: {error}")
+            }
+            Self::SshTimeout(operation) => {
+                write!(f, "system ssh timed out while {operation}")
+            }
             Self::SshNonZero(Some(code)) => write!(f, "system ssh exited with status {code}"),
             Self::SshNonZero(None) => write!(f, "system ssh terminated without an exit status"),
             Self::SshOutputTooLarge(limit) => {
                 write!(f, "system ssh stdout exceeds the {limit}-byte limit")
+            }
+            Self::SshConfigMalformed(field) => {
+                write!(f, "system ssh -G output has no valid {field}")
             }
             Self::MissingIdPasskeyMarker => {
                 write!(f, "system ssh output is missing the IDPASSKEY marker")
@@ -68,8 +88,16 @@ impl std::fmt::Display for ClientError {
             Self::InvalidPasskey => {
                 write!(f, "IDPASSKEY passkey must be 32 ASCII alphanumeric bytes")
             }
+            Self::DnsTimeout(endpoint) => {
+                write!(f, "DNS resolution timed out for ET endpoint {endpoint}")
+            }
+            Self::DnsWorker(error) => write!(f, "could not start DNS resolver: {error}"),
+            Self::DnsWorkerPanicked => write!(f, "DNS resolver worker terminated unexpectedly"),
             Self::UnreachableEndpoint { endpoint, source } => {
                 write!(f, "could not reach the ET server at {endpoint}: {source}")
+            }
+            Self::BootstrapTimeout(operation) => {
+                write!(f, "ET bootstrap timed out while {operation}")
             }
             Self::ConnectIo { operation, source } => {
                 write!(f, "ET connection failed while {operation}: {source}")
@@ -129,6 +157,8 @@ impl std::error::Error for ClientError {
             Self::SshSpawn(error)
             | Self::SshStdout(error)
             | Self::SshWait(error)
+            | Self::SshTerminate(error)
+            | Self::DnsWorker(error)
             | Self::UnreachableEndpoint { source: error, .. }
             | Self::ConnectIo { source: error, .. } => Some(error),
             Self::Transport(error) => Some(error),

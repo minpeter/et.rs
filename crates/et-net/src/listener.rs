@@ -30,6 +30,10 @@ impl BoundTcpListeners {
     pub fn iter(&self) -> impl Iterator<Item = &TcpListener> {
         self.ipv4.iter().chain(self.ipv6.iter())
     }
+
+    pub fn into_listeners(self) -> Vec<TcpListener> {
+        self.ipv4.into_iter().chain(self.ipv6).collect()
+    }
 }
 
 #[derive(Debug)]

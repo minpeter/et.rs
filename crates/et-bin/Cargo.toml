@@ -19,9 +19,11 @@ workspace = true
 et-cli = { path = "../et-cli" }
 et-core = { path = "../et-core" }
 et-net = { path = "../et-net" }
+et-server = { path = "../et-server" }
 clap = { version = "4", features = ["derive"] }
 nix = { version = "0.31.3", default-features = false, features = ["signal"] }
 prost = "0.13"
+signal-hook = "0.3.18"
 wait-timeout = "0.2.1"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

@@ -164,7 +164,9 @@ fn process_registration(
                     .map_err(|error| match error {
                         RegistrationError::Invalid => RouterReject::InvalidRegistration,
                         RegistrationError::Duplicate => RouterReject::Duplicate,
-                        RegistrationError::Unavailable => RouterReject::RegistryUnavailable,
+                        RegistrationError::Unavailable | RegistrationError::Timeout => {
+                            RouterReject::RegistryUnavailable
+                        }
                     })
             })
     };

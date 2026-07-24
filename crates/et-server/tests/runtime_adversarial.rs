@@ -1,0 +1,142 @@
+#![forbid(unsafe_code)]
+
+mod runtime_support;
+mod support;
+
+use std::collections::HashMap;
+use std::io::Write;
+use std::net::TcpStream;
+
+use et_core::keys::passkey_to_key;
+use et_core::proto::{
+    ConnectRequest, ConnectResponse, ConnectStatus, InitialPayload, InitialResponse,
+};
+use et_net::connection::Connection;
+use et_net::framing_io::{read_proto_limited, write_proto};
+use et_net::handshake::client_request;
+use et_server::SessionState;
+use prost::Message;
+use runtime_support::{bound, default_payload, TestRuntime, ID_A, KEY_A, TIMEOUT};
+
+#[test]
+fn bad_encrypted_initial_messages_reset_the_slot() {
+    let mut server = TestRuntime::start();
+    let _terminal = server.register(ID_A, KEY_A);
+    let good_key = passkey_to_key(KEY_A).unwrap();
+
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let mut wrong = Connection::new_client(stream, &[7; 32]);
+    wrong
+        .write_packet(253, &default_payload().encode_to_vec())
+        .unwrap();
+    assert!(wrong.read_packet().is_err());
+    server
+        .handle
+        .wait_for_state(ID_A, SessionState::Registered, TIMEOUT)
+        .unwrap();
+
+    for (header, bytes) in [(1, default_payload().encode_to_vec()), (253, vec![0xff])] {
+        let (stream, response) = server.handshake(ID_A);
+        assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+        let mut client = Connection::new_client(stream, &good_key);
+        client.write_packet(header, &bytes).unwrap();
+        let packet = client.read_packet().unwrap();
+        let response = InitialResponse::decode(packet.payload()).unwrap();
+        assert!(response.error.is_some());
+        server
+            .handle
+            .wait_for_state(ID_A, SessionState::Registered, TIMEOUT)
+            .unwrap();
+    }
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
+fn unsupported_jumphost_and_reverse_tunnel_reset_the_slot() {
+    let mut server = TestRuntime::start();
+    let _terminal = server.register(ID_A, KEY_A);
+    let key = passkey_to_key(KEY_A).unwrap();
+    let payloads = [
+        InitialPayload {
+            jumphost: Some(true),
+            reversetunnels: Vec::new(),
+            environmentvariables: HashMap::new(),
+        },
+        InitialPayload {
+            jumphost: Some(false),
+            reversetunnels: vec![Default::default()],
+            environmentvariables: HashMap::new(),
+        },
+    ];
+    for payload in payloads {
+        let (stream, response) = server.handshake(ID_A);
+        assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+        let (_, initial) = runtime_support::initialize(stream, &key, payload);
+        assert!(initial.error.is_some());
+        server
+            .handle
+            .wait_for_state(ID_A, SessionState::Registered, TIMEOUT)
+            .unwrap();
+    }
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
+fn capped_malformed_unknown_and_mismatched_handshakes_are_typed() {
+    let mut server = TestRuntime::start();
+    let _terminal = server.register(ID_A, KEY_A);
+
+    let cases = [
+        (
+            (64 * 1024 + 1i64).to_le_bytes().to_vec(),
+            ConnectStatus::InvalidKey,
+        ),
+        (
+            {
+                let mut wire = (2i64).to_le_bytes().to_vec();
+                wire.extend_from_slice(&[0xff, 0xff]);
+                wire
+            },
+            ConnectStatus::InvalidKey,
+        ),
+    ];
+    for (wire, status) in cases {
+        let mut stream = TcpStream::connect(server.address).unwrap();
+        bound(&stream);
+        stream.write_all(&wire).unwrap();
+        let response: ConnectResponse = read_proto_limited(&mut stream, 64 * 1024).unwrap();
+        assert_eq!(response.status, Some(status as i32));
+    }
+
+    for id in ["short", "aaaaaaaaaaaaaaa!", "aaaaaaaaaaaaaaaaa"] {
+        let mut malformed = TcpStream::connect(server.address).unwrap();
+        bound(&malformed);
+        write_proto(&mut malformed, &client_request(id)).unwrap();
+        let response: ConnectResponse = read_proto_limited(&mut malformed, 64 * 1024).unwrap();
+        assert_eq!(response.status, Some(ConnectStatus::InvalidKey as i32));
+    }
+
+    let mut unknown = TcpStream::connect(server.address).unwrap();
+    bound(&unknown);
+    write_proto(&mut unknown, &client_request("unknownunknown00")).unwrap();
+    let response: ConnectResponse = read_proto_limited(&mut unknown, 64 * 1024).unwrap();
+    assert_eq!(response.status, Some(ConnectStatus::InvalidKey as i32));
+
+    let mut mismatch = TcpStream::connect(server.address).unwrap();
+    bound(&mismatch);
+    write_proto(
+        &mut mismatch,
+        &ConnectRequest {
+            client_id: Some(ID_A.to_owned()),
+            version: Some(5),
+        },
+    )
+    .unwrap();
+    let response: ConnectResponse = read_proto_limited(&mut mismatch, 64 * 1024).unwrap();
+    assert_eq!(
+        response.status,
+        Some(ConnectStatus::MismatchedProtocol as i32)
+    );
+    server.runtime.shutdown().unwrap();
+}

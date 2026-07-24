@@ -1,5 +1,5 @@
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 
 use et_core::backed_reader::{BackedReader, ReadError, ReadItem};
 use et_core::backed_writer::{BackedWriter, RecoverError, WriterOutcome};
@@ -9,7 +9,9 @@ use et_core::crypto::{
 use et_core::packet::Packet;
 use et_core::proto::{CatchupBuffer, SequenceHeader};
 
-use crate::framing_io::{read_proto, write_proto};
+use crate::framing_io::{read_proto_limited, write_proto_limited};
+
+pub const MAX_RECOVERY_PROTO_LEN: i64 = 80 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum ConnError {
@@ -19,42 +21,51 @@ pub enum ConnError {
     Encrypt(EncryptError),
     Backpressure,
     SequenceOutOfRange(i64),
+    InvalidRecoverySequence(Option<i32>),
 }
 
 impl From<io::Error> for ConnError {
-    fn from(e: io::Error) -> Self {
-        Self::Io(e)
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
     }
 }
+
 impl From<ReadError> for ConnError {
-    fn from(e: ReadError) -> Self {
-        Self::Read(e)
+    fn from(error: ReadError) -> Self {
+        Self::Read(error)
     }
 }
+
 impl From<RecoverError> for ConnError {
-    fn from(e: RecoverError) -> Self {
-        Self::Recover(e)
+    fn from(error: RecoverError) -> Self {
+        Self::Recover(error)
     }
 }
+
 impl From<EncryptError> for ConnError {
-    fn from(e: EncryptError) -> Self {
-        Self::Encrypt(e)
+    fn from(error: EncryptError) -> Self {
+        Self::Encrypt(error)
     }
 }
+
 impl std::fmt::Display for ConnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io(e) => write!(f, "io: {e}"),
-            Self::Read(e) => write!(f, "read: {e}"),
-            Self::Recover(e) => write!(f, "recover: {e}"),
-            Self::Encrypt(e) => write!(f, "encrypt: {e}"),
+            Self::Io(error) => write!(f, "io: {error}"),
+            Self::Read(error) => write!(f, "read: {error}"),
+            Self::Recover(error) => write!(f, "recover: {error}"),
+            Self::Encrypt(error) => write!(f, "encrypt: {error}"),
             Self::Backpressure => write!(f, "disconnected write buffer is full"),
             Self::SequenceOutOfRange(sequence) => {
                 write!(f, "sequence number {sequence} exceeds the wire format")
             }
+            Self::InvalidRecoverySequence(sequence) => {
+                write!(f, "invalid recovery sequence {sequence:?}")
+            }
         }
     }
 }
+
 impl std::error::Error for ConnError {}
 
 pub struct Connection {
@@ -65,29 +76,29 @@ pub struct Connection {
 
 impl Connection {
     pub fn new_client(stream: TcpStream, key: &[u8; KEY_LEN]) -> Self {
-        let enc = CryptoHandler::new(key, DIR_CLIENT_TO_SERVER);
-        let dec = CryptoHandler::new(key, DIR_SERVER_TO_CLIENT);
-        Self {
-            stream,
-            writer: BackedWriter::new(enc, true),
-            reader: BackedReader::new(dec, true),
-        }
+        Self::new(stream, key, DIR_CLIENT_TO_SERVER, DIR_SERVER_TO_CLIENT)
     }
 
     pub fn new_server(stream: TcpStream, key: &[u8; KEY_LEN]) -> Self {
-        let enc = CryptoHandler::new(key, DIR_SERVER_TO_CLIENT);
-        let dec = CryptoHandler::new(key, DIR_CLIENT_TO_SERVER);
+        Self::new(stream, key, DIR_SERVER_TO_CLIENT, DIR_CLIENT_TO_SERVER)
+    }
+
+    fn new(stream: TcpStream, key: &[u8; KEY_LEN], encrypt: u8, decrypt: u8) -> Self {
         Self {
             stream,
-            writer: BackedWriter::new(enc, true),
-            reader: BackedReader::new(dec, true),
+            writer: BackedWriter::new(CryptoHandler::new(key, encrypt), true),
+            reader: BackedReader::new(CryptoHandler::new(key, decrypt), true),
         }
     }
 
     pub fn write_packet(&mut self, header: u8, payload: &[u8]) -> Result<(), ConnError> {
+        self.refresh_connectivity()?;
         match self.writer.write_packet(header, payload)? {
             WriterOutcome::Send(frame) => {
-                self.stream.write_all(&frame)?;
+                if let Err(error) = self.stream.write_all(&frame) {
+                    self.disconnect();
+                    return Err(ConnError::Io(error));
+                }
                 Ok(())
             }
             WriterOutcome::BufferedOnly => Ok(()),
@@ -97,16 +108,26 @@ impl Connection {
 
     pub fn read_packet(&mut self) -> Result<Packet, ConnError> {
         loop {
-            match self.reader.pop()? {
-                ReadItem::Packet(packet) => return Ok(packet),
-                ReadItem::NeedMore => {}
+            match self.reader.pop() {
+                Ok(ReadItem::Packet(packet)) => return Ok(packet),
+                Ok(ReadItem::NeedMore) => {}
+                Err(error) => {
+                    self.disconnect();
+                    return Err(ConnError::Read(error));
+                }
             }
-
-            let mut buf = [0u8; 8192];
-            match self.stream.read(&mut buf) {
-                Ok(0) => return Err(ConnError::Io(io::ErrorKind::UnexpectedEof.into())),
-                Ok(n) => self.reader.feed(&buf[..n]),
-                Err(e) => return Err(ConnError::Io(e)),
+            let mut buffer = [0u8; 8192];
+            match self.stream.read(&mut buffer) {
+                Ok(0) => {
+                    self.disconnect();
+                    return Err(ConnError::Io(io::ErrorKind::UnexpectedEof.into()));
+                }
+                Ok(count) => self.reader.feed(&buffer[..count]),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    self.disconnect();
+                    return Err(ConnError::Io(error));
+                }
             }
         }
     }
@@ -124,29 +145,32 @@ impl Connection {
         self.reader.invalidate();
     }
 
+    pub fn shutdown(&mut self) -> Result<(), ConnError> {
+        self.disconnect();
+        match self.stream.shutdown(Shutdown::Both) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
+            Err(error) => Err(ConnError::Io(error)),
+        }
+    }
+
     pub fn recover(&mut self, new_stream: TcpStream) -> Result<(), ConnError> {
-        let local_seq = self.reader.sequence();
-        let wire_sequence =
-            i32::try_from(local_seq).map_err(|_| ConnError::SequenceOutOfRange(local_seq))?;
-        let header = SequenceHeader {
-            sequence_number: Some(wire_sequence),
-        };
-        write_proto(&mut new_stream.try_clone()?, &header)?;
-
-        let remote_header: SequenceHeader = read_proto(&mut new_stream.try_clone()?)?;
-        let catchup_packets = self
-            .writer
-            .recover(i64::from(remote_header.sequence_number.unwrap_or(0)))?;
-        let catchup = CatchupBuffer {
-            buffer: catchup_packets,
-        };
-        write_proto(&mut new_stream.try_clone()?, &catchup)?;
-
-        let remote_catchup: CatchupBuffer = read_proto(&mut new_stream.try_clone()?)?;
-        self.reader.revive(remote_catchup.buffer);
-        self.writer.revive();
-        self.stream = new_stream;
-        Ok(())
+        self.disconnect();
+        let _ = self.stream.shutdown(Shutdown::Both);
+        let result = self.exchange_recovery(&new_stream);
+        match result {
+            Ok(remote_catchup) => {
+                self.reader.revive(remote_catchup.buffer);
+                self.writer.revive();
+                self.stream = new_stream;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = new_stream.shutdown(Shutdown::Both);
+                self.disconnect();
+                Err(error)
+            }
+        }
     }
 
     pub fn writer_sequence(&self) -> i64 {
@@ -155,5 +179,67 @@ impl Connection {
 
     pub fn reader_sequence(&self) -> i64 {
         self.reader.sequence()
+    }
+
+    fn exchange_recovery(&self, stream: &TcpStream) -> Result<CatchupBuffer, ConnError> {
+        let local_sequence = self.reader.sequence();
+        let wire_sequence = i32::try_from(local_sequence)
+            .map_err(|_| ConnError::SequenceOutOfRange(local_sequence))?;
+        let mut stream = stream.try_clone()?;
+        write_proto_limited(
+            &mut stream,
+            &SequenceHeader {
+                sequence_number: Some(wire_sequence),
+            },
+            MAX_RECOVERY_PROTO_LEN,
+        )?;
+        let remote: SequenceHeader = read_proto_limited(&mut stream, MAX_RECOVERY_PROTO_LEN)?;
+        let remote_sequence = match remote.sequence_number {
+            Some(sequence) if sequence >= 0 => i64::from(sequence),
+            value => return Err(ConnError::InvalidRecoverySequence(value)),
+        };
+        let catchup = CatchupBuffer {
+            buffer: self.writer.recover(remote_sequence)?,
+        };
+        write_proto_limited(&mut stream, &catchup, MAX_RECOVERY_PROTO_LEN)?;
+        read_proto_limited(&mut stream, MAX_RECOVERY_PROTO_LEN).map_err(ConnError::Io)
+    }
+
+    fn refresh_connectivity(&mut self) -> Result<(), ConnError> {
+        if !self.writer.connected() {
+            return Ok(());
+        }
+        if let Err(error) = self.stream.set_nonblocking(true) {
+            self.disconnect();
+            return Err(ConnError::Io(error));
+        }
+        let mut byte = [0u8; 1];
+        let probe = self.stream.peek(&mut byte);
+        if let Err(error) = self.stream.set_nonblocking(false) {
+            self.disconnect();
+            return Err(ConnError::Io(error));
+        }
+        match probe {
+            Ok(0) => self.disconnect(),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::NotConnected
+                ) =>
+            {
+                self.disconnect();
+            }
+            Err(error) => {
+                self.disconnect();
+                return Err(ConnError::Io(error));
+            }
+        }
+        Ok(())
     }
 }

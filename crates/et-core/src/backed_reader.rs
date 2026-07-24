@@ -103,6 +103,8 @@ impl BackedReader {
     }
 
     pub fn invalidate(&mut self) {
+        self.partial.clear();
+        self.replay.clear();
         self.connected = false;
     }
 
@@ -177,6 +179,19 @@ mod tests {
             }
         }
         assert_eq!(r.pop().unwrap(), ReadItem::NeedMore);
+    }
+
+    #[test]
+    fn invalidate_discards_partial_transport_bytes() {
+        let (mut writer, mut reader) = pair();
+        let WriterOutcome::Send(frame) = writer.write_packet(4, b"clean").unwrap() else {
+            panic!();
+        };
+        reader.feed(&frame[..3]);
+        reader.invalidate();
+        reader.revive(Vec::new());
+        reader.feed(&frame);
+        assert!(matches!(reader.pop().unwrap(), ReadItem::Packet(_)));
     }
 
     #[test]

@@ -1,15 +1,24 @@
 #![forbid(unsafe_code)]
 
-//! Internal secure server-listener and local terminal registration foundation.
-//!
-//! TCP session routing intentionally remains outside this crate until the next
-//! coherent server work unit.
+//! Secure server listeners, local terminal registration, and encrypted session routing.
 
 pub mod path;
 mod registry;
 mod router;
 mod router_loop;
+mod runtime;
+mod runtime_accept;
+mod runtime_error;
+mod runtime_handle;
+mod runtime_handler;
+mod runtime_state;
+mod session;
+mod session_table;
 mod socket_path;
 
 pub use registry::{Registration, RegistrationError, Registry};
 pub use router::{Router, RouterError, RouterEvent, RouterReject};
+pub use runtime::Runtime;
+pub use runtime_error::RuntimeError;
+pub use runtime_handle::{HandleError, RuntimeHandle};
+pub use session_table::{SessionState, SessionTable, SessionTableError};

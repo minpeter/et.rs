@@ -3,7 +3,8 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use et_core::crypto::KEY_LEN;
 use et_core::keys::passkey_to_key;
@@ -24,9 +25,20 @@ struct StoredRegistration {
     _stream: UnixStream,
 }
 
+#[derive(Default)]
+struct RegistryState {
+    registrations: HashMap<String, StoredRegistration>,
+}
+
+#[derive(Default)]
+struct RegistryInner {
+    state: Mutex<RegistryState>,
+    changed: Condvar,
+}
+
 #[derive(Clone, Default)]
 pub struct Registry {
-    inner: Arc<Mutex<HashMap<String, StoredRegistration>>>,
+    inner: Arc<RegistryInner>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +46,7 @@ pub enum RegistrationError {
     Invalid,
     Duplicate,
     Unavailable,
+    Timeout,
 }
 
 impl std::fmt::Display for RegistrationError {
@@ -42,6 +55,7 @@ impl std::fmt::Display for RegistrationError {
             Self::Invalid => write!(f, "terminal registration is invalid"),
             Self::Duplicate => write!(f, "terminal id is already registered"),
             Self::Unavailable => write!(f, "terminal registry is unavailable"),
+            Self::Timeout => write!(f, "timed out waiting for terminal registration"),
         }
     }
 }
@@ -60,16 +74,18 @@ impl Registry {
     ) -> Result<String, RegistrationError> {
         let registration = validate(user_info)?;
         let id = registration.id.clone();
-        let mut registrations = self
+        let mut state = self
             .inner
+            .state
             .lock()
             .map_err(|_| RegistrationError::Unavailable)?;
-        match registrations.entry(id.clone()) {
+        match state.registrations.entry(id.clone()) {
             Entry::Vacant(entry) => {
                 entry.insert(StoredRegistration {
                     info: registration,
                     _stream: stream,
                 });
+                self.inner.changed.notify_all();
                 Ok(id)
             }
             Entry::Occupied(_) => Err(RegistrationError::Duplicate),
@@ -77,19 +93,52 @@ impl Registry {
     }
 
     pub fn get(&self, id: &str) -> Result<Option<Registration>, RegistrationError> {
-        let registrations = self
+        let state = self
             .inner
+            .state
             .lock()
             .map_err(|_| RegistrationError::Unavailable)?;
-        Ok(registrations.get(id).map(|stored| stored.info.clone()))
+        Ok(state
+            .registrations
+            .get(id)
+            .map(|stored| stored.info.clone()))
+    }
+
+    pub fn wait_for(&self, id: &str, timeout: Duration) -> Result<Registration, RegistrationError> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(RegistrationError::Timeout)?;
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| RegistrationError::Unavailable)?;
+        loop {
+            if let Some(stored) = state.registrations.get(id) {
+                return Ok(stored.info.clone());
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(RegistrationError::Timeout);
+            };
+            let (next, wait) = self
+                .inner
+                .changed
+                .wait_timeout(state, remaining)
+                .map_err(|_| RegistrationError::Unavailable)?;
+            state = next;
+            if wait.timed_out() && !state.registrations.contains_key(id) {
+                return Err(RegistrationError::Timeout);
+            }
+        }
     }
 
     pub fn len(&self) -> Result<usize, RegistrationError> {
-        let registrations = self
+        let state = self
             .inner
+            .state
             .lock()
             .map_err(|_| RegistrationError::Unavailable)?;
-        Ok(registrations.len())
+        Ok(state.registrations.len())
     }
 
     pub fn is_empty(&self) -> Result<bool, RegistrationError> {

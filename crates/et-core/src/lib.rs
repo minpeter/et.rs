@@ -7,5 +7,6 @@
 pub mod crypto;
 pub mod framing;
 pub mod packet;
+pub mod proto;
 
 pub const PROTOCOL_VERSION: u32 = 6;

@@ -58,3 +58,6 @@ mod server;
 mod ssh_config;
 mod ssh_process;
 mod terminal;
+mod terminal_credentials;
+mod terminal_protocol;
+mod terminal_pty;

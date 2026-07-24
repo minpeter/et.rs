@@ -23,6 +23,8 @@ et-server = { path = "../et-server" }
 clap = { version = "4", features = ["derive"] }
 nix = { version = "0.31.3", default-features = false, features = ["signal"] }
 prost = "0.13"
+portable-pty = "0.9.0"
+rustix = { version = "1.1.4", features = ["event", "process"] }
 signal-hook = "0.3.18"
 wait-timeout = "0.2.1"
 

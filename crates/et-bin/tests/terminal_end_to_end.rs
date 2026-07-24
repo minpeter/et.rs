@@ -94,6 +94,47 @@ fn real_client_bootstrap_server_bridge_and_pty_execute_command() {
         "{stdout_text:?}"
     );
 
+    let mut no_exit = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env("PATH", format!("{}:{existing_path}", directory.display()))
+        .env("TERM", "xterm-256color")
+        .args(["--terminal-path"])
+        .arg(&terminal)
+        .args(["--serverfifo"])
+        .arg(&router)
+        .arg("-p")
+        .arg(port.to_string())
+        .args([
+            "--no-exit",
+            "-c",
+            "printf 'NOEXIT:%s\\n' \"$TERM\"; exit",
+            "127.0.0.1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let status = no_exit.wait_timeout(TIMEOUT).unwrap().unwrap();
+    let mut no_exit_stdout = String::new();
+    let mut no_exit_stderr = String::new();
+    no_exit
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut no_exit_stdout)
+        .unwrap();
+    no_exit
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut no_exit_stderr)
+        .unwrap();
+    assert!(status.success(), "{no_exit_stderr}");
+    assert!(
+        no_exit_stdout.contains("NOEXIT:xterm-256color"),
+        "{no_exit_stdout:?}"
+    );
+
     let server_pid = Pid::from_raw(i32::try_from(server.id()).unwrap());
     kill(server_pid, Signal::SIGTERM).unwrap();
     assert!(server.wait_timeout(TIMEOUT).unwrap().unwrap().success());

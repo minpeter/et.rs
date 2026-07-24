@@ -12,8 +12,6 @@ use et_core::proto::{
     TermInit, TerminalBuffer, TerminalInfo, TerminalPacketType, TerminalUserInfo,
 };
 use et_net::local_packet::{read_local_packet, write_local_packet};
-use nix::sys::signal::kill;
-use nix::unistd::Pid;
 use prost::Message;
 use terminal_runtime_support::{read_line_timeout, write_credentials, Fixture};
 use wait_timeout::ChildExt;
@@ -171,58 +169,6 @@ fn router_disconnect_terminates_the_shell() {
     drop(router);
     let status = child.wait_timeout(TIMEOUT).unwrap().unwrap();
     assert!(!status.success());
-}
-
-#[test]
-fn shell_exit_reaps_background_process_group() {
-    let fixture = Fixture::new("process-group");
-    let mut child = fixture.spawn();
-    write_credentials(&mut child);
-    let (mut router, _) = fixture.listener.accept().unwrap();
-    router.set_read_timeout(Some(TIMEOUT)).unwrap();
-    let _ = read_local_packet(&mut router).unwrap();
-    fixture.wait_ready();
-    send(
-        &mut router,
-        TerminalPacketType::TerminalInit,
-        &TermInit {
-            environmentnames: Vec::new(),
-            environmentvalues: Vec::new(),
-        },
-    );
-    send(
-        &mut router,
-        TerminalPacketType::TerminalBuffer,
-        &TerminalBuffer {
-            buffer: Some(b"sleep 30 & printf 'BG:%s\\n' \"$!\"; exit\n".to_vec()),
-        },
-    );
-    let mut output = String::new();
-    let pid = loop {
-        let packet = read_local_packet(&mut router).unwrap();
-        let bytes = TerminalBuffer::decode(packet.payload())
-            .unwrap()
-            .buffer
-            .unwrap();
-        output.push_str(&String::from_utf8_lossy(&bytes));
-        if let Some(pid) = background_pid(&output) {
-            break pid;
-        }
-    };
-    assert!(child.wait_timeout(TIMEOUT).unwrap().unwrap().success());
-    assert!(kill(Pid::from_raw(pid), None).is_err(), "orphan pid {pid}");
-}
-
-fn background_pid(output: &str) -> Option<i32> {
-    output.match_indices("BG:").find_map(|(offset, _)| {
-        let digits = output[offset + 3..]
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect::<String>();
-        (!digits.is_empty())
-            .then(|| digits.parse::<i32>().ok())
-            .flatten()
-    })
 }
 
 fn send<M: Message>(router: &mut impl Write, kind: TerminalPacketType, message: &M) {

@@ -39,6 +39,10 @@ impl Fixture {
     }
 
     pub fn spawn(&self) -> std::process::Child {
+        self.spawn_with_shell("/bin/sh")
+    }
+
+    pub fn spawn_with_shell(&self, shell: &str) -> std::process::Child {
         Command::new(env!("CARGO_BIN_EXE_et"))
             .args([
                 "terminal",
@@ -48,7 +52,7 @@ impl Fixture {
                 "--serverfifo",
             ])
             .arg(&self.socket)
-            .env("SHELL", "/bin/sh")
+            .env("SHELL", shell)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

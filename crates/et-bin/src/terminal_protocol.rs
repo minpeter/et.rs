@@ -126,6 +126,8 @@ fn valid_size(info: TerminalInfo) -> Result<PtySize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use et_core::packet::Packet;
+    use et_net::local_packet::write_local_packet;
 
     #[test]
     fn resize_rejects_zero_negative_and_oversized_dimensions() {
@@ -165,5 +167,49 @@ mod tests {
         assert_eq!(size.cols, 100);
         assert_eq!(size.pixel_width, 800);
         assert_eq!(size.pixel_height, 600);
+    }
+
+    #[test]
+    fn initialization_rejects_wrong_type_malformed_and_invalid_environment() {
+        let wrong_type = Packet::new(
+            TerminalPacketType::TerminalBuffer as u8,
+            TerminalBuffer {
+                buffer: Some(Vec::new()),
+            }
+            .encode_to_vec(),
+        );
+        assert!(read_environment_packet(wrong_type).is_err());
+        assert!(read_environment_packet(Packet::new(
+            TerminalPacketType::TerminalInit as u8,
+            vec![0xff]
+        ))
+        .is_err());
+        for init in [
+            TermInit {
+                environmentnames: vec!["A".to_owned()],
+                environmentvalues: Vec::new(),
+            },
+            TermInit {
+                environmentnames: vec!["BAD-NAME".to_owned()],
+                environmentvalues: vec!["value".to_owned()],
+            },
+            TermInit {
+                environmentnames: vec!["VALID".to_owned()],
+                environmentvalues: vec!["bad\0value".to_owned()],
+            },
+            TermInit {
+                environmentnames: vec!["VALID".to_owned()],
+                environmentvalues: vec!["x".repeat(MAX_ENV_VALUE + 1)],
+            },
+        ] {
+            let packet = Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec());
+            assert!(read_environment_packet(packet).is_err());
+        }
+    }
+
+    fn read_environment_packet(packet: Packet) -> Result<Vec<(String, String)>, String> {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        write_local_packet(&mut writer, &packet).unwrap();
+        read_initial_environment(&mut reader)
     }
 }

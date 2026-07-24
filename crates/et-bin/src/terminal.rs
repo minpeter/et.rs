@@ -28,6 +28,10 @@ struct TerminalArgs {
     idpasskey: Option<String>,
     #[arg(long)]
     idpasskeyfile: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    session_child: bool,
+    #[arg(long, hide = true, requires = "session_child")]
+    ready_socket: Option<PathBuf>,
 }
 
 pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
@@ -40,16 +44,29 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
     let input = load_credentials(&parsed).map_err(clap_error)?;
     let router_path = select_router_path(parsed.serverfifo.as_deref())
         .map_err(|error| clap_error(error.to_string()))?;
+    if !parsed.session_child {
+        crate::terminal_daemon::spawn(router_path.path(), &input, parsed.verbose)
+            .map_err(clap_error)?;
+        return print_marker(&input);
+    }
     let mut router = UnixStream::connect(router_path.path())
         .map_err(|error| clap_error(format!("could not connect terminal router: {error}")))?;
     register(&mut router, &input).map_err(clap_error)?;
+    let ready_socket = parsed
+        .ready_socket
+        .as_deref()
+        .ok_or_else(|| clap_error("terminal session child has no readiness socket"))?;
+    crate::terminal_daemon::signal(ready_socket).map_err(clap_error)?;
+    terminal_pty::run(router, &input.term).map_err(clap_error)
+}
+
+fn print_marker(input: &CredentialInput) -> Result<i32, clap::Error> {
     let stdout = io::stdout();
     let mut output = stdout.lock();
     writeln!(output, "IDPASSKEY:{}/{}", input.id, input.passkey)
         .and_then(|()| output.flush())
         .map_err(|error| clap_error(format!("could not write bootstrap marker: {error}")))?;
-    drop(output);
-    terminal_pty::run(router, &input.term).map_err(clap_error)
+    Ok(0)
 }
 
 fn load_credentials(args: &TerminalArgs) -> Result<CredentialInput, String> {

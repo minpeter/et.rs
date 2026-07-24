@@ -43,6 +43,7 @@ pub enum ClientError {
     UnexpectedInitialPacket(u8),
     MalformedInitialResponse(prost::DecodeError),
     InitialResponseRejected(String),
+    Terminal(String),
 }
 
 impl From<HostError> for ClientError {
@@ -135,6 +136,7 @@ impl std::fmt::Display for ClientError {
             Self::InitialResponseRejected(message) => {
                 write!(f, "ET server rejected the initial payload: {message}")
             }
+            Self::Terminal(message) => write!(f, "{message}"),
         }
     }
 }

@@ -72,7 +72,7 @@ fn run_client(
     let provisional = provisional_credentials()?;
     let invocation = build_invocation(&request, &provisional);
     let credentials = run_bootstrap(runner, &invocation, deadline)?;
-    connect_initial(
+    let connection = connect_initial(
         &Endpoint {
             host: resolved.hostname,
             port: destination.port,
@@ -80,7 +80,11 @@ fn run_client(
         &credentials,
         resolver,
         deadline,
-    )
+    )?;
+    if args.no_terminal {
+        return Ok(());
+    }
+    crate::client_terminal::run(connection, args.command.as_deref(), args.no_exit)
 }
 
 fn command_user(positional: Option<String>, option: Option<String>) -> Option<String> {
@@ -101,11 +105,6 @@ fn effective_user(
 }
 
 fn validate_bootstrap_mode(args: &ClientArgs) -> Result<(), ClientError> {
-    if !args.no_terminal {
-        return Err(ClientError::Unsupported(
-            "interactive terminal sessions are not implemented yet; use -N without tunnels for bootstrap-only mode",
-        ));
-    }
     if !args.tunnel.is_empty()
         || !args.reverse_tunnel.is_empty()
         || args.forward_ssh_agent
@@ -120,10 +119,8 @@ fn validate_bootstrap_mode(args: &ClientArgs) -> Result<(), ClientError> {
             "jumphost sessions are not implemented yet",
         ));
     }
-    if args.command.is_some() || args.no_exit {
-        return Err(ClientError::Unsupported(
-            "remote commands require the interactive terminal runtime, which is not implemented yet",
-        ));
+    if args.no_exit && args.command.is_none() {
+        return Err(ClientError::Unsupported("--no-exit requires --command"));
     }
     Ok(())
 }

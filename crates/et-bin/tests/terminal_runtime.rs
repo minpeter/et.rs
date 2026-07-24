@@ -1,11 +1,10 @@
 #![forbid(unsafe_code)]
 
-use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
+#[path = "terminal_runtime_support/mod.rs"]
+mod terminal_runtime_support;
+
+use std::io::Write;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
 use std::time::Duration;
 
 use et_core::packet::Packet;
@@ -14,11 +13,59 @@ use et_core::proto::{
 };
 use et_net::local_packet::{read_local_packet, write_local_packet};
 use prost::Message;
+use terminal_runtime_support::{read_line_timeout, write_credentials, Fixture};
 use wait_timeout::ChildExt;
 
 const ID: &str = "abcdefghijklmnop";
 const KEY: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
 const TIMEOUT: Duration = Duration::from_secs(5);
+
+#[test]
+fn bootstrap_parent_reports_marker_and_leaves_registered_session_running() {
+    let fixture = Fixture::new("bootstrap-parent");
+    let mut parent = fixture.spawn_parent();
+    write_credentials(&mut parent);
+    let (mut router, _) = fixture.listener.accept().unwrap();
+    router.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let registration = read_local_packet(&mut router).unwrap();
+    assert_eq!(
+        registration.header(),
+        TerminalPacketType::TerminalUserInfo as u8
+    );
+    assert_eq!(
+        read_line_timeout(parent.stdout.take().unwrap()),
+        format!("IDPASSKEY:{ID}/{KEY}\n")
+    );
+    assert!(parent.wait_timeout(TIMEOUT).unwrap().unwrap().success());
+    send(
+        &mut router,
+        TerminalPacketType::TerminalInit,
+        &TermInit {
+            environmentnames: Vec::new(),
+            environmentvalues: Vec::new(),
+        },
+    );
+    send(
+        &mut router,
+        TerminalPacketType::TerminalBuffer,
+        &TerminalBuffer {
+            buffer: Some(b"printf 'DETACHED-PTY\\n'; exit\n".to_vec()),
+        },
+    );
+    let mut output = Vec::new();
+    while !output
+        .windows(b"DETACHED-PTY".len())
+        .any(|window| window == b"DETACHED-PTY")
+    {
+        let packet = read_local_packet(&mut router).unwrap();
+        output.extend(
+            TerminalBuffer::decode(packet.payload())
+                .unwrap()
+                .buffer
+                .unwrap(),
+        );
+    }
+}
 
 #[test]
 fn real_terminal_registers_runs_shell_and_resizes_pty() {
@@ -35,6 +82,7 @@ fn real_terminal_registers_runs_shell_and_resizes_pty() {
     let user = TerminalUserInfo::decode(registration.payload()).unwrap();
     assert_eq!(user.id.as_deref(), Some(ID));
     assert_eq!(user.passkey.as_deref(), Some(KEY));
+    fixture.wait_ready();
 
     send(
         &mut router,
@@ -44,8 +92,6 @@ fn real_terminal_registers_runs_shell_and_resizes_pty() {
             environmentvalues: vec!["literal-value".to_owned()],
         },
     );
-    let marker = read_marker(&mut child);
-    assert_eq!(marker, format!("IDPASSKEY:{ID}/{KEY}\n"));
     send(
         &mut router,
         TerminalPacketType::TerminalInfo,
@@ -111,6 +157,7 @@ fn router_disconnect_terminates_the_shell() {
     write_credentials(&mut child);
     let (mut router, _) = fixture.listener.accept().unwrap();
     let _ = read_local_packet(&mut router).unwrap();
+    fixture.wait_ready();
     send(
         &mut router,
         TerminalPacketType::TerminalInit,
@@ -119,7 +166,6 @@ fn router_disconnect_terminates_the_shell() {
             environmentvalues: Vec::new(),
         },
     );
-    let _ = read_marker(&mut child);
     drop(router);
     let status = child.wait_timeout(TIMEOUT).unwrap().unwrap();
     assert!(!status.success());
@@ -127,61 +173,4 @@ fn router_disconnect_terminates_the_shell() {
 
 fn send<M: Message>(router: &mut impl Write, kind: TerminalPacketType, message: &M) {
     write_local_packet(router, &Packet::new(kind as u8, message.encode_to_vec())).unwrap();
-}
-
-fn write_credentials(child: &mut std::process::Child) {
-    let mut stdin = child.stdin.take().unwrap();
-    writeln!(stdin, "{ID}/{KEY}_xterm-256color").unwrap();
-}
-
-fn read_marker(child: &mut std::process::Child) -> String {
-    let stdout = child.stdout.take().unwrap();
-    let (sender, receiver) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
-        let _ = sender.send(result);
-    });
-    receiver.recv_timeout(TIMEOUT).unwrap().unwrap()
-}
-
-struct Fixture {
-    directory: std::path::PathBuf,
-    socket: std::path::PathBuf,
-    listener: UnixListener,
-}
-
-impl Fixture {
-    fn new(label: &str) -> Self {
-        let directory =
-            std::env::temp_dir().join(format!("et-rs-terminal-{label}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir(&directory).unwrap();
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
-        let socket = directory.join("router.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        Self {
-            directory,
-            socket,
-            listener,
-        }
-    }
-
-    fn spawn(&self) -> std::process::Child {
-        Command::new(env!("CARGO_BIN_EXE_et"))
-            .args(["terminal", "--serverfifo"])
-            .arg(&self.socket)
-            .env("SHELL", "/bin/sh")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap()
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.directory);
-    }
 }

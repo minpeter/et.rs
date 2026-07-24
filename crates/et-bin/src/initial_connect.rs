@@ -43,7 +43,7 @@ pub fn connect_initial(
     credentials: &Credentials,
     resolver: &dyn EndpointResolver,
     deadline: Deadline,
-) -> Result<(), ClientError> {
+) -> Result<Connection, ClientError> {
     let key = passkey_to_key(&credentials.passkey).ok_or(ClientError::InvalidPasskey)?;
     let mut stream = connect_endpoint(endpoint, resolver, deadline)?;
     set_stream_timeout(&stream, deadline)?;
@@ -78,7 +78,7 @@ pub fn connect_initial(
     if let Some(message) = response.error {
         return Err(ClientError::InitialResponseRejected(message));
     }
-    Ok(())
+    Ok(connection)
 }
 
 fn connect_endpoint(

@@ -317,11 +317,11 @@ fn leading_hyphen_destination_components_are_rejected_before_spawn() {
 }
 
 #[test]
-fn unsupported_modes_do_not_claim_session_completion() {
+fn unsupported_forwarding_modes_do_not_claim_session_completion() {
     let no_ssh = TestDir::new("honest");
     for args in [
-        vec!["example.test"],
         vec!["-N", "-t", "8080:host:80", "example.test"],
+        vec!["--no-exit", "example.test"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_et"))
             .env("PATH", &no_ssh.0)
@@ -329,6 +329,9 @@ fn unsupported_modes_do_not_claim_session_completion() {
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(2));
-        assert!(stderr(&output).contains("not implemented"));
+        assert!(
+            stderr(&output).contains("not implemented")
+                || stderr(&output).contains("--no-exit requires --command")
+        );
     }
 }

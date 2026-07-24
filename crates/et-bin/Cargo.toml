@@ -21,6 +21,7 @@ et-core = { path = "../et-core" }
 et-net = { path = "../et-net" }
 et-server = { path = "../et-server" }
 clap = { version = "4", features = ["derive"] }
+crossterm = "0.29.0"
 nix = { version = "0.31.3", default-features = false, features = ["signal"] }
 prost = "0.13"
 portable-pty = "0.9.0"

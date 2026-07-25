@@ -51,6 +51,7 @@ fn dispatch(prog: &str, args: &[OsString]) -> Result<i32, clap::Error> {
 mod bootstrap;
 mod client;
 mod client_terminal;
+mod client_terminal_loop;
 mod deadline;
 mod error;
 mod initial_connect;

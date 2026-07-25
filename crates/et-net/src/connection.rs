@@ -1,5 +1,6 @@
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
+use std::time::Duration;
 
 use et_core::backed_reader::{BackedReader, ReadError, ReadItem};
 use et_core::backed_writer::{BackedWriter, RecoverError, WriterOutcome};
@@ -7,11 +8,10 @@ use et_core::crypto::{
     CryptoHandler, EncryptError, DIR_CLIENT_TO_SERVER, DIR_SERVER_TO_CLIENT, KEY_LEN,
 };
 use et_core::packet::Packet;
-use et_core::proto::{CatchupBuffer, SequenceHeader};
+#[path = "connection_recovery.rs"]
+mod recovery;
 
-use crate::framing_io::{read_proto_limited, write_proto_limited};
-
-pub const MAX_RECOVERY_PROTO_LEN: i64 = 80 * 1024 * 1024;
+pub use recovery::{DEFAULT_RECOVERY_TIMEOUT, MAX_RECOVERY_PROTO_LEN};
 
 #[derive(Debug)]
 pub enum ConnError {
@@ -48,7 +48,14 @@ impl Connection {
     }
 
     pub fn write_packet(&mut self, header: u8, payload: &[u8]) -> Result<(), ConnError> {
-        self.refresh_connectivity()?;
+        if let Err(error) = self.refresh_connectivity() {
+            self.disconnect();
+            return match self.writer.write_packet(header, payload)? {
+                WriterOutcome::BufferedOnly => Err(error),
+                WriterOutcome::Skipped => Err(ConnError::Backpressure),
+                WriterOutcome::Send(_) => Err(error),
+            };
+        }
         match self.writer.write_packet(header, payload)? {
             WriterOutcome::Send(frame) => {
                 if let Err(error) = self.stream.write_all(&frame) {
@@ -120,25 +127,6 @@ impl Connection {
         }
     }
 
-    pub fn recover(&mut self, new_stream: TcpStream) -> Result<(), ConnError> {
-        self.disconnect();
-        let _ = self.stream.shutdown(Shutdown::Both);
-        let result = self.exchange_recovery(&new_stream);
-        match result {
-            Ok(remote_catchup) => {
-                self.reader.revive(remote_catchup.buffer);
-                self.writer.revive();
-                self.stream = new_stream;
-                Ok(())
-            }
-            Err(error) => {
-                let _ = new_stream.shutdown(Shutdown::Both);
-                self.disconnect();
-                Err(error)
-            }
-        }
-    }
-
     pub fn try_clone_stream(&self) -> Result<TcpStream, ConnError> {
         self.stream.try_clone().map_err(ConnError::Io)
     }
@@ -151,36 +139,18 @@ impl Connection {
         self.writer.has_capacity(bytes)
     }
 
+    pub fn set_io_timeout(&self, timeout: Option<Duration>) -> Result<(), ConnError> {
+        self.stream.set_read_timeout(timeout)?;
+        self.stream.set_write_timeout(timeout)?;
+        Ok(())
+    }
+
     pub fn writer_sequence(&self) -> i64 {
         self.writer.sequence()
     }
 
     pub fn reader_sequence(&self) -> i64 {
         self.reader.sequence()
-    }
-
-    fn exchange_recovery(&self, stream: &TcpStream) -> Result<CatchupBuffer, ConnError> {
-        let local_sequence = self.reader.sequence();
-        let wire_sequence = i32::try_from(local_sequence)
-            .map_err(|_| ConnError::SequenceOutOfRange(local_sequence))?;
-        let mut stream = stream.try_clone()?;
-        write_proto_limited(
-            &mut stream,
-            &SequenceHeader {
-                sequence_number: Some(wire_sequence),
-            },
-            MAX_RECOVERY_PROTO_LEN,
-        )?;
-        let remote: SequenceHeader = read_proto_limited(&mut stream, MAX_RECOVERY_PROTO_LEN)?;
-        let remote_sequence = match remote.sequence_number {
-            Some(sequence) if sequence >= 0 => i64::from(sequence),
-            value => return Err(ConnError::InvalidRecoverySequence(value)),
-        };
-        let catchup = CatchupBuffer {
-            buffer: self.writer.recover(remote_sequence)?,
-        };
-        write_proto_limited(&mut stream, &catchup, MAX_RECOVERY_PROTO_LEN)?;
-        read_proto_limited(&mut stream, MAX_RECOVERY_PROTO_LEN).map_err(ConnError::Io)
     }
 
     fn refresh_connectivity(&mut self) -> Result<(), ConnError> {

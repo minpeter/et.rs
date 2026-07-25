@@ -5,7 +5,8 @@ use et_core::proto::{TerminalBuffer, TerminalPacketType};
 use et_net::connection::{ConnError, Connection};
 use prost::Message;
 
-use super::{connection_ended, send_command};
+use super::send_command;
+use crate::client_terminal_loop::connection_ended;
 
 #[test]
 fn command_exit_suffix_matches_no_exit_flag() {

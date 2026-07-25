@@ -33,7 +33,8 @@ fn explicit_ipv6_listener_is_v6_only() {
     let listeners = bind_tcp(IpAddr::V6(Ipv6Addr::LOCALHOST), 0).unwrap();
     assert!(listeners.ipv4().is_none());
     assert!(listeners.ipv6().is_some());
-    assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, listeners.port())).is_err());
+    let socket = socket2::Socket::from(listeners.ipv6().unwrap().try_clone().unwrap());
+    assert!(socket.only_v6().unwrap());
 }
 
 #[test]

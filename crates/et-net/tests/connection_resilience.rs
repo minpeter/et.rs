@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 
@@ -42,4 +43,33 @@ fn recovery_protobuf_limit_is_explicit_and_enforced() {
     let stream = TcpStream::connect(address).unwrap();
     assert!(connection.recover(stream).is_err());
     peer.join().unwrap();
+}
+
+#[test]
+fn detected_disconnect_buffers_write_exactly_once() {
+    let old_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client_stream = TcpStream::connect(old_listener.local_addr().unwrap()).unwrap();
+    let (server_stream, _) = old_listener.accept().unwrap();
+    let mut observer = server_stream.try_clone().unwrap();
+    let mut client = Connection::new_client(client_stream, &[5; 32]);
+    let mut server = Connection::new_server(server_stream, &[5; 32]);
+    client.shutdown().unwrap();
+    let mut byte = [0u8; 1];
+    assert_eq!(observer.read(&mut byte).unwrap(), 0);
+
+    server.write_packet(9, b"once").unwrap();
+    assert_eq!(server.writer_sequence(), 1);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let recovered_client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (recovered_server, _) = listener.accept().unwrap();
+    let peer = thread::spawn(move || {
+        client.recover(recovered_client).unwrap();
+        client.read_packet().unwrap()
+    });
+    server.recover(recovered_server).unwrap();
+    let packet = peer.join().unwrap();
+    assert_eq!(packet.header(), 9);
+    assert_eq!(packet.payload(), b"once");
+    assert_eq!(server.writer_sequence(), 1);
 }

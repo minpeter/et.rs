@@ -4,6 +4,8 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use et_core::proto::TerminalPacketType;
+use et_net::connection::DEFAULT_RECOVERY_TIMEOUT;
 use et_net::connection::{ConnError, Connection};
 
 pub(crate) struct ActiveSession {
@@ -69,29 +71,40 @@ impl ActiveSession {
             .connection
             .lock()
             .map_err(|_| SessionError::Unavailable)?;
-        match connection.write_packet(header, payload) {
-            Ok(()) => Ok(()),
-            Err(ConnError::Io(_)) => connection
-                .write_packet(header, payload)
-                .map_err(SessionError::Connection),
-            Err(error) => Err(SessionError::Connection(error)),
-        }
+        connection
+            .write_packet(header, payload)
+            .map_err(SessionError::Connection)
     }
 
     pub(crate) fn recover(&self, stream: TcpStream) -> Result<(), SessionError> {
-        let new_control = stream.try_clone().map_err(SessionError::Io)?;
-        {
-            let mut control = self.control.lock().map_err(|_| SessionError::Unavailable)?;
-            let old_control = std::mem::replace(&mut *control, new_control);
-            let _ = old_control.shutdown(Shutdown::Both);
-        }
+        let mut control = self.control.lock().map_err(|_| SessionError::Unavailable)?;
         let mut connection = self
             .connection
             .lock()
             .map_err(|_| SessionError::Unavailable)?;
-        connection
-            .recover(stream)
+        let mut candidate = connection
+            .recovery_candidate(stream, DEFAULT_RECOVERY_TIMEOUT)
             .map_err(SessionError::Connection)?;
+        let proof = candidate
+            .authenticate_peer(DEFAULT_RECOVERY_TIMEOUT)
+            .map_err(SessionError::Connection)?;
+        if proof.header() != TerminalPacketType::KeepAlive as u8 || !proof.payload().is_empty() {
+            return Err(SessionError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "returning client sent an invalid recovery proof",
+            )));
+        }
+        candidate
+            .write_packet(TerminalPacketType::KeepAlive as u8, &[])
+            .map_err(SessionError::Connection)?;
+        let new_control = candidate
+            .try_clone_stream()
+            .map_err(SessionError::Connection)?;
+        let old_control = std::mem::replace(&mut *control, new_control);
+        let _ = old_control.shutdown(Shutdown::Both);
+        *connection = candidate;
+        drop(connection);
+        drop(control);
         self.signal()
     }
 

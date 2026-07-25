@@ -22,10 +22,23 @@ const MAX_ENDPOINT_ADDRESSES: usize = 16;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[path = "reconnect.rs"]
+mod reconnect_impl;
+
+pub use reconnect_impl::reconnect;
+#[cfg(test)]
+use reconnect_impl::{accept_reconnect_response, ReconnectStatus};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
     pub host: String,
     pub port: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReconnectOutcome {
+    Recovered,
+    SessionEnded,
 }
 
 impl std::fmt::Display for Endpoint {
@@ -78,6 +91,9 @@ pub fn connect_initial(
     if let Some(message) = response.error {
         return Err(ClientError::InitialResponseRejected(message));
     }
+    connection
+        .set_io_timeout(None)
+        .map_err(ClientError::Transport)?;
     Ok(connection)
 }
 
@@ -172,18 +188,5 @@ fn accept_response(response: ConnectResponse) -> Result<(), ClientError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fresh_bootstrap_rejects_returning_status() {
-        let response = ConnectResponse {
-            status: Some(ConnectStatus::ReturningClient as i32),
-            error: None,
-        };
-        assert!(matches!(
-            accept_response(response),
-            Err(ClientError::ReturningSessionRequiresRecovery)
-        ));
-    }
-}
+#[path = "initial_connect_tests.rs"]
+mod tests;

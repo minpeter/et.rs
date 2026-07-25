@@ -20,4 +20,8 @@ impl Deadline {
             .checked_duration_since(Instant::now())
             .filter(|remaining| !remaining.is_zero())
     }
+
+    pub fn expires_at(self) -> Instant {
+        self.expires_at
+    }
 }

@@ -8,12 +8,15 @@
 
 use std::collections::VecDeque;
 
-use crate::crypto::{CryptoHandler, EncryptError};
+use crate::crypto::{CryptoHandler, EncryptError, MAC_LEN};
 use crate::framing::frame_be_u32;
 use crate::packet::Packet;
 
 pub const MAX_BACKUP_BYTES: i64 = 64 * 1024 * 1024;
 pub const DISCONNECT_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
+pub const MAX_RECOVERY_BACKUP_BYTES: i64 = 76 * 1024 * 1024;
+pub const MAX_BACKUP_PACKETS: usize = 262_144;
+pub const MAX_DISCONNECT_PACKETS: usize = 262_144;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriterOutcome {
@@ -39,11 +42,13 @@ impl std::fmt::Display for RecoverError {
 
 impl std::error::Error for RecoverError {}
 
+#[derive(Clone)]
 pub struct BackedWriter {
     crypto: CryptoHandler,
     backup: VecDeque<Packet>,
     backup_size: i64,
     disconnected_bytes: i64,
+    disconnected_packets: usize,
     sequence: i64,
     connected: bool,
 }
@@ -55,6 +60,7 @@ impl BackedWriter {
             backup: VecDeque::new(),
             backup_size: 0,
             disconnected_bytes: 0,
+            disconnected_packets: 0,
             sequence: 0,
             connected,
         }
@@ -67,7 +73,19 @@ impl BackedWriter {
     ) -> Result<WriterOutcome, EncryptError> {
         let mut packet = Packet::new(header, payload);
         let packet_len = 2 + payload.len();
-        if !self.connected && self.disconnected_bytes + packet_len as i64 > DISCONNECT_BUFFER_BYTES
+        let wire_len = i64::try_from(packet_len + MAC_LEN).unwrap_or(i64::MAX);
+        let disconnected_fits = i64::try_from(packet_len)
+            .ok()
+            .and_then(|length| self.disconnected_bytes.checked_add(length))
+            .is_some_and(|total| total <= DISCONNECT_BUFFER_BYTES);
+        let recovery_fits = self
+            .backup_size
+            .checked_add(wire_len)
+            .is_some_and(|total| total <= MAX_RECOVERY_BACKUP_BYTES);
+        if !self.connected
+            && (!disconnected_fits
+                || self.disconnected_packets >= MAX_DISCONNECT_PACKETS
+                || !recovery_fits)
         {
             return Ok(WriterOutcome::Skipped);
         }
@@ -75,13 +93,16 @@ impl BackedWriter {
         self.backup.push_front(packet.clone());
         self.backup_size += packet.wire_len() as i64;
         self.sequence += 1;
-        while self.connected && self.backup_size > MAX_BACKUP_BYTES {
+        while self.connected
+            && (self.backup_size > MAX_BACKUP_BYTES || self.backup.len() > MAX_BACKUP_PACKETS)
+        {
             if let Some(old) = self.backup.pop_back() {
                 self.backup_size -= old.wire_len() as i64;
             }
         }
         if !self.connected {
             self.disconnected_bytes += packet.wire_len() as i64;
+            self.disconnected_packets += 1;
             return Ok(WriterOutcome::BufferedOnly);
         }
         Ok(WriterOutcome::Send(frame_be_u32(&packet.serialize())))
@@ -110,6 +131,7 @@ impl BackedWriter {
     pub fn revive(&mut self) {
         self.connected = true;
         self.disconnected_bytes = 0;
+        self.disconnected_packets = 0;
     }
 
     pub fn invalidate(&mut self) {
@@ -117,7 +139,16 @@ impl BackedWriter {
     }
 
     pub fn has_capacity(&self, bytes: i64) -> bool {
-        self.connected || self.disconnected_bytes + bytes <= DISCONNECT_BUFFER_BYTES
+        self.connected
+            || (self
+                .disconnected_bytes
+                .checked_add(bytes)
+                .is_some_and(|total| total <= DISCONNECT_BUFFER_BYTES)
+                && self.disconnected_packets < MAX_DISCONNECT_PACKETS
+                && self
+                    .backup_size
+                    .checked_add(bytes)
+                    .is_some_and(|total| total <= MAX_RECOVERY_BACKUP_BYTES))
     }
 
     pub fn sequence(&self) -> i64 {

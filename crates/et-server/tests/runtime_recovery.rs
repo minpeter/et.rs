@@ -7,9 +7,10 @@ use std::sync::{mpsc, Arc, Barrier};
 use std::thread;
 
 use et_core::keys::passkey_to_key;
-use et_core::proto::{ConnectResponse, ConnectStatus};
+use et_core::proto::{ConnectResponse, ConnectStatus, TerminalPacketType};
 use et_net::framing_io::{read_proto_limited, write_proto};
 use et_net::handshake::client_request;
+use et_net::local_packet::read_local_packet;
 use et_server::SessionState;
 use runtime_support::{default_payload, initialize, TestRuntime, ID_A, KEY_A, TIMEOUT};
 
@@ -48,6 +49,9 @@ fn simultaneous_same_id_is_new_then_serialized_returning() {
     let (returning_stream, response) = receiver.recv_timeout(TIMEOUT).unwrap();
     assert_eq!(response.status, Some(ConnectStatus::ReturningClient as i32));
     client.recover(returning_stream).unwrap();
+    client
+        .write_packet(TerminalPacketType::KeepAlive as u8, &[])
+        .unwrap();
     for worker in workers {
         worker.join().unwrap();
     }
@@ -57,7 +61,8 @@ fn simultaneous_same_id_is_new_then_serialized_returning() {
 #[test]
 fn returning_client_receives_exact_buffered_server_catchup() {
     let mut server = TestRuntime::start();
-    let _terminal = server.register(ID_A, KEY_A);
+    let mut terminal = server.register(ID_A, KEY_A);
+    terminal.set_read_timeout(Some(TIMEOUT)).unwrap();
     let (stream, response) = server.handshake(ID_A);
     assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
     let key = passkey_to_key(KEY_A).unwrap();
@@ -67,6 +72,11 @@ fn returning_client_receives_exact_buffered_server_catchup() {
         .handle
         .wait_for_state(ID_A, SessionState::Active, TIMEOUT)
         .unwrap();
+    let initial_terminal_packet = read_local_packet(&mut terminal).unwrap();
+    assert_eq!(
+        initial_terminal_packet.header(),
+        TerminalPacketType::TerminalInit as u8
+    );
 
     client.shutdown().unwrap();
     server.handle.send_packet(ID_A, 31, b"buffer-one").unwrap();
@@ -75,6 +85,9 @@ fn returning_client_receives_exact_buffered_server_catchup() {
     let (returning, response) = server.handshake(ID_A);
     assert_eq!(response.status, Some(ConnectStatus::ReturningClient as i32));
     client.recover(returning).unwrap();
+    client
+        .write_packet(TerminalPacketType::KeepAlive as u8, &[])
+        .unwrap();
     let first = client.read_packet().unwrap();
     let second = client.read_packet().unwrap();
     assert_eq!(
@@ -85,6 +98,12 @@ fn returning_client_receives_exact_buffered_server_catchup() {
         (second.header(), second.payload()),
         (32, b"buffer-two".as_slice())
     );
+    client
+        .write_packet(TerminalPacketType::TerminalInfo as u8, b"post-recovery")
+        .unwrap();
+    let forwarded = read_local_packet(&mut terminal).unwrap();
+    assert_eq!(forwarded.header(), TerminalPacketType::TerminalInfo as u8);
+    assert_eq!(forwarded.payload(), b"post-recovery");
     server.runtime.shutdown().unwrap();
 }
 

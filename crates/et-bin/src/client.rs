@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::time::Duration;
 
 use clap::Parser;
 use et_cli::client::ClientArgs;
@@ -9,10 +10,12 @@ use crate::bootstrap::{
 };
 use crate::deadline::Deadline;
 use crate::error::ClientError;
-use crate::initial_connect::{connect_initial, Endpoint};
+use crate::initial_connect::{connect_initial, reconnect, Endpoint};
 use crate::resolver::{EndpointResolver, SystemResolver};
 use crate::ssh_config::resolve_ssh_config;
 use crate::ssh_process::{run_bootstrap, SshRunner, SystemSsh};
+
+const RECONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
     let parsed = ClientArgs::try_parse_from(
@@ -72,19 +75,29 @@ fn run_client(
     let provisional = provisional_credentials()?;
     let invocation = build_invocation(&request, &provisional);
     let credentials = run_bootstrap(runner, &invocation, deadline)?;
-    let connection = connect_initial(
-        &Endpoint {
-            host: resolved.hostname,
-            port: destination.port,
-        },
-        &credentials,
-        resolver,
-        deadline,
-    )?;
+    let endpoint = Endpoint {
+        host: resolved.hostname,
+        port: destination.port,
+    };
+    let connection = connect_initial(&endpoint, &credentials, resolver, deadline)?;
     if args.no_terminal {
         return Ok(());
     }
-    crate::client_terminal::run(connection, args.command.as_deref(), args.no_exit)
+    crate::client_terminal::run(
+        connection,
+        args.command.as_deref(),
+        args.no_exit,
+        args.keepalive,
+        |connection| {
+            reconnect(
+                connection,
+                &endpoint,
+                &credentials,
+                resolver,
+                Deadline::after(RECONNECT_TIMEOUT),
+            )
+        },
+    )
 }
 
 fn command_user(positional: Option<String>, option: Option<String>) -> Option<String> {

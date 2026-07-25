@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use et_core::packet::Packet;
 use et_core::proto::TerminalPacketType;
+use et_net::connection::ConnError;
 use et_net::local_packet::{write_local_packet, LocalPacketDecoder};
 use rustix::event::{poll, PollFd, PollFlags};
 
@@ -28,7 +29,8 @@ pub(crate) fn run(
         let accept_terminal = session.can_buffer_write((READ_BUFFER * 2) as i64)?;
         let (terminal_events, wake_events, client_events) =
             wait(&terminal, &wake, client.as_ref(), accept_terminal)?;
-        if wake_events.intersects(PollFlags::IN | PollFlags::HUP) {
+        let client_events_are_stale = wake_events.intersects(PollFlags::IN | PollFlags::HUP);
+        if client_events_are_stale {
             drain(&mut wake)?;
             if session.is_shutting_down() {
                 return Ok(());
@@ -41,11 +43,19 @@ pub(crate) fn run(
         if terminal_events.contains(PollFlags::IN) {
             if let Some(packet) = read_terminal_packet(&mut terminal, &mut decoder)? {
                 validate_terminal_output(&packet)?;
-                session.send_packet(packet.header(), packet.payload())?;
                 decoder = LocalPacketDecoder::new();
+                match session.send_packet(packet.header(), packet.payload()) {
+                    Ok(()) => {}
+                    Err(SessionError::Connection(ConnError::Io(error)))
+                        if connection_ended(&error) =>
+                    {
+                        connected = false;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
-        if client_events.contains(PollFlags::IN) {
+        if !client_events_are_stale && client_events.contains(PollFlags::IN) {
             loop {
                 match session.try_read_packet() {
                     Ok(Some(packet)) => forward_client_packet(&session, &mut terminal, packet)?,
@@ -58,10 +68,21 @@ pub(crate) fn run(
                 }
             }
         }
-        if client_events.intersects(PollFlags::HUP | PollFlags::ERR) {
+        if !client_events_are_stale && client_events.intersects(PollFlags::HUP | PollFlags::ERR) {
             connected = false;
         }
     }
+}
+
+fn connection_ended(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+    )
 }
 
 fn wait(

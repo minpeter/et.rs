@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io;
 use std::net::TcpStream;
 use std::time::Duration;
@@ -54,6 +53,7 @@ impl std::fmt::Display for Endpoint {
 pub fn connect_initial(
     endpoint: &Endpoint,
     credentials: &Credentials,
+    initial_payload: &InitialPayload,
     resolver: &dyn EndpointResolver,
     deadline: Deadline,
 ) -> Result<Connection, ClientError> {
@@ -69,15 +69,13 @@ pub fn connect_initial(
         .map_err(|source| connect_error(deadline, "reading ConnectResponse", source))?;
     accept_response(response)?;
 
-    let payload = InitialPayload {
-        jumphost: Some(false),
-        reversetunnels: Vec::new(),
-        environmentvariables: HashMap::new(),
-    };
     ensure_deadline(deadline, "sending INITIAL_PAYLOAD")?;
     let mut connection = Connection::new_client(stream, &key);
     connection
-        .write_packet(EtPacketType::InitialPayload as u8, &payload.encode_to_vec())
+        .write_packet(
+            EtPacketType::InitialPayload as u8,
+            &initial_payload.encode_to_vec(),
+        )
         .map_err(|error| transport_error(deadline, "sending INITIAL_PAYLOAD", error))?;
     ensure_deadline(deadline, "reading INITIAL_RESPONSE")?;
     let packet = connection

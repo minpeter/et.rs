@@ -317,10 +317,10 @@ fn leading_hyphen_destination_components_are_rejected_before_spawn() {
 }
 
 #[test]
-fn unsupported_forwarding_modes_do_not_claim_session_completion() {
+fn invalid_client_modes_fail_before_ssh_bootstrap() {
     let no_ssh = TestDir::new("honest");
     for args in [
-        vec!["-N", "-t", "8080:host:80", "example.test"],
+        vec!["-N", "-t", "0:80", "example.test"],
         vec!["--no-exit", "example.test"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_et"))
@@ -330,8 +330,100 @@ fn unsupported_forwarding_modes_do_not_claim_session_completion() {
             .unwrap();
         assert_eq!(output.status.code(), Some(2));
         assert!(
-            stderr(&output).contains("not implemented")
+            stderr(&output).contains("invalid tunnel endpoint")
                 || stderr(&output).contains("--no-exit requires --command")
+        );
+    }
+}
+
+#[test]
+fn jumphost_proxyjump_is_passed_to_ssh_bootstrap() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        bound(&stream);
+        let request = read_request(&mut stream).unwrap();
+        assert_eq!(request.version, Some(6));
+        write_response(&mut stream, &response_status(ConnectStatus::NewClient)).unwrap();
+        let key = passkey_to_key(SERVER_KEY).unwrap();
+        let mut connection = Connection::new_server(stream, &key);
+        let packet = connection.read_packet().unwrap();
+        assert_eq!(packet.header(), EtPacketType::InitialPayload as u8);
+        let payload = InitialPayload::decode(packet.payload()).unwrap();
+        // SSH ProxyJump bootstrap still presents a normal (non-ET-relay) payload.
+        assert_eq!(payload.jumphost, Some(false));
+        connection
+            .write_packet(
+                EtPacketType::InitialResponse as u8,
+                &InitialResponse { error: None }.encode_to_vec(),
+            )
+            .unwrap();
+    });
+
+    let fake = FakeSsh::new();
+    let output = fake
+        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
+        .args([
+            "-N",
+            "--jumphost",
+            "jump.example,user@hop2",
+            &format!("test-user@server-alias:{}", address.port()),
+        ])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let invocations = fake.invocations();
+    assert_eq!(invocations.len(), 2);
+    // Config resolution stays on the destination alias (no -J required for -G).
+    assert_eq!(invocations[0], ["-G", "test-user@server-alias"]);
+    let argv = &invocations[1];
+    // Shape: ssh -J hop1,hop2 user@dest 'remote etterminal pipe'
+    assert_eq!(argv[0], "-J");
+    assert_eq!(argv[1], "jump.example,user@hop2");
+    assert_eq!(argv[2], "test-user@server-alias");
+    assert!(
+        argv[3].contains("etterminal") || argv[3].starts_with("printf"),
+        "remote command missing: {:?}",
+        argv[3]
+    );
+}
+
+#[test]
+fn malformed_jumphost_and_jserverfifo_fail_before_ssh() {
+    let no_ssh = TestDir::new("jump-fail");
+    // Use `--jumphost=value` form so values starting with `-` reach validation.
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["-N", "--jumphost=", "example.test"],
+            "empty --jumphost value",
+        ),
+        (
+            &["-N", "--jumphost=-oProxyCommand=bad", "example.test"],
+            "must not begin with a hyphen",
+        ),
+        (
+            &["-N", "--jumphost=good,-evil", "example.test"],
+            "must not begin with a hyphen",
+        ),
+        (
+            &["-N", "--jserverfifo=/tmp/fifo", "example.test"],
+            "--jserverfifo jumphost fifo sessions are not implemented",
+        ),
+    ];
+    for (args, message) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_et"))
+            .env("PATH", &no_ssh.0)
+            .args(*args)
+            .output()
+            .unwrap();
+        assert_ne!(output.status.code(), Some(0), "args={args:?}");
+        let err = stderr(&output);
+        assert!(
+            err.contains(message),
+            "args={args:?} expected `{message}` in stderr={err}"
         );
     }
 }

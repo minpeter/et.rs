@@ -5,6 +5,7 @@ use std::thread;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use et_core::proto::{TerminalBuffer, TerminalInfo, TerminalPacketType};
 use et_net::connection::{ConnError, Connection};
+use et_net::forward::Forwarder;
 use prost::Message;
 use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
@@ -17,15 +18,25 @@ pub fn run<F>(
     command: Option<&str>,
     no_exit: bool,
     keepalive: u32,
+    forwarder: Forwarder,
+    terminal_enabled: bool,
     reconnect: F,
 ) -> Result<(), ClientError>
 where
     F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
 {
-    let raw_mode = RawMode::enter()?;
-    send_size(&mut connection)?;
-    if let Some(command) = command {
-        send_command(&mut connection, command, no_exit)?;
+    let raw_mode = if terminal_enabled {
+        RawMode::enter()?
+    } else {
+        RawMode { enabled: false }
+    };
+    if terminal_enabled {
+        send_size(&mut connection)?;
+    }
+    if terminal_enabled {
+        if let Some(command) = command {
+            send_command(&mut connection, command, no_exit)?;
+        }
     }
     let (mut wake_reader, mut wake_writer) =
         UnixStream::pair().map_err(|error| terminal_io("creating resize wakeup", error))?;
@@ -51,12 +62,14 @@ where
             }
         })
         .map_err(|error| terminal_io("starting resize signal worker", error))?;
-    let read_stdin = command.is_none() || io::stdin().is_terminal();
+    let read_stdin = terminal_enabled && (command.is_none() || io::stdin().is_terminal());
     let result = crate::client_terminal_loop::pump(
         &mut connection,
         &mut wake_reader,
         read_stdin,
         keepalive,
+        &forwarder,
+        terminal_enabled,
         reconnect,
     );
     signal_handle.close();

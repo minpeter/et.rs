@@ -10,3 +10,4 @@
 pub mod client;
 pub mod host;
 pub mod server;
+pub mod tunnel;

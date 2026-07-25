@@ -201,6 +201,26 @@ mod tests {
     }
 
     #[test]
+    fn jumphost_uses_ssh_proxyjump_flag() {
+        let credentials = Credentials {
+            id: "XXXdefghijklmnop".into(),
+            passkey: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef".into(),
+        };
+        let mut req = request();
+        req.jumphost = Some("jump.example,user@hop2".into());
+        let invocation = build_invocation(&req, &credentials);
+        assert_eq!(
+            invocation.args[0..4],
+            [
+                "-J",
+                "jump.example,user@hop2",
+                "alice@server",
+                "-oPort=2222"
+            ]
+        );
+    }
+
+    #[test]
     fn quotes_every_remote_shell_input() {
         let mut request = request();
         request.user = Some("a'; touch user; echo '".into());

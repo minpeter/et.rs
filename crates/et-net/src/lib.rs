@@ -6,6 +6,10 @@
 pub mod connection;
 mod connection_error;
 mod connection_nonblocking;
+pub mod forward;
+mod forward_endpoint;
+mod forward_io;
+mod forward_worker;
 pub mod framing_io;
 pub mod handshake;
 pub mod listener;

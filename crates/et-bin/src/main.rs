@@ -54,6 +54,7 @@ mod client_terminal;
 mod client_terminal_loop;
 mod deadline;
 mod error;
+mod forward_config;
 mod initial_connect;
 mod resolver;
 mod server;

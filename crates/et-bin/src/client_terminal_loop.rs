@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use et_core::proto::TerminalPacketType;
 use et_net::connection::{ConnError, Connection};
+use et_net::forward::{is_forward_packet, Forwarder};
 use rustix::event::{poll, PollFd, PollFlags};
 use rustix::time::Timespec;
 
@@ -21,6 +22,8 @@ pub fn pump<F>(
     wake: &mut UnixStream,
     read_stdin: bool,
     keepalive_seconds: u32,
+    forwarder: &Forwarder,
+    terminal_enabled: bool,
     mut reconnect: F,
 ) -> Result<(), ClientError>
 where
@@ -32,14 +35,23 @@ where
     let mut last_received = Instant::now();
     let mut next_keepalive = last_received + interval;
     let mut stream = connection.try_clone_stream().map_err(terminal_error)?;
+    let forward_wake = forwarder
+        .wake()
+        .map_err(|error| terminal_text(error.to_string()))?;
+    // Test harness only: signal after the encrypted session and local forwarder
+    // are live so -N tunnel probes do not race bootstrap.
+    if let Ok(path) = std::env::var("ET_SSH_READY") {
+        let _ = std::fs::write(path, b"ready");
+    }
     loop {
         let deadline = next_keepalive.min(last_received + silence);
         let timeout = Timespec::try_from(deadline.saturating_duration_since(Instant::now()))
             .map_err(|_| terminal_text("keepalive deadline exceeds poll range"))?;
-        let (network, resize, input) = {
+        let (network, resize, forwarding, input) = {
             let mut descriptors = vec![
                 PollFd::new(&stream, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
                 PollFd::new(&*wake, PollFlags::IN | PollFlags::HUP),
+                PollFd::new(forward_wake, PollFlags::IN | PollFlags::HUP),
             ];
             if read_stdin {
                 descriptors.push(PollFd::new(
@@ -52,8 +64,9 @@ where
             (
                 descriptors[0].revents(),
                 descriptors[1].revents(),
+                descriptors[2].revents(),
                 descriptors
-                    .get(2)
+                    .get(3)
                     .map(PollFd::revents)
                     .unwrap_or(PollFlags::empty()),
             )
@@ -61,7 +74,11 @@ where
         let mut reconnect_needed = network.intersects(PollFlags::HUP | PollFlags::ERR);
         if resize.intersects(PollFlags::IN | PollFlags::HUP) {
             drain(wake)?;
-            match send_size(connection) {
+            match if terminal_enabled {
+                send_size(connection)
+            } else {
+                Ok(())
+            } {
                 Ok(()) => {}
                 Err(ClientError::Transport(error)) if connection_ended(&error) => {
                     reconnect_needed = true;
@@ -74,9 +91,24 @@ where
                 match connection.try_read_packet() {
                     Ok(Some(packet)) => {
                         last_received = Instant::now();
-                        display_packet(packet)?;
+                        route_server_packet(packet, forwarder, terminal_enabled)?;
                     }
                     Ok(None) => break,
+                    Err(error) if connection_ended(&error) => {
+                        reconnect_needed = true;
+                        break;
+                    }
+                    Err(error) => return Err(terminal_error(error)),
+                }
+            }
+        }
+        if forwarding.intersects(PollFlags::IN | PollFlags::HUP) {
+            while let Some(packet) = forwarder
+                .try_outbound()
+                .map_err(|error| terminal_text(error.to_string()))?
+            {
+                match connection.write_packet(packet.header(), packet.payload()) {
+                    Ok(()) => {}
                     Err(error) if connection_ended(&error) => {
                         reconnect_needed = true;
                         break;
@@ -90,7 +122,7 @@ where
             reconnect_needed = true;
         }
         if reconnect_needed {
-            if !recover(connection, &mut reconnect, &mut stream)? {
+            if !recover(connection, &mut reconnect, &mut stream, terminal_enabled)? {
                 return Ok(());
             }
             last_received = Instant::now();
@@ -109,7 +141,7 @@ where
             match send_buffer(connection, &bytes[..count]) {
                 Ok(()) => {}
                 Err(error) if connection_ended(&error) => {
-                    if !recover(connection, &mut reconnect, &mut stream)? {
+                    if !recover(connection, &mut reconnect, &mut stream, terminal_enabled)? {
                         return Ok(());
                     }
                     last_received = Instant::now();
@@ -126,7 +158,7 @@ where
             if connection
                 .write_packet(TerminalPacketType::KeepAlive as u8, &[])
                 .is_err()
-                && !recover(connection, &mut reconnect, &mut stream)?
+                && !recover(connection, &mut reconnect, &mut stream, terminal_enabled)?
             {
                 return Ok(());
             }
@@ -135,10 +167,32 @@ where
     }
 }
 
+fn route_server_packet(
+    packet: et_core::packet::Packet,
+    forwarder: &Forwarder,
+    terminal_enabled: bool,
+) -> Result<(), ClientError> {
+    if is_forward_packet(packet.header()) {
+        return forwarder
+            .receive(packet)
+            .map_err(|error| terminal_text(error.to_string()));
+    }
+    if terminal_enabled || packet.header() == TerminalPacketType::KeepAlive as u8 {
+        return display_packet(packet);
+    }
+    if packet.header() == TerminalPacketType::TerminalBuffer as u8 {
+        return Ok(());
+    }
+    Err(terminal_text(
+        "server sent an unsupported no-terminal packet",
+    ))
+}
+
 fn recover<F>(
     connection: &mut Connection,
     reconnect: &mut F,
     stream: &mut std::net::TcpStream,
+    send_terminal_size: bool,
 ) -> Result<bool, ClientError>
 where
     F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
@@ -146,7 +200,9 @@ where
     match reconnect(connection)? {
         ReconnectOutcome::Recovered => {
             *stream = connection.try_clone_stream().map_err(terminal_error)?;
-            send_size(connection)?;
+            if send_terminal_size {
+                send_size(connection)?;
+            }
             Ok(true)
         }
         ReconnectOutcome::SessionEnded => Ok(false),

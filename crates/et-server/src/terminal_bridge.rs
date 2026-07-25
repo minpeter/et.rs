@@ -5,6 +5,7 @@ use std::sync::Arc;
 use et_core::packet::Packet;
 use et_core::proto::TerminalPacketType;
 use et_net::connection::ConnError;
+use et_net::forward::{is_forward_packet, Forwarder};
 use et_net::local_packet::{write_local_packet, LocalPacketDecoder};
 use rustix::event::{poll, PollFd, PollFlags};
 
@@ -15,6 +16,7 @@ const READ_BUFFER: usize = 16 * 1024;
 pub(crate) fn run(
     session: Arc<ActiveSession>,
     mut terminal: UnixStream,
+    forwarder: Forwarder,
 ) -> Result<(), SessionError> {
     terminal.set_nonblocking(true).map_err(SessionError::Io)?;
     let mut wake = session.take_wake_reader()?;
@@ -27,8 +29,13 @@ pub(crate) fn run(
         }
         let client = connected.then(|| session.try_clone_stream()).transpose()?;
         let accept_terminal = session.can_buffer_write((READ_BUFFER * 2) as i64)?;
-        let (terminal_events, wake_events, client_events) =
-            wait(&terminal, &wake, client.as_ref(), accept_terminal)?;
+        let (terminal_events, wake_events, forward_events, client_events) = wait(
+            &terminal,
+            &wake,
+            forwarder.wake().map_err(forward_error)?,
+            client.as_ref(),
+            accept_terminal,
+        )?;
         let client_events_are_stale = wake_events.intersects(PollFlags::IN | PollFlags::HUP);
         if client_events_are_stale {
             drain(&mut wake)?;
@@ -58,6 +65,9 @@ pub(crate) fn run(
         if !client_events_are_stale && client_events.contains(PollFlags::IN) {
             loop {
                 match session.try_read_packet() {
+                    Ok(Some(packet)) if is_forward_packet(packet.header()) => {
+                        forwarder.receive(packet).map_err(forward_error)?;
+                    }
                     Ok(Some(packet)) => forward_client_packet(&session, &mut terminal, packet)?,
                     Ok(None) => break,
                     Err(SessionError::Connection(_)) => {
@@ -70,6 +80,20 @@ pub(crate) fn run(
         }
         if !client_events_are_stale && client_events.intersects(PollFlags::HUP | PollFlags::ERR) {
             connected = false;
+        }
+        if forward_events.intersects(PollFlags::IN | PollFlags::HUP) {
+            while let Some(packet) = forwarder.try_outbound().map_err(forward_error)? {
+                match session.send_packet(packet.header(), packet.payload()) {
+                    Ok(()) => {}
+                    Err(SessionError::Connection(ConnError::Io(error)))
+                        if connection_ended(&error) =>
+                    {
+                        connected = false;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         }
     }
 }
@@ -88,9 +112,10 @@ fn connection_ended(error: &io::Error) -> bool {
 fn wait(
     terminal: &UnixStream,
     wake: &UnixStream,
+    forward_wake: &UnixStream,
     client: Option<&std::net::TcpStream>,
     accept_terminal: bool,
-) -> Result<(PollFlags, PollFlags, PollFlags), SessionError> {
+) -> Result<(PollFlags, PollFlags, PollFlags, PollFlags), SessionError> {
     let terminal_flags = if accept_terminal {
         PollFlags::IN | PollFlags::HUP | PollFlags::ERR
     } else {
@@ -99,6 +124,7 @@ fn wait(
     let mut descriptors = vec![
         PollFd::new(terminal, terminal_flags),
         PollFd::new(wake, PollFlags::IN | PollFlags::HUP),
+        PollFd::new(forward_wake, PollFlags::IN | PollFlags::HUP),
     ];
     if let Some(client) = client {
         descriptors.push(PollFd::new(
@@ -110,11 +136,16 @@ fn wait(
     Ok((
         descriptors[0].revents(),
         descriptors[1].revents(),
+        descriptors[2].revents(),
         descriptors
-            .get(2)
+            .get(3)
             .map(PollFd::revents)
             .unwrap_or(PollFlags::empty()),
     ))
+}
+
+fn forward_error(error: et_net::forward::ForwardError) -> SessionError {
+    SessionError::Io(io::Error::other(error))
 }
 
 fn read_terminal_packet(

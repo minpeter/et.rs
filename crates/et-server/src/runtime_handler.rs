@@ -105,10 +105,13 @@ fn handle_new(mut stream: TcpStream, start: crate::session_slot::SessionStart, c
         send_initial_error(&mut connection, "jumphost sessions are not implemented");
         return;
     }
-    if !payload.reversetunnels.is_empty() {
-        send_initial_error(&mut connection, "reverse tunnels are not implemented");
-        return;
-    }
+    let forwarder = match et_net::forward::Forwarder::start(payload.reversetunnels.clone()) {
+        Ok(forwarder) => forwarder,
+        Err(error) => {
+            send_initial_error(&mut connection, &error.to_string());
+            return;
+        }
+    };
     if connection
         .write_packet(
             EtPacketType::InitialResponse as u8,
@@ -141,7 +144,7 @@ fn handle_new(mut stream: TcpStream, start: crate::session_slot::SessionStart, c
     if start.activate(active.clone()).is_err() {
         return;
     }
-    let _ = crate::terminal_bridge::run(active.clone(), terminal);
+    let _ = crate::terminal_bridge::run(active.clone(), terminal, forwarder);
     let _ = active.shutdown();
 }
 

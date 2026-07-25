@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader};
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -11,6 +12,7 @@ use nix::unistd::Pid;
 use wait_timeout::ChildExt;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+static NEXT_STACK: AtomicU64 = AtomicU64::new(1);
 
 pub struct Stack {
     pub directory: std::path::PathBuf,
@@ -23,8 +25,11 @@ pub struct Stack {
 
 impl Stack {
     pub fn start() -> Self {
-        let directory =
-            std::env::temp_dir().join(format!("et-rs-reconnect-{}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!(
+            "et-rs-reconnect-{}-{}",
+            std::process::id(),
+            NEXT_STACK.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();

@@ -345,6 +345,7 @@ version = "0.1.0"
 dependencies = [
  "et-core",
  "prost",
+ "rustix",
  "socket2",
 ]
 

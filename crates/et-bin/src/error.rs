@@ -3,9 +3,12 @@ use std::io;
 use et_cli::host::HostError;
 use et_net::connection::ConnError;
 
+use crate::forward_config::ForwardConfigError;
+
 #[derive(Debug)]
 pub enum ClientError {
     Host(HostError),
+    ForwardConfig(ForwardConfigError),
     Unsupported(&'static str),
     InvalidSshComponent(&'static str),
     SshSpawn(io::Error),
@@ -52,10 +55,17 @@ impl From<HostError> for ClientError {
     }
 }
 
+impl From<ForwardConfigError> for ClientError {
+    fn from(value: ForwardConfigError) -> Self {
+        Self::ForwardConfig(value)
+    }
+}
+
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Host(error) => write!(f, "{error}"),
+            Self::ForwardConfig(error) => write!(f, "{error}"),
             Self::Unsupported(message) => write!(f, "{message}"),
             Self::InvalidSshComponent(component) => {
                 write!(f, "SSH {component} must not begin with a hyphen")
@@ -151,7 +161,7 @@ fn write_message(f: &mut std::fmt::Formatter<'_>, message: &Option<String>) -> s
 impl ClientError {
     pub fn exit_code(&self) -> i32 {
         match self {
-            Self::Unsupported(_) => 2,
+            Self::Unsupported(_) | Self::ForwardConfig(_) => 2,
             _ => 1,
         }
     }
@@ -161,6 +171,7 @@ impl std::error::Error for ClientError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Host(error) => Some(error),
+            Self::ForwardConfig(error) => Some(error),
             Self::SshSpawn(error)
             | Self::SshStdout(error)
             | Self::SshWait(error)

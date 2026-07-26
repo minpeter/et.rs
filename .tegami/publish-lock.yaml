@@ -1,9 +1,9 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n### Identify the et.rs port in `--version` output\n\n`--version` on every role (`et`, `etserver`, `etterminal`, `htm`, `htmd`) now\nprints the et.rs identity and project URL:\n\n```\net version 0.0.3 (et.rs)\nA Rust port of Eternal Terminal\nhttps://github.com/minpeter/et.rs\n```\n\n`-V` keeps the short upstream-compatible `et version X.Y.Z` line for scripts.\n`etterminal` gains `--version`/`-V` support.\n"
-    filename: long-version-identity.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Fix client dying with \"polling terminal streams: Interrupted system call (os error 4)\"\n\nThe client installs a process-wide SIGWINCH handler for terminal resizes, and\n`poll()` is never auto-restarted by `SA_RESTART`: any signal delivered to the\nthread blocked in `poll()` (a window resize, `SIGCONT` after job control,\n`SIGINFO` from Ctrl-T on macOS) made it fail with `EINTR`, which the client\ntreated as fatal and tore the session down mid-use.\n\nThe terminal loop now retries `poll()` on `EINTR`, recomputing the keepalive\ntimeout from the absolute deadline so timing stays correct. The same retry was\napplied to every other interruptible `poll()` in the workspace: the server\nsession bridge, the PTY worker, the jump-host bridge, and the port-forward\nacceptor (which previously exited silently on `EINTR`).\n"
+    filename: fix-poll-eintr-signal-resilience.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - long-version-identity.md
+      - fix-poll-eintr-signal-resilience.md
     id: cargo:et
     updated: true

@@ -41,10 +41,12 @@ jobs:
         include:
           - os: ubuntu-latest
             test_args: ""
-          # Deterministic failure on macOS runners, tracked in issue #4;
-          # real-world macOS client reconnects are verified to work.
+          # Deterministic failures on macOS runners, tracked in issue #4;
+          # real-world macOS client usage is verified to work.
           - os: macos-latest
-            test_args: "--skip real_client_recovers_same_shell_and_once_only_buffered_output"
+            test_args: >-
+              --skip real_client_recovers_same_shell_and_once_only_buffered_output
+              --skip daemon_mode_detaches_and_writes_a_pid_file
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

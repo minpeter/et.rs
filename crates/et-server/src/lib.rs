@@ -20,6 +20,8 @@ mod session_slot;
 mod session_table;
 mod session_wait;
 mod socket_path;
+#[cfg(windows)]
+mod socket_path_windows;
 mod terminal_bridge;
 
 pub use registry::{Registration, RegistrationError, Registry};

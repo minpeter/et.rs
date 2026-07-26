@@ -1,9 +1,9 @@
 //! Synchronized terminal registration state.
 
+use et_net::local::LocalStream;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io;
-use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -40,12 +40,12 @@ pub(crate) struct RegistrationIdentity {
 
 pub(crate) struct RegisteredTerminal {
     pub(crate) identity: RegistrationIdentity,
-    pub(crate) watcher: UnixStream,
+    pub(crate) watcher: LocalStream,
 }
 
 struct StoredRegistration {
     info: Registration,
-    stream: UnixStream,
+    stream: LocalStream,
 }
 
 #[derive(Default)]
@@ -102,10 +102,16 @@ impl Registry {
     pub(crate) fn register(
         &self,
         user_info: TerminalUserInfo,
-        stream: UnixStream,
+        stream: LocalStream,
     ) -> Result<RegisteredTerminal, RegistrationError> {
         let registration = validate(user_info)?;
         let watcher = stream.try_clone().map_err(RegistrationError::Io)?;
+        // The Windows router peeks this handle for EOF, which requires
+        // non-blocking mode so a live session never stalls the loop.
+        #[cfg(windows)]
+        watcher
+            .set_nonblocking(true)
+            .map_err(RegistrationError::Io)?;
         let identity = registration.identity();
         let mut state = self.lock()?;
         match state.registrations.entry(registration.id.clone()) {
@@ -166,7 +172,7 @@ impl Registry {
     pub(crate) fn clone_stream(
         &self,
         registration: &Registration,
-    ) -> Result<UnixStream, RegistrationError> {
+    ) -> Result<LocalStream, RegistrationError> {
         let registrations = self
             .inner
             .state

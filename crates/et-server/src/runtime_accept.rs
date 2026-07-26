@@ -1,10 +1,11 @@
+use et_net::local::LocalStream;
 use std::io::{self, Read};
 use std::net::TcpListener;
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
 
+#[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags};
 
 use crate::runtime_error::RuntimeError;
@@ -13,7 +14,7 @@ use crate::runtime_state::RuntimeCore;
 
 pub(crate) fn run(
     listener: TcpListener,
-    mut wake_reader: UnixStream,
+    mut wake_reader: LocalStream,
     core: Arc<RuntimeCore>,
 ) -> Result<(), RuntimeError> {
     listener
@@ -29,30 +30,45 @@ pub(crate) fn run(
             source,
         })?;
     loop {
-        let mut descriptors = [
-            PollFd::new(&listener, PollFlags::IN),
-            PollFd::new(&wake_reader, PollFlags::IN | PollFlags::HUP),
-        ];
-        match poll(&mut descriptors, None) {
-            Ok(_) => {}
-            Err(error) if error == rustix::io::Errno::INTR => continue,
-            Err(error) => {
-                return Err(RuntimeError::Io {
-                    operation: "poll TCP listener",
-                    source: io::Error::from(error),
-                });
+        #[cfg(unix)]
+        {
+            let mut descriptors = [
+                PollFd::new(&listener, PollFlags::IN),
+                PollFd::new(&wake_reader, PollFlags::IN | PollFlags::HUP),
+            ];
+            match poll(&mut descriptors, None) {
+                Ok(_) => {}
+                Err(error) if error == rustix::io::Errno::INTR => continue,
+                Err(error) => {
+                    return Err(RuntimeError::Io {
+                        operation: "poll TCP listener",
+                        source: io::Error::from(error),
+                    });
+                }
+            }
+            let listener_ready = descriptors[0].revents().contains(PollFlags::IN);
+            let wake_ready = descriptors[1]
+                .revents()
+                .intersects(PollFlags::IN | PollFlags::HUP);
+            if wake_ready && core.shutdown.load(Ordering::Acquire) {
+                drain(&mut wake_reader);
+                return Ok(());
+            }
+            if listener_ready {
+                accept_ready(&listener, &core)?;
             }
         }
-        let listener_ready = descriptors[0].revents().contains(PollFlags::IN);
-        let wake_ready = descriptors[1]
-            .revents()
-            .intersects(PollFlags::IN | PollFlags::HUP);
-        if wake_ready && core.shutdown.load(Ordering::Acquire) {
-            drain(&mut wake_reader);
-            return Ok(());
-        }
-        if listener_ready {
+        // Windows cannot poll the listener and the shutdown wake handle
+        // together, so both are checked without blocking on upstream's 10ms
+        // `select()` cadence.
+        #[cfg(windows)]
+        {
+            if core.shutdown.load(Ordering::Acquire) {
+                drain(&mut wake_reader);
+                return Ok(());
+            }
             accept_ready(&listener, &core)?;
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 }
@@ -61,8 +77,11 @@ fn accept_ready(listener: &TcpListener, core: &Arc<RuntimeCore>) -> Result<(), R
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                // Windows inherits the listener's non-blocking mode on accepted
+                // sockets (Unix does not), and the handshake below is blocking.
                 stream
-                    .set_nodelay(true)
+                    .set_nonblocking(false)
+                    .and_then(|()| stream.set_nodelay(true))
                     .map_err(|source| RuntimeError::Io {
                         operation: "configure accepted TCP stream",
                         source,
@@ -90,7 +109,7 @@ fn accept_ready(listener: &TcpListener, core: &Arc<RuntimeCore>) -> Result<(), R
     }
 }
 
-fn drain(wake_reader: &mut UnixStream) {
+fn drain(wake_reader: &mut LocalStream) {
     let mut buffer = [0u8; 64];
     loop {
         match wake_reader.read(&mut buffer) {

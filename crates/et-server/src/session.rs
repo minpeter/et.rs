@@ -1,6 +1,6 @@
+use et_net::local::LocalStream;
 use std::io::{self, Write};
 use std::net::{Shutdown, TcpStream};
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -11,9 +11,9 @@ use et_net::connection::{ConnError, Connection};
 pub(crate) struct ActiveSession {
     connection: Mutex<Connection>,
     control: Mutex<TcpStream>,
-    terminal_control: Mutex<UnixStream>,
-    wake_writer: Mutex<UnixStream>,
-    wake_reader: Mutex<Option<UnixStream>>,
+    terminal_control: Mutex<LocalStream>,
+    wake_writer: Mutex<LocalStream>,
+    wake_reader: Mutex<Option<LocalStream>>,
     shutdown: AtomicBool,
 }
 
@@ -50,12 +50,15 @@ impl std::error::Error for SessionError {
 }
 
 impl ActiveSession {
-    pub(crate) fn new(connection: Connection, terminal: &UnixStream) -> Result<Self, SessionError> {
+    pub(crate) fn new(
+        connection: Connection,
+        terminal: &LocalStream,
+    ) -> Result<Self, SessionError> {
         let control = connection
             .try_clone_stream()
             .map_err(SessionError::Connection)?;
         let terminal_control = terminal.try_clone().map_err(SessionError::Io)?;
-        let (wake_reader, wake_writer) = UnixStream::pair().map_err(SessionError::Io)?;
+        let (wake_reader, wake_writer) = et_net::local::wake_pair().map_err(SessionError::Io)?;
         Ok(Self {
             connection: Mutex::new(connection),
             control: Mutex::new(control),
@@ -131,7 +134,7 @@ impl ActiveSession {
         connection.shutdown().map_err(SessionError::Connection)
     }
 
-    pub(crate) fn take_wake_reader(&self) -> Result<UnixStream, SessionError> {
+    pub(crate) fn take_wake_reader(&self) -> Result<LocalStream, SessionError> {
         self.wake_reader
             .lock()
             .map_err(|_| SessionError::Unavailable)?
@@ -139,6 +142,7 @@ impl ActiveSession {
             .ok_or(SessionError::Unavailable)
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn try_clone_stream(&self) -> Result<TcpStream, SessionError> {
         self.connection
             .lock()

@@ -15,4 +15,6 @@ workspace = true
 et-core = { path = "../et-core" }
 et-net = { path = "../et-net" }
 prost = "0.13"
+
+[target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", features = ["event", "process"] }

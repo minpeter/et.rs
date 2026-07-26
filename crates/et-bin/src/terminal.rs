@@ -1,7 +1,7 @@
+use et_net::local::LocalStream;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use clap::error::ErrorKind;
@@ -81,7 +81,7 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
             .map_err(clap_error)?;
         return print_marker(&input);
     }
-    let mut router = UnixStream::connect(router_path.path())
+    let mut router = et_net::local::connect(router_path.path())
         .map_err(|error| clap_error(format!("could not connect terminal router: {error}")))?;
     register(&mut router, &input).map_err(clap_error)?;
     let ready_socket = parsed
@@ -122,7 +122,7 @@ fn run_jump(
         .map_err(clap_error)?;
         return print_marker(input);
     }
-    let mut router = UnixStream::connect(router_path)
+    let mut router = et_net::local::connect(router_path)
         .map_err(|error| clap_error(format!("could not connect terminal router: {error}")))?;
     register(&mut router, input).map_err(clap_error)?;
     let ready_socket = parsed_ready_socket(args)?;
@@ -176,9 +176,16 @@ fn load_credentials(args: &TerminalArgs) -> Result<CredentialInput, String> {
     parse_credential_input(text.trim())
 }
 
-fn register(router: &mut UnixStream, input: &CredentialInput) -> Result<(), String> {
-    let uid = i64::from(rustix::process::getuid().as_raw());
-    let gid = i64::from(rustix::process::getgid().as_raw());
+fn register(router: &mut LocalStream, input: &CredentialInput) -> Result<(), String> {
+    // Upstream uses these to chown forwarded named pipes; Windows has no
+    // POSIX ids, so the session reports zero there.
+    #[cfg(unix)]
+    let (uid, gid) = (
+        i64::from(rustix::process::getuid().as_raw()),
+        i64::from(rustix::process::getgid().as_raw()),
+    );
+    #[cfg(windows)]
+    let (uid, gid) = (0i64, 0i64);
     let user = TerminalUserInfo {
         id: Some(input.id.clone()),
         passkey: Some(input.passkey.clone()),

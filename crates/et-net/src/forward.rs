@@ -1,4 +1,7 @@
-use std::io::{self, Read};
+#[cfg(unix)]
+use std::io::Read;
+use std::io::{self};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
@@ -45,6 +48,11 @@ pub(crate) type Outbound = Result<Packet, ForwardError>;
 pub struct Forwarder {
     commands: mpsc::SyncSender<Command>,
     outbound: mpsc::Receiver<Outbound>,
+    /// Readiness channel for outbound packets. Unix callers poll it exactly
+    /// like upstream's `select()`; Windows callers drain [`Forwarder::try_outbound`]
+    /// on the client loop's 10ms cadence instead, because a socket pair created
+    /// this way is not selectable there.
+    #[cfg(unix)]
     wake: UnixStream,
     worker: Option<JoinHandle<()>>,
 }
@@ -66,9 +74,18 @@ impl Forwarder {
         let (sources, environment) = bind_sources(sources, owner)?;
         let (commands_tx, commands_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let (outbound_tx, outbound_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
-        let (wake, wake_writer) = UnixStream::pair()?;
-        wake.set_nonblocking(true)?;
+        #[cfg(unix)]
+        let (wake, wake_writer) = {
+            let (reader, writer) = UnixStream::pair()?;
+            reader.set_nonblocking(true)?;
+            (reader, writer)
+        };
+        #[cfg(unix)]
         let (listener_stop, listener_stop_reader) = UnixStream::pair()?;
+        #[cfg(windows)]
+        let listener_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(windows)]
+        let listener_stop_reader = listener_stop.clone();
         let worker_commands = commands_tx.clone();
         let worker = std::thread::Builder::new()
             .name("et-forwarding".to_owned())
@@ -78,16 +95,21 @@ impl Forwarder {
                     commands_rx,
                     worker_commands,
                     outbound_tx,
+                    #[cfg(unix)]
                     wake_writer,
                     listener_stop_reader,
                 );
+                #[cfg(unix)]
                 drop(listener_stop);
+                #[cfg(windows)]
+                listener_stop.store(true, std::sync::atomic::Ordering::Release);
             })
             .map_err(ForwardError::Io)?;
         Ok((
             Self {
                 commands: commands_tx,
                 outbound: outbound_rx,
+                #[cfg(unix)]
                 wake,
                 worker: Some(worker),
             },
@@ -95,6 +117,8 @@ impl Forwarder {
         ))
     }
 
+    /// Pollable readiness handle for outbound forwarding packets (Unix only).
+    #[cfg(unix)]
     pub fn wake(&self) -> Result<&UnixStream, ForwardError> {
         Ok(&self.wake)
     }
@@ -106,6 +130,7 @@ impl Forwarder {
     }
 
     pub fn try_outbound(&self) -> Result<Option<Packet>, ForwardError> {
+        #[cfg(unix)]
         drain_wake(&self.wake)?;
         match self.outbound.try_recv() {
             Ok(result) => result.map(Some),
@@ -147,6 +172,7 @@ fn bind_sources(
     owner: Option<(u32, u32)>,
 ) -> Result<(Vec<BoundSource>, ForwardEnvironment), ForwardError> {
     let mut bound = Vec::with_capacity(sources.len());
+    #[cfg_attr(windows, allow(unused_mut))]
     let mut environment = Vec::new();
     for request in sources {
         // The destination is passed through verbatim in the
@@ -157,26 +183,37 @@ fn bind_sources(
         if let Some(variable) = request.environmentvariable {
             // Named-pipe forwarding: upstream creates a private temporary
             // socket, exports its path through the environment variable, and
-            // rejects requests that also carry an explicit source.
+            // rejects requests that also carry an explicit source. Upstream
+            // builds this path only on POSIX systems.
             if request.source.is_some() {
                 return Err(ForwardError::Protocol(
                     "Do not set a source when forwarding named pipes with environment variables",
                 ));
             }
-            let path = create_forward_pipe(owner)?;
-            let mut listeners = Endpoint::Unix(path.clone()).bind()?;
-            apply_pipe_ownership(&path, owner)?;
-            environment.push((variable, path.to_string_lossy().into_owned()));
-            for mut listener in listeners.drain(..) {
-                if let Some(directory) = path.parent() {
-                    listener.also_remove_dir(directory.to_path_buf());
+            #[cfg(unix)]
+            {
+                let path = create_forward_pipe(owner)?;
+                let mut listeners = Endpoint::Unix(path.clone()).bind()?;
+                apply_pipe_ownership(&path, owner)?;
+                environment.push((variable, path.to_string_lossy().into_owned()));
+                for mut listener in listeners.drain(..) {
+                    if let Some(directory) = path.parent() {
+                        listener.also_remove_dir(directory.to_path_buf());
+                    }
+                    bound.push(BoundSource {
+                        listener,
+                        destination: destination.clone(),
+                    });
                 }
-                bound.push(BoundSource {
-                    listener,
-                    destination: destination.clone(),
-                });
+                continue;
             }
-            continue;
+            #[cfg(windows)]
+            {
+                let _ = (&variable, owner);
+                return Err(ForwardError::Protocol(
+                    "named-pipe forwarding is not supported on Windows",
+                ));
+            }
         }
         let source = Endpoint::parse(request.source)?;
         for listener in source.bind()? {
@@ -191,6 +228,7 @@ fn bind_sources(
 
 /// Create the private directory for a named-pipe forward and return the
 /// socket path inside it (upstream `et_forward_sock_XXXXXX/sock`).
+#[cfg(unix)]
 fn create_forward_pipe(owner: Option<(u32, u32)>) -> Result<std::path::PathBuf, ForwardError> {
     use std::os::unix::fs::DirBuilderExt;
     let (suffix, _) = et_core::keys::gen_id_passkey();
@@ -205,6 +243,7 @@ fn create_forward_pipe(owner: Option<(u32, u32)>) -> Result<std::path::PathBuf, 
     Ok(directory.join("sock"))
 }
 
+#[cfg(unix)]
 fn apply_pipe_ownership(
     path: &std::path::Path,
     owner: Option<(u32, u32)>,
@@ -218,6 +257,7 @@ fn apply_pipe_ownership(
     Ok(())
 }
 
+#[cfg(unix)]
 fn drain_wake(mut wake: &UnixStream) -> Result<(), ForwardError> {
     let mut buffer = [0u8; 64];
     loop {

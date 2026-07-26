@@ -6,8 +6,8 @@ use et_cli::client::ClientArgs;
 use et_cli::host::parse_positional_host;
 
 use crate::bootstrap::{
-    build_invocation, build_jump_invocation, provisional_credentials, validate_ssh_destination,
-    BootstrapRequest, JumpBootstrapRequest,
+    build_invocation, build_jump_invocation, cmd_safe, provisional_credentials,
+    validate_ssh_destination, BootstrapRequest, JumpBootstrapRequest, RemoteShell,
 };
 use crate::deadline::Deadline;
 use crate::error::ClientError;
@@ -80,7 +80,27 @@ fn run_client(
         verbose: args.verbose,
         ssh_options: args.ssh_option.clone(),
         term,
+        remote_shell: if args.remote_is_windows() {
+            RemoteShell::Cmd
+        } else {
+            RemoteShell::Posix
+        },
     };
+    if args.remote_is_windows() {
+        // cmd.exe cannot quote the credential line, so anything unusual in
+        // TERM or the paths must be rejected before it reaches the remote.
+        for value in [
+            request.term.as_str(),
+            provisional.id.as_str(),
+            provisional.passkey.as_str(),
+        ] {
+            if !cmd_safe(value) {
+                return Err(ClientError::Unsupported(
+                    "Windows bootstrap requires alphanumeric TERM and credentials",
+                ));
+            }
+        }
+    }
     let invocation = build_invocation(&request, &provisional);
     et_cli::logging::verbose(
         1,
@@ -144,11 +164,14 @@ fn run_client(
         .map_err(|error| ClientError::Terminal(error.to_string()))?;
     crate::client_terminal::run(
         connection,
-        args.command.as_deref(),
-        args.no_exit,
-        args.keepalive,
+        crate::client_terminal::TerminalOptions {
+            command: args.command.as_deref(),
+            no_exit: args.no_exit,
+            keepalive: args.keepalive,
+            terminal_enabled: !args.no_terminal,
+            lines: crate::client_terminal::RemoteLines::from(args.effective_remote_shell()),
+        },
         forwarder,
-        !args.no_terminal,
         |connection| {
             reconnect(
                 connection,

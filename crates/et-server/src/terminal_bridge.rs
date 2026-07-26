@@ -1,5 +1,5 @@
+use et_net::local::LocalStream;
 use std::io::{self, Read};
-use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
 use et_core::packet::Packet;
@@ -7,6 +7,7 @@ use et_core::proto::TerminalPacketType;
 use et_net::connection::ConnError;
 use et_net::forward::{is_forward_packet, Forwarder};
 use et_net::local_packet::{write_local_packet, LocalPacketDecoder};
+#[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags};
 
 use crate::session::{ActiveSession, SessionError};
@@ -27,7 +28,7 @@ pub(crate) enum BridgeMode {
 
 pub(crate) fn run(
     session: Arc<ActiveSession>,
-    terminal: UnixStream,
+    terminal: LocalStream,
     forwarder: Forwarder,
 ) -> Result<(), SessionError> {
     run_mode(session, terminal, forwarder, BridgeMode::Terminal)
@@ -35,7 +36,21 @@ pub(crate) fn run(
 
 pub(crate) fn run_mode(
     session: Arc<ActiveSession>,
-    mut terminal: UnixStream,
+    terminal: LocalStream,
+    forwarder: Forwarder,
+    mode: BridgeMode,
+) -> Result<(), SessionError> {
+    #[cfg(unix)]
+    return run_mode_poll(session, terminal, forwarder, mode);
+    #[cfg(windows)]
+    return run_mode_windows(session, terminal, forwarder, mode);
+}
+
+/// Readiness-driven bridge, mirroring upstream's `select()` loop.
+#[cfg(unix)]
+fn run_mode_poll(
+    session: Arc<ActiveSession>,
+    mut terminal: LocalStream,
     forwarder: Forwarder,
     mode: BridgeMode,
 ) -> Result<(), SessionError> {
@@ -126,6 +141,124 @@ pub(crate) fn run_mode(
     }
 }
 
+/// Windows bridge.
+///
+/// Windows cannot poll the terminal channel, the client socket, and the
+/// forwarder wake handle together, so this walks every source with
+/// non-blocking reads and idles on the same 10ms cadence upstream's `select()`
+/// timeout uses. Behaviour (backpressure, packet validation, disconnect
+/// handling) matches the readiness-driven loop above.
+#[cfg(windows)]
+fn run_mode_windows(
+    session: Arc<ActiveSession>,
+    mut terminal: LocalStream,
+    forwarder: Forwarder,
+    mode: BridgeMode,
+) -> Result<(), SessionError> {
+    const IDLE: std::time::Duration = std::time::Duration::from_millis(10);
+    terminal.set_nonblocking(true).map_err(SessionError::Io)?;
+    let mut wake = session.take_wake_reader()?;
+    wake.set_nonblocking(true).map_err(SessionError::Io)?;
+    let mut decoder = LocalPacketDecoder::new();
+    let mut connected = session.connected()?;
+    loop {
+        if session.is_shutting_down() {
+            return Ok(());
+        }
+        let mut progress = false;
+
+        // Connection state changes are announced through the wake channel.
+        if drain_available(&mut wake)? {
+            if session.is_shutting_down() {
+                return Ok(());
+            }
+            connected = session.connected()?;
+            progress = true;
+        }
+
+        // Terminal -> client, honouring the same write-buffer backpressure.
+        if session.can_buffer_write((READ_BUFFER * 2) as i64)? {
+            match read_terminal_packet(&mut terminal, &mut decoder) {
+                Ok(Some(packet)) => {
+                    progress = true;
+                    if mode == BridgeMode::Terminal {
+                        validate_terminal_output(&packet)?;
+                    }
+                    decoder = LocalPacketDecoder::new();
+                    match session.send_packet(packet.header(), packet.payload()) {
+                        Ok(()) => {}
+                        Err(SessionError::Connection(ConnError::Io(error)))
+                            if connection_ended(&error) =>
+                        {
+                            connected = false;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        // Client -> terminal / forwarder.
+        if connected {
+            loop {
+                match session.try_read_packet() {
+                    Ok(Some(packet)) => {
+                        progress = true;
+                        if mode == BridgeMode::Jumphost {
+                            write_local_packet(&mut terminal, &packet).map_err(SessionError::Io)?;
+                        } else if is_forward_packet(packet.header()) {
+                            forwarder.receive(packet).map_err(forward_error)?;
+                        } else {
+                            forward_client_packet(&session, &mut terminal, packet)?;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(SessionError::Connection(_)) => {
+                        connected = false;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+
+        // Forwarding -> client.
+        while let Some(packet) = forwarder.try_outbound().map_err(forward_error)? {
+            progress = true;
+            match session.send_packet(packet.header(), packet.payload()) {
+                Ok(()) => {}
+                Err(SessionError::Connection(ConnError::Io(error))) if connection_ended(&error) => {
+                    connected = false;
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        if !progress {
+            std::thread::sleep(IDLE);
+        }
+    }
+}
+
+/// Drain a wake channel, reporting whether anything was pending.
+#[cfg(windows)]
+fn drain_available(wake: &mut LocalStream) -> Result<bool, SessionError> {
+    let mut buffer = [0u8; 64];
+    let mut signalled = false;
+    loop {
+        match wake.read(&mut buffer) {
+            Ok(0) => return Ok(signalled),
+            Ok(_) => signalled = true,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(signalled),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(SessionError::Io(error)),
+        }
+    }
+}
+
 fn connection_ended(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -137,10 +270,11 @@ fn connection_ended(error: &io::Error) -> bool {
     )
 }
 
+#[cfg(unix)]
 fn wait(
-    terminal: &UnixStream,
-    wake: &UnixStream,
-    forward_wake: &UnixStream,
+    terminal: &LocalStream,
+    wake: &LocalStream,
+    forward_wake: &LocalStream,
     client: Option<&std::net::TcpStream>,
     accept_terminal: bool,
 ) -> Result<(PollFlags, PollFlags, PollFlags, PollFlags), SessionError> {
@@ -177,7 +311,7 @@ fn forward_error(error: et_net::forward::ForwardError) -> SessionError {
 }
 
 fn read_terminal_packet(
-    terminal: &mut UnixStream,
+    terminal: &mut LocalStream,
     decoder: &mut LocalPacketDecoder,
 ) -> Result<Option<Packet>, SessionError> {
     let mut buffer = [0u8; READ_BUFFER];
@@ -214,7 +348,7 @@ fn validate_terminal_output(packet: &Packet) -> Result<(), SessionError> {
 
 fn forward_client_packet(
     session: &ActiveSession,
-    terminal: &mut UnixStream,
+    terminal: &mut LocalStream,
     packet: Packet,
 ) -> Result<(), SessionError> {
     match packet.header() {
@@ -234,7 +368,8 @@ fn forward_client_packet(
     }
 }
 
-fn drain(wake: &mut UnixStream) -> Result<(), SessionError> {
+#[cfg(unix)]
+fn drain(wake: &mut LocalStream) -> Result<(), SessionError> {
     let mut buffer = [0u8; 64];
     loop {
         match wake.read(&mut buffer) {

@@ -13,4 +13,5 @@ mod forward_worker;
 pub mod framing_io;
 pub mod handshake;
 pub mod listener;
+pub mod local;
 pub mod local_packet;

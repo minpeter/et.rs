@@ -7,7 +7,9 @@ use clap::Parser;
 use et_cli::server::{resolve_config, ServerArgs};
 use et_server::path::select_router_path;
 use et_server::Runtime;
+#[cfg(unix)]
 use signal_hook::consts::{SIGINT, SIGTERM};
+#[cfg(unix)]
 use signal_hook::iterator::Signals;
 
 pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
@@ -42,7 +44,7 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
         max_size: config.log_size,
     });
     et_cli::logging::info("In child, about to start server.");
-    let mut signals = Signals::new([SIGINT, SIGTERM])
+    let shutdown = ShutdownSignal::install()
         .map_err(|error| clap_io("could not install server signal handlers", error))?;
     let router_path = select_router_path(config.server_fifo.as_deref())
         .map_err(|error| clap_io("could not select terminal router path", error))?;
@@ -57,7 +59,7 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
         print_ready(&runtime)?;
     }
 
-    if signals.forever().next().is_none() {
+    if !shutdown.wait() {
         return Err(clap::Error::raw(
             ErrorKind::Io,
             "server signal stream ended unexpectedly",
@@ -105,6 +107,51 @@ fn print_ready(runtime: &Runtime) -> Result<(), clap::Error> {
     )
     .and_then(|()| output.flush())
     .map_err(|error| clap_io("could not write server readiness", error))
+}
+
+/// Blocks until the operating system asks the server to stop.
+///
+/// Unix waits for SIGINT/SIGTERM like upstream; Windows waits for a console
+/// Ctrl+C / Ctrl+Break, which is the closest equivalent for a foreground
+/// server process.
+struct ShutdownSignal {
+    #[cfg(unix)]
+    signals: Signals,
+    #[cfg(windows)]
+    receiver: std::sync::mpsc::Receiver<()>,
+}
+
+impl ShutdownSignal {
+    fn install() -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            Ok(Self {
+                signals: Signals::new([SIGINT, SIGTERM])?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            ctrlc::set_handler(move || {
+                let _ = sender.send(());
+            })
+            .map_err(io::Error::other)?;
+            Ok(Self { receiver })
+        }
+    }
+
+    /// Returns `false` if the signal source ended without firing.
+    #[cfg_attr(windows, allow(unused_mut))]
+    fn wait(mut self) -> bool {
+        #[cfg(unix)]
+        {
+            self.signals.forever().next().is_some()
+        }
+        #[cfg(windows)]
+        {
+            self.receiver.recv().is_ok()
+        }
+    }
 }
 
 fn clap_io(message: &str, error: impl std::fmt::Display) -> clap::Error {

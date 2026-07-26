@@ -1,4 +1,4 @@
-use std::os::unix::net::UnixStream;
+use et_net::local::LocalStream;
 
 use et_core::packet::Packet;
 use et_core::proto::{TerminalPacketType, TerminalUserInfo};
@@ -9,7 +9,7 @@ use crate::router::RouterReject;
 
 pub(crate) fn process(
     packet: Packet,
-    stream: UnixStream,
+    stream: LocalStream,
     registry: &Registry,
 ) -> Result<RegisteredTerminal, RouterReject> {
     if packet.is_encrypted() {

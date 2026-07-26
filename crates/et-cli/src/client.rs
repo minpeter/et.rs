@@ -63,6 +63,19 @@ pub struct ClientArgs {
     )]
     pub macserver: bool,
 
+    /// Bootstrap a Windows server, whose default shell is `cmd.exe` and has no
+    /// `printf`. Also defaults `--terminal-path` to `et.exe`.
+    #[arg(
+        long = "winserver",
+        help = "Set when connecting to a Windows server. Uses a cmd.exe-compatible bootstrap and sets --terminal-path=et.exe"
+    )]
+    pub winserver: bool,
+
+    /// Grammar of the remote login shell, used for `--command` injection.
+    /// Defaults to `posix`, or to `cmd` when `--winserver` is given.
+    #[arg(long = "remote-shell", value_enum)]
+    pub remote_shell: Option<RemoteShellKind>,
+
     #[arg(
         short = 'v',
         long = "verbose",
@@ -110,14 +123,47 @@ pub struct ClientArgs {
     pub telemetry: bool,
 }
 
+/// Remote login-shell grammar.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteShellKind {
+    /// `sh`-family: `<cmd>; exit` terminated with LF.
+    Posix,
+    /// `cmd.exe`: `<cmd> & exit` terminated with CRLF.
+    Cmd,
+    /// PowerShell: `<cmd>; exit` terminated with CRLF.
+    Powershell,
+}
+
 impl ClientArgs {
-    /// Effective etterminal path: `--terminal-path` wins over `--macserver`.
+    /// Effective remote shell grammar.
+    pub fn effective_remote_shell(&self) -> RemoteShellKind {
+        self.remote_shell.unwrap_or({
+            if self.winserver {
+                RemoteShellKind::Cmd
+            } else {
+                RemoteShellKind::Posix
+            }
+        })
+    }
+
+    /// Whether the remote is a Windows host (cmd or PowerShell).
+    pub fn remote_is_windows(&self) -> bool {
+        matches!(
+            self.effective_remote_shell(),
+            RemoteShellKind::Cmd | RemoteShellKind::Powershell
+        )
+    }
+    /// Effective etterminal path: `--terminal-path` wins over the platform
+    /// shortcuts.
     pub fn effective_terminal_path(&self) -> Option<String> {
         if let Some(path) = &self.terminal_path {
             return Some(path.clone());
         }
         if self.macserver {
             return Some("/usr/local/bin/etterminal".to_owned());
+        }
+        if self.remote_is_windows() {
+            return Some("et.exe".to_owned());
         }
         None
     }
@@ -178,6 +224,37 @@ mod tests {
         .unwrap();
         assert!(a.no_exit);
         assert_eq!(a.reverse_tunnel.len(), 1);
+    }
+
+    #[test]
+    fn remote_shell_overrides_and_defaults() {
+        let a = ClientArgs::try_parse_from(["et", "host"]).unwrap();
+        assert_eq!(a.effective_remote_shell(), RemoteShellKind::Posix);
+        assert!(!a.remote_is_windows());
+        let a = ClientArgs::try_parse_from(["et", "host", "--winserver"]).unwrap();
+        assert_eq!(a.effective_remote_shell(), RemoteShellKind::Cmd);
+        let a = ClientArgs::try_parse_from(["et", "host", "--remote-shell", "powershell"]).unwrap();
+        assert_eq!(a.effective_remote_shell(), RemoteShellKind::Powershell);
+        assert!(a.remote_is_windows());
+        assert_eq!(a.effective_terminal_path().as_deref(), Some("et.exe"));
+    }
+
+    #[test]
+    fn winserver_sets_the_default_terminal_path() {
+        let a = ClientArgs::try_parse_from(["et", "host", "--winserver"]).unwrap();
+        assert_eq!(a.effective_terminal_path().as_deref(), Some("et.exe"));
+        let a = ClientArgs::try_parse_from([
+            "et",
+            "host",
+            "--winserver",
+            "--terminal-path",
+            "C:/tools/et.exe",
+        ])
+        .unwrap();
+        assert_eq!(
+            a.effective_terminal_path().as_deref(),
+            Some("C:/tools/et.exe")
+        );
     }
 
     #[test]

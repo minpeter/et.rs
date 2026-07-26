@@ -8,11 +8,14 @@
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[cfg(unix)]
 pub const DEFAULT_PID_FILE: &str = "/var/run/etserver.pid";
+/// Windows has no `/var/run`; the pid file lives beside the router endpoint.
+#[cfg(windows)]
+pub const DEFAULT_PID_FILE: &str = "etserver.pid";
 
 /// Re-exec this binary as a detached background server and return.
 ///
@@ -24,7 +27,7 @@ pub fn spawn_detached(args: &[std::ffi::OsString]) -> Result<(), String> {
     let mut child = Command::new(executable);
     child.arg("server");
     for argument in args {
-        if argument.as_bytes() == b"--daemon" {
+        if argument == std::ffi::OsStr::new("--daemon") {
             child.arg("--daemon-child");
         } else {
             child.arg(argument);
@@ -34,9 +37,9 @@ pub fn spawn_detached(args: &[std::ffi::OsString]) -> Result<(), String> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .current_dir("/");
-    child
-        .spawn()
+        .current_dir(root_directory());
+    crate::detach::configure(&mut child);
+    crate::detach::spawn(&mut child)
         .map(|_| ())
         .map_err(|error| format!("could not start background etserver: {error}"))
 }
@@ -44,12 +47,15 @@ pub fn spawn_detached(args: &[std::ffi::OsString]) -> Result<(), String> {
 /// Finish detaching inside the re-executed child: become a session leader,
 /// move to `/`, and record the pid file.
 pub fn detach_child(pidfile: Option<&Path>) -> Result<(), String> {
-    // A fresh child of the original shell is not a process-group leader, so
-    // this succeeds and drops the controlling terminal.
-    if let Err(error) = rustix::process::setsid() {
-        // Already a session leader is not an error for our purposes.
-        if error != rustix::io::Errno::PERM {
-            return Err(format!("could not create a new session: {error}"));
+    #[cfg(unix)]
+    {
+        // A fresh child of the original shell is not a process-group leader, so
+        // this succeeds and drops the controlling terminal.
+        if let Err(error) = rustix::process::setsid() {
+            // Already a session leader is not an error for our purposes.
+            if error != rustix::io::Errno::PERM {
+                return Err(format!("could not create a new session: {error}"));
+            }
         }
     }
     // The working directory is already `/`: the parent sets it on the child
@@ -58,20 +64,34 @@ pub fn detach_child(pidfile: Option<&Path>) -> Result<(), String> {
     write_pid_file(path)
 }
 
+/// Working directory for the detached server.
+fn root_directory() -> PathBuf {
+    #[cfg(unix)]
+    {
+        PathBuf::from("/")
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("SystemDrive")
+            .map(|drive| PathBuf::from(format!("{}\\", drive.to_string_lossy())))
+            .unwrap_or_else(|| PathBuf::from("C:\\"))
+    }
+}
+
 fn write_pid_file(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|error| {
-            format!(
-                "Error opening pidfile for writing: {}: {error}",
-                path.display()
-            )
-        })?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|error| {
+        format!(
+            "Error opening pidfile for writing: {}: {error}",
+            path.display()
+        )
+    })?;
     writeln!(file, "{}", std::process::id())
         .and_then(|()| file.flush())
         .map_err(|error| format!("Error writing pidfile: {}: {error}", path.display()))

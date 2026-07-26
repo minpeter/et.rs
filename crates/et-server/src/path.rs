@@ -2,10 +2,12 @@
 
 use std::fs;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const FIFO_NAME: &str = "etserver.idpasskey.fifo";
+#[cfg(unix)]
 const ROOT_FIFO: &str = "/var/run/etserver.idpasskey.fifo";
 
 #[derive(Clone, Debug)]
@@ -18,9 +20,21 @@ pub struct RouterPath {
 #[derive(Clone, Debug)]
 enum DirectoryPlan {
     Existing,
+    #[cfg_attr(windows, allow(dead_code))]
     RootDefault,
-    Xdg { base: PathBuf },
-    Home { home: PathBuf },
+    #[cfg_attr(windows, allow(dead_code))]
+    Xdg {
+        base: PathBuf,
+    },
+    #[cfg_attr(windows, allow(dead_code))]
+    Home {
+        home: PathBuf,
+    },
+    /// `%LOCALAPPDATA%\\etserver`, which Windows already keeps user-private.
+    #[cfg(windows)]
+    LocalAppData {
+        base: PathBuf,
+    },
 }
 
 impl RouterPath {
@@ -56,6 +70,11 @@ impl RouterPath {
             DirectoryPlan::Xdg { base } => {
                 validate_directory(base, true)?;
                 create_and_validate(&base.join("etserver"), 0o700, true)
+            }
+            #[cfg(windows)]
+            DirectoryPlan::LocalAppData { base } => {
+                validate_directory(base, true)?;
+                create_and_validate(&base.join("etserver"), 0, true)
             }
             DirectoryPlan::Home { home } => {
                 validate_directory(home, true)?;
@@ -134,6 +153,7 @@ impl std::error::Error for PathError {
     }
 }
 
+#[cfg(unix)]
 pub fn select_router_path(override_path: Option<&Path>) -> Result<RouterPath, PathError> {
     let euid = rustix::process::geteuid().as_raw();
     let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
@@ -141,6 +161,35 @@ pub fn select_router_path(override_path: Option<&Path>) -> Result<RouterPath, Pa
     select_router_path_for(euid, override_path, xdg.as_deref(), home.as_deref())
 }
 
+/// Windows router endpoint path. The default lives in the user-private
+/// `%LOCALAPPDATA%\\etserver` directory, which is what protects the token file
+/// in place of Unix socket permissions.
+#[cfg(windows)]
+pub fn select_router_path(override_path: Option<&Path>) -> Result<RouterPath, PathError> {
+    if let Some(path) = override_path {
+        if !path.is_absolute() {
+            return Err(PathError::RelativeOverride(path.to_path_buf()));
+        }
+        return Ok(RouterPath {
+            path: path.to_path_buf(),
+            socket_mode: 0,
+            plan: DirectoryPlan::Existing,
+        });
+    }
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .ok_or(PathError::MissingHome)?;
+    if !base.is_absolute() {
+        return Err(PathError::RelativeHome(base));
+    }
+    Ok(RouterPath {
+        path: base.join("etserver").join(FIFO_NAME),
+        socket_mode: 0,
+        plan: DirectoryPlan::LocalAppData { base },
+    })
+}
+
+#[cfg(unix)]
 pub fn select_router_path_for(
     euid: u32,
     override_path: Option<&Path>,
@@ -193,6 +242,7 @@ pub fn select_router_path_for(
 
 fn create_and_validate(path: &Path, mode: u32, private: bool) -> Result<(), PathError> {
     match fs::create_dir(path) {
+        #[cfg(unix)]
         Ok(()) => {
             fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|source| {
                 PathError::Io {
@@ -201,6 +251,12 @@ fn create_and_validate(path: &Path, mode: u32, private: bool) -> Result<(), Path
                     source,
                 }
             })?
+        }
+        #[cfg(windows)]
+        Ok(()) => {
+            // Windows inherits the ACL of %LOCALAPPDATA%, which is
+            // user-private; there is no mode to set.
+            let _ = mode;
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(source) => {
@@ -223,16 +279,21 @@ fn validate_directory(path: &Path, private: bool) -> Result<(), PathError> {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(PathError::UnsafeDirectory(path.to_path_buf()));
     }
-    if metadata.uid() != rustix::process::geteuid().as_raw() {
-        return Err(PathError::WrongOwner(path.to_path_buf()));
+    #[cfg(unix)]
+    {
+        if metadata.uid() != rustix::process::geteuid().as_raw() {
+            return Err(PathError::WrongOwner(path.to_path_buf()));
+        }
+        let forbidden = if private { 0o077 } else { 0o022 };
+        if metadata.mode() & forbidden != 0 {
+            return Err(PathError::UnsafeDirectory(path.to_path_buf()));
+        }
     }
-    let forbidden = if private { 0o077 } else { 0o022 };
-    if metadata.mode() & forbidden != 0 {
-        return Err(PathError::UnsafeDirectory(path.to_path_buf()));
-    }
+    #[cfg(windows)]
+    let _ = private;
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "path_tests.rs"]
 mod path_tests;

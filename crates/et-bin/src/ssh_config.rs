@@ -77,7 +77,7 @@ mod tests {
                 ["-G", "-oPort=2222", "requested@server-alias"]
             );
             Ok(SshOutput {
-                status: success_status(),
+                status: Some(success_status()),
                 stdout: self.stdout.clone(),
             })
         }

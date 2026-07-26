@@ -6,9 +6,9 @@
 //! client, opens its own ET client connection to the final destination with
 //! the same id/passkey, and then relays packets verbatim in both directions.
 
+use et_net::local::LocalStream;
 use std::io::{self, Read};
 use std::net::ToSocketAddrs;
-use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use et_core::keys::passkey_to_key;
@@ -22,6 +22,7 @@ use et_net::framing_io::{read_proto_limited, write_proto};
 use et_net::handshake::client_request;
 use et_net::local_packet::{write_local_packet, LocalPacketDecoder};
 use prost::Message;
+#[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags};
 
 use crate::terminal_credentials::CredentialInput;
@@ -33,7 +34,7 @@ const READ_BUFFER: usize = 16 * 1024;
 const CONNECT_ATTEMPTS: usize = 3;
 
 pub fn run(
-    mut router: UnixStream,
+    mut router: LocalStream,
     input: &CredentialInput,
     destination_host: &str,
     destination_port: u16,
@@ -51,7 +52,7 @@ pub fn run(
     relay(router, &mut destination)
 }
 
-fn read_jumphost_init(router: &mut UnixStream) -> Result<InitialPayload, String> {
+fn read_jumphost_init(router: &mut LocalStream) -> Result<InitialPayload, String> {
     let packet = et_net::local_packet::read_local_packet(router)
         .map_err(|error| format!("Cannot read jumphost init from router: {error}"))?;
     if packet.is_encrypted() || packet.header() != TerminalPacketType::JumphostInit as u8 {
@@ -157,11 +158,46 @@ fn try_connect_once(
 }
 
 /// Relay packets verbatim between the local router and the destination.
-fn relay(mut router: UnixStream, destination: &mut Connection) -> Result<i32, String> {
+fn relay(mut router: LocalStream, destination: &mut Connection) -> Result<i32, String> {
     router
         .set_nonblocking(true)
         .map_err(|error| format!("could not configure the router socket: {error}"))?;
     let mut decoder = LocalPacketDecoder::new();
+    // Windows cannot poll the router channel and the destination socket
+    // together, so it walks both without blocking on upstream's 10ms cadence.
+    #[cfg(windows)]
+    loop {
+        let mut progress = false;
+        match read_router_packet(&mut router, &mut decoder)? {
+            Some(packet) => {
+                progress = true;
+                decoder = LocalPacketDecoder::new();
+                if destination
+                    .write_packet(packet.header(), packet.payload())
+                    .is_err()
+                {
+                    return Ok(0);
+                }
+            }
+            None => {}
+        }
+        loop {
+            match destination.try_read_packet() {
+                Ok(Some(packet)) => {
+                    progress = true;
+                    if write_local_packet(&mut router, &packet).is_err() {
+                        return Ok(0);
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => return Ok(0),
+            }
+        }
+        if !progress {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    #[cfg(unix)]
     loop {
         let client = destination
             .try_clone_stream()
@@ -209,7 +245,7 @@ fn relay(mut router: UnixStream, destination: &mut Connection) -> Result<i32, St
 }
 
 fn read_router_packet(
-    router: &mut UnixStream,
+    router: &mut LocalStream,
     decoder: &mut LocalPacketDecoder,
 ) -> Result<Option<Packet>, String> {
     let mut buffer = [0u8; READ_BUFFER];

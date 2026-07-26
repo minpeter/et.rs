@@ -34,48 +34,72 @@ fn main() {
 }
 
 fn dispatch(prog: &str, args: &[OsString]) -> Result<i32, clap::Error> {
-    if prog == "etserver" {
-        return crate::server::run(args);
-    }
-    if prog == "etterminal" {
-        return crate::terminal::run(args);
-    }
-    if prog == "htm" {
-        return crate::htm::run_client(args);
-    }
-    if prog == "htmd" {
-        return crate::htm::run_daemon(args);
+    match prog {
+        "etserver" => return role("etserver", args),
+        "etterminal" => return role("etterminal", args),
+        "htm" => return role("htm", args),
+        "htmd" => return role("htmd", args),
+        _ => {}
     }
     if let Some(first) = args.first().and_then(|s| s.to_str()) {
         match first {
-            "server" => return crate::server::run(&args[1..]),
-            "terminal" => return crate::terminal::run(&args[1..]),
+            "server" => return role("etserver", &args[1..]),
+            "terminal" => return role("etterminal", &args[1..]),
+            "htm" => return role("htm", &args[1..]),
+            "htmd" => return role("htmd", &args[1..]),
             "client" => return crate::client::run(&args[1..]),
-            "htm" => return crate::htm::run_client(&args[1..]),
-            "htmd" => return crate::htm::run_daemon(&args[1..]),
             _ => {}
         }
     }
     crate::client::run(args)
 }
 
+fn role(name: &str, args: &[OsString]) -> Result<i32, clap::Error> {
+    match name {
+        "etserver" => crate::server::run(args),
+        "etterminal" => crate::terminal::run(args),
+        #[cfg(unix)]
+        "htm" => crate::htm::run_client(args),
+        #[cfg(unix)]
+        "htmd" => crate::htm::run_daemon(args),
+        // Upstream's htm/htmd are POSIX-only, and their multiplexer state model
+        // has no Windows counterpart yet.
+        #[cfg(windows)]
+        "htm" | "htmd" => Err(clap::Error::raw(
+            clap::error::ErrorKind::InvalidSubcommand,
+            format!("{name} is not available on Windows yet\n"),
+        )),
+        _ => crate::client::run(args),
+    }
+}
+
 mod bootstrap;
 mod client;
 mod client_terminal;
 mod client_terminal_loop;
+#[cfg(windows)]
+mod client_terminal_windows;
 mod deadline;
+mod detach;
 mod error;
 mod forward_config;
-mod htm;
 mod initial_connect;
 mod resolver;
-mod server;
-mod server_daemon;
 mod ssh_config;
 mod ssh_process;
+
+// Server-side roles. Upstream builds these only on POSIX, which is why an ET
+// server on Windows meant running the Unix build inside WSL; here they are
+// native on Windows too (ConPTY plus a loopback router).
+mod server;
+mod server_daemon;
 mod terminal;
 mod terminal_credentials;
 mod terminal_daemon;
-mod terminal_jump;
 mod terminal_protocol;
 mod terminal_pty;
+
+// The headless multiplexer still needs the Unix-only pieces of upstream's htm.
+#[cfg(unix)]
+mod htm;
+mod terminal_jump;

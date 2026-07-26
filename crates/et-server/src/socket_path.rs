@@ -1,3 +1,8 @@
+//! Router listener binding on Unix: upstream's socket-file semantics
+//! (ownership, mode, and stale-socket recovery).
+
+#![cfg(unix)]
+
 use std::fs;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};

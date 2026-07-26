@@ -1,26 +1,30 @@
+use et_net::local::LocalStream;
 use std::io::{self, Read};
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use et_core::packet::Packet;
 use et_net::local_packet::LocalPacketDecoder;
+#[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags};
 
 use crate::registry::{RegistrationIdentity, Registry};
 use crate::router::{RouterError, RouterEvent, RouterReject};
 use crate::router_registration;
 use crate::runtime_lifecycle::LifecycleEvent;
+#[cfg(unix)]
 use crate::socket_path::OwnedRouterListener;
+#[cfg(windows)]
+use crate::socket_path_windows::OwnedRouterListener;
 
 struct PendingConnection {
-    stream: UnixStream,
+    stream: LocalStream,
     decoder: LocalPacketDecoder,
 }
 
 struct WatchedRegistration {
-    stream: UnixStream,
+    stream: LocalStream,
     identity: RegistrationIdentity,
 }
 
@@ -32,7 +36,22 @@ enum ReadOutcome {
 
 pub(crate) fn run(
     listener: OwnedRouterListener,
-    mut wake_reader: UnixStream,
+    wake_reader: LocalStream,
+    registry: Registry,
+    events: Sender<RouterEvent>,
+    lifecycle: Option<Sender<LifecycleEvent>>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), RouterError> {
+    #[cfg(unix)]
+    return run_poll(listener, wake_reader, registry, events, lifecycle, shutdown);
+    #[cfg(windows)]
+    return run_windows(listener, wake_reader, registry, events, lifecycle, shutdown);
+}
+
+#[cfg(unix)]
+fn run_poll(
+    listener: OwnedRouterListener,
+    mut wake_reader: LocalStream,
     registry: Registry,
     events: Sender<RouterEvent>,
     lifecycle: Option<Sender<LifecycleEvent>>,
@@ -125,6 +144,102 @@ pub(crate) fn run(
     }
 }
 
+/// Windows router loop.
+///
+/// The listener, the pending registrations, and the registered watchers cannot
+/// be polled together, so each is serviced without blocking on upstream's 10ms
+/// `select()` cadence. Registration handling, rejection reasons, and disconnect
+/// bookkeeping are identical to the readiness-driven loop.
+#[cfg(windows)]
+fn run_windows(
+    listener: OwnedRouterListener,
+    mut wake_reader: LocalStream,
+    registry: Registry,
+    events: Sender<RouterEvent>,
+    lifecycle: Option<Sender<LifecycleEvent>>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), RouterError> {
+    const IDLE: std::time::Duration = std::time::Duration::from_millis(10);
+    let mut pending = Vec::<PendingConnection>::new();
+    let mut watched = Vec::<WatchedRegistration>::new();
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            drain_waker(&mut wake_reader)?;
+            return Ok(());
+        }
+        let mut progress = false;
+
+        // Terminals that closed their connection release their registration.
+        // The watcher shares the session socket, so this must never consume
+        // bytes: `peek` reports EOF without stealing session data.
+        let mut disconnected = Vec::new();
+        for (index, registration) in watched.iter().enumerate() {
+            let mut probe = [0u8; 1];
+            match registration.stream.peek(&mut probe) {
+                Ok(0) => disconnected.push(index),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => disconnected.push(index),
+            }
+        }
+        for index in disconnected.into_iter().rev() {
+            progress = true;
+            let registration = watched.swap_remove(index);
+            if registry
+                .remove_if_current(&registration.identity)
+                .map_err(|error| RouterError::Io(io::Error::other(error)))?
+            {
+                let id = registration.identity.id().to_owned();
+                let _ = events.send(RouterEvent::Disconnected { id });
+                if let Some(sender) = lifecycle.as_ref() {
+                    let _ =
+                        sender.send(LifecycleEvent::TerminalDisconnected(registration.identity));
+                }
+            }
+        }
+
+        let before = pending.len();
+        accept_ready(&listener, &mut pending)?;
+        if pending.len() != before {
+            progress = true;
+        }
+
+        for index in (0..pending.len()).rev() {
+            match read_ready(&mut pending[index])? {
+                ReadOutcome::Pending => {}
+                ReadOutcome::Packet(packet) => {
+                    progress = true;
+                    let connection = pending.swap_remove(index);
+                    match router_registration::process(packet, connection.stream, &registry) {
+                        Ok(terminal) => {
+                            let id = terminal.identity.id().to_owned();
+                            watched.push(WatchedRegistration {
+                                stream: terminal.watcher,
+                                identity: terminal.identity,
+                            });
+                            let _ = events.send(RouterEvent::Registered { id });
+                        }
+                        Err(error) => {
+                            let _ = events.send(RouterEvent::Rejected(error));
+                        }
+                    }
+                }
+                ReadOutcome::Reject => {
+                    progress = true;
+                    pending.swap_remove(index);
+                    let _ = events.send(RouterEvent::Rejected(RouterReject::MalformedFrame));
+                }
+            }
+        }
+
+        if !progress {
+            std::thread::sleep(IDLE);
+        }
+    }
+}
+
+#[cfg(unix)]
 fn disconnect_ready(
     readiness: &[PollFlags],
     watched: &mut Vec<WatchedRegistration>,
@@ -207,7 +322,7 @@ fn read_ready(connection: &mut PendingConnection) -> Result<ReadOutcome, RouterE
     }
 }
 
-fn drain_waker(wake_reader: &mut UnixStream) -> Result<(), RouterError> {
+fn drain_waker(wake_reader: &mut LocalStream) -> Result<(), RouterError> {
     let mut buffer = [0u8; 64];
     loop {
         match wake_reader.read(&mut buffer) {

@@ -1,5 +1,5 @@
+use et_net::local::LocalStream;
 use std::io::{self, Write};
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
@@ -10,7 +10,10 @@ use crate::path::{PathError, RouterPath};
 use crate::registry::Registry;
 use crate::router_loop;
 use crate::runtime_lifecycle::LifecycleEvent;
+#[cfg(unix)]
 use crate::socket_path::OwnedRouterListener;
+#[cfg(windows)]
+use crate::socket_path_windows::OwnedRouterListener;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RouterEvent {
@@ -66,7 +69,7 @@ impl From<PathError> for RouterError {
 }
 
 pub struct Router {
-    wake_writer: UnixStream,
+    wake_writer: LocalStream,
     shutdown: Arc<AtomicBool>,
     worker: Option<JoinHandle<Result<(), RouterError>>>,
     events: Receiver<RouterEvent>,
@@ -83,7 +86,7 @@ impl Router {
         lifecycle: Option<Sender<LifecycleEvent>>,
     ) -> Result<Self, RouterError> {
         let listener = OwnedRouterListener::bind(&path)?;
-        let (wake_reader, wake_writer) = UnixStream::pair().map_err(RouterError::Io)?;
+        let (wake_reader, wake_writer) = et_net::local::wake_pair().map_err(RouterError::Io)?;
         wake_reader.set_nonblocking(true).map_err(RouterError::Io)?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = shutdown.clone();

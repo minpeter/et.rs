@@ -4,9 +4,6 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use nix::errno::Errno;
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
 use wait_timeout::ChildExt;
 
 use crate::bootstrap::{parse_id_passkey, Credentials, SshInvocation};
@@ -18,7 +15,9 @@ pub const DEFAULT_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 pub struct SshOutput {
-    pub status: ExitStatus,
+    /// Exit status, or `None` when the bootstrap finished early because the
+    /// `IDPASSKEY:` marker had already arrived.
+    pub status: Option<ExitStatus>,
     pub stdout: Vec<u8>,
 }
 
@@ -70,7 +69,7 @@ impl SshRunner for SystemSsh {
         // Cleanup therefore targets the process subtree plus anything still
         // holding the captured stdout pipe.
         let mut child = command.spawn().map_err(ClientError::SshSpawn)?;
-        let child_pid = Pid::from_raw(child.id().cast_signed());
+        let child_pid = process_id(child.id());
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
@@ -106,7 +105,19 @@ impl SshRunner for SystemSsh {
                 }
                 let status =
                     wait_for_exit(&mut child, child_pid, pipe, deadline, invocation.operation)?;
-                Ok(SshOutput { status, stdout })
+                Ok(SshOutput {
+                    status: Some(status),
+                    stdout,
+                })
+            }
+            Ok(Capture::Marker(stdout)) => {
+                // The remote terminal is registered and detached; stop waiting
+                // on a channel a detached child may keep open.
+                stop_child(&mut child, child_pid, pipe, reader)?;
+                Ok(SshOutput {
+                    status: None,
+                    stdout,
+                })
             }
             Ok(Capture::TooLarge) => {
                 stop_child(&mut child, child_pid, pipe, reader)?;
@@ -136,8 +147,11 @@ pub fn run_checked<R: SshRunner + ?Sized>(
     deadline: Deadline,
 ) -> Result<Vec<u8>, ClientError> {
     let output = runner.run(invocation, deadline)?;
-    if !output.status.success() {
-        return Err(ClientError::SshNonZero(output.status.code()));
+    // A bootstrap that stopped at the marker has no meaningful status.
+    if let Some(status) = output.status {
+        if !status.success() {
+            return Err(ClientError::SshNonZero(status.code()));
+        }
     }
     Ok(output.stdout)
 }
@@ -152,8 +166,24 @@ pub fn run_bootstrap<R: SshRunner + ?Sized>(
 
 enum Capture {
     Complete(Vec<u8>),
+    /// The credential marker arrived, so the remote terminal is registered and
+    /// detached; nothing else on that channel matters.
+    Marker(Vec<u8>),
     TooLarge,
     Failed(io::Error),
+}
+
+/// `IDPASSKEY:` plus `<16 id>/<32 passkey>`.
+const MARKER: &[u8] = b"IDPASSKEY:";
+const MARKER_TOTAL: usize = 10 + 16 + 1 + 32;
+
+/// Position just past a complete marker, if one is present.
+fn marker_end(captured: &[u8]) -> Option<usize> {
+    captured
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)
+        .map(|start| start + MARKER_TOTAL)
+        .filter(|end| *end <= captured.len())
 }
 
 fn spawn_reader(mut stdout: ChildStdout) -> io::Result<(mpsc::Receiver<Capture>, JoinHandle<()>)> {
@@ -177,7 +207,15 @@ fn capture_bounded(reader: &mut impl Read) -> Capture {
         match reader.read(&mut buffer[..read_len]) {
             Ok(0) => return Capture::Complete(captured),
             Ok(count) if count > available => return Capture::TooLarge,
-            Ok(count) => captured.extend_from_slice(&buffer[..count]),
+            Ok(count) => {
+                captured.extend_from_slice(&buffer[..count]);
+                // Waiting for EOF is not reliable everywhere: on Windows the
+                // detached session process can inherit this pipe, so the
+                // channel never closes even though the session is ready.
+                if marker_end(&captured).is_some() {
+                    return Capture::Marker(captured);
+                }
+            }
             Err(error) => return Capture::Failed(error),
         }
     }
@@ -185,7 +223,7 @@ fn capture_bounded(reader: &mut impl Read) -> Capture {
 
 fn wait_for_exit(
     child: &mut Child,
-    child_pid: Pid,
+    child_pid: ProcessId,
     pipe: Option<PipeIdentity>,
     deadline: Deadline,
     operation: &'static str,
@@ -212,7 +250,7 @@ fn wait_for_exit(
 
 fn stop_child(
     child: &mut Child,
-    child_pid: Pid,
+    child_pid: ProcessId,
     pipe: Option<PipeIdentity>,
     reader: JoinHandle<()>,
 ) -> Result<(), ClientError> {
@@ -220,14 +258,17 @@ fn stop_child(
     terminate_and_reap(child, child_pid, pipe)
 }
 
-/// Identity of the captured stdout pipe (device + inode), used to find every
-/// process that still holds it.
+/// Identity of the captured stdout pipe, used to find every process that still
+/// holds it. Only Linux exposes this through `/proc`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PipeIdentity {
+    #[cfg(target_os = "linux")]
     device: u64,
+    #[cfg(target_os = "linux")]
     inode: u64,
 }
 
+#[cfg(target_os = "linux")]
 fn pipe_identity(stdout: &ChildStdout) -> Option<PipeIdentity> {
     use std::os::fd::AsFd;
     let stat = rustix::fs::fstat(stdout.as_fd()).ok()?;
@@ -237,9 +278,14 @@ fn pipe_identity(stdout: &ChildStdout) -> Option<PipeIdentity> {
     })
 }
 
+#[cfg(not(target_os = "linux"))]
+fn pipe_identity(_stdout: &ChildStdout) -> Option<PipeIdentity> {
+    None
+}
+
 fn terminate_and_reap(
     child: &mut Child,
-    child_pid: Pid,
+    child_pid: ProcessId,
     pipe: Option<PipeIdentity>,
 ) -> Result<(), ClientError> {
     // ssh may leave descendants (ProxyJump helpers, remote-command wrappers)
@@ -256,9 +302,8 @@ fn terminate_and_reap(
     targets.push(child_pid);
     let mut failure = None;
     for pid in targets {
-        match kill(pid, Signal::SIGKILL) {
-            Ok(()) | Err(Errno::ESRCH) => {}
-            Err(error) => failure = Some(io::Error::from(error)),
+        if let Err(error) = kill_process(pid) {
+            failure = Some(error);
         }
     }
     let waited = child.wait();
@@ -269,8 +314,52 @@ fn terminate_and_reap(
     }
 }
 
+/// Process identifier used for subtree cleanup.
+#[cfg(unix)]
+pub(crate) type ProcessId = nix::unistd::Pid;
+#[cfg(windows)]
+pub(crate) type ProcessId = u32;
+
+#[cfg(unix)]
+fn process_id(raw: u32) -> ProcessId {
+    nix::unistd::Pid::from_raw(raw.cast_signed())
+}
+
+#[cfg(windows)]
+fn process_id(raw: u32) -> ProcessId {
+    raw
+}
+
+#[cfg(unix)]
+fn kill_process(pid: ProcessId) -> io::Result<()> {
+    use nix::errno::Errno;
+    use nix::sys::signal::{kill, Signal};
+    match kill(pid, Signal::SIGKILL) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(error) => Err(io::Error::from(error)),
+    }
+}
+
+#[cfg(windows)]
+fn kill_process(pid: ProcessId) -> io::Result<()> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut system = System::new();
+    let pid = Pid::from_u32(pid);
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    match system.process(pid) {
+        // Already gone is success, like ESRCH on Unix.
+        None => Ok(()),
+        Some(process) if process.kill() => Ok(()),
+        Some(_) => Err(io::Error::other("could not terminate the ssh process")),
+    }
+}
+
 /// Descendants of `root`, deepest first.
-fn descendants(root: Pid) -> Vec<Pid> {
+fn descendants(root: ProcessId) -> Vec<ProcessId> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
     let mut system = System::new();
     system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
@@ -285,7 +374,7 @@ fn descendants(root: Pid) -> Vec<Pid> {
         }
     }
     let mut found = Vec::new();
-    let mut queue = std::collections::VecDeque::from([u32::try_from(root.as_raw()).unwrap_or(0)]);
+    let mut queue = std::collections::VecDeque::from([raw_pid(root)]);
     while let Some(current) = queue.pop_front() {
         for child in children_of.remove(&current).unwrap_or_default() {
             found.push(child);
@@ -294,16 +383,22 @@ fn descendants(root: Pid) -> Vec<Pid> {
     }
     // Signal children before parents so nothing re-parents mid-cleanup.
     found.reverse();
-    found
-        .into_iter()
-        .filter_map(|pid| i32::try_from(pid).ok())
-        .map(Pid::from_raw)
-        .collect()
+    found.into_iter().map(process_id).collect()
+}
+
+#[cfg(unix)]
+fn raw_pid(pid: ProcessId) -> u32 {
+    u32::try_from(pid.as_raw()).unwrap_or(0)
+}
+
+#[cfg(windows)]
+fn raw_pid(pid: ProcessId) -> u32 {
+    pid
 }
 
 /// Processes (other than us) holding an open descriptor on `pipe`.
 #[cfg(target_os = "linux")]
-fn pipe_holders(pipe: PipeIdentity) -> Vec<Pid> {
+fn pipe_holders(pipe: PipeIdentity) -> Vec<ProcessId> {
     let mut holders = Vec::new();
     let me = std::process::id();
     let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -329,9 +424,7 @@ fn pipe_holders(pipe: PipeIdentity) -> Vec<Pid> {
             };
             use std::os::unix::fs::MetadataExt;
             if stat.dev() == pipe.device && stat.ino() == pipe.inode {
-                if let Ok(raw) = i32::try_from(pid) {
-                    holders.push(Pid::from_raw(raw));
-                }
+                holders.push(process_id(pid));
                 break;
             }
         }
@@ -340,7 +433,7 @@ fn pipe_holders(pipe: PipeIdentity) -> Vec<Pid> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pipe_holders(_pipe: PipeIdentity) -> Vec<Pid> {
+fn pipe_holders(_pipe: PipeIdentity) -> Vec<ProcessId> {
     Vec::new()
 }
 
@@ -447,7 +540,7 @@ mod tests {
     #[test]
     fn runner_seam_returns_credentials() {
         let runner = FakeRunner(Ok(SshOutput {
-            status: status("true"),
+            status: Some(status("true")),
             stdout: b"IDPASSKEY:abcdefghijklmnop/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef".to_vec(),
         }));
         let invocation = invocation("ssh", &[]);
@@ -466,7 +559,7 @@ mod tests {
     #[test]
     fn nonzero_output_is_typed() {
         let runner = FakeRunner(Ok(SshOutput {
-            status: status("false"),
+            status: Some(status("false")),
             stdout: Vec::new(),
         }));
         let invocation = invocation("ssh", &[]);

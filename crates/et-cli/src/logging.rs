@@ -147,12 +147,15 @@ impl Logger {
 }
 
 fn create(path: &Path) -> std::io::Result<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    // Upstream opens log files 0600; Windows has no mode bits.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 /// `<prefix>-<YYYY-MM-DD_HH-MM-SS>.<micros>[_<pid>].log`
@@ -257,6 +260,7 @@ mod tests {
         assert!(!directory.exists());
     }
 
+    #[cfg_attr(windows, ignore = "file mode bits are POSIX-only")]
     #[test]
     fn file_logging_respects_verbosity_and_rollover() {
         let directory = std::env::temp_dir().join(format!("et-log-{}", std::process::id()));

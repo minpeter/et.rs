@@ -1,9 +1,11 @@
 use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
+#[cfg(windows)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 
+#[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags};
 
 use crate::forward_endpoint::{Endpoint, ForwardListener, ForwardStream};
@@ -28,10 +30,27 @@ pub(crate) enum WriteCommand {
     Stop,
 }
 
+/// Signal used to stop listener threads.
+///
+/// On Unix this is the read end of a socket pair so the accept loop can block
+/// in `poll(2)` exactly like upstream's `select()`. Windows cannot poll a
+/// socket pair created this way, so the loop uses a non-blocking accept with
+/// the same 10ms cadence upstream's `select()` timeout provides, driven by a
+/// shared flag.
+#[cfg(unix)]
+pub(crate) type ListenerStop = std::os::unix::net::UnixStream;
+#[cfg(windows)]
+pub(crate) type ListenerStop = Arc<AtomicBool>;
+
+/// Accept cadence for the Windows listener loop, matching the 10ms `select()`
+/// timeout upstream uses for its accept/update loop.
+#[cfg(windows)]
+const ACCEPT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
 pub(crate) fn spawn_listener(
     source: BoundSource,
     commands: mpsc::SyncSender<Command>,
-    stop: UnixStream,
+    stop: ListenerStop,
     next_client_fd: Arc<AtomicI32>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -40,42 +59,60 @@ pub(crate) fn spawn_listener(
             destination,
         } = source;
         loop {
-            let mut descriptors = [
-                PollFd::new(&listener, PollFlags::IN),
-                PollFd::new(&stop, PollFlags::IN),
-            ];
-            if poll(&mut descriptors, None).is_err() {
-                return;
-            }
-            if descriptors[1]
-                .revents()
-                .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
+            #[cfg(unix)]
             {
-                return;
-            }
-            if descriptors[0].revents().contains(PollFlags::IN) {
-                loop {
-                    match listener.accept() {
-                        Ok(stream) => {
-                            let client_fd = next_client_fd.fetch_add(1, Ordering::Relaxed);
-                            if client_fd <= 0
-                                || commands
-                                    .send(Command::Accepted {
-                                        client_fd,
-                                        destination: destination.clone(),
-                                        stream,
-                                    })
-                                    .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                        Err(_) => return,
-                    }
+                let mut descriptors = [
+                    PollFd::new(&listener, PollFlags::IN),
+                    PollFd::new(&stop, PollFlags::IN),
+                ];
+                if poll(&mut descriptors, None).is_err() {
+                    return;
+                }
+                if descriptors[1]
+                    .revents()
+                    .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
+                {
+                    return;
+                }
+                if !descriptors[0].revents().contains(PollFlags::IN) {
+                    continue;
                 }
             }
+            #[cfg(windows)]
+            {
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+            }
+            let mut accepted_any = false;
+            loop {
+                match listener.accept() {
+                    Ok(stream) => {
+                        accepted_any = true;
+                        let client_fd = next_client_fd.fetch_add(1, Ordering::Relaxed);
+                        if client_fd <= 0
+                            || commands
+                                .send(Command::Accepted {
+                                    client_fd,
+                                    destination: destination.clone(),
+                                    stream,
+                                })
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => return,
+                }
+            }
+            #[cfg(windows)]
+            if !accepted_any {
+                thread::sleep(ACCEPT_INTERVAL);
+            }
+            #[cfg(unix)]
+            let _ = accepted_any;
         }
     })
 }

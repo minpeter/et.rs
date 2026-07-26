@@ -19,17 +19,25 @@ workspace = true
 et-cli = { path = "../et-cli" }
 et-core = { path = "../et-core" }
 et-net = { path = "../et-net" }
-et-htm = { path = "../et-htm" }
 et-server = { path = "../et-server" }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29.0"
-nix = { version = "0.31.3", default-features = false, features = ["signal"] }
-prost = "0.13"
+# ConPTY on Windows, forkpty on Unix.
 portable-pty = "0.9.0"
-rustix = { version = "1.1.4", features = ["event", "fs", "process", "time"] }
-signal-hook = "0.3.18"
+prost = "0.13"
 sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
 wait-timeout = "0.2.1"
+
+# The headless multiplexer follows upstream and stays POSIX-only.
+[target.'cfg(unix)'.dependencies]
+et-htm = { path = "../et-htm" }
+nix = { version = "0.31.3", default-features = false, features = ["signal"] }
+rustix = { version = "1.1.4", features = ["event", "fs", "process", "time"] }
+signal-hook = "0.3.18"
+
+[target.'cfg(windows)'.dependencies]
+# Ctrl+C / console shutdown signalling, the Windows analogue of SIGINT/SIGTERM.
+ctrlc = "3.5"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 nix = { version = "0.31.3", default-features = false, features = ["fs", "poll"] }

@@ -1,5 +1,5 @@
+use et_net::local::LocalStream;
 use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
 
 use et_core::packet::Packet;
 use et_core::proto::{TermInit, TerminalBuffer, TerminalInfo, TerminalPacketType};
@@ -11,7 +11,7 @@ const MAX_ENVIRONMENT: usize = 128;
 const MAX_ENV_VALUE: usize = 4096;
 const READ_BUFFER: usize = 16 * 1024;
 
-pub fn read_initial_environment(router: &mut UnixStream) -> Result<Vec<(String, String)>, String> {
+pub fn read_initial_environment(router: &mut LocalStream) -> Result<Vec<(String, String)>, String> {
     let packet = read_local_packet(router)
         .map_err(|error| format!("could not read terminal initialization: {error}"))?;
     if packet.is_encrypted() || packet.header() != TerminalPacketType::TerminalInit as u8 {
@@ -38,7 +38,7 @@ pub fn read_initial_environment(router: &mut UnixStream) -> Result<Vec<(String, 
 }
 
 pub fn read_ready_packet(
-    router: &mut UnixStream,
+    router: &mut LocalStream,
     decoder: &mut LocalPacketDecoder,
 ) -> Result<Option<Packet>, String> {
     let mut buffer = [0u8; READ_BUFFER];
@@ -202,7 +202,7 @@ mod tests {
     }
 
     fn read_environment_packet(packet: Packet) -> Result<Vec<(String, String)>, String> {
-        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let (mut reader, mut writer) = et_net::local::wake_pair().unwrap();
         write_local_packet(&mut writer, &packet).unwrap();
         read_initial_environment(&mut reader)
     }

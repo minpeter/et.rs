@@ -11,6 +11,17 @@ pub struct Credentials {
     pub passkey: String,
 }
 
+/// Shell grammar used for the remote bootstrap command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RemoteShell {
+    /// POSIX shell, as upstream assumes: `printf '%s\n' '<cred>' | 'etterminal'`.
+    #[default]
+    Posix,
+    /// Windows `cmd.exe`, which has no `printf` and no single-quote quoting:
+    /// `echo <cred>| "et.exe" "--verbose=0"`.
+    Cmd,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapRequest {
     pub user: Option<String>,
@@ -22,6 +33,7 @@ pub struct BootstrapRequest {
     pub verbose: u8,
     pub ssh_options: Vec<String>,
     pub term: String,
+    pub remote_shell: RemoteShell,
 }
 
 /// Second bootstrap hop for ET-native jumphosts, mirroring the
@@ -223,11 +235,17 @@ fn remote_command(request: &BootstrapRequest, credentials: &Credentials) -> Stri
         .terminal_path
         .as_deref()
         .filter(|path| !path.is_empty())
-        .unwrap_or("etterminal");
+        .unwrap_or(match request.remote_shell {
+            RemoteShell::Posix => "etterminal",
+            RemoteShell::Cmd => "et.exe",
+        });
     let input = format!(
         "{}/{}_{}",
         credentials.id, credentials.passkey, request.term
     );
+    if request.remote_shell == RemoteShell::Cmd {
+        return cmd_remote_command(request, terminal, &input);
+    }
     let mut command = String::new();
     if request.kill_other_sessions {
         let user = request
@@ -250,6 +268,57 @@ fn remote_command(request: &BootstrapRequest, credentials: &Credentials) -> Stri
     command
 }
 
+/// Build the bootstrap command for a Windows `cmd.exe` remote.
+///
+/// `cmd` has no `printf`, does not understand single quotes, and would treat
+/// `& | < > ^ %` as syntax, so the credential line is validated instead of
+/// escaped: everything in it is ASCII-alphanumeric plus `/`, `_`, `-`, and `.`.
+fn cmd_remote_command(request: &BootstrapRequest, terminal: &str, input: &str) -> String {
+    let mut command = String::new();
+    if request.kill_other_sessions {
+        // Best-effort equivalent of `pkill etterminal -u <user>`.
+        command.push_str("taskkill /F /FI \"USERNAME eq %USERNAME%\" /IM et.exe >nul 2>&1 & ");
+    }
+    // `echo x| y` avoids the trailing space cmd would otherwise include.
+    command.push_str(&format!("echo {input}| {}", cmd_quote(terminal)));
+    // The Windows binary is the single `et.exe`, so the role has to be named
+    // explicitly instead of relying on an `etterminal` argv[0].
+    if !terminal_is_etterminal(terminal) {
+        command.push_str(" terminal");
+    }
+    command.push_str(&format!(
+        " {}",
+        cmd_quote(&format!("--verbose={}", request.verbose))
+    ));
+    if let Some(fifo) = request.server_fifo.as_deref() {
+        command.push_str(&format!(" {}", cmd_quote(&format!("--serverfifo={fifo}"))));
+    }
+    command
+}
+
+/// Whether the remote path already dispatches to the terminal role by name.
+fn terminal_is_etterminal(path: &str) -> bool {
+    let name = path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+    name == "etterminal" || name == "etterminal.exe"
+}
+
+/// Quote one argument for `cmd.exe`.
+fn cmd_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+/// Reject credential material that would not survive a `cmd.exe` `echo`.
+pub fn cmd_safe(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'.' | b'+')
+        })
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -269,6 +338,7 @@ mod tests {
             verbose: 2,
             ssh_options: vec!["Port=2222".into()],
             term: "xterm-256color".into(),
+            remote_shell: RemoteShell::Posix,
         }
     }
 
@@ -349,6 +419,38 @@ mod tests {
             parse_id_passkey(b"IDPASSKEY:abcdefghijklmnop/ABCDEFGHIJKLMNOPQRSTUVWXYZabcde!"),
             Err(ClientError::InvalidPasskey)
         ));
+    }
+
+    #[test]
+    fn cmd_bootstrap_uses_echo_and_double_quotes() {
+        let credentials = Credentials {
+            id: "XXXdefghijklmnop".into(),
+            passkey: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef".into(),
+        };
+        let mut request = request();
+        request.remote_shell = RemoteShell::Cmd;
+        request.terminal_path = None;
+        request.server_fifo = Some("C:\\Users\\me\\router".into());
+        let command = build_invocation(&request, &credentials).args.pop().unwrap();
+        assert_eq!(
+            command,
+            "echo XXXdefghijklmnop/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef_xterm-256color| \"et.exe\" terminal \"--verbose=2\" \"--serverfifo=C:\\Users\\me\\router\""
+        );
+        assert!(!command.contains('\''));
+
+        // A path already named etterminal keeps upstream's argv[0] dispatch.
+        request.terminal_path = Some("C:\\tools\\etterminal.exe".into());
+        let command = build_invocation(&request, &credentials).args.pop().unwrap();
+        assert!(!command.contains(" terminal \""), "{command}");
+    }
+
+    #[test]
+    fn cmd_safe_rejects_shell_metacharacters() {
+        assert!(cmd_safe("XXXabc/DEF_xterm-256color"));
+        assert!(!cmd_safe("bad&echo"));
+        assert!(!cmd_safe("bad|echo"));
+        assert!(!cmd_safe("bad>file"));
+        assert!(!cmd_safe(""));
     }
 
     #[test]

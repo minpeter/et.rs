@@ -6,13 +6,16 @@ use et_net::connection::{ConnError, Connection};
 use prost::Message;
 
 use super::send_command;
-use crate::client_terminal_loop::connection_ended;
+use crate::client_terminal::{connection_ended, RemoteLines};
 
 #[test]
-fn command_exit_suffix_matches_no_exit_flag() {
-    for (no_exit, expected) in [
-        (false, b"printf ok; exit\n".as_slice()),
-        (true, b"printf ok\n".as_slice()),
+fn command_exit_suffix_matches_no_exit_flag_and_remote_shell() {
+    for (lines, no_exit, expected) in [
+        (RemoteLines::Posix, false, b"printf ok; exit\n".as_slice()),
+        (RemoteLines::Posix, true, b"printf ok\n".as_slice()),
+        // cmd.exe needs `&` and CRLF, otherwise the line is never executed.
+        (RemoteLines::Cmd, false, b"printf ok & exit\r\n".as_slice()),
+        (RemoteLines::Cmd, true, b"printf ok\r\n".as_slice()),
     ] {
         let (client_stream, server_stream) = tcp_pair();
         let key = [7u8; KEY_LEN];
@@ -21,7 +24,7 @@ fn command_exit_suffix_matches_no_exit_flag() {
             server.read_packet().unwrap()
         });
         let mut client = Connection::new_client(client_stream, &key);
-        send_command(&mut client, "printf ok", no_exit).unwrap();
+        send_command(&mut client, "printf ok", no_exit, lines).unwrap();
         let packet = worker.join().unwrap();
         assert_eq!(packet.header(), TerminalPacketType::TerminalBuffer as u8);
         assert_eq!(

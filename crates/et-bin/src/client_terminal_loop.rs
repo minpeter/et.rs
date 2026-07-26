@@ -1,34 +1,61 @@
+#[cfg(unix)]
 use std::io::{self, Read};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use et_core::proto::TerminalPacketType;
-use et_net::connection::{ConnError, Connection};
+#[cfg(unix)]
+use et_net::connection::Connection;
+#[cfg(unix)]
 use et_net::forward::{is_forward_packet, Forwarder};
+#[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags};
+#[cfg(unix)]
 use rustix::time::Timespec;
 
+#[cfg(unix)]
 use crate::client_terminal::{
-    display_packet, send_buffer, send_size, terminal_error, terminal_io, terminal_text,
+    connection_ended, display_packet, send_buffer, send_size, terminal_error, terminal_io,
+    terminal_text,
 };
+#[cfg(unix)]
 use crate::error::ClientError;
+#[cfg(unix)]
 use crate::initial_connect::ReconnectOutcome;
 
+#[cfg(unix)]
 const INPUT_CHUNK: usize = 16 * 1024;
+#[cfg(unix)]
 const MISSED_KEEPALIVES: u32 = 3;
 
+/// Loop configuration resolved by [`crate::client_terminal::run`].
+pub(crate) struct PumpOptions {
+    pub(crate) read_stdin: bool,
+    pub(crate) keepalive_seconds: u32,
+    pub(crate) terminal_enabled: bool,
+    pub(crate) auto_cursor_report: bool,
+}
+
+#[cfg(unix)]
 pub fn pump<F>(
     connection: &mut Connection,
     wake: &mut UnixStream,
-    read_stdin: bool,
-    keepalive_seconds: u32,
+    options: PumpOptions,
     forwarder: &Forwarder,
-    terminal_enabled: bool,
     mut reconnect: F,
 ) -> Result<(), ClientError>
 where
     F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
 {
+    let PumpOptions {
+        read_stdin,
+        keepalive_seconds,
+        terminal_enabled,
+        auto_cursor_report,
+    } = options;
     let stdin = io::stdin();
     let interval = Duration::from_secs(u64::from(keepalive_seconds.max(1)));
     let silence = interval.saturating_mul(MISSED_KEEPALIVES);
@@ -91,7 +118,14 @@ where
                 match connection.try_read_packet() {
                     Ok(Some(packet)) => {
                         last_received = Instant::now();
-                        route_server_packet(packet, forwarder, terminal_enabled)?;
+                        if route_server_packet(packet, forwarder, terminal_enabled)?
+                            && auto_cursor_report
+                        {
+                            let _ = send_buffer(
+                                connection,
+                                crate::client_terminal::CURSOR_REPORT_REPLY,
+                            );
+                        }
                     }
                     Ok(None) => break,
                     Err(error) if connection_ended(&error) => {
@@ -167,27 +201,31 @@ where
     }
 }
 
+/// Returns `true` when a cursor position report must be sent back.
+#[cfg(unix)]
 fn route_server_packet(
     packet: et_core::packet::Packet,
     forwarder: &Forwarder,
     terminal_enabled: bool,
-) -> Result<(), ClientError> {
+) -> Result<bool, ClientError> {
     if is_forward_packet(packet.header()) {
         return forwarder
             .receive(packet)
+            .map(|()| false)
             .map_err(|error| terminal_text(error.to_string()));
     }
     if terminal_enabled || packet.header() == TerminalPacketType::KeepAlive as u8 {
         return display_packet(packet);
     }
     if packet.header() == TerminalPacketType::TerminalBuffer as u8 {
-        return Ok(());
+        return Ok(false);
     }
     Err(terminal_text(
         "server sent an unsupported no-terminal packet",
     ))
 }
 
+#[cfg(unix)]
 fn recover<F>(
     connection: &mut Connection,
     reconnect: &mut F,
@@ -209,6 +247,7 @@ where
     }
 }
 
+#[cfg(unix)]
 fn drain(wake: &mut UnixStream) -> Result<(), ClientError> {
     let mut buffer = [0u8; 64];
     loop {
@@ -220,19 +259,4 @@ fn drain(wake: &mut UnixStream) -> Result<(), ClientError> {
             Err(error) => return Err(terminal_io("draining resize wakeup", error)),
         }
     }
-}
-
-pub(crate) fn connection_ended(error: &ConnError) -> bool {
-    matches!(
-        error,
-        ConnError::Io(source)
-            if matches!(
-                source.kind(),
-                io::ErrorKind::UnexpectedEof
-                    | io::ErrorKind::BrokenPipe
-                    | io::ErrorKind::ConnectionAborted
-                    | io::ErrorKind::ConnectionReset
-                    | io::ErrorKind::NotConnected
-            )
-    )
 }

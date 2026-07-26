@@ -1,6 +1,6 @@
+use et_net::local::LocalStream;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -24,7 +24,7 @@ pub struct Runtime {
     router: Option<Router>,
     lifecycle_sender: Option<Sender<LifecycleEvent>>,
     lifecycle_worker: Option<JoinHandle<Result<(), RuntimeError>>>,
-    accept_wakers: Vec<UnixStream>,
+    accept_wakers: Vec<LocalStream>,
     accept_workers: Vec<JoinHandle<Result<(), RuntimeError>>>,
     tcp_addresses: Vec<SocketAddr>,
     router_path: PathBuf,
@@ -78,7 +78,7 @@ impl Runtime {
             router_path: router_name,
         };
         for listener in bound.into_listeners() {
-            let (wake_reader, wake_writer) = match UnixStream::pair() {
+            let (wake_reader, wake_writer) = match et_net::local::wake_pair() {
                 Ok(pair) => pair,
                 Err(source) => {
                     let _ = runtime.shutdown();
@@ -217,7 +217,6 @@ mod tests {
     use std::io::Read;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
     use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -307,8 +306,11 @@ mod tests {
         runtime.shutdown().unwrap();
     }
 
-    fn register(path: &Path, handle: &crate::runtime_handle::RuntimeHandle) -> UnixStream {
-        let mut stream = UnixStream::connect(path).unwrap();
+    fn register(
+        path: &Path,
+        handle: &crate::runtime_handle::RuntimeHandle,
+    ) -> et_net::local::LocalStream {
+        let mut stream = et_net::local::connect(path).unwrap();
         let packet = Packet::new(
             TerminalPacketType::TerminalUserInfo as u8,
             TerminalUserInfo {

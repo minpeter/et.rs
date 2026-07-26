@@ -1,4 +1,6 @@
-use std::io::{self, Write};
+#[cfg(unix)]
+use std::io::Write;
+use std::io::{self};
 
 use et_core::packet::Packet;
 use et_core::proto::{
@@ -250,6 +252,9 @@ impl Worker {
         self.outbound
             .send(Ok(Packet::new(header, message.encode_to_vec())))
             .map_err(|_| ForwardError::Unavailable)?;
+        // Unix consumers poll the wake socket; Windows consumers drain
+        // `try_outbound` on the client loop's 10ms cadence.
+        #[cfg(unix)]
         let _ = self.outbound_wake.write(&[1]);
         Ok(())
     }

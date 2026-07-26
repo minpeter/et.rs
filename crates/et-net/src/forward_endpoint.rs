@@ -1,8 +1,9 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
-use std::os::fd::{AsFd, BorrowedFd};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -13,7 +14,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug)]
 pub(crate) enum Endpoint {
-    Tcp { host: String, port: u16 },
+    Tcp {
+        host: String,
+        port: u16,
+    },
+    /// Unix-socket endpoint. Upstream only forwards these on POSIX systems
+    /// (`PipeSocketHandler` is guarded by `#ifndef WIN32` for chmod and is not
+    /// built into the Windows client), so they are Unix-only here as well.
+    #[cfg(unix)]
     Unix(PathBuf),
 }
 
@@ -42,7 +50,13 @@ impl Endpoint {
                 })
             }
             None => match name {
+                #[cfg(unix)]
                 Some(name) if name.starts_with('/') => Ok(Self::Unix(PathBuf::from(name))),
+                #[cfg(windows)]
+                Some(name) if name.starts_with('/') => Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Unix-socket tunnels are not supported on Windows",
+                )),
                 _ => Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "Unix endpoint path must be absolute",
@@ -85,7 +99,18 @@ impl Endpoint {
                             "Unix endpoint path must be absolute",
                         )
                     })?;
-                Ok(Self::Unix(PathBuf::from(name)))
+                #[cfg(unix)]
+                {
+                    Ok(Self::Unix(PathBuf::from(name)))
+                }
+                #[cfg(windows)]
+                {
+                    let _ = name;
+                    Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "Unix-socket tunnels are not supported on Windows",
+                    ))
+                }
             }
         }
     }
@@ -118,6 +143,7 @@ impl Endpoint {
                     io::Error::new(io::ErrorKind::AddrNotAvailable, "endpoint did not resolve")
                 }))
             }
+            #[cfg(unix)]
             Self::Unix(path) => UnixStream::connect(path).map(ForwardStream::Unix),
         }
     }
@@ -161,6 +187,7 @@ impl Endpoint {
                 }
                 Ok(listeners)
             }
+            #[cfg(unix)]
             Self::Unix(path) => {
                 if path.exists() {
                     return Err(io::Error::new(
@@ -214,6 +241,7 @@ fn bind_tcp_single_family(address: std::net::SocketAddr) -> io::Result<TcpListen
 
 pub(crate) enum ForwardStream {
     Tcp(TcpStream),
+    #[cfg(unix)]
     Unix(UnixStream),
 }
 
@@ -221,6 +249,7 @@ impl ForwardStream {
     pub(crate) fn try_clone(&self) -> io::Result<Self> {
         match self {
             Self::Tcp(stream) => stream.try_clone().map(Self::Tcp),
+            #[cfg(unix)]
             Self::Unix(stream) => stream.try_clone().map(Self::Unix),
         }
     }
@@ -228,6 +257,7 @@ impl ForwardStream {
     pub(crate) fn shutdown(&self) {
         let _ = match self {
             Self::Tcp(stream) => stream.shutdown(Shutdown::Both),
+            #[cfg(unix)]
             Self::Unix(stream) => stream.shutdown(Shutdown::Both),
         };
     }
@@ -237,6 +267,7 @@ impl Read for ForwardStream {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Tcp(stream) => stream.read(buffer),
+            #[cfg(unix)]
             Self::Unix(stream) => stream.read(buffer),
         }
     }
@@ -246,6 +277,7 @@ impl Write for ForwardStream {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         match self {
             Self::Tcp(stream) => stream.write(buffer),
+            #[cfg(unix)]
             Self::Unix(stream) => stream.write(buffer),
         }
     }
@@ -253,6 +285,7 @@ impl Write for ForwardStream {
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Tcp(stream) => stream.flush(),
+            #[cfg(unix)]
             Self::Unix(stream) => stream.flush(),
         }
     }
@@ -260,6 +293,7 @@ impl Write for ForwardStream {
 
 enum ListenerKind {
     Tcp(TcpListener),
+    #[cfg(unix)]
     Unix(UnixListener),
 }
 
@@ -272,6 +306,7 @@ pub(crate) struct ForwardListener {
 impl ForwardListener {
     /// Also remove this directory when the listener is dropped (used for the
     /// private named-pipe directories created for environment forwards).
+    #[cfg(unix)]
     pub(crate) fn also_remove_dir(&mut self, directory: PathBuf) {
         self.cleanup_dir = Some(directory);
     }
@@ -282,6 +317,7 @@ impl ForwardListener {
                 let _ = stream.set_nonblocking(false);
                 ForwardStream::Tcp(stream)
             }),
+            #[cfg(unix)]
             ListenerKind::Unix(listener) => listener.accept().map(|(stream, _)| {
                 let _ = stream.set_nonblocking(false);
                 ForwardStream::Unix(stream)
@@ -291,8 +327,9 @@ impl ForwardListener {
     }
 }
 
-impl AsFd for ForwardListener {
-    fn as_fd(&self) -> BorrowedFd<'_> {
+#[cfg(unix)]
+impl std::os::fd::AsFd for ForwardListener {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         match &self.inner {
             ListenerKind::Tcp(listener) => listener.as_fd(),
             ListenerKind::Unix(listener) => listener.as_fd(),

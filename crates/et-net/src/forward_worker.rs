@@ -1,5 +1,8 @@
 use std::collections::HashMap;
-use std::io::{self, Write};
+#[cfg(unix)]
+use std::io::Write;
+use std::io::{self};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::AtomicI32;
 use std::sync::{mpsc, Arc};
@@ -8,7 +11,8 @@ use std::thread::JoinHandle;
 use crate::forward::{ForwardError, Outbound};
 use crate::forward_endpoint::ForwardStream;
 use crate::forward_io::{
-    spawn_connector, spawn_io, spawn_listener, stop_io, ActiveIo, BoundSource, WriteCommand,
+    spawn_connector, spawn_io, spawn_listener, stop_io, ActiveIo, BoundSource, ListenerStop,
+    WriteCommand,
 };
 use et_core::packet::Packet;
 use et_core::proto::SocketEndpoint;
@@ -56,17 +60,22 @@ pub(crate) fn run(
     commands: mpsc::Receiver<Command>,
     command_sender: mpsc::SyncSender<Command>,
     outbound: mpsc::SyncSender<Outbound>,
-    mut outbound_wake: UnixStream,
-    listener_stop: UnixStream,
+    #[cfg(unix)] mut outbound_wake: UnixStream,
+    listener_stop: ListenerStop,
 ) {
+    #[cfg(unix)]
     let result = Worker::new(
         command_sender,
         outbound.clone(),
         outbound_wake.try_clone().ok(),
     )
     .and_then(|mut worker| worker.run(sources, commands, listener_stop));
+    #[cfg(windows)]
+    let result = Worker::new(command_sender, outbound.clone())
+        .and_then(|mut worker| worker.run(sources, commands, listener_stop));
     if let Err(error) = result {
         let _ = outbound.send(Err(error));
+        #[cfg(unix)]
         let _ = outbound_wake.write(&[1]);
     }
 }
@@ -74,6 +83,7 @@ pub(crate) fn run(
 struct Worker {
     commands: mpsc::SyncSender<Command>,
     outbound: mpsc::SyncSender<Outbound>,
+    #[cfg(unix)]
     outbound_wake: UnixStream,
     pending: HashMap<i32, ForwardStream>,
     sources: HashMap<i32, ActiveIo>,
@@ -86,15 +96,18 @@ impl Worker {
     fn new(
         commands: mpsc::SyncSender<Command>,
         outbound: mpsc::SyncSender<Outbound>,
-        outbound_wake: Option<UnixStream>,
+        #[cfg(unix)] outbound_wake: Option<UnixStream>,
     ) -> Result<Self, ForwardError> {
-        let outbound_wake = outbound_wake.ok_or(ForwardError::Unavailable)?;
-        outbound_wake
-            .set_nonblocking(true)
-            .map_err(ForwardError::Io)?;
+        #[cfg(unix)]
+        let outbound_wake = {
+            let wake = outbound_wake.ok_or(ForwardError::Unavailable)?;
+            wake.set_nonblocking(true).map_err(ForwardError::Io)?;
+            wake
+        };
         Ok(Self {
             commands,
             outbound,
+            #[cfg(unix)]
             outbound_wake,
             pending: HashMap::new(),
             sources: HashMap::new(),
@@ -108,14 +121,18 @@ impl Worker {
         &mut self,
         sources: Vec<BoundSource>,
         commands: mpsc::Receiver<Command>,
-        listener_stop: UnixStream,
+        listener_stop: ListenerStop,
     ) -> Result<(), ForwardError> {
         let next_client_fd = Arc::new(AtomicI32::new(1));
         for source in sources {
+            #[cfg(unix)]
+            let stop = listener_stop.try_clone().map_err(ForwardError::Io)?;
+            #[cfg(windows)]
+            let stop = listener_stop.clone();
             self.threads.push(spawn_listener(
                 source,
                 self.commands.clone(),
-                listener_stop.try_clone().map_err(ForwardError::Io)?,
+                stop,
                 next_client_fd.clone(),
             ));
         }
@@ -160,7 +177,10 @@ impl Worker {
             }
         };
         drop(commands);
+        #[cfg(unix)]
         let _ = listener_stop.shutdown(std::net::Shutdown::Both);
+        #[cfg(windows)]
+        listener_stop.store(true, std::sync::atomic::Ordering::Release);
         for (_, stream) in self.pending.drain() {
             stream.shutdown();
         }

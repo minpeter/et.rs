@@ -139,3 +139,30 @@ jobs:
             --clobber
         env:
           GH_TOKEN: ${{ github.token }}
+
+  homebrew:
+    needs: [release, binaries]
+    if: needs.release.outputs.tag != ''
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: minpeter/homebrew-tap
+          ssh-key: ${{ secrets.TAP_DEPLOY_KEY }}
+          path: homebrew-tap
+
+      - name: Update formula
+        run: |
+          version="${TAG#et@}"
+          ./scripts/generate-formula.sh "$version" > homebrew-tap/Formula/et-rs.rb
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/et-rs.rb
+          git diff --cached --quiet && { echo "formula unchanged"; exit 0; }
+          git commit -m "et-rs ${version}"
+          git push origin HEAD:main

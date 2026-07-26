@@ -40,13 +40,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            # Full suite, including the PTY-heavy e2e harnesses.
-            scope: ""
-          # The PTY/process e2e harnesses fail in the macOS runner sandbox
-          # (issue #4); run unit tests only until investigated on real
-          # macOS hardware.
           - os: macos-latest
-            scope: "--lib --bins"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -61,7 +55,7 @@ jobs:
 
       # The PTY-heavy end-to-end tests are timing-sensitive on shared
       # 2-core runners; run tests sequentially for stability.
-      - run: cargo test --workspace ${{ matrix.scope }} -- --test-threads=1
+      - run: cargo test --workspace -- --test-threads=1
 
   # Windows build is release-critical; the test harnesses are POSIX-only,
   # so compile the shipped binary crate (like the release pipeline) and

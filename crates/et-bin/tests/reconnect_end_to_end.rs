@@ -33,7 +33,8 @@ fn real_client_recovers_same_shell_and_once_only_buffered_output() {
         "before=$(stty -g); {} --terminal-path {} --serverfifo {} \
          --keepalive=1 -p {} 127.0.0.1; code=$?; after=$(stty -g); restored=no; \
          [ \"$before\" = \"$after\" ] && restored=yes; \
-         printf '\\nRECONNECT-TERMIOS:%s:CODE:%s\\n' \"$restored\" \"$code\"; exit \"$code\"",
+         printf '\\nRECONNECT-TERMIOS:%s:CODE:%s:BEFORE:%s:AFTER:%s\\n' \
+         \"$restored\" \"$code\" \"$before\" \"$after\"; exit \"$code\"",
         shell_quote(env!("CARGO_BIN_EXE_et")),
         shell_quote(stack.terminal.to_str().unwrap()),
         shell_quote(stack.router.to_str().unwrap()),
@@ -51,6 +52,8 @@ fn real_client_recovers_same_shell_and_once_only_buffered_output() {
     );
     client.env("TERM", "xterm-256color");
     client.env("ET_SSH_COUNT", &stack.ssh_count);
+    let client_ready = stack.directory.join("client-ready");
+    client.env("ET_SSH_READY", &client_ready);
     let mut child = pair.slave.spawn_command(client).unwrap();
     drop(pair.slave);
     let mut writer = pair.master.take_writer().unwrap();
@@ -75,6 +78,7 @@ fn real_client_recovers_same_shell_and_once_only_buffered_output() {
     mkfifo(&ready);
     mkfifo(&second_gate);
     mkfifo(&second_ready);
+    wait_for_file(&client_ready, b"ready");
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let ready_reader = ready.clone();
     std::thread::spawn(move || {
@@ -146,18 +150,54 @@ fn real_client_recovers_same_shell_and_once_only_buffered_output() {
     let status = child.wait().unwrap();
     let text = String::from_utf8_lossy(&output);
     let errors: Vec<_> = text.lines().filter(|line| line.contains("et:")).collect();
-    assert!(status.success(), "status={status:?} errors={errors:?}");
+    assert!(
+        status.success(),
+        "status={status:?} errors={errors:?} output={text}"
+    );
     let after_pid = marker_number(&output, b"AFTER-PID:");
     assert_eq!(before_pid, after_pid);
     assert!(output.windows(11).any(|window| window == b"SIZE:44 111"));
     assert_eq!(count(&output, b"BUFFERED-ONCE\r\n"), 1);
     assert_eq!(count(&output, b"BUFFERED-TWICE\r\n"), 1);
-    assert!(output
-        .windows(b"RECONNECT-TERMIOS:yes:CODE:0".len())
-        .any(|window| window == b"RECONNECT-TERMIOS:yes:CODE:0"));
+    assert!(text.contains("RECONNECT-TERMIOS:"), "output={text}");
+    assert!(text.contains(":CODE:0:"), "output={text}");
+    assert!(termios_restored(&text), "output={text}");
     assert_eq!(fs::read_to_string(&stack.ssh_count).unwrap(), "x");
     proxy.join();
     stack.shutdown();
+}
+
+fn termios_restored(output: &str) -> bool {
+    let Some((before, after)) = output
+        .split_once(":BEFORE:")
+        .and_then(|(_, modes)| modes.split_once(":AFTER:"))
+    else {
+        return false;
+    };
+    let after = after.trim_end_matches(['\r', '\n']);
+    if before == after {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        before
+            .split(':')
+            .zip(after.split(':'))
+            .all(|(left, right)| {
+                if let (Some(left), Some(right)) =
+                    (left.strip_prefix("lflag="), right.strip_prefix("lflag="))
+                {
+                    let left = u32::from_str_radix(left, 16).ok();
+                    let right = u32::from_str_radix(right, 16).ok();
+                    return left
+                        .zip(right)
+                        .is_some_and(|(left, right)| left & !0x2000_0000 == right & !0x2000_0000);
+                }
+                left == right
+            })
+    }
+    #[cfg(not(target_os = "macos"))]
+    false
 }
 
 fn receive_until(
@@ -166,7 +206,13 @@ fn receive_until(
     marker: &[u8],
 ) -> Vec<u8> {
     while !output.windows(marker.len()).any(|window| window == marker) {
-        output.extend(receiver.recv_timeout(TIMEOUT).unwrap());
+        output.extend(receiver.recv_timeout(TIMEOUT).unwrap_or_else(|error| {
+            panic!(
+                "timed out waiting for {}: {error}; output={}",
+                String::from_utf8_lossy(marker),
+                String::from_utf8_lossy(&output)
+            )
+        }));
     }
     output
 }
@@ -196,7 +242,13 @@ fn receive_number(
         if let Some(value) = marker_number_optional(&output, marker) {
             return (output, value);
         }
-        output.extend(receiver.recv_timeout(TIMEOUT).unwrap());
+        output.extend(receiver.recv_timeout(TIMEOUT).unwrap_or_else(|error| {
+            panic!(
+                "timed out waiting for {}: {error}; output={}",
+                String::from_utf8_lossy(marker),
+                String::from_utf8_lossy(&output)
+            )
+        }));
     }
 }
 
@@ -228,4 +280,19 @@ fn write_fifo(path: std::path::PathBuf, value: &'static str) {
         let _ = sender.send(fs::write(path, value));
     });
     receiver.recv_timeout(TIMEOUT).unwrap().unwrap();
+}
+
+fn wait_for_file(path: &std::path::Path, expected: &[u8]) {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if fs::read(path).is_ok_and(|contents| contents == expected) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }

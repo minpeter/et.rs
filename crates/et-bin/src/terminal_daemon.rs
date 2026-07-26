@@ -37,7 +37,9 @@ pub fn spawn_with_args(
 ) -> Result<(), String> {
     let readiness = Readiness::bind()?;
     let executable = std::env::current_exe()
-        .map_err(|error| format!("could not locate et executable: {error}"))?;
+        .map_err(|error| format!("could not locate et executable: {error}"))?
+        .canonicalize()
+        .map_err(|error| format!("could not resolve et executable: {error}"))?;
     let mut child = Command::new(executable);
     child
         .args([

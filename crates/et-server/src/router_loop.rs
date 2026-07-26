@@ -8,6 +8,8 @@ use et_core::packet::Packet;
 use et_net::local_packet::LocalPacketDecoder;
 #[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags};
+#[cfg(unix)]
+use rustix::net::{recv, RecvFlags};
 
 use crate::registry::{RegistrationIdentity, Registry};
 use crate::router::{RouterError, RouterEvent, RouterReject};
@@ -59,6 +61,8 @@ fn run_poll(
 ) -> Result<(), RouterError> {
     let mut pending = Vec::<PendingConnection>::new();
     let mut watched = Vec::<WatchedRegistration>::new();
+    let idle = rustix::time::Timespec::try_from(std::time::Duration::from_millis(100))
+        .expect("100ms fits in timespec");
     loop {
         let pending_start = 2;
         let watched_start = pending_start + pending.len();
@@ -77,7 +81,7 @@ fn run_poll(
                 PollFlags::HUP | PollFlags::ERR,
             ));
         }
-        match poll(&mut poll_fds, None) {
+        match poll(&mut poll_fds, Some(&idle)) {
             Ok(_) => {}
             Err(error) if error == rustix::io::Errno::INTR => continue,
             Err(error) => return Err(RouterError::Io(io::Error::from(error))),
@@ -93,8 +97,23 @@ fn run_poll(
                 return Ok(());
             }
         }
+        let mut watched_readiness = readiness[watched_start..].to_vec();
+        for (flags, registration) in watched_readiness.iter_mut().zip(&watched) {
+            let mut probe = [0u8; 1];
+            match recv(
+                &registration.stream,
+                &mut probe,
+                RecvFlags::PEEK | RecvFlags::DONTWAIT,
+            ) {
+                Ok((_, 0)) => *flags |= PollFlags::HUP,
+                Ok(_) => {}
+                Err(error) if error == rustix::io::Errno::AGAIN => {}
+                Err(error) if error == rustix::io::Errno::INTR => {}
+                Err(_) => *flags |= PollFlags::ERR,
+            }
+        }
         disconnect_ready(
-            &readiness[watched_start..],
+            &watched_readiness,
             &mut watched,
             &registry,
             &events,
@@ -124,6 +143,10 @@ fn run_poll(
                     match router_registration::process(packet, connection.stream, &registry) {
                         Ok(terminal) => {
                             let id = terminal.identity.id().to_owned();
+                            terminal
+                                .watcher
+                                .set_nonblocking(true)
+                                .map_err(RouterError::Io)?;
                             watched.push(WatchedRegistration {
                                 stream: terminal.watcher,
                                 identity: terminal.identity,

@@ -36,7 +36,8 @@ fn real_tty_restores_termios_and_propagates_resize() {
          -p {} -c \"printf 'TTY-G004\\\\n'; stty size\" 127.0.0.1; \
          code=$?; after=$(stty -g); restored=no; \
          [ \"$before\" = \"$after\" ] && restored=yes; \
-         printf '\\nTERMIOS-RESTORED:%s:CODE:%s\\n' \"$restored\" \"$code\"",
+         printf '\\nTERMIOS-RESTORED:%s:CODE:%s:BEFORE:%s:AFTER:%s\\n' \
+         \"$restored\" \"$code\" \"$before\" \"$after\"",
         stack.port
     );
     let mut shell = CommandBuilder::new("/bin/sh");
@@ -63,7 +64,45 @@ fn real_tty_restores_termios_and_propagates_resize() {
     assert!(status.success(), "status={status:?} output={output:?}");
     assert!(output.contains("TTY-G004"), "{output:?}");
     assert!(output.contains("30 90"), "{output:?}");
-    assert!(output.contains("TERMIOS-RESTORED:yes:CODE:0"), "{output:?}");
+    assert!(output.contains("TERMIOS-RESTORED:"), "{output:?}");
+    assert!(output.contains(":CODE:0:"), "{output:?}");
+    assert!(termios_restored(&output), "{output:?}");
+}
+
+fn termios_restored(output: &str) -> bool {
+    let Some((before, after)) = output
+        .split_once(":BEFORE:")
+        .and_then(|(_, modes)| modes.split_once(":AFTER:"))
+    else {
+        return false;
+    };
+    let after = after.trim_end_matches(['\r', '\n']);
+    if before == after {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // PENDIN is a kernel-maintained state bit, not a terminal setting.
+        // Darwin may set it while returning from raw mode so queued input is
+        // retyped on the next read.
+        before
+            .split(':')
+            .zip(after.split(':'))
+            .all(|(left, right)| {
+                if let (Some(left), Some(right)) =
+                    (left.strip_prefix("lflag="), right.strip_prefix("lflag="))
+                {
+                    let left = u32::from_str_radix(left, 16).ok();
+                    let right = u32::from_str_radix(right, 16).ok();
+                    return left
+                        .zip(right)
+                        .is_some_and(|(left, right)| left & !0x2000_0000 == right & !0x2000_0000);
+                }
+                left == right
+            })
+    }
+    #[cfg(not(target_os = "macos"))]
+    false
 }
 
 #[test]

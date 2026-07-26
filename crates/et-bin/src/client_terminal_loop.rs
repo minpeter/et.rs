@@ -162,8 +162,7 @@ where
                         pending_forward = forwarder
                             .try_receive(packet)
                             .map_err(|error| terminal_text(error.to_string()))?;
-                    } else if route_server_packet(packet, terminal_enabled)? && auto_cursor_report
-                    {
+                    } else if route_server_packet(packet, terminal_enabled)? && auto_cursor_report {
                         let _ =
                             send_buffer(connection, crate::client_terminal::CURSOR_REPORT_REPLY);
                     }

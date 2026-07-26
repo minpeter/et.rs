@@ -122,8 +122,7 @@ fn run_mode_poll(
                         write_local_packet(&mut terminal, &packet).map_err(SessionError::Io)?;
                     }
                     Ok(Some(packet)) if is_forward_packet(packet.header()) => {
-                        pending_forward =
-                            forwarder.try_receive(packet).map_err(forward_error)?;
+                        pending_forward = forwarder.try_receive(packet).map_err(forward_error)?;
                     }
                     Ok(Some(packet)) => forward_client_packet(&session, &mut terminal, packet)?,
                     Ok(None) => break,
@@ -321,9 +320,7 @@ fn wait(
         PollFlags::IN | PollFlags::HUP | PollFlags::ERR
     };
     let timeout = if forward_blocked {
-        Some(
-            Timespec::try_from(std::time::Duration::from_millis(10)).expect("10ms fits timespec"),
-        )
+        Some(Timespec::try_from(std::time::Duration::from_millis(10)).expect("10ms fits timespec"))
     } else {
         None
     };

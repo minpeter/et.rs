@@ -159,6 +159,23 @@ fn write_message(f: &mut std::fmt::Formatter<'_>, message: &Option<String>) -> s
 }
 
 impl ClientError {
+    /// Errors that mean the network is temporarily unreachable (e.g. a
+    /// laptop waking from sleep before Wi-Fi is back, a DNS outage, a
+    /// half-restored link). A live session should retry the reconnect
+    /// instead of exiting, mirroring upstream ET.
+    pub fn is_transient_reconnect(&self) -> bool {
+        matches!(
+            self,
+            Self::DnsTimeout(_)
+                | Self::DnsWorker(_)
+                | Self::DnsWorkerPanicked
+                | Self::UnreachableEndpoint { .. }
+                | Self::BootstrapTimeout(_)
+                | Self::ConnectIo { .. }
+                | Self::Transport(ConnError::Io(_))
+        )
+    }
+
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Unsupported(_) | Self::ForwardConfig(_) => 2,

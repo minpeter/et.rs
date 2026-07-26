@@ -240,6 +240,22 @@ pub(crate) fn send_size(connection: &mut Connection) -> Result<(), ClientError> 
         .map_err(terminal_error)
 }
 
+/// Reset sequences for terminal modes a remote application may have enabled
+/// in the local emulator. The session can end while the remote side has no
+/// chance to restore them (connection lost, reconnect given up), which
+/// otherwise leaves the shell prompt receiving kitty keyboard reports
+/// (`CSI … u`, seen as garbage like `2618;9u`), mouse reports, or bracketed
+/// paste markers as literal text. Terminals ignore sequences they do not
+/// support, and every reset is a no-op when the mode is already off.
+///
+/// In order: pop and zero the kitty keyboard flags on the current (possibly
+/// alternate) screen, leave the alternate screen, pop and zero the kitty
+/// flags again on the main screen (the stacks are per-screen), disable
+/// xterm modifyOtherKeys, bracketed paste, focus reporting and all mouse
+/// modes, and show the cursor.
+const TERMINAL_MODE_RESET: &[u8] = b"\x1b[<64u\x1b[=0;1u\x1b[?1049l\x1b[<64u\x1b[=0;1u\
+\x1b[>4;0m\x1b[?2004l\x1b[?1004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h";
+
 struct RawMode {
     enabled: bool,
 }
@@ -257,6 +273,9 @@ impl RawMode {
 impl Drop for RawMode {
     fn drop(&mut self) {
         if self.enabled {
+            let mut stdout = io::stdout().lock();
+            let _ = stdout.write_all(TERMINAL_MODE_RESET);
+            let _ = stdout.flush();
             let _ = disable_raw_mode();
         }
     }

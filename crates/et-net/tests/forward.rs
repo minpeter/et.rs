@@ -3,10 +3,14 @@
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use et_core::proto::{PortForwardSourceRequest, SocketEndpoint};
+use et_core::packet::Packet;
+use et_core::proto::{
+    PortForwardDestinationRequest, PortForwardSourceRequest, SocketEndpoint, TerminalPacketType,
+};
 use et_net::forward::Forwarder;
+use prost::Message;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -68,6 +72,75 @@ fn refused_destination_closes_the_accepted_source() {
     assert_eq!(application.read(&mut byte).unwrap(), 0);
     source.shutdown().unwrap();
     destination.shutdown().unwrap();
+}
+
+/// Regression test for the forwarder deadlock cycle: the worker can block
+/// emitting outbound packets, which only the session loop drains, while a
+/// blocking `receive` would leave the session loop stuck handing the worker
+/// its next packet — wedging the session permanently. `try_receive` must
+/// report a full worker instead of blocking, and draining outbound packets
+/// (the session loop's next step) must make the held packet deliverable.
+#[test]
+fn try_receive_reports_backpressure_and_outbound_drain_recovers() {
+    let forwarder = Forwarder::start(Vec::new()).unwrap();
+    // Every destination request with an unparseable destination (port 0)
+    // makes the worker emit exactly one error response. Nothing drains the
+    // outbound queue yet, so the worker eventually blocks emitting and the
+    // command queue fills — the exact state that used to deadlock.
+    let request = |fd: i32| {
+        Packet::new(
+            TerminalPacketType::PortForwardDestinationRequest as u8,
+            PortForwardDestinationRequest {
+                destination: Some(SocketEndpoint {
+                    name: None,
+                    port: Some(0),
+                }),
+                fd: Some(fd),
+            }
+            .encode_to_vec(),
+        )
+    };
+    let mut delivered: usize = 0;
+    let mut held = None;
+    for fd in 1..=4096 {
+        match forwarder.try_receive(request(fd)).unwrap() {
+            None => delivered += 1,
+            Some(packet) => {
+                held = Some(packet);
+                break;
+            }
+        }
+    }
+    // With a blocking send this loop would never return once both queues
+    // filled; try_receive must surface the backpressure instead.
+    let held = held.expect("the worker queues never filled");
+
+    // Mirror the session loops: drain outbound, retry the held packet.
+    let deadline = Instant::now() + TIMEOUT;
+    let mut outbound: usize = 0;
+    let mut held = Some(held);
+    while let Some(packet) = held.take() {
+        assert!(
+            Instant::now() < deadline,
+            "held packet was never accepted after draining outbound"
+        );
+        while forwarder.try_outbound().unwrap().is_some() {
+            outbound += 1;
+        }
+        held = forwarder.try_receive(packet).unwrap();
+        if held.is_some() {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    delivered += 1;
+
+    // Every delivered request produces exactly one response; drain the rest
+    // so the worker is idle before shutting down.
+    while outbound < delivered {
+        forwarder.wait_outbound(TIMEOUT).unwrap();
+        outbound += 1;
+    }
+    forwarder.shutdown().unwrap();
 }
 
 fn reserve_port() -> u16 {

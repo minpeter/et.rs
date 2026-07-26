@@ -62,6 +62,10 @@ where
     let mut last_received = Instant::now();
     let mut next_keepalive = last_received + interval;
     let mut stream = connection.try_clone_stream().map_err(terminal_error)?;
+    // A forwarding packet the worker had no room for. While it is held, no
+    // further session packets are read (ordering) and the network fd is not
+    // watched for readability (a readable socket would busy-loop the poll).
+    let mut pending_forward: Option<et_core::packet::Packet> = None;
     let forward_wake = forwarder
         .wake()
         .map_err(|error| terminal_text(error.to_string()))?;
@@ -71,10 +75,23 @@ where
         let _ = std::fs::write(path, b"ready");
     }
     loop {
+        // Retry a held forwarding packet first: draining the forwarder's
+        // outbound queue below is what frees worker capacity, so this makes
+        // progress every iteration instead of deadlocking on a blocking send.
+        if let Some(packet) = pending_forward.take() {
+            pending_forward = forwarder
+                .try_receive(packet)
+                .map_err(|error| terminal_text(error.to_string()))?;
+        }
+        let network_flags = if pending_forward.is_none() {
+            PollFlags::IN | PollFlags::HUP | PollFlags::ERR
+        } else {
+            PollFlags::HUP | PollFlags::ERR
+        };
         let deadline = next_keepalive.min(last_received + silence);
         let (network, resize, forwarding, input) = {
             let mut descriptors = vec![
-                PollFd::new(&stream, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
+                PollFd::new(&stream, network_flags),
                 PollFd::new(&*wake, PollFlags::IN | PollFlags::HUP),
                 PollFd::new(forward_wake, PollFlags::IN | PollFlags::HUP),
             ];
@@ -90,7 +107,14 @@ where
             // cap also lets the nonblocking read below detect closed sockets
             // when Darwin omits the expected readiness bit.
             loop {
-                let poll_deadline = deadline.min(Instant::now() + Duration::from_millis(100));
+                // Cap at 10ms while a forwarding packet is held so the retry
+                // above runs even when nothing else becomes ready.
+                let poll_cap = if pending_forward.is_some() {
+                    Duration::from_millis(10)
+                } else {
+                    Duration::from_millis(100)
+                };
+                let poll_deadline = deadline.min(Instant::now() + poll_cap);
                 let timeout =
                     Timespec::try_from(poll_deadline.saturating_duration_since(Instant::now()))
                         .map_err(|_| terminal_text("keepalive deadline exceeds poll range"))?;
@@ -130,13 +154,15 @@ where
                 Err(error) => return Err(error),
             }
         }
-        loop {
+        while pending_forward.is_none() {
             match connection.try_read_packet() {
                 Ok(Some(packet)) => {
                     last_received = Instant::now();
-                    if route_server_packet(packet, forwarder, terminal_enabled)?
-                        && auto_cursor_report
-                    {
+                    if is_forward_packet(packet.header()) {
+                        pending_forward = forwarder
+                            .try_receive(packet)
+                            .map_err(|error| terminal_text(error.to_string()))?;
+                    } else if route_server_packet(packet, terminal_enabled)? && auto_cursor_report {
                         let _ =
                             send_buffer(connection, crate::client_terminal::CURSOR_REPORT_REPLY);
                     }
@@ -218,15 +244,8 @@ where
 #[cfg(unix)]
 fn route_server_packet(
     packet: et_core::packet::Packet,
-    forwarder: &Forwarder,
     terminal_enabled: bool,
 ) -> Result<bool, ClientError> {
-    if is_forward_packet(packet.header()) {
-        return forwarder
-            .receive(packet)
-            .map(|()| false)
-            .map_err(|error| terminal_text(error.to_string()));
-    }
     if terminal_enabled || packet.header() == TerminalPacketType::KeepAlive as u8 {
         return display_packet(packet);
     }

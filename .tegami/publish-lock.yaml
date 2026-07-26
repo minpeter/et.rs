@@ -1,0 +1,9 @@
+core:changelogs:
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Initial release\n\nFirst automated release of et.rs: a single telemetry-free EternalTerminal binary (Rust port).\n\nOne binary serves every role: `et` (client), `etserver`, `etterminal`, `htm`, `htmd`.\n"
+    filename: initial-release.md
+    v: 0.0.0
+core:packages:
+  - changelogIds:
+      - initial-release.md
+    id: cargo:et
+    updated: true

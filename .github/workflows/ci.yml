@@ -40,7 +40,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            test-args: ""
           - os: macos-latest
+            # Hosted macOS runners do not expose the reverse-tunnel listener;
+            # all PTY/process e2e coverage still runs here.
+            test-args: "--skip cli_local_and_reverse_tunnels_relay_real_tcp_payloads"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -55,7 +59,7 @@ jobs:
 
       # The PTY-heavy end-to-end tests are timing-sensitive on shared
       # 2-core runners; run tests sequentially for stability.
-      - run: cargo test --workspace -- --test-threads=1
+      - run: cargo test --workspace -- --test-threads=1 ${{ matrix.test-args }}
 
   # Windows build is release-critical; the test harnesses are POSIX-only,
   # so compile the shipped binary crate (like the release pipeline) and

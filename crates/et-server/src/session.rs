@@ -95,8 +95,12 @@ impl ActiveSession {
         candidate
             .authenticate_peer(DEFAULT_RECOVERY_TIMEOUT)
             .map_err(SessionError::Connection)?;
+        // The proof keep-alive carries a delivery acknowledgement so an
+        // et.rs client trims its replay backup right after recovery; legacy
+        // clients ignore the payload.
+        let ack = candidate.keepalive_ack();
         candidate
-            .write_packet(TerminalPacketType::KeepAlive as u8, &[])
+            .write_packet(TerminalPacketType::KeepAlive as u8, &ack)
             .map_err(SessionError::Connection)?;
         let new_control = candidate
             .try_clone_stream()
@@ -163,6 +167,26 @@ impl ActiveSession {
             .lock()
             .map_err(|_| SessionError::Unavailable)?
             .connected())
+    }
+
+    /// Apply a client delivery acknowledgement to the replay backup.
+    pub(crate) fn acknowledge_delivery(&self, sequence: i64) -> Result<(), SessionError> {
+        self.connection
+            .lock()
+            .map_err(|_| SessionError::Unavailable)?
+            .acknowledge_delivery(sequence);
+        Ok(())
+    }
+
+    /// Keep-alive payload acknowledging everything read from the client.
+    pub(crate) fn keepalive_ack(
+        &self,
+    ) -> Result<[u8; et_core::keepalive::ACK_PAYLOAD_LEN], SessionError> {
+        Ok(self
+            .connection
+            .lock()
+            .map_err(|_| SessionError::Unavailable)?
+            .keepalive_ack())
     }
 
     pub(crate) fn can_buffer_write(&self, bytes: i64) -> Result<bool, SessionError> {

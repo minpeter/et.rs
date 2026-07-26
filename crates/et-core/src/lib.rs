@@ -10,6 +10,7 @@ pub mod backed_reader;
 pub mod backed_writer;
 pub mod crypto;
 pub mod framing;
+pub mod keepalive;
 pub mod keys;
 pub mod packet;
 pub mod proto;

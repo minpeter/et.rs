@@ -272,10 +272,7 @@ mod tests {
             w.recover(extra as i64).unwrap().len(),
             CONNECTED_BACKUP_PACKETS
         );
-        assert_eq!(
-            w.recover(extra as i64 - 1),
-            Err(RecoverError::TooFarBehind)
-        );
+        assert_eq!(w.recover(extra as i64 - 1), Err(RecoverError::TooFarBehind));
     }
 
     #[test]

@@ -23,6 +23,15 @@ Installs `et` plus the `etserver`, `etterminal`, `htm`, and `htmd` role symlinks
 conflicts with the upstream `et` formula — et.rs is a drop-in replacement, so uninstall one before
 installing the other. Upgrade later with `brew upgrade et-rs`.
 
+### AUR (Arch Linux)
+
+```sh
+paru -S et-rs-bin        # or: yay -S et-rs-bin
+```
+
+Installs the prebuilt release binary (x86_64, aarch64) with the role symlinks. Conflicts with the
+`eternal-terminal` package for the same drop-in-replacement reason.
+
 ### Prebuilt binaries
 
 Every [release](https://github.com/minpeter/et.rs/releases) ships archives (with `.sha256`

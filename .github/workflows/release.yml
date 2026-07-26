@@ -166,3 +166,27 @@ jobs:
           git diff --cached --quiet && { echo "formula unchanged"; exit 0; }
           git commit -m "et-rs ${version}"
           git push origin HEAD:main
+
+  aur:
+    needs: [release, binaries]
+    if: needs.release.outputs.tag != ''
+    runs-on: ubuntu-latest
+    # AUR publishing must not block a release (e.g. AUR maintenance windows).
+    continue-on-error: true
+    env:
+      TAG: ${{ needs.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate PKGBUILD
+        run: ./scripts/generate-pkgbuild.sh "${TAG#et@}" > ./PKGBUILD
+
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
+        with:
+          pkgname: et-rs-bin
+          pkgbuild: ./PKGBUILD
+          commit_username: github-actions[bot]
+          commit_email: 41898282+github-actions[bot]@users.noreply.github.com
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: et-rs-bin ${{ env.TAG }}

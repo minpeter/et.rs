@@ -1,5 +1,9 @@
 # et.rs
 
+[![GitHub release](https://img.shields.io/github/v/release/minpeter/et.rs?label=release)](https://github.com/minpeter/et.rs/releases/latest)
+[![AUR version](https://img.shields.io/aur/version/et-rs-bin?label=AUR)](https://aur.archlinux.org/packages/et-rs-bin)
+[![Homebrew tap](https://img.shields.io/badge/dynamic/regex?url=https%3A%2F%2Fraw.githubusercontent.com%2Fminpeter%2Fhomebrew-tap%2Fmain%2FFormula%2Fet-rs.rb&search=version%20%22(%5B0-9.%5D%2B)%22&replace=%241&label=homebrew%20tap&color=orange)](https://github.com/minpeter/homebrew-tap)
+
 A Rust port of [Eternal Terminal](https://github.com/MisterTea/EternalTerminal) — a remote shell that
 automatically reconnects without interrupting the session.
 
@@ -10,14 +14,6 @@ Windows is a first-class target. Upstream builds only its client there, so hosti
 Windows meant running the POSIX server inside WSL and landing in a WSL shell. et.rs runs the server
 and the per-session terminal natively on Windows using ConPTY, so `et` gives you a real `cmd.exe` or
 PowerShell — no WSL involved.
-
-## Packaging status
-
-[![AUR version](https://img.shields.io/aur/version/et-rs-bin?label=AUR)](https://aur.archlinux.org/packages/et-rs-bin)
-[![Homebrew tap](https://img.shields.io/badge/dynamic/regex?url=https%3A%2F%2Fraw.githubusercontent.com%2Fminpeter%2Fhomebrew-tap%2Fmain%2FFormula%2Fet-rs.rb&search=version%20%22(%5B0-9.%5D%2B)%22&replace=%241&label=homebrew%20tap&color=orange)](https://github.com/minpeter/homebrew-tap)
-[![GitHub release](https://img.shields.io/github/v/release/minpeter/et.rs?label=release)](https://github.com/minpeter/et.rs/releases/latest)
-
-[![Packaging status](https://repology.org/badge/vertical-allrepos/et-rs-bin.svg?exclude_unsupported=1)](https://repology.org/project/et-rs-bin/versions)
 
 ## Install
 

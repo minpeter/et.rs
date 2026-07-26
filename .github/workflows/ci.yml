@@ -44,7 +44,7 @@ jobs:
           # Deterministic failure on macOS runners, tracked in issue #4;
           # real-world macOS client reconnects are verified to work.
           - os: macos-latest
-            test_args: "-- --skip real_client_recovers_same_shell_and_once_only_buffered_output"
+            test_args: "--skip real_client_recovers_same_shell_and_once_only_buffered_output"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +57,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - run: cargo test --workspace ${{ matrix.test_args }}
+      # The PTY-heavy end-to-end tests are timing-sensitive on shared
+      # 2-core runners; run tests sequentially for stability.
+      - run: cargo test --workspace -- --test-threads=1 ${{ matrix.test_args }}
 
   # Windows build is release-critical; the test harnesses are POSIX-only,
   # so compile the shipped binary crate (like the release pipeline) and

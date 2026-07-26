@@ -1,9 +1,9 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Initial release\n\nFirst automated release of et.rs: a single telemetry-free EternalTerminal binary (Rust port).\n\nOne binary serves every role: `et` (client), `etserver`, `etterminal`, `htm`, `htmd`.\n"
-    filename: initial-release.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Fix reconnect against upstream C++ peers rejecting the session with \"invalid recovery proof\"\n\nReconnecting to an upstream C++ `etserver` (or accepting an upstream C++ `et`\nclient) failed with `server sent an invalid recovery proof` whenever the peer's\nfirst packet after recovery was regular session traffic, such as terminal\noutput. et.rs required the first post-recovery packet to be an empty\nkeep-alive, a convention upstream does not follow.\n\nRecovery authentication now accepts any packet that decrypts with the session\nkey (which is the actual proof) and requeues it for the session loop instead\nof discarding it, so no traffic is lost.\n\nAlso fixes a port-forwarding race surfaced by this change: closing a forwarded\nsocket could drop data still queued for its writer thread. Teardown now drains\nqueued writes before shutting the socket down.\n"
+    filename: fix-recovery-proof-interop.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - initial-release.md
+      - fix-recovery-proof-interop.md
     id: cargo:et
     updated: true

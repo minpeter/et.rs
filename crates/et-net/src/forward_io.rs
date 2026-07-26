@@ -190,7 +190,12 @@ pub(crate) fn spawn_io(
                         return;
                     }
                 }
-                WriteCommand::Stop => return,
+                WriteCommand::Stop => {
+                    // Perform the final shutdown here so every Data command
+                    // queued before Stop is flushed to the socket first.
+                    writer.shutdown();
+                    return;
+                }
             }
         }
     });
@@ -204,6 +209,10 @@ pub(crate) fn spawn_io(
 }
 
 pub(crate) fn stop_io(io: ActiveIo) {
-    io.control.shutdown();
+    // Queue Stop before touching the socket: the writer thread drains any
+    // pending Data commands in FIFO order and then closes the socket. Only
+    // shut down the read half here to wake the reader thread; a full
+    // shutdown would discard writes that are still queued.
     let _ = io.writer.send(WriteCommand::Stop);
+    io.control.shutdown_read();
 }

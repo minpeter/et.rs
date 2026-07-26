@@ -88,15 +88,13 @@ impl ActiveSession {
         let mut candidate = connection
             .recovery_candidate(stream, DEFAULT_RECOVERY_TIMEOUT)
             .map_err(SessionError::Connection)?;
-        let proof = candidate
+        // Any packet that decrypts with the session key authenticates the
+        // returning client; it is requeued and handled by the session loop.
+        // Upstream C++ clients send regular traffic here (e.g. typed input or
+        // a keep-alive), not a dedicated proof packet.
+        candidate
             .authenticate_peer(DEFAULT_RECOVERY_TIMEOUT)
             .map_err(SessionError::Connection)?;
-        if proof.header() != TerminalPacketType::KeepAlive as u8 || !proof.payload().is_empty() {
-            return Err(SessionError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "returning client sent an invalid recovery proof",
-            )));
-        }
         candidate
             .write_packet(TerminalPacketType::KeepAlive as u8, &[])
             .map_err(SessionError::Connection)?;

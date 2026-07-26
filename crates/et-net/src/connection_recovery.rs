@@ -59,10 +59,17 @@ impl Connection {
         }
     }
 
-    pub fn authenticate_peer(&mut self, timeout: Duration) -> Result<Packet, ConnError> {
+    /// Wait for one live packet on the revived stream and requeue it for the
+    /// session loop. Successfully decrypting a packet proves the peer holds
+    /// the session key, which is the only recovery proof required: upstream
+    /// C++ peers do not send a dedicated proof packet, so the first packet
+    /// may be any regular session traffic and must not be inspected or
+    /// discarded.
+    pub fn authenticate_peer(&mut self, timeout: Duration) -> Result<(), ConnError> {
         let packet = self.read_live_packet_until(recovery_deadline(timeout)?)?;
+        self.reader.unread(packet);
         self.set_io_timeout(None)?;
-        Ok(packet)
+        Ok(())
     }
 
     fn exchange_recovery(&self, deadline: Instant) -> Result<CatchupBuffer, ConnError> {

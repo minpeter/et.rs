@@ -261,6 +261,16 @@ impl ForwardStream {
             Self::Unix(stream) => stream.shutdown(Shutdown::Both),
         };
     }
+
+    /// Shut down only the receive half, waking a blocked reader thread
+    /// without discarding data still queued for the writer thread.
+    pub(crate) fn shutdown_read(&self) {
+        let _ = match self {
+            Self::Tcp(stream) => stream.shutdown(Shutdown::Read),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.shutdown(Shutdown::Read),
+        };
+    }
 }
 
 impl Read for ForwardStream {

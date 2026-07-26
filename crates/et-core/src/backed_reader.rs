@@ -119,6 +119,15 @@ impl BackedReader {
         Ok(())
     }
 
+    /// Requeue a live packet consumed during recovery so it is returned by
+    /// `pop()` after the catchup replay entries, preserving stream order.
+    /// Must be called before any post-revive `pop()`; the recovery proof
+    /// packet may be regular session traffic when the peer is the upstream
+    /// C++ implementation, so it must not be lost.
+    pub fn unread(&mut self, packet: Packet) {
+        self.replay.push_back(packet);
+    }
+
     pub fn invalidate(&mut self) {
         self.partial.clear();
         self.connected = false;

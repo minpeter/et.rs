@@ -58,14 +58,13 @@ fn recover_connection(
     connection
         .write_packet(TerminalPacketType::KeepAlive as u8, &[])
         .map_err(|error| transport_error(deadline, "authenticating recovery", error))?;
-    let proof = connection
+    // Any packet that decrypts with the session key authenticates the server;
+    // it is requeued and handled by the session loop. Upstream C++ servers
+    // send regular traffic here (e.g. terminal output or a keep-alive echo),
+    // not a dedicated proof packet.
+    connection
         .authenticate_peer(remaining_time(deadline, "verifying recovery proof")?)
         .map_err(|error| transport_error(deadline, "verifying recovery proof", error))?;
-    if proof.header() != TerminalPacketType::KeepAlive as u8 || !proof.payload().is_empty() {
-        return Err(ClientError::Terminal(
-            "server sent an invalid recovery proof".to_owned(),
-        ));
-    }
     Ok(ReconnectOutcome::Recovered)
 }
 

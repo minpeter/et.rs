@@ -1,11 +1,15 @@
 //! Native-`i64` framing for packets exchanged with local terminal processes.
 
 use std::io::{self, Read, Write};
+use std::time::Duration;
 
 use et_core::packet::{Packet, PacketError};
 
 pub const MAX_LOCAL_PACKET_LEN: usize = 64 * 1024;
 const PREFIX_LEN: usize = std::mem::size_of::<i64>();
+/// How long a writer naps before retrying a `WouldBlock` write. Matches the
+/// 10ms cadence the Windows pump loops already use.
+const BACKPRESSURE_RETRY: Duration = Duration::from_millis(10);
 
 #[derive(Debug)]
 pub enum LocalPacketError {
@@ -65,9 +69,50 @@ pub fn write_local_packet<W: Write>(writer: &mut W, packet: &Packet) -> io::Resu
     }
     let length = i64::try_from(serialized.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "local packet too large"))?;
-    writer.write_all(&length.to_ne_bytes())?;
-    writer.write_all(&serialized)?;
-    writer.flush()
+    write_all_blocking(writer, &length.to_ne_bytes())?;
+    write_all_blocking(writer, &serialized)?;
+    flush_blocking(writer)
+}
+
+/// `write_all` that treats `WouldBlock` as backpressure instead of an error.
+///
+/// `set_nonblocking(true)` applies to the underlying socket, not the handle:
+/// every `try_clone()` of a [`crate::local::LocalStream`] shares the flag
+/// (`O_NONBLOCK` lives on the open file description; `FIONBIO` is per-socket
+/// on Windows). The readiness-driven session loops flip their local streams
+/// to non-blocking for reads, which silently makes the packet *writers* on
+/// cloned handles non-blocking too. A full socket buffer (e.g. a shell that
+/// stops reading input during a large paste, or a bridge that pauses reading
+/// terminal output while a client reconnects) must wait for the peer to
+/// drain, exactly like upstream's blocking writes, rather than tearing the
+/// session down — and a bare `write_all` would also abandon a partially
+/// written frame, corrupting the stream for good.
+fn write_all_blocking<W: Write>(writer: &mut W, mut buffer: &[u8]) -> io::Result<()> {
+    while !buffer.is_empty() {
+        match writer.write(buffer) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(count) => buffer = &buffer[count..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(BACKPRESSURE_RETRY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn flush_blocking<W: Write>(writer: &mut W) -> io::Result<()> {
+    loop {
+        match writer.flush() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(BACKPRESSURE_RETRY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 pub struct LocalPacketDecoder {

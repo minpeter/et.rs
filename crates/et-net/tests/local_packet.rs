@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::io::{Cursor, ErrorKind};
+use std::io::{Cursor, ErrorKind, Read};
 
 use et_core::packet::Packet;
 use et_net::local_packet::{
@@ -63,4 +63,55 @@ fn writer_rejects_packets_above_the_local_cap() {
     let packet = Packet::new(8, vec![0; MAX_LOCAL_PACKET_LEN]);
     let error = write_local_packet(&mut Vec::new(), &packet).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
+}
+
+/// Regression test: `set_nonblocking(true)` on a local stream applies to
+/// every clone of the socket, so packet writers can see `WouldBlock` when the
+/// kernel buffer fills. `write_local_packet` must wait for the peer to drain
+/// instead of failing (which previously killed the terminal session) or
+/// leaving a truncated frame behind.
+#[test]
+fn writer_survives_wouldblock_backpressure_on_a_nonblocking_stream() {
+    let (mut reader, mut writer) = et_net::local::wake_pair().unwrap();
+    // Mirror the session loops: the reader side flips the stream to
+    // non-blocking, which also affects the writer clone of the same socket.
+    writer.set_nonblocking(true).unwrap();
+
+    const PACKETS: usize = 64;
+    const PAYLOAD: usize = 32 * 1024;
+    let drain = std::thread::spawn(move || {
+        // Let the writer hit a full socket buffer before draining slowly.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        reader.set_nonblocking(false).unwrap();
+        let mut decoder = LocalPacketDecoder::new();
+        let mut received = Vec::new();
+        let mut buffer = [0u8; 4096];
+        while received.len() < PACKETS {
+            let count = reader.read(&mut buffer).unwrap();
+            assert_ne!(count, 0, "writer hung up before all packets arrived");
+            let mut chunk = &buffer[..count];
+            while !chunk.is_empty() {
+                let take = decoder.required_bytes().min(chunk.len());
+                if let Some(packet) = decoder.feed(&chunk[..take]).unwrap() {
+                    received.push(packet);
+                    decoder = LocalPacketDecoder::new();
+                }
+                chunk = &chunk[take..];
+            }
+        }
+        received
+    });
+
+    for index in 0..PACKETS {
+        let packet = Packet::new(index as u8, vec![index as u8; PAYLOAD]);
+        write_local_packet(&mut writer, &packet)
+            .expect("backpressure on a non-blocking local stream must not fail the write");
+    }
+
+    let received = drain.join().unwrap();
+    assert_eq!(received.len(), PACKETS);
+    for (index, packet) in received.iter().enumerate() {
+        assert_eq!(packet.header(), index as u8);
+        assert_eq!(packet.payload(), vec![index as u8; PAYLOAD]);
+    }
 }

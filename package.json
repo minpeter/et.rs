@@ -1,0 +1,14 @@
+{
+  "name": "et-rs-release-tools",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "tegami": "node scripts/tegami.mts"
+  },
+  "devDependencies": {
+    "tegami": "^1.2.6"
+  }
+}

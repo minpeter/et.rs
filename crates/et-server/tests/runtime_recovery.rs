@@ -131,7 +131,10 @@ fn keepalive_echo_acknowledges_everything_read_from_the_client() {
     let written = client.writer_sequence();
     let echo = client.read_packet().unwrap();
     assert_eq!(echo.header(), TerminalPacketType::KeepAlive as u8);
-    assert_eq!(et_core::keepalive::decode_ack(echo.payload()), Some(written));
+    assert_eq!(
+        et_core::keepalive::decode_ack(echo.payload()),
+        Some(written)
+    );
 
     // A legacy empty keep-alive still gets an echo.
     client

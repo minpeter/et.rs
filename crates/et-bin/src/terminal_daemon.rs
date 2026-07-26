@@ -13,6 +13,17 @@ use crate::terminal_credentials::CredentialInput;
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn spawn(router: &Path, input: &CredentialInput, verbose: u8) -> Result<(), String> {
+    spawn_with_args(router, input, verbose, &[])
+}
+
+/// Spawn the detached session process, forwarding `extra` arguments (used by
+/// `--jump` to pass the relay destination).
+pub fn spawn_with_args(
+    router: &Path,
+    input: &CredentialInput,
+    verbose: u8,
+    extra: &[String],
+) -> Result<(), String> {
     let directory = readiness_directory()?;
     let socket = directory.join("ready.sock");
     let listener = UnixListener::bind(&socket)
@@ -34,6 +45,7 @@ pub fn spawn(router: &Path, input: &CredentialInput, verbose: u8) -> Result<(), 
                 .ok_or_else(|| "invalid terminal router path".to_owned())?,
             &format!("--verbose={verbose}"),
         ])
+        .args(extra)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

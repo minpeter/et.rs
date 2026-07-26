@@ -85,7 +85,7 @@ pub fn handle_packet(
             let info = TerminalInfo::decode(packet.payload())
                 .map_err(|_| "TERMINAL_INFO protobuf is malformed".to_owned())?;
             master
-                .resize(valid_size(info)?)
+                .resize(terminal_size(&info))
                 .map_err(|error| format!("could not resize PTY: {error}"))
         }
         _ => Err("unsupported local terminal packet type".to_owned()),
@@ -98,29 +98,23 @@ fn valid_environment_name(name: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
-fn valid_size(info: TerminalInfo) -> Result<PtySize, String> {
-    fn dimension(value: Option<i32>, max: u16, name: &str) -> Result<u16, String> {
-        let value = value.ok_or_else(|| format!("TERMINAL_INFO is missing {name}"))?;
-        let value = u16::try_from(value).map_err(|_| format!("invalid terminal {name}"))?;
-        if value == 0 || value > max {
-            return Err(format!("invalid terminal {name}"));
-        }
-        Ok(value)
+/// Convert a `TERMINAL_INFO` payload into a PTY size with upstream semantics.
+///
+/// Upstream (`UserTerminalHandler.cpp`) assigns the int32 protobuf fields
+/// straight into a `winsize` struct (`unsigned short` members) and calls
+/// `TIOCSWINSZ` without validation. That means missing fields become 0,
+/// zero sizes are accepted (terminals report 0x0 when no real TTY backs
+/// them, e.g. under `script` or CI), and out-of-range values truncate.
+fn terminal_size(info: &TerminalInfo) -> PtySize {
+    fn dimension(value: Option<i32>) -> u16 {
+        (value.unwrap_or(0) as u32 & 0xFFFF) as u16
     }
-    fn pixels(value: Option<i32>, name: &str) -> Result<u16, String> {
-        let value = value.unwrap_or(0);
-        let value = u16::try_from(value).map_err(|_| format!("invalid terminal {name}"))?;
-        if value > 10_000 {
-            return Err(format!("invalid terminal {name}"));
-        }
-        Ok(value)
+    PtySize {
+        rows: dimension(info.row),
+        cols: dimension(info.column),
+        pixel_width: dimension(info.width),
+        pixel_height: dimension(info.height),
     }
-    Ok(PtySize {
-        rows: dimension(info.row, 1000, "rows")?,
-        cols: dimension(info.column, 1000, "columns")?,
-        pixel_width: pixels(info.width, "pixel width")?,
-        pixel_height: pixels(info.height, "pixel height")?,
-    })
 }
 
 #[cfg(test)]
@@ -130,39 +124,39 @@ mod tests {
     use et_net::local_packet::write_local_packet;
 
     #[test]
-    fn resize_rejects_zero_negative_and_oversized_dimensions() {
-        for info in [
-            TerminalInfo {
-                row: Some(0),
-                column: Some(80),
-                ..Default::default()
-            },
-            TerminalInfo {
-                row: Some(24),
-                column: Some(-1),
-                ..Default::default()
-            },
-            TerminalInfo {
-                row: Some(24),
-                column: Some(80),
-                width: Some(10_001),
-                ..Default::default()
-            },
-        ] {
-            assert!(valid_size(info).is_err());
-        }
+    fn resize_accepts_zero_and_truncates_like_upstream_winsize() {
+        // Upstream copies int32 fields into `winsize` (unsigned short) without
+        // validation; 0x0 windows (script/CI/emacs shells) must not error.
+        let zero = terminal_size(&TerminalInfo {
+            row: Some(0),
+            column: Some(0),
+            ..Default::default()
+        });
+        assert_eq!((zero.rows, zero.cols), (0, 0));
+        assert_eq!((zero.pixel_width, zero.pixel_height), (0, 0));
+
+        let truncated = terminal_size(&TerminalInfo {
+            row: Some(65536 + 24),
+            column: Some(-1),
+            width: Some(70_000),
+            height: None,
+            ..Default::default()
+        });
+        assert_eq!(truncated.rows, 24);
+        assert_eq!(truncated.cols, 65535);
+        assert_eq!(truncated.pixel_width, (70_000u32 & 0xFFFF) as u16);
+        assert_eq!(truncated.pixel_height, 0);
     }
 
     #[test]
     fn resize_accepts_upstream_terminal_geometry() {
-        let size = valid_size(TerminalInfo {
+        let size = terminal_size(&TerminalInfo {
             row: Some(40),
             column: Some(100),
             width: Some(800),
             height: Some(600),
             ..Default::default()
-        })
-        .unwrap();
+        });
         assert_eq!(size.rows, 40);
         assert_eq!(size.cols, 100);
         assert_eq!(size.pixel_width, 800);

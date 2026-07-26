@@ -51,7 +51,19 @@ pub struct Forwarder {
 
 impl Forwarder {
     pub fn start(sources: Vec<PortForwardSourceRequest>) -> Result<Self, ForwardError> {
-        let sources = bind_sources(sources)?;
+        Self::start_with_user(sources, None).map(|(forwarder, _)| forwarder)
+    }
+
+    /// Bind all forwarding sources and return the forwarder together with the
+    /// environment variables created for named-pipe requests, mirroring the
+    /// upstream server (`PortForwardHandler::createSource` +
+    /// `TerminalServer::runTerminal`). `owner` is the terminal user that
+    /// created pipes are chowned to.
+    pub fn start_with_user(
+        sources: Vec<PortForwardSourceRequest>,
+        owner: Option<(u32, u32)>,
+    ) -> Result<(Self, ForwardEnvironment), ForwardError> {
+        let (sources, environment) = bind_sources(sources, owner)?;
         let (commands_tx, commands_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let (outbound_tx, outbound_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let (wake, wake_writer) = UnixStream::pair()?;
@@ -72,12 +84,15 @@ impl Forwarder {
                 drop(listener_stop);
             })
             .map_err(ForwardError::Io)?;
-        Ok(Self {
-            commands: commands_tx,
-            outbound: outbound_rx,
-            wake,
-            worker: Some(worker),
-        })
+        Ok((
+            Self {
+                commands: commands_tx,
+                outbound: outbound_rx,
+                wake,
+                worker: Some(worker),
+            },
+            environment,
+        ))
     }
 
     pub fn wake(&self) -> Result<&UnixStream, ForwardError> {
@@ -124,17 +139,83 @@ impl Drop for Forwarder {
     }
 }
 
-fn bind_sources(sources: Vec<PortForwardSourceRequest>) -> Result<Vec<BoundSource>, ForwardError> {
+/// Environment variables created for named-pipe forwards.
+pub type ForwardEnvironment = Vec<(String, String)>;
+
+fn bind_sources(
+    sources: Vec<PortForwardSourceRequest>,
+    owner: Option<(u32, u32)>,
+) -> Result<(Vec<BoundSource>, ForwardEnvironment), ForwardError> {
     let mut bound = Vec::with_capacity(sources.len());
+    let mut environment = Vec::new();
     for request in sources {
+        // The destination is passed through verbatim in the
+        // PORT_FORWARD_DESTINATION_REQUEST, exactly like upstream: it is only
+        // interpreted (and validated) by the remote side when a connection
+        // arrives.
+        let destination = request.destination.unwrap_or_default();
+        if let Some(variable) = request.environmentvariable {
+            // Named-pipe forwarding: upstream creates a private temporary
+            // socket, exports its path through the environment variable, and
+            // rejects requests that also carry an explicit source.
+            if request.source.is_some() {
+                return Err(ForwardError::Protocol(
+                    "Do not set a source when forwarding named pipes with environment variables",
+                ));
+            }
+            let path = create_forward_pipe(owner)?;
+            let mut listeners = Endpoint::Unix(path.clone()).bind()?;
+            apply_pipe_ownership(&path, owner)?;
+            environment.push((variable, path.to_string_lossy().into_owned()));
+            for mut listener in listeners.drain(..) {
+                if let Some(directory) = path.parent() {
+                    listener.also_remove_dir(directory.to_path_buf());
+                }
+                bound.push(BoundSource {
+                    listener,
+                    destination: destination.clone(),
+                });
+            }
+            continue;
+        }
         let source = Endpoint::parse(request.source)?;
-        let destination = Endpoint::parse(request.destination)?;
-        bound.push(BoundSource {
-            listener: source.bind()?,
-            destination,
-        });
+        for listener in source.bind()? {
+            bound.push(BoundSource {
+                listener,
+                destination: destination.clone(),
+            });
+        }
     }
-    Ok(bound)
+    Ok((bound, environment))
+}
+
+/// Create the private directory for a named-pipe forward and return the
+/// socket path inside it (upstream `et_forward_sock_XXXXXX/sock`).
+fn create_forward_pipe(owner: Option<(u32, u32)>) -> Result<std::path::PathBuf, ForwardError> {
+    use std::os::unix::fs::DirBuilderExt;
+    let (suffix, _) = et_core::keys::gen_id_passkey();
+    let directory = std::env::temp_dir().join(format!("et_forward_sock_{suffix}"));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .map_err(ForwardError::Io)?;
+    if let Some((uid, gid)) = owner {
+        std::os::unix::fs::chown(&directory, Some(uid), Some(gid)).map_err(ForwardError::Io)?;
+    }
+    Ok(directory.join("sock"))
+}
+
+fn apply_pipe_ownership(
+    path: &std::path::Path,
+    owner: Option<(u32, u32)>,
+) -> Result<(), ForwardError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .map_err(ForwardError::Io)?;
+    if let Some((uid, gid)) = owner {
+        std::os::unix::fs::chown(path, Some(uid), Some(gid)).map_err(ForwardError::Io)?;
+    }
+    Ok(())
 }
 
 fn drain_wake(mut wake: &UnixStream) -> Result<(), ForwardError> {

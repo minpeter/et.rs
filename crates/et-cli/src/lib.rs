@@ -9,5 +9,6 @@
 
 pub mod client;
 pub mod host;
+pub mod logging;
 pub mod server;
 pub mod tunnel;

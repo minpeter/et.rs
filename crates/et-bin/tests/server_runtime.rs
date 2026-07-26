@@ -88,19 +88,75 @@ fn foreground_binary_loads_config_and_sigterm_cleans_every_surface() {
 }
 
 #[test]
-fn daemon_mode_is_rejected_for_subcommand_and_busybox_dispatch() {
+fn daemon_mode_detaches_and_writes_a_pid_file() {
     let directory = tempfile_path("daemon");
     fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
     let busybox = directory.join("etserver");
     symlink(env!("CARGO_BIN_EXE_et"), &busybox).unwrap();
-    for (program, arguments) in [
-        (env!("CARGO_BIN_EXE_et"), vec!["server", "--daemon"]),
-        (busybox.to_str().unwrap(), vec!["--daemon"]),
-    ] {
-        let output = Command::new(program).args(arguments).output().unwrap();
-        assert_eq!(output.status.code(), Some(2));
-        assert!(String::from_utf8_lossy(&output.stderr).contains("daemon mode is not implemented"));
+    let pidfile = directory.join("etserver.pid");
+
+    // Argument validation still happens in the parent, before detaching.
+    let invalid = Command::new(env!("CARGO_BIN_EXE_et"))
+        .args(["server", "--daemon", "--port", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(invalid.status.code(), Some(2));
+
+    // A real daemon run returns immediately and the child records its pid,
+    // matching upstream `DaemonCreator::create`.
+    for (index, program) in [env!("CARGO_BIN_EXE_et"), busybox.to_str().unwrap()]
+        .into_iter()
+        .enumerate()
+    {
+        let router = directory.join(format!("router-{index}"));
+        let pidfile = directory.join(format!("etserver-{index}.pid"));
+        let mut arguments = Vec::new();
+        if index == 0 {
+            arguments.push("server".to_owned());
+        }
+        arguments.extend([
+            "--daemon".to_owned(),
+            "--port".to_owned(),
+            "0".to_owned(),
+            "--pidfile".to_owned(),
+            pidfile.to_str().unwrap().to_owned(),
+            "--serverfifo".to_owned(),
+            router.to_str().unwrap().to_owned(),
+        ]);
+        // Replace the rejected port with an ephemeral one the OS assigns.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let position = arguments.iter().position(|value| value == "0").unwrap();
+        arguments[position] = port.to_string();
+
+        let output = Command::new(program).args(&arguments).output().unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+
+        // The detached child writes the pid file shortly after starting.
+        let mut recorded = None;
+        for _ in 0..50 {
+            if let Ok(text) = fs::read_to_string(&pidfile) {
+                if let Ok(pid) = text.trim().parse::<i32>() {
+                    recorded = Some(pid);
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let pid = recorded.expect("daemon did not write a pid file");
+        assert!(pid > 0);
+        // Owner-only permissions, like upstream's 0600 open().
+        let mode = fs::metadata(&pidfile).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // The daemon runs detached from this process.
+        let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
     }
+    let _ = fs::remove_file(&pidfile);
     fs::remove_dir_all(directory).unwrap();
 }
 

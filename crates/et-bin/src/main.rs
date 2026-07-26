@@ -2,13 +2,16 @@
 
 //! Single-binary entry point with role dispatch by `argv[0]`.
 //!
-//! One compiled binary serves all three EternalTerminal roles:
+//! One compiled binary serves every EternalTerminal role:
 //! - `et`        → client (default)
 //! - `etserver`  → server
 //! - `etterminal`→ per-session terminal
+//! - `htm`       → headless terminal multiplexer client
+//! - `htmd`      → headless terminal multiplexer daemon
 //!
 //! Busybox-style symlinks (`ln -s et etserver`) select the role. The leading
-//! positional subcommand (`et server`, `et terminal`) is an explicit fallback.
+//! positional subcommand (`et server`, `et terminal`, `et htm`, `et htmd`) is
+//! an explicit fallback.
 
 use std::ffi::OsString;
 
@@ -37,11 +40,19 @@ fn dispatch(prog: &str, args: &[OsString]) -> Result<i32, clap::Error> {
     if prog == "etterminal" {
         return crate::terminal::run(args);
     }
+    if prog == "htm" {
+        return crate::htm::run_client(args);
+    }
+    if prog == "htmd" {
+        return crate::htm::run_daemon(args);
+    }
     if let Some(first) = args.first().and_then(|s| s.to_str()) {
         match first {
             "server" => return crate::server::run(&args[1..]),
             "terminal" => return crate::terminal::run(&args[1..]),
             "client" => return crate::client::run(&args[1..]),
+            "htm" => return crate::htm::run_client(&args[1..]),
+            "htmd" => return crate::htm::run_daemon(&args[1..]),
             _ => {}
         }
     }
@@ -55,13 +66,16 @@ mod client_terminal_loop;
 mod deadline;
 mod error;
 mod forward_config;
+mod htm;
 mod initial_connect;
 mod resolver;
 mod server;
+mod server_daemon;
 mod ssh_config;
 mod ssh_process;
 mod terminal;
 mod terminal_credentials;
 mod terminal_daemon;
+mod terminal_jump;
 mod terminal_protocol;
 mod terminal_pty;

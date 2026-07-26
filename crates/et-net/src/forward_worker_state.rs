@@ -2,21 +2,23 @@ use std::io::{self, Write};
 
 use et_core::packet::Packet;
 use et_core::proto::{
-    PortForwardData, PortForwardDestinationRequest, PortForwardDestinationResponse,
+    PortForwardData, PortForwardDestinationRequest, PortForwardDestinationResponse, SocketEndpoint,
     TerminalPacketType,
 };
 use prost::Message;
 
+use crate::forward_endpoint::Endpoint;
+
 use super::{
-    spawn_connector, spawn_io, ActiveIo, Endpoint, ForwardError, ForwardStream, Role, Worker,
-    WriteCommand, MAX_ACTIVE_SOCKETS, MAX_DATA_PACKET,
+    spawn_connector, spawn_io, ActiveIo, ForwardError, ForwardStream, Role, Worker, WriteCommand,
+    MAX_ACTIVE_SOCKETS, MAX_DATA_PACKET,
 };
 
 impl Worker {
     pub(super) fn accepted(
         &mut self,
         client_fd: i32,
-        destination: Endpoint,
+        destination: SocketEndpoint,
         stream: ForwardStream,
     ) -> Result<(), ForwardError> {
         if self.total_sockets() >= MAX_ACTIVE_SOCKETS {
@@ -27,7 +29,7 @@ impl Worker {
         self.emit(
             TerminalPacketType::PortForwardDestinationRequest as u8,
             PortForwardDestinationRequest {
-                destination: Some(destination.to_proto()),
+                destination: Some(destination),
                 fd: Some(client_fd),
             },
         )
@@ -85,8 +87,13 @@ impl Worker {
             .fd
             .filter(|value| *value > 0)
             .ok_or(ForwardError::Protocol("destination request fd is invalid"))?;
-        let destination = Endpoint::parse(request.destination)
-            .map_err(|_| ForwardError::Protocol("invalid destination"))?;
+        // Upstream (`PortForwardHandler::createDestination`) never tears the
+        // session down for a bad destination: every failure is reported back
+        // in a PORT_FORWARD_DESTINATION_RESPONSE with the error field set.
+        let destination = match Endpoint::parse_destination(request.destination) {
+            Ok(destination) => destination,
+            Err(error) => return self.connected(client_fd, 0, Err(error)),
+        };
         if self.total_sockets() >= MAX_ACTIVE_SOCKETS {
             return self.connected(
                 client_fd,
@@ -108,44 +115,32 @@ impl Worker {
         &mut self,
         response: PortForwardDestinationResponse,
     ) -> Result<(), ForwardError> {
-        let client_fd = response
+        // A response for an fd we no longer track is logged-and-ignored
+        // upstream (`closeSourceFd`), not treated as a fatal protocol error.
+        let Some(stream) = response
             .clientfd
-            .filter(|value| *value > 0)
-            .ok_or(ForwardError::Protocol("destination response fd is invalid"))?;
-        let stream = self
-            .pending
-            .remove(&client_fd)
-            .ok_or(ForwardError::Protocol("destination response fd is unknown"))?;
+            .and_then(|client_fd| self.pending.remove(&client_fd))
+        else {
+            return Ok(());
+        };
         if response.error.is_some() {
             stream.shutdown();
             return Ok(());
         }
-        let socket_id =
-            response
-                .socketid
-                .filter(|value| *value > 0)
-                .ok_or(ForwardError::Protocol(
-                    "destination response socket id is invalid",
-                ))?;
+        let Some(socket_id) = response.socketid.filter(|value| *value > 0) else {
+            stream.shutdown();
+            return Ok(());
+        };
         self.activate(Role::Source, socket_id, stream)
     }
 
     fn receive_data(&mut self, data: PortForwardData) -> Result<(), ForwardError> {
-        let socket_id = data
-            .socketid
-            .filter(|value| *value > 0)
-            .ok_or(ForwardError::Protocol(
-                "forwarding data socket id is invalid",
-            ))?;
-        let source_to_destination = data.sourcetodestination.ok_or(ForwardError::Protocol(
-            "forwarding data direction is missing",
-        ))?;
+        // proto2 defaults: missing socket id is 0 and missing direction is
+        // false; upstream reads them through the generated accessors without
+        // presence checks.
+        let socket_id = data.socketid.unwrap_or(0);
+        let source_to_destination = data.sourcetodestination.unwrap_or(false);
         let buffer = data.buffer.unwrap_or_default();
-        if buffer.len() > MAX_DATA_PACKET {
-            return Err(ForwardError::Protocol(
-                "forwarding data exceeds packet limit",
-            ));
-        }
         let role = if source_to_destination {
             Role::Destination
         } else {
@@ -158,7 +153,16 @@ impl Worker {
         if buffer.is_empty() {
             return Ok(());
         }
-        let active = self.active(role, socket_id)?;
+        if buffer.len() > MAX_DATA_PACKET {
+            // Defensive bound: drop the offending socket, never the session.
+            self.remove(role, socket_id);
+            return Ok(());
+        }
+        // Data for an already-closed socket id is a normal race; upstream
+        // logs a warning and drops it.
+        let Some(active) = self.map_ref(role).get(&socket_id) else {
+            return Ok(());
+        };
         active
             .writer
             .send(WriteCommand::Data(buffer))
@@ -173,14 +177,25 @@ impl Worker {
         closed: bool,
         error: Option<String>,
     ) -> Result<(), ForwardError> {
+        // proto2 fields carry explicit presence, and upstream branches on
+        // `has_closed()` / `has_error()`: exactly one of buffer, closed, or
+        // error may be set. Emitting `closed = false` would make upstream
+        // tear the socket down on every data packet.
+        let (buffer, closed) = if error.is_some() {
+            (None, None)
+        } else if closed {
+            (None, Some(true))
+        } else {
+            (Some(buffer).filter(|bytes| !bytes.is_empty()), None)
+        };
         self.emit(
             TerminalPacketType::PortForwardData as u8,
             PortForwardData {
                 sourcetodestination: Some(role == Role::Source),
                 socketid: Some(socket_id),
-                buffer: (!buffer.is_empty()).then_some(buffer),
+                buffer,
                 error,
-                closed: Some(closed),
+                closed,
             },
         )
     }
@@ -196,12 +211,6 @@ impl Worker {
         self.map(role).insert(socket_id, active);
         self.threads.extend(handles);
         Ok(())
-    }
-
-    fn active(&self, role: Role, socket_id: i32) -> Result<&ActiveIo, ForwardError> {
-        self.map_ref(role)
-            .get(&socket_id)
-            .ok_or(ForwardError::Protocol("forwarding socket id is unknown"))
     }
 
     pub(super) fn remove(&mut self, role: Role, socket_id: i32) {

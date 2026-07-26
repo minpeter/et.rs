@@ -7,6 +7,7 @@ use std::thread::{self, JoinHandle};
 use rustix::event::{poll, PollFd, PollFlags};
 
 use crate::forward_endpoint::{Endpoint, ForwardListener, ForwardStream};
+use et_core::proto::SocketEndpoint;
 
 use super::forward_worker::{Command, Role};
 
@@ -14,7 +15,7 @@ const READ_CHUNK: usize = 16 * 1024;
 
 pub(crate) struct BoundSource {
     pub(crate) listener: ForwardListener,
-    pub(crate) destination: Endpoint,
+    pub(crate) destination: SocketEndpoint,
 }
 
 pub(crate) struct ActiveIo {

@@ -32,6 +32,20 @@ struct TerminalArgs {
     session_child: bool,
     #[arg(long, hide = true, requires = "session_child")]
     ready_socket: Option<PathBuf>,
+    #[arg(short = 'l', long = "logdir", help = "Base directory for log files.")]
+    logdir: Option<PathBuf>,
+    #[arg(long = "logtostdout", help = "Write log to stdout")]
+    logtostdout: bool,
+    #[arg(long, help = "Run as a jumphost relay to --dsthost/--dstport")]
+    jump: bool,
+    #[arg(long, help = "Must be set if jump is set to true")]
+    dsthost: Option<String>,
+    #[arg(
+        long,
+        default_value_t = 2022,
+        help = "Must be set if jump is set to true"
+    )]
+    dstport: u16,
 }
 
 pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
@@ -42,8 +56,26 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
             .chain(args.iter().cloned()),
     )?;
     let input = load_credentials(&parsed).map_err(clap_error)?;
+    // Upstream names these logs `etterminal-<user>-<id>` (or `etjump-...`).
+    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_owned());
+    et_cli::logging::init(et_cli::logging::LogOptions {
+        directory: parsed.logdir.clone().unwrap_or_else(std::env::temp_dir),
+        prefix: format!(
+            "{}-{user}-{}",
+            if parsed.jump { "etjump" } else { "etterminal" },
+            input.id
+        ),
+        to_stdout: parsed.logtostdout,
+        silent: false,
+        append_pid: true,
+        verbose: parsed.verbose,
+        max_size: et_cli::logging::DEFAULT_MAX_LOG_SIZE,
+    });
     let router_path = select_router_path(parsed.serverfifo.as_deref())
         .map_err(|error| clap_error(error.to_string()))?;
+    if parsed.jump {
+        return run_jump(&parsed, router_path.path(), &input);
+    }
     if !parsed.session_child {
         crate::terminal_daemon::spawn(router_path.path(), &input, parsed.verbose)
             .map_err(clap_error)?;
@@ -58,6 +90,50 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
         .ok_or_else(|| clap_error("terminal session child has no readiness socket"))?;
     crate::terminal_daemon::signal(ready_socket).map_err(clap_error)?;
     terminal_pty::run(router, &input.term).map_err(clap_error)
+}
+
+/// `etterminal --jump`: print the marker the client scrapes, then relay the
+/// session between the local jumphost router and the final destination,
+/// mirroring upstream `TerminalMain.cpp`'s `--jump` branch.
+fn run_jump(
+    args: &TerminalArgs,
+    router_path: &std::path::Path,
+    input: &CredentialInput,
+) -> Result<i32, clap::Error> {
+    let destination_host = args
+        .dsthost
+        .as_deref()
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| clap_error("--dsthost must be set when --jump is used"))?
+        .to_owned();
+    if !args.session_child {
+        // Upstream calls `DaemonCreator::createSessionLeader()` here so the
+        // bootstrap ssh can return while the relay keeps running.
+        crate::terminal_daemon::spawn_with_args(
+            router_path,
+            input,
+            args.verbose,
+            &[
+                "--jump".to_owned(),
+                format!("--dsthost={destination_host}"),
+                format!("--dstport={}", args.dstport),
+            ],
+        )
+        .map_err(clap_error)?;
+        return print_marker(input);
+    }
+    let mut router = UnixStream::connect(router_path)
+        .map_err(|error| clap_error(format!("could not connect terminal router: {error}")))?;
+    register(&mut router, input).map_err(clap_error)?;
+    let ready_socket = parsed_ready_socket(args)?;
+    crate::terminal_daemon::signal(ready_socket).map_err(clap_error)?;
+    crate::terminal_jump::run(router, input, &destination_host, args.dstport).map_err(clap_error)
+}
+
+fn parsed_ready_socket(args: &TerminalArgs) -> Result<&std::path::Path, clap::Error> {
+    args.ready_socket
+        .as_deref()
+        .ok_or_else(|| clap_error("terminal session child has no readiness socket"))
 }
 
 fn print_marker(input: &CredentialInput) -> Result<i32, clap::Error> {

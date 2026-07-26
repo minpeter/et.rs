@@ -12,8 +12,8 @@ pub const DEFAULT_CONFIG_PATH: &str = "/etc/et/config";
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "etserver",
-    version,
-    about = "EternalTerminal server (Rust port)",
+    version = concat!("version ", env!("CARGO_PKG_VERSION")),
+    about = "Remote shell for the busy and impatient",
     long_about = "Listen for ET client connections and spawn terminal sessions."
 )]
 pub struct ServerArgs {
@@ -26,8 +26,12 @@ pub struct ServerArgs {
     #[arg(long = "serverfifo")]
     pub serverfifo: Option<PathBuf>,
 
-    #[arg(long = "daemon")]
+    #[arg(long = "daemon", help = "Daemonize the server")]
     pub daemon: bool,
+
+    /// Internal marker: this process is the re-executed daemon child.
+    #[arg(long = "daemon-child", hide = true)]
+    pub daemon_child: bool,
 
     #[arg(long = "cfgfile", default_value = DEFAULT_CONFIG_PATH)]
     pub cfgfile: PathBuf,
@@ -38,14 +42,26 @@ pub struct ServerArgs {
     #[arg(long = "logtostdout")]
     pub logtostdout: bool,
 
-    #[arg(long = "pidfile")]
+    #[arg(long = "pidfile", help = "Location of the pid file")]
     pub pidfile: Option<PathBuf>,
 
-    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
+    #[arg(
+        short = 'v',
+        long = "verbose",
+        value_name = "LEVEL",
+        default_value_t = 0
+    )]
     pub verbose: u8,
 
-    #[arg(long = "telemetry", default_value_t = false, hide = true)]
-    pub telemetry: bool,
+    /// Accepted for upstream compatibility; et.rs never collects telemetry.
+    #[arg(
+        long = "telemetry",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+        hide = true
+    )]
+    pub telemetry: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,7 +71,14 @@ pub struct ServerConfig {
     pub server_fifo: Option<PathBuf>,
     pub verbose: u8,
     pub log_directory: PathBuf,
+    pub silent: bool,
+    pub log_size: u64,
+    /// Parsed for upstream compatibility only; et.rs never sends telemetry.
+    pub telemetry: bool,
 }
+
+/// Upstream default max log size for `etserver` (20 MiB).
+pub const DEFAULT_LOG_SIZE: u64 = 20_971_520;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
@@ -84,6 +107,9 @@ pub fn resolve_config(
         server_fifo: None,
         verbose: 0,
         log_directory: std::env::temp_dir(),
+        silent: false,
+        log_size: DEFAULT_LOG_SIZE,
+        telemetry: false,
     };
     if let Some(text) = ini_text {
         apply_ini(&mut config, args, text)?;
@@ -140,6 +166,16 @@ fn apply_ini(config: &mut ServerConfig, args: &ServerArgs, text: &str) -> Result
             ("debug", "logdirectory") if args.logdir.is_none() => {
                 config.log_directory = PathBuf::from(value);
             }
+            ("debug", "silent") => {
+                config.silent = value.parse::<i64>().is_ok_and(|value| value != 0);
+            }
+            ("debug", "logsize") => {
+                if let Ok(size) = value.parse::<u64>() {
+                    if size != 0 {
+                        config.log_size = size;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -171,11 +207,44 @@ mod tests {
 
     #[test]
     fn verbose_and_logdir_cli_values_override_ini() {
-        let args =
-            ServerArgs::try_parse_from(["etserver", "-vv", "--logdir", "/tmp/cli-logs"]).unwrap();
+        let args = ServerArgs::try_parse_from(["etserver", "-v", "2", "--logdir", "/tmp/cli-logs"])
+            .unwrap();
         let ini = "[Debug]\nverbose=1\nlogdirectory=/tmp/ini-logs\n";
         let config = resolve_config(&args, Some(ini)).unwrap();
         assert_eq!(config.verbose, 2);
         assert_eq!(config.log_directory, PathBuf::from("/tmp/cli-logs"));
+    }
+
+    #[test]
+    fn verbose_takes_an_integer_level_like_upstream() {
+        let args = ServerArgs::try_parse_from(["etserver", "--verbose=3"]).unwrap();
+        assert_eq!(args.verbose, 3);
+    }
+
+    #[test]
+    fn silent_and_logsize_ini_keys_are_honored() {
+        let args = ServerArgs::try_parse_from(["etserver"]).unwrap();
+        let ini = "[Debug]\nsilent=1\nlogsize=1048576\n";
+        let config = resolve_config(&args, Some(ini)).unwrap();
+        assert!(config.silent);
+        assert_eq!(config.log_size, 1_048_576);
+    }
+
+    #[test]
+    fn telemetry_ini_and_flag_are_parsed_without_effect() {
+        let args = ServerArgs::try_parse_from(["etserver", "--telemetry", "false"]).unwrap();
+        assert_eq!(args.telemetry, Some(false));
+        let args = ServerArgs::try_parse_from(["etserver"]).unwrap();
+        let ini = "[Debug]\ntelemetry=true\n";
+        // Parsed for compatibility; et.rs never reports telemetry.
+        assert!(!resolve_config(&args, Some(ini)).unwrap().telemetry);
+    }
+
+    #[test]
+    fn daemon_defaults_to_the_upstream_pid_file() {
+        let args = ServerArgs::try_parse_from(["etserver", "--daemon"]).unwrap();
+        assert!(args.daemon);
+        assert!(!args.daemon_child);
+        assert_eq!(args.pidfile, None);
     }
 }

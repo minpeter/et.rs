@@ -11,8 +11,8 @@ pub const MAX_KEEPALIVE: u32 = 5;
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "et",
-    version,
-    about = "EternalTerminal client (Rust port)",
+    version = concat!("version ", env!("CARGO_PKG_VERSION")),
+    about = "Remote shell for the busy and impatient",
     long_about = "Connect to a remote shell over a persistent, reconnectable session."
 )]
 pub struct ClientArgs {
@@ -28,7 +28,7 @@ pub struct ClientArgs {
     #[arg(short = 'c', long = "command")]
     pub command: Option<String>,
 
-    #[arg(short = 'e', long = "no-exit")]
+    #[arg(short = 'e', long = "noexit", alias = "no-exit")]
     pub no_exit: bool,
 
     #[arg(long = "terminal-path")]
@@ -37,7 +37,12 @@ pub struct ClientArgs {
     #[arg(short = 't', long = "tunnel", value_name = "SPEC")]
     pub tunnel: Vec<String>,
 
-    #[arg(short = 'r', long = "reverse-tunnel", value_name = "SPEC")]
+    #[arg(
+        short = 'r',
+        long = "reversetunnel",
+        alias = "reverse-tunnel",
+        value_name = "SPEC"
+    )]
     pub reverse_tunnel: Vec<String>,
 
     #[arg(long = "jumphost")]
@@ -52,10 +57,21 @@ pub struct ClientArgs {
     #[arg(short = 'x', long = "kill-other-sessions")]
     pub kill_other_sessions: bool,
 
-    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
+    #[arg(
+        long = "macserver",
+        help = "Set when connecting to an macOS server.  Sets --terminal-path=/usr/local/bin/etterminal"
+    )]
+    pub macserver: bool,
+
+    #[arg(
+        short = 'v',
+        long = "verbose",
+        value_name = "LEVEL",
+        default_value_t = 0
+    )]
     pub verbose: u8,
 
-    #[arg(short = 'k', long = "keepalive", default_value_t = 1, value_parser = validate_keepalive)]
+    #[arg(short = 'k', long = "keepalive", default_value_t = MAX_KEEPALIVE, value_parser = validate_keepalive)]
     pub keepalive: u32,
 
     #[arg(short = 'l', long = "logdir")]
@@ -82,8 +98,29 @@ pub struct ClientArgs {
     #[arg(long = "ssh-option", value_name = "OPT")]
     pub ssh_option: Vec<String>,
 
-    #[arg(long = "telemetry", default_value_t = false, hide = true)]
+    /// Accepted for upstream compatibility; et.rs never collects telemetry.
+    #[arg(
+        long = "telemetry",
+        num_args = 0..=1,
+        default_value_t = true,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+        hide = true
+    )]
     pub telemetry: bool,
+}
+
+impl ClientArgs {
+    /// Effective etterminal path: `--terminal-path` wins over `--macserver`.
+    pub fn effective_terminal_path(&self) -> Option<String> {
+        if let Some(path) = &self.terminal_path {
+            return Some(path.clone());
+        }
+        if self.macserver {
+            return Some("/usr/local/bin/etterminal".to_owned());
+        }
+        None
+    }
 }
 
 fn validate_keepalive(s: &str) -> Result<u32, String> {
@@ -112,9 +149,56 @@ mod tests {
     }
 
     #[test]
-    fn verbose_count_accumulates() {
-        let a = ClientArgs::try_parse_from(["et", "host", "-vvv"]).unwrap();
+    fn verbose_takes_an_integer_level_like_upstream() {
+        let a = ClientArgs::try_parse_from(["et", "host", "-v", "3"]).unwrap();
         assert_eq!(a.verbose, 3);
+        let a = ClientArgs::try_parse_from(["et", "host", "--verbose=2"]).unwrap();
+        assert_eq!(a.verbose, 2);
+        let a = ClientArgs::try_parse_from(["et", "host"]).unwrap();
+        assert_eq!(a.verbose, 0);
+    }
+
+    #[test]
+    fn keepalive_defaults_to_upstream_maximum() {
+        let a = ClientArgs::try_parse_from(["et", "host"]).unwrap();
+        assert_eq!(a.keepalive, MAX_KEEPALIVE);
+    }
+
+    #[test]
+    fn upstream_long_flag_spellings_parse() {
+        let a = ClientArgs::try_parse_from([
+            "et",
+            "host",
+            "-c",
+            "true",
+            "--noexit",
+            "--reversetunnel",
+            "8080:80",
+        ])
+        .unwrap();
+        assert!(a.no_exit);
+        assert_eq!(a.reverse_tunnel.len(), 1);
+    }
+
+    #[test]
+    fn macserver_sets_the_default_terminal_path() {
+        let a = ClientArgs::try_parse_from(["et", "host", "--macserver"]).unwrap();
+        assert_eq!(
+            a.effective_terminal_path().as_deref(),
+            Some("/usr/local/bin/etterminal")
+        );
+        let a = ClientArgs::try_parse_from([
+            "et",
+            "host",
+            "--macserver",
+            "--terminal-path",
+            "/opt/etterminal",
+        ])
+        .unwrap();
+        assert_eq!(
+            a.effective_terminal_path().as_deref(),
+            Some("/opt/etterminal")
+        );
     }
 
     #[test]
@@ -157,6 +241,8 @@ mod tests {
     fn telemetry_flag_accepted_as_noop() {
         let a = ClientArgs::try_parse_from(["et", "host", "--telemetry"]).unwrap();
         assert!(a.telemetry);
+        let a = ClientArgs::try_parse_from(["et", "host", "--telemetry", "false"]).unwrap();
+        assert!(!a.telemetry);
     }
 
     #[test]

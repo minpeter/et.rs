@@ -1,11 +1,10 @@
 use et_cli::client::ClientArgs;
 use et_cli::tunnel::parse_tunnels;
-use et_core::proto::{InitialPayload, PortForwardSourceRequest};
+use et_core::proto::{InitialPayload, PortForwardSourceRequest, SocketEndpoint};
 
 #[derive(Debug)]
 pub enum ForwardConfigError {
     MissingAgentSocket,
-    InvalidSessionId,
     Tunnel(et_cli::tunnel::TunnelError),
 }
 
@@ -14,9 +13,8 @@ impl std::fmt::Display for ForwardConfigError {
         match self {
             Self::MissingAgentSocket => write!(
                 formatter,
-                "SSH-agent forwarding requires --ssh-socket or SSH_AUTH_SOCK"
+                "Missing environment variable SSH_AUTH_SOCK.  Are you sure you ran ssh-agent first?"
             ),
-            Self::InvalidSessionId => write!(formatter, "invalid session id for SSH-agent socket"),
             Self::Tunnel(error) => error.fmt(formatter),
         }
     }
@@ -26,7 +24,7 @@ impl std::error::Error for ForwardConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Tunnel(error) => Some(error),
-            Self::MissingAgentSocket | Self::InvalidSessionId => None,
+            Self::MissingAgentSocket => None,
         }
     }
 }
@@ -44,35 +42,35 @@ pub struct ForwardConfig {
 
 pub fn build(
     args: &ClientArgs,
-    session_id: &str,
     environment_agent: Option<&str>,
 ) -> Result<ForwardConfig, ForwardConfigError> {
     let local_sources = parse_tunnels(&args.tunnel)?;
     let mut reverse_tunnels = parse_tunnels(&args.reverse_tunnel)?;
-    let mut environmentvariables = std::collections::HashMap::new();
     if args.forward_ssh_agent {
-        if session_id.len() != 16 || !session_id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
-            return Err(ForwardConfigError::InvalidSessionId);
-        }
+        // Upstream sends a reverse tunnel with no source: the server creates
+        // a private socket, exports it as SSH_AUTH_SOCK, and connections are
+        // forwarded back to the local agent socket.
         let destination = args
             .ssh_socket
             .as_deref()
             .or(environment_agent)
+            .filter(|value| !value.is_empty())
             .ok_or(ForwardConfigError::MissingAgentSocket)?;
-        let source = format!("/tmp/et-agent-{session_id}/agent.sock");
-        let mut agent = parse_tunnels(&[format!("{source}:{destination}")])?
-            .pop()
-            .ok_or(ForwardConfigError::MissingAgentSocket)?;
-        agent.environmentvariable = Some("SSH_AUTH_SOCK".to_owned());
-        environmentvariables.insert("SSH_AUTH_SOCK".to_owned(), source);
-        reverse_tunnels.push(agent);
+        reverse_tunnels.push(PortForwardSourceRequest {
+            source: None,
+            destination: Some(SocketEndpoint {
+                name: Some(destination.to_owned()),
+                port: None,
+            }),
+            environmentvariable: Some("SSH_AUTH_SOCK".to_owned()),
+        });
     }
     Ok(ForwardConfig {
         local_sources,
         initial_payload: InitialPayload {
             jumphost: Some(false),
             reversetunnels: reverse_tunnels,
-            environmentvariables,
+            environmentvariables: std::collections::HashMap::new(),
         },
     })
 }

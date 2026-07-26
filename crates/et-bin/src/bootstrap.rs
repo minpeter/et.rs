@@ -24,6 +24,93 @@ pub struct BootstrapRequest {
     pub term: String,
 }
 
+/// Second bootstrap hop for ET-native jumphosts, mirroring the
+/// `if (!jumphost.empty())` branch of upstream `SshSetupHandler::SetupSsh`:
+/// `ssh [-p sshport] [user@]jumphost '<etterminal --jump ...>'`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JumpBootstrapRequest {
+    /// `[user@]host[:sshport]` jumphost as given on the command line.
+    pub jumphost: String,
+    /// Final destination host passed to `--dsthost`.
+    pub destination_host: String,
+    /// Final destination ET port passed to `--dstport`.
+    pub destination_port: u16,
+    /// `--jserverfifo` value, forwarded as the jump terminal's `--serverfifo`.
+    pub jump_server_fifo: Option<String>,
+    pub terminal_path: Option<String>,
+    pub kill_other_sessions: bool,
+    pub verbose: u8,
+    pub ssh_options: Vec<String>,
+    pub term: String,
+}
+
+pub fn build_jump_invocation(
+    request: &JumpBootstrapRequest,
+    credentials: &Credentials,
+) -> SshInvocation {
+    let parsed = et_cli::host::parse_host_string(&request.jumphost);
+    // ssh destinations do not accept user@host:port, so the ssh port from the
+    // jumphost string becomes an explicit `-p` flag.
+    let mut args = Vec::new();
+    if let Some(port) = parsed.port_suffix.strip_prefix(':') {
+        args.push("-p".to_string());
+        args.push(port.to_string());
+    }
+    for option in &request.ssh_options {
+        args.push(format!("-o{option}"));
+    }
+    let host = parsed.host.trim_matches(|c| c == '[' || c == ']');
+    args.push(if parsed.user.is_empty() {
+        host.to_string()
+    } else {
+        format!("{}@{host}", parsed.user)
+    });
+    args.push(jump_remote_command(request, credentials));
+    SshInvocation {
+        program: "ssh".to_string(),
+        args,
+        operation: "starting the jumphost etterminal",
+    }
+}
+
+fn jump_remote_command(request: &JumpBootstrapRequest, credentials: &Credentials) -> String {
+    let terminal = request
+        .terminal_path
+        .as_deref()
+        .filter(|path| !path.is_empty())
+        .unwrap_or("etterminal");
+    let input = format!(
+        "{}/{}_{}",
+        credentials.id, credentials.passkey, request.term
+    );
+    let mut command = String::new();
+    if request.kill_other_sessions {
+        command.push_str("pkill -u \"$(id -un)\" 'etterminal'; sleep 0.5; ");
+    }
+    command.push_str(&format!(
+        "printf '%s\\n' {} | {} {}",
+        shell_quote(&input),
+        shell_quote(terminal),
+        shell_quote(&format!("--verbose={}", request.verbose))
+    ));
+    if let Some(fifo) = request.jump_server_fifo.as_deref() {
+        command.push(' ');
+        command.push_str(&shell_quote(&format!("--serverfifo={fifo}")));
+    }
+    command.push_str(" '--jump'");
+    command.push(' ');
+    command.push_str(&shell_quote(&format!(
+        "--dsthost={}",
+        request.destination_host
+    )));
+    command.push(' ');
+    command.push_str(&shell_quote(&format!(
+        "--dstport={}",
+        request.destination_port
+    )));
+    command
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshInvocation {
     pub program: String,
@@ -262,6 +349,63 @@ mod tests {
             parse_id_passkey(b"IDPASSKEY:abcdefghijklmnop/ABCDEFGHIJKLMNOPQRSTUVWXYZabcde!"),
             Err(ClientError::InvalidPasskey)
         ));
+    }
+
+    #[test]
+    fn jump_bootstrap_matches_upstream_command_shape() {
+        let credentials = Credentials {
+            id: "XXXdefghijklmnop".into(),
+            passkey: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef".into(),
+        };
+        let request = JumpBootstrapRequest {
+            jumphost: "user@jump.example:2200".into(),
+            destination_host: "dst.internal".into(),
+            destination_port: 9901,
+            jump_server_fifo: Some("/tmp/jump.fifo".into()),
+            terminal_path: None,
+            kill_other_sessions: false,
+            verbose: 1,
+            ssh_options: vec!["StrictHostKeyChecking=no".into()],
+            term: "xterm-256color".into(),
+        };
+        let invocation = build_jump_invocation(&request, &credentials);
+        assert_eq!(
+            invocation.args[0..4],
+            [
+                "-p",
+                "2200",
+                "-oStrictHostKeyChecking=no",
+                "user@jump.example"
+            ]
+        );
+        let command = &invocation.args[4];
+        assert!(command.contains("'--serverfifo=/tmp/jump.fifo'"));
+        assert!(command.contains("'--jump'"));
+        assert!(command.contains("'--dsthost=dst.internal'"));
+        assert!(command.contains("'--dstport=9901'"));
+    }
+
+    #[test]
+    fn jump_bootstrap_quotes_injection_attempts() {
+        let credentials = provisional_credentials().unwrap();
+        let request = JumpBootstrapRequest {
+            jumphost: "jump".into(),
+            destination_host: "d'; touch dst; echo '".into(),
+            destination_port: 2022,
+            jump_server_fifo: Some("/tmp/f'; touch fifo; echo '".into()),
+            terminal_path: None,
+            kill_other_sessions: false,
+            verbose: 0,
+            ssh_options: Vec::new(),
+            term: "xterm".into(),
+        };
+        let command = build_jump_invocation(&request, &credentials)
+            .args
+            .pop()
+            .unwrap();
+        assert!(command.contains("touch dst"));
+        assert!(command.contains("touch fifo"));
+        assert_eq!(command.matches("'\"'\"'").count(), 4);
     }
 
     #[test]

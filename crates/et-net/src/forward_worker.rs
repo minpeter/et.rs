@@ -6,11 +6,12 @@ use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 
 use crate::forward::{ForwardError, Outbound};
-use crate::forward_endpoint::{Endpoint, ForwardStream};
+use crate::forward_endpoint::ForwardStream;
 use crate::forward_io::{
     spawn_connector, spawn_io, spawn_listener, stop_io, ActiveIo, BoundSource, WriteCommand,
 };
 use et_core::packet::Packet;
+use et_core::proto::SocketEndpoint;
 
 const MAX_ACTIVE_SOCKETS: usize = 256;
 const MAX_DATA_PACKET: usize = 64 * 1024;
@@ -25,7 +26,7 @@ pub(crate) enum Command {
     Packet(Packet),
     Accepted {
         client_fd: i32,
-        destination: Endpoint,
+        destination: SocketEndpoint,
         stream: ForwardStream,
     },
     Connected {

@@ -102,11 +102,18 @@ fn handle_new(mut stream: TcpStream, start: crate::session_slot::SessionStart, c
         }
     };
     if payload.jumphost.unwrap_or(false) {
-        send_initial_error(&mut connection, "jumphost sessions are not implemented");
+        run_jumphost(connection, start, core, payload);
         return;
     }
-    let forwarder = match et_net::forward::Forwarder::start(payload.reversetunnels.clone()) {
-        Ok(forwarder) => forwarder,
+    let owner = {
+        let registration = start.registration();
+        (registration.uid, registration.gid)
+    };
+    let (forwarder, forward_environment) = match et_net::forward::Forwarder::start_with_user(
+        payload.reversetunnels.clone(),
+        Some(owner),
+    ) {
+        Ok(started) => started,
         Err(error) => {
             send_initial_error(&mut connection, &error.to_string());
             return;
@@ -125,9 +132,17 @@ fn handle_new(mut stream: TcpStream, start: crate::session_slot::SessionStart, c
         Ok(terminal) => terminal,
         Err(_) => return,
     };
+    // Merge the client-supplied environment with variables created for
+    // named-pipe forwards; upstream stores them in a sorted std::map.
+    let mut environment: std::collections::BTreeMap<String, String> = payload
+        .environmentvariables
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    environment.extend(forward_environment);
     let term_init = TermInit {
-        environmentnames: payload.environmentvariables.keys().cloned().collect(),
-        environmentvalues: payload.environmentvariables.values().cloned().collect(),
+        environmentnames: environment.keys().cloned().collect(),
+        environmentvalues: environment.values().cloned().collect(),
     };
     let init_packet = et_core::packet::Packet::new(
         TerminalPacketType::TerminalInit as u8,
@@ -145,6 +160,57 @@ fn handle_new(mut stream: TcpStream, start: crate::session_slot::SessionStart, c
         return;
     }
     let _ = crate::terminal_bridge::run(active.clone(), terminal, forwarder);
+    let _ = active.shutdown();
+}
+
+/// Upstream `TerminalServer::runJumpHost`: answer the initial response, hand
+/// the payload to the registered `etterminal --jump` process through a
+/// JUMPHOST_INIT packet, then relay packets verbatim in both directions.
+fn run_jumphost(
+    mut connection: Connection,
+    start: crate::session_slot::SessionStart,
+    core: &RuntimeCore,
+    payload: InitialPayload,
+) {
+    if connection
+        .write_packet(
+            EtPacketType::InitialResponse as u8,
+            &InitialResponse { error: None }.encode_to_vec(),
+        )
+        .is_err()
+    {
+        return;
+    }
+    let mut terminal = match core.registry.clone_stream(start.registration()) {
+        Ok(terminal) => terminal,
+        Err(_) => return,
+    };
+    let init_packet = et_core::packet::Packet::new(
+        TerminalPacketType::JumphostInit as u8,
+        payload.encode_to_vec(),
+    );
+    if write_local_packet(&mut terminal, &init_packet).is_err() {
+        return;
+    }
+    let active = match ActiveSession::new(connection, &terminal) {
+        Ok(active) => active,
+        Err(_) => return,
+    };
+    let active = Arc::new(active);
+    if start.activate(active.clone()).is_err() {
+        return;
+    }
+    // A jumphost session owns no local forwarding: the destination side does.
+    let Ok(forwarder) = et_net::forward::Forwarder::start(Vec::new()) else {
+        let _ = active.shutdown();
+        return;
+    };
+    let _ = crate::terminal_bridge::run_mode(
+        active.clone(),
+        terminal,
+        forwarder,
+        crate::terminal_bridge::BridgeMode::Jumphost,
+    );
     let _ = active.shutdown();
 }
 

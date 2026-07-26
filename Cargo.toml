@@ -5,6 +5,7 @@ members = [
     "crates/et-cli",
     "crates/et-net",
     "crates/et-server",
+    "crates/et-htm",
     "crates/et-bin",
 ]
 

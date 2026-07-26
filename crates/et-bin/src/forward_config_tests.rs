@@ -17,34 +17,36 @@ fn builds_local_reverse_and_agent_forwarding_configuration() {
         "/tmp/local-agent.sock",
     ])
     .unwrap();
-    let config = build(&args, "abcdefghijklmnop", None).unwrap();
+    let config = build(&args, None).unwrap();
     assert_eq!(config.local_sources.len(), 1);
     assert_eq!(config.initial_payload.reversetunnels.len(), 2);
     let agent = &config.initial_payload.reversetunnels[1];
-    assert_eq!(
-        agent.source.as_ref().unwrap().name.as_deref(),
-        Some("/tmp/et-agent-abcdefghijklmnop/agent.sock")
-    );
+    // Upstream leaves the source unset: the server picks a private socket
+    // path and exports it through SSH_AUTH_SOCK.
+    assert_eq!(agent.source, None);
     assert_eq!(
         agent.destination.as_ref().unwrap().name.as_deref(),
         Some("/tmp/local-agent.sock")
     );
     assert_eq!(agent.environmentvariable.as_deref(), Some("SSH_AUTH_SOCK"));
-    assert_eq!(
-        config
-            .initial_payload
-            .environmentvariables
-            .get("SSH_AUTH_SOCK")
-            .map(String::as_str),
-        Some("/tmp/et-agent-abcdefghijklmnop/agent.sock")
-    );
+    assert!(config.initial_payload.environmentvariables.is_empty());
 }
 
 #[test]
-fn agent_forwarding_requires_an_absolute_socket() {
+fn agent_forwarding_falls_back_to_environment_and_requires_a_socket() {
     let args = ClientArgs::try_parse_from(["et", "host", "--forward-ssh-agent"]).unwrap();
+    let config = build(&args, Some("/run/agent.sock")).unwrap();
+    assert_eq!(
+        config.initial_payload.reversetunnels[0]
+            .destination
+            .as_ref()
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("/run/agent.sock")
+    );
     assert!(matches!(
-        build(&args, "abcdefghijklmnop", None),
+        build(&args, None),
         Err(ForwardConfigError::MissingAgentSocket)
     ));
 }

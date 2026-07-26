@@ -1,12 +1,11 @@
 use std::io::{self, Read};
-use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use nix::errno::Errno;
-use nix::sys::signal::{killpg, Signal};
+use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use wait_timeout::ChildExt;
 
@@ -64,22 +63,30 @@ impl SshRunner for SystemSsh {
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        command.process_group(0);
+        // ssh stays in our process group so it can prompt on the controlling
+        // terminal (password, passphrase, host-key confirmation), matching
+        // upstream `SubprocessToStringInteractive`. Moving it to its own group
+        // would make terminal reads raise SIGTTIN and hang the bootstrap.
+        // Cleanup therefore targets the process subtree plus anything still
+        // holding the captured stdout pipe.
         let mut child = command.spawn().map_err(ClientError::SshSpawn)?;
-        let process_group = Pid::from_raw(child.id().cast_signed());
+        let child_pid = Pid::from_raw(child.id().cast_signed());
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
-                terminate_and_reap(&mut child, process_group)?;
+                terminate_and_reap(&mut child, child_pid, None)?;
                 return Err(ClientError::SshStdout(io::Error::other(
                     "ssh stdout pipe was not created",
                 )));
             }
         };
+        // Identify the stdout pipe so descendants that outlive ssh while still
+        // holding it can be found even after they re-parent to init.
+        let pipe = pipe_identity(&stdout);
         let (receiver, reader) = match spawn_reader(stdout) {
             Ok(reader) => reader,
             Err(error) => {
-                terminate_and_reap(&mut child, process_group)?;
+                terminate_and_reap(&mut child, child_pid, pipe)?;
                 return Err(ClientError::SshStdout(error));
             }
         };
@@ -87,34 +94,34 @@ impl SshRunner for SystemSsh {
         let remaining = match deadline.remaining() {
             Some(remaining) => remaining,
             None => {
-                stop_child(&mut child, process_group, reader)?;
+                stop_child(&mut child, child_pid, pipe, reader)?;
                 return Err(ClientError::SshTimeout(invocation.operation));
             }
         };
         match receiver.recv_timeout(remaining) {
             Ok(Capture::Complete(stdout)) => {
                 if let Err(error) = join_reader(reader) {
-                    terminate_and_reap(&mut child, process_group)?;
+                    terminate_and_reap(&mut child, child_pid, pipe)?;
                     return Err(error);
                 }
                 let status =
-                    wait_for_exit(&mut child, process_group, deadline, invocation.operation)?;
+                    wait_for_exit(&mut child, child_pid, pipe, deadline, invocation.operation)?;
                 Ok(SshOutput { status, stdout })
             }
             Ok(Capture::TooLarge) => {
-                stop_child(&mut child, process_group, reader)?;
+                stop_child(&mut child, child_pid, pipe, reader)?;
                 Err(ClientError::SshOutputTooLarge(MAX_SSH_STDOUT))
             }
             Ok(Capture::Failed(error)) => {
-                stop_child(&mut child, process_group, reader)?;
+                stop_child(&mut child, child_pid, pipe, reader)?;
                 Err(ClientError::SshStdout(error))
             }
             Err(RecvTimeoutError::Timeout) => {
-                stop_child(&mut child, process_group, reader)?;
+                stop_child(&mut child, child_pid, pipe, reader)?;
                 Err(ClientError::SshTimeout(invocation.operation))
             }
             Err(RecvTimeoutError::Disconnected) => {
-                stop_child(&mut child, process_group, reader)?;
+                stop_child(&mut child, child_pid, pipe, reader)?;
                 Err(ClientError::SshStdout(io::Error::other(
                     "ssh stdout reader stopped unexpectedly",
                 )))
@@ -178,25 +185,26 @@ fn capture_bounded(reader: &mut impl Read) -> Capture {
 
 fn wait_for_exit(
     child: &mut Child,
-    process_group: Pid,
+    child_pid: Pid,
+    pipe: Option<PipeIdentity>,
     deadline: Deadline,
     operation: &'static str,
 ) -> Result<ExitStatus, ClientError> {
     let remaining = match deadline.remaining() {
         Some(remaining) => remaining,
         None => {
-            terminate_and_reap(child, process_group)?;
+            terminate_and_reap(child, child_pid, pipe)?;
             return Err(ClientError::SshTimeout(operation));
         }
     };
     match child.wait_timeout(remaining) {
         Ok(Some(status)) => Ok(status),
         Ok(None) => {
-            terminate_and_reap(child, process_group)?;
+            terminate_and_reap(child, child_pid, pipe)?;
             Err(ClientError::SshTimeout(operation))
         }
         Err(error) => {
-            terminate_and_reap(child, process_group)?;
+            terminate_and_reap(child, child_pid, pipe)?;
             Err(ClientError::SshWait(error))
         }
     }
@@ -204,26 +212,136 @@ fn wait_for_exit(
 
 fn stop_child(
     child: &mut Child,
-    process_group: Pid,
+    child_pid: Pid,
+    pipe: Option<PipeIdentity>,
     reader: JoinHandle<()>,
 ) -> Result<(), ClientError> {
     drop(reader);
-    terminate_and_reap(child, process_group)
+    terminate_and_reap(child, child_pid, pipe)
 }
 
-fn terminate_and_reap(child: &mut Child, process_group: Pid) -> Result<(), ClientError> {
-    let kill = match killpg(process_group, Signal::SIGKILL) {
-        Ok(()) | Err(Errno::ESRCH) => Ok(()),
-        Err(error) => {
-            let _ = child.kill();
-            Err(io::Error::from(error))
+/// Identity of the captured stdout pipe (device + inode), used to find every
+/// process that still holds it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PipeIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn pipe_identity(stdout: &ChildStdout) -> Option<PipeIdentity> {
+    use std::os::fd::AsFd;
+    let stat = rustix::fs::fstat(stdout.as_fd()).ok()?;
+    Some(PipeIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+    })
+}
+
+fn terminate_and_reap(
+    child: &mut Child,
+    child_pid: Pid,
+    pipe: Option<PipeIdentity>,
+) -> Result<(), ClientError> {
+    // ssh may leave descendants (ProxyJump helpers, remote-command wrappers)
+    // that outlive it and keep the captured stdout pipe open, so kill the
+    // subtree and anything still holding that pipe.
+    let mut targets = descendants(child_pid);
+    if let Some(pipe) = pipe {
+        for holder in pipe_holders(pipe) {
+            if !targets.contains(&holder) {
+                targets.push(holder);
+            }
         }
-    };
-    let waited = child.wait();
-    match (kill, waited) {
-        (Ok(()), Ok(_)) => Ok(()),
-        (Err(error), _) | (_, Err(error)) => Err(ClientError::SshTerminate(error)),
     }
+    targets.push(child_pid);
+    let mut failure = None;
+    for pid in targets {
+        match kill(pid, Signal::SIGKILL) {
+            Ok(()) | Err(Errno::ESRCH) => {}
+            Err(error) => failure = Some(io::Error::from(error)),
+        }
+    }
+    let waited = child.wait();
+    match (failure, waited) {
+        (None, Ok(_)) => Ok(()),
+        (Some(error), _) => Err(ClientError::SshTerminate(error)),
+        (_, Err(error)) => Err(ClientError::SshTerminate(error)),
+    }
+}
+
+/// Descendants of `root`, deepest first.
+fn descendants(root: Pid) -> Vec<Pid> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut system = System::new();
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    let mut children_of: std::collections::HashMap<u32, Vec<u32>> =
+        std::collections::HashMap::new();
+    for (pid, process) in system.processes() {
+        if let Some(parent) = process.parent() {
+            children_of
+                .entry(parent.as_u32())
+                .or_default()
+                .push(pid.as_u32());
+        }
+    }
+    let mut found = Vec::new();
+    let mut queue = std::collections::VecDeque::from([u32::try_from(root.as_raw()).unwrap_or(0)]);
+    while let Some(current) = queue.pop_front() {
+        for child in children_of.remove(&current).unwrap_or_default() {
+            found.push(child);
+            queue.push_back(child);
+        }
+    }
+    // Signal children before parents so nothing re-parents mid-cleanup.
+    found.reverse();
+    found
+        .into_iter()
+        .filter_map(|pid| i32::try_from(pid).ok())
+        .map(Pid::from_raw)
+        .collect()
+}
+
+/// Processes (other than us) holding an open descriptor on `pipe`.
+#[cfg(target_os = "linux")]
+fn pipe_holders(pipe: PipeIdentity) -> Vec<Pid> {
+    let mut holders = Vec::new();
+    let me = std::process::id();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return holders;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(descriptors) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        for descriptor in descriptors.flatten() {
+            let Ok(stat) = std::fs::metadata(descriptor.path()) else {
+                continue;
+            };
+            use std::os::unix::fs::MetadataExt;
+            if stat.dev() == pipe.device && stat.ino() == pipe.inode {
+                if let Ok(raw) = i32::try_from(pid) {
+                    holders.push(Pid::from_raw(raw));
+                }
+                break;
+            }
+        }
+    }
+    holders
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pipe_holders(_pipe: PipeIdentity) -> Vec<Pid> {
+    Vec::new()
 }
 
 fn join_reader(reader: JoinHandle<()>) -> Result<(), ClientError> {

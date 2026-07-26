@@ -148,7 +148,9 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
         .env("TERM", "xterm-test")
         .args([
             "-N",
-            "-vv",
+            // Upstream takes an explicit verbosity level, not a repeat count.
+            "-v",
+            "2",
             "--terminal-path",
             "/opt/et terminal",
             "--serverfifo",
@@ -337,7 +339,11 @@ fn invalid_client_modes_fail_before_ssh_bootstrap() {
 }
 
 #[test]
-fn jumphost_proxyjump_is_passed_to_ssh_bootstrap() {
+fn jumphost_starts_a_jump_terminal_and_connects_to_the_jumphost() {
+    // Upstream `--jumphost` is an ET-native relay: the destination terminal is
+    // started through `ssh -J`, a second `etterminal --jump` is started on the
+    // jumphost, and the ET session is established against the jumphost's
+    // etserver with `jumphost = true` in the initial payload.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
@@ -351,8 +357,7 @@ fn jumphost_proxyjump_is_passed_to_ssh_bootstrap() {
         let packet = connection.read_packet().unwrap();
         assert_eq!(packet.header(), EtPacketType::InitialPayload as u8);
         let payload = InitialPayload::decode(packet.payload()).unwrap();
-        // SSH ProxyJump bootstrap still presents a normal (non-ET-relay) payload.
-        assert_eq!(payload.jumphost, Some(false));
+        assert_eq!(payload.jumphost, Some(true));
         connection
             .write_packet(
                 EtPacketType::InitialResponse as u8,
@@ -367,8 +372,11 @@ fn jumphost_proxyjump_is_passed_to_ssh_bootstrap() {
         .args([
             "-N",
             "--jumphost",
-            "jump.example,user@hop2",
-            &format!("test-user@server-alias:{}", address.port()),
+            "jump.example",
+            "--jport",
+            &address.port().to_string(),
+            "--jserverfifo=/tmp/jump.fifo",
+            "test-user@server-alias:2022",
         ])
         .output()
         .unwrap();
@@ -376,18 +384,29 @@ fn jumphost_proxyjump_is_passed_to_ssh_bootstrap() {
     assert!(output.status.success(), "{}", stderr(&output));
 
     let invocations = fake.invocations();
-    assert_eq!(invocations.len(), 2);
-    // Config resolution stays on the destination alias (no -J required for -G).
+    // -G dst, dst bootstrap through -J, -G jumphost, jump bootstrap.
+    assert_eq!(invocations.len(), 4, "{invocations:?}");
     assert_eq!(invocations[0], ["-G", "test-user@server-alias"]);
-    let argv = &invocations[1];
-    // Shape: ssh -J hop1,hop2 user@dest 'remote etterminal pipe'
-    assert_eq!(argv[0], "-J");
-    assert_eq!(argv[1], "jump.example,user@hop2");
-    assert_eq!(argv[2], "test-user@server-alias");
+    let destination = &invocations[1];
+    assert_eq!(destination[0], "-J");
+    assert_eq!(destination[1], "jump.example");
+    assert_eq!(destination[2], "test-user@server-alias");
     assert!(
-        argv[3].contains("etterminal") || argv[3].starts_with("printf"),
+        destination[3].contains("etterminal") || destination[3].starts_with("printf"),
         "remote command missing: {:?}",
-        argv[3]
+        destination[3]
+    );
+    assert_eq!(invocations[2], ["-G", "jump.example"]);
+    let jump = &invocations[3];
+    assert_eq!(jump[0], "jump.example");
+    // The jump terminal receives the relay destination and its own fifo.
+    assert!(jump[1].contains("'--jump'"), "{:?}", jump[1]);
+    assert!(jump[1].contains("'--dsthost=127.0.0.1'"), "{:?}", jump[1]);
+    assert!(jump[1].contains("'--dstport=2022'"), "{:?}", jump[1]);
+    assert!(
+        jump[1].contains("'--serverfifo=/tmp/jump.fifo'"),
+        "{:?}",
+        jump[1]
     );
 }
 
@@ -409,8 +428,9 @@ fn malformed_jumphost_and_jserverfifo_fail_before_ssh() {
             "must not begin with a hyphen",
         ),
         (
+            // `--jserverfifo` only makes sense together with `--jumphost`.
             &["-N", "--jserverfifo=/tmp/fifo", "example.test"],
-            "--jserverfifo jumphost fifo sessions are not implemented",
+            "--jserverfifo requires --jumphost",
         ),
     ];
     for (args, message) in cases {

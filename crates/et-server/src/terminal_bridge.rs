@@ -13,10 +13,31 @@ use crate::session::{ActiveSession, SessionError};
 
 const READ_BUFFER: usize = 16 * 1024;
 
+/// Which upstream server loop this bridge reproduces.
+///
+/// `Terminal` mirrors `TerminalServer::runTerminal`: terminal output must be
+/// TERMINAL_BUFFER, client packets are dispatched by type, and port
+/// forwarding is handled locally. `Jumphost` mirrors
+/// `TerminalServer::runJumpHost`: both directions are relayed verbatim.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BridgeMode {
+    Terminal,
+    Jumphost,
+}
+
 pub(crate) fn run(
+    session: Arc<ActiveSession>,
+    terminal: UnixStream,
+    forwarder: Forwarder,
+) -> Result<(), SessionError> {
+    run_mode(session, terminal, forwarder, BridgeMode::Terminal)
+}
+
+pub(crate) fn run_mode(
     session: Arc<ActiveSession>,
     mut terminal: UnixStream,
     forwarder: Forwarder,
+    mode: BridgeMode,
 ) -> Result<(), SessionError> {
     terminal.set_nonblocking(true).map_err(SessionError::Io)?;
     let mut wake = session.take_wake_reader()?;
@@ -49,7 +70,9 @@ pub(crate) fn run(
         }
         if terminal_events.contains(PollFlags::IN) {
             if let Some(packet) = read_terminal_packet(&mut terminal, &mut decoder)? {
-                validate_terminal_output(&packet)?;
+                if mode == BridgeMode::Terminal {
+                    validate_terminal_output(&packet)?;
+                }
                 decoder = LocalPacketDecoder::new();
                 match session.send_packet(packet.header(), packet.payload()) {
                     Ok(()) => {}
@@ -65,6 +88,11 @@ pub(crate) fn run(
         if !client_events_are_stale && client_events.contains(PollFlags::IN) {
             loop {
                 match session.try_read_packet() {
+                    // Jumphost relays every packet verbatim to the jump
+                    // terminal, which owns the destination connection.
+                    Ok(Some(packet)) if mode == BridgeMode::Jumphost => {
+                        write_local_packet(&mut terminal, &packet).map_err(SessionError::Io)?;
+                    }
                     Ok(Some(packet)) if is_forward_packet(packet.header()) => {
                         forwarder.receive(packet).map_err(forward_error)?;
                     }

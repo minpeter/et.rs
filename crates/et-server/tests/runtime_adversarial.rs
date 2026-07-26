@@ -53,32 +53,52 @@ fn bad_encrypted_initial_messages_reset_the_slot() {
 }
 
 #[test]
-fn unsupported_jumphost_and_reverse_tunnel_reset_the_slot() {
+fn unbindable_reverse_tunnel_reports_an_error_and_resets_the_slot() {
     let mut server = TestRuntime::start();
     let _terminal = server.register(ID_A, KEY_A);
     let key = passkey_to_key(KEY_A).unwrap();
-    let payloads = [
-        InitialPayload {
-            jumphost: Some(true),
-            reversetunnels: Vec::new(),
-            environmentvariables: HashMap::new(),
-        },
-        InitialPayload {
-            jumphost: Some(false),
-            reversetunnels: vec![Default::default()],
-            environmentvariables: HashMap::new(),
-        },
-    ];
-    for payload in payloads {
-        let (stream, response) = server.handshake(ID_A);
-        assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
-        let (_, initial) = runtime_support::initialize(stream, &key, payload);
-        assert!(initial.error.is_some());
-        server
-            .handle
-            .wait_for_state(ID_A, SessionState::Registered, TIMEOUT)
-            .unwrap();
-    }
+    // An empty reverse-tunnel request has no usable source endpoint, so the
+    // server answers INITIAL_RESPONSE with an error like upstream does when
+    // `createSource` fails.
+    let payload = InitialPayload {
+        jumphost: Some(false),
+        reversetunnels: vec![Default::default()],
+        environmentvariables: HashMap::new(),
+    };
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let (_, initial) = runtime_support::initialize(stream, &key, payload);
+    assert!(initial.error.is_some());
+    server
+        .handle
+        .wait_for_state(ID_A, SessionState::Registered, TIMEOUT)
+        .unwrap();
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
+fn jumphost_payload_is_relayed_to_the_registered_terminal() {
+    let mut server = TestRuntime::start();
+    let mut terminal = server.register(ID_A, KEY_A);
+    let key = passkey_to_key(KEY_A).unwrap();
+    let payload = InitialPayload {
+        jumphost: Some(true),
+        reversetunnels: Vec::new(),
+        environmentvariables: HashMap::new(),
+    };
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let (_client, initial) = runtime_support::initialize(stream, &key, payload);
+    // Jumphost sessions succeed: upstream `runJumpHost` answers with an empty
+    // InitialResponse and forwards JUMPHOST_INIT to the jump terminal.
+    assert!(initial.error.is_none(), "{:?}", initial.error);
+    let packet = et_net::local_packet::read_local_packet(&mut terminal).unwrap();
+    assert_eq!(
+        packet.header(),
+        et_core::proto::TerminalPacketType::JumphostInit as u8
+    );
+    let relayed = InitialPayload::decode(packet.payload()).unwrap();
+    assert_eq!(relayed.jumphost, Some(true));
     server.runtime.shutdown().unwrap();
 }
 

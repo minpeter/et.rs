@@ -11,6 +11,10 @@ Windows meant running the POSIX server inside WSL and landing in a WSL shell. et
 and the per-session terminal natively on Windows using ConPTY, so `et` gives you a real `cmd.exe` or
 PowerShell — no WSL involved.
 
+## Packaging status
+
+[![Packaging status](https://repology.org/badge/vertical-allrepos/et-rs-bin.svg?exclude_unsupported=1)](https://repology.org/project/et-rs-bin/versions)
+
 ## Install
 
 ### Homebrew (macOS, Linux)
@@ -26,7 +30,9 @@ installing the other. Upgrade later with `brew upgrade et-rs`.
 ### AUR (Arch Linux)
 
 ```sh
-paru -S et-rs-bin        # or: yay -S et-rs-bin
+yay -S et-rs-bin
+# or
+paru -S et-rs-bin
 ```
 
 Installs the prebuilt release binary (x86_64, aarch64) with the role symlinks. Conflicts with the

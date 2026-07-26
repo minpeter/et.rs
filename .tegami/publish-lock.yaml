@@ -1,9 +1,9 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Fix client dying with \"polling terminal streams: Interrupted system call (os error 4)\"\n\nThe client installs a process-wide SIGWINCH handler for terminal resizes, and\n`poll()` is never auto-restarted by `SA_RESTART`: any signal delivered to the\nthread blocked in `poll()` (a window resize, `SIGCONT` after job control,\n`SIGINFO` from Ctrl-T on macOS) made it fail with `EINTR`, which the client\ntreated as fatal and tore the session down mid-use.\n\nThe terminal loop now retries `poll()` on `EINTR`, recomputing the keepalive\ntimeout from the absolute deadline so timing stays correct. The same retry was\napplied to every other interruptible `poll()` in the workspace: the server\nsession bridge, the PTY worker, the jump-host bridge, and the port-forward\nacceptor (which previously exited silently on `EINTR`).\n"
-    filename: fix-poll-eintr-signal-resilience.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Fix macOS reconnect and PTY end-to-end failures\n\nFix the remaining macOS portability failures in reconnect, terminal shutdown,\nand background process-group cleanup.\n\nThe terminal launcher now resolves busybox-style symlinks before re-exec,\nclient and router loops detect Darwin socket closure reliably, and the PTY\nfixtures no longer depend on interactive-shell timing. macOS CI now runs the\naffected reconnect and PTY/process integration tests explicitly.\n"
+    filename: fix-macos-pty-end-to-end.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - fix-poll-eintr-signal-resilience.md
+      - fix-macos-pty-end-to-end.md
     id: cargo:et
     updated: true

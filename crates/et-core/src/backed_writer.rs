@@ -4,7 +4,14 @@
 //! [`WriterOutcome`] describing the bytes the transport must send, so the
 //! reconnect/replay logic is fully testable without I/O.
 //!
-//! Buffer caps match upstream exactly (64 MiB backup, 64 MiB disconnect).
+//! Wire-facing caps match upstream exactly (64 MiB disconnect buffer, 76 MiB
+//! recovery total, and the catchup entry limits validated on receive). The
+//! *connected* backup retention deliberately diverges from upstream's 64 MiB:
+//! while the transport is up, a reconnecting peer can only be missing data
+//! that was in flight (bounded by kernel socket buffers, typically <= 4 MiB),
+//! so retaining 64 MiB per session mostly wastes daemon memory. The connected
+//! backup is therefore trimmed to 8 MiB / 32 Ki packets; the disconnected
+//! catchup path keeps upstream's full 64 MiB.
 
 use std::collections::VecDeque;
 
@@ -17,6 +24,11 @@ pub const DISCONNECT_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
 pub const MAX_RECOVERY_BACKUP_BYTES: i64 = 76 * 1024 * 1024;
 pub const MAX_BACKUP_PACKETS: usize = 262_144;
 pub const MAX_DISCONNECT_PACKETS: usize = 262_144;
+/// Replay history kept while connected; must comfortably exceed the largest
+/// amount of written-but-undelivered data a live TCP connection can hold
+/// (socket send buffer + in flight, <= 4 MiB on default Linux autotuning).
+pub const CONNECTED_BACKUP_BYTES: i64 = 8 * 1024 * 1024;
+pub const CONNECTED_BACKUP_PACKETS: usize = 32_768;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriterOutcome {
@@ -94,11 +106,20 @@ impl BackedWriter {
         self.backup_size += packet.wire_len() as i64;
         self.sequence += 1;
         while self.connected
-            && (self.backup_size > MAX_BACKUP_BYTES || self.backup.len() > MAX_BACKUP_PACKETS)
+            && (self.backup_size > CONNECTED_BACKUP_BYTES
+                || self.backup.len() > CONNECTED_BACKUP_PACKETS)
         {
             if let Some(old) = self.backup.pop_back() {
                 self.backup_size -= old.wire_len() as i64;
             }
+        }
+        // A disconnect can balloon the deque to the 64 MiB catchup cap;
+        // return that slack once the trimmed length no longer needs it.
+        if self.connected
+            && self.backup.capacity() > 4096
+            && self.backup.capacity() / 4 > self.backup.len()
+        {
+            self.backup.shrink_to(self.backup.len() * 2);
         }
         if !self.connected {
             self.disconnected_bytes += packet.wire_len() as i64;
@@ -223,6 +244,52 @@ mod tests {
         let recovered = w.recover(0).unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(w.recover(2), Err(RecoverError::AheadOfServer));
+    }
+
+    #[test]
+    fn connected_backup_trims_to_connected_byte_cap() {
+        let mut w = writer(true);
+        let chunk = vec![0u8; 3 * 1024 * 1024];
+        for _ in 0..3 {
+            assert!(matches!(
+                w.write_packet(0, &chunk).unwrap(),
+                WriterOutcome::Send(_)
+            ));
+        }
+        // 9 MiB written while connected; only ~6 MiB (2 packets) is retained.
+        assert_eq!(w.recover(0), Err(RecoverError::TooFarBehind));
+        assert_eq!(w.recover(1).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn connected_backup_trims_to_connected_packet_cap() {
+        let mut w = writer(true);
+        let extra = 10;
+        for _ in 0..CONNECTED_BACKUP_PACKETS + extra {
+            w.write_packet(0, b"").unwrap();
+        }
+        assert_eq!(
+            w.recover(extra as i64).unwrap().len(),
+            CONNECTED_BACKUP_PACKETS
+        );
+        assert_eq!(
+            w.recover(extra as i64 - 1),
+            Err(RecoverError::TooFarBehind)
+        );
+    }
+
+    #[test]
+    fn disconnected_backup_keeps_full_catchup_history() {
+        let mut w = writer(false);
+        let chunk = vec![0u8; 3 * 1024 * 1024];
+        for _ in 0..3 {
+            assert_eq!(
+                w.write_packet(0, &chunk).unwrap(),
+                WriterOutcome::BufferedOnly
+            );
+        }
+        // Beyond the connected cap, but every packet must stay replayable.
+        assert_eq!(w.recover(0).unwrap().len(), 3);
     }
 
     #[test]

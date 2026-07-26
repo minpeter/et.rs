@@ -1,9 +1,9 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Fix reconnect against upstream C++ peers rejecting the session with \"invalid recovery proof\"\n\nReconnecting to an upstream C++ `etserver` (or accepting an upstream C++ `et`\nclient) failed with `server sent an invalid recovery proof` whenever the peer's\nfirst packet after recovery was regular session traffic, such as terminal\noutput. et.rs required the first post-recovery packet to be an empty\nkeep-alive, a convention upstream does not follow.\n\nRecovery authentication now accepts any packet that decrypts with the session\nkey (which is the actual proof) and requeues it for the session loop instead\nof discarding it, so no traffic is lost.\n\nAlso fixes a port-forwarding race surfaced by this change: closing a forwarded\nsocket could drop data still queued for its writer thread. Teardown now drains\nqueued writes before shutting the socket down.\n"
-    filename: fix-recovery-proof-interop.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n### Identify the et.rs port in `--version` output\n\n`--version` on every role (`et`, `etserver`, `etterminal`, `htm`, `htmd`) now\nprints the et.rs identity and project URL:\n\n```\net version 0.0.3 (et.rs)\nA Rust port of Eternal Terminal\nhttps://github.com/minpeter/et.rs\n```\n\n`-V` keeps the short upstream-compatible `et version X.Y.Z` line for scripts.\n`etterminal` gains `--version`/`-V` support.\n"
+    filename: long-version-identity.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - fix-recovery-proof-interop.md
+      - long-version-identity.md
     id: cargo:et
     updated: true

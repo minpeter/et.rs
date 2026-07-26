@@ -65,8 +65,12 @@ pub(crate) fn spawn_listener(
                     PollFd::new(&listener, PollFlags::IN),
                     PollFd::new(&stop, PollFlags::IN),
                 ];
-                if poll(&mut descriptors, None).is_err() {
-                    return;
+                // poll() is never restarted by SA_RESTART; retry on EINTR so
+                // a stray signal cannot silently stop the forward acceptor.
+                match poll(&mut descriptors, None) {
+                    Ok(_) => {}
+                    Err(error) if error == rustix::io::Errno::INTR => continue,
+                    Err(_) => return,
                 }
                 if descriptors[1]
                     .revents()

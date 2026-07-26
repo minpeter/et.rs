@@ -72,8 +72,6 @@ where
     }
     loop {
         let deadline = next_keepalive.min(last_received + silence);
-        let timeout = Timespec::try_from(deadline.saturating_duration_since(Instant::now()))
-            .map_err(|_| terminal_text("keepalive deadline exceeds poll range"))?;
         let (network, resize, forwarding, input) = {
             let mut descriptors = vec![
                 PollFd::new(&stream, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
@@ -86,8 +84,26 @@ where
                     PollFlags::IN | PollFlags::HUP | PollFlags::ERR,
                 ));
             }
-            poll(&mut descriptors, Some(&timeout))
-                .map_err(|error| terminal_io("polling terminal streams", io::Error::from(error)))?;
+            // poll() is never auto-restarted by SA_RESTART, so any signal
+            // delivered to this thread (e.g. SIGWINCH from a window resize,
+            // SIGCONT after job control) interrupts it with EINTR. Retry with
+            // a freshly computed timeout so the keepalive deadline stays
+            // absolute instead of treating the interruption as fatal.
+            loop {
+                let timeout =
+                    Timespec::try_from(deadline.saturating_duration_since(Instant::now()))
+                        .map_err(|_| terminal_text("keepalive deadline exceeds poll range"))?;
+                match poll(&mut descriptors, Some(&timeout)) {
+                    Ok(_) => break,
+                    Err(error) if error == rustix::io::Errno::INTR => {}
+                    Err(error) => {
+                        return Err(terminal_io(
+                            "polling terminal streams",
+                            io::Error::from(error),
+                        ));
+                    }
+                }
+            }
             (
                 descriptors[0].revents(),
                 descriptors[1].revents(),

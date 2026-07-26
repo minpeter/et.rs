@@ -5,18 +5,21 @@ use clap::Parser;
 use et_cli::client::ClientArgs;
 use et_cli::host::parse_positional_host;
 
+use et_net::connection::Connection;
+
 use crate::bootstrap::{
     build_invocation, build_jump_invocation, cmd_safe, provisional_credentials,
-    validate_ssh_destination, BootstrapRequest, JumpBootstrapRequest, RemoteShell,
+    validate_ssh_destination, BootstrapRequest, Credentials, JumpBootstrapRequest, RemoteShell,
 };
 use crate::deadline::Deadline;
 use crate::error::ClientError;
-use crate::initial_connect::{connect_initial, reconnect, Endpoint};
+use crate::initial_connect::{connect_initial, reconnect, Endpoint, ReconnectOutcome};
 use crate::resolver::{EndpointResolver, SystemResolver};
 use crate::ssh_config::resolve_ssh_config;
 use crate::ssh_process::{run_bootstrap, SshRunner, SystemSsh};
 
 const RECONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const RECONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
     let parsed = ClientArgs::try_parse_from(
@@ -172,16 +175,124 @@ fn run_client(
             lines: crate::client_terminal::RemoteLines::from(args.effective_remote_shell()),
         },
         forwarder,
-        |connection| {
+        |connection| reconnect_with_retry(connection, &endpoint, &credentials, resolver),
+    )
+}
+
+/// Reconnect, retrying transient network failures until the link returns.
+///
+/// A laptop that slept through a Wi-Fi drop wakes with no route to the
+/// server for several seconds; a single failed attempt must not kill the
+/// session (upstream ET retries until the server ends the session). Raw
+/// mode turns off ISIG, so Ctrl-C arrives as the 0x03 byte on stdin and is
+/// honoured as "give up now" while waiting between attempts.
+fn reconnect_with_retry(
+    connection: &mut Connection,
+    endpoint: &Endpoint,
+    credentials: &Credentials,
+    resolver: &dyn EndpointResolver,
+) -> Result<ReconnectOutcome, ClientError> {
+    let mut announced = false;
+    retry_transient(
+        || {
             reconnect(
                 connection,
-                &endpoint,
-                &credentials,
+                endpoint,
+                credentials,
                 resolver,
                 Deadline::after(RECONNECT_TIMEOUT),
             )
         },
+        |error| {
+            if !announced {
+                announced = true;
+                // Raw mode is active: lines need explicit carriage returns.
+                eprint!("\r\net: connection lost, reconnecting... (press Ctrl-C to give up)\r\n");
+            }
+            et_cli::logging::info(format!("reconnect attempt failed, retrying: {error}"));
+            reconnect_wait_aborted(RECONNECT_RETRY_DELAY)
+        },
     )
+}
+
+/// Run `attempt` until it succeeds, retrying transient network errors.
+/// `wait` runs between attempts and returns `true` to give up with the
+/// last error; non-transient errors propagate immediately.
+fn retry_transient<T>(
+    mut attempt: impl FnMut() -> Result<T, ClientError>,
+    mut wait: impl FnMut(&ClientError) -> bool,
+) -> Result<T, ClientError> {
+    loop {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error) if error.is_transient_reconnect() => {
+                if wait(&error) {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Wait out the retry delay. Returns `true` when the user pressed Ctrl-C.
+///
+/// Stdin is in raw mode, so the byte must be read to be seen. Other input
+/// typed while the link is down cannot reach the server and is dropped,
+/// which is also what a dead TCP connection would have done with it.
+#[cfg(unix)]
+fn reconnect_wait_aborted(delay: Duration) -> bool {
+    use std::io::{IsTerminal, Read};
+
+    use rustix::event::{poll, PollFd, PollFlags};
+    use rustix::time::Timespec;
+
+    const CTRL_C: u8 = 0x03;
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        std::thread::sleep(delay);
+        return false;
+    }
+    let deadline = std::time::Instant::now() + delay;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let Ok(timeout) = Timespec::try_from(remaining) else {
+            return false;
+        };
+        let mut descriptors = [PollFd::new(&stdin, PollFlags::IN)];
+        match poll(&mut descriptors, Some(&timeout)) {
+            Ok(0) => return false,
+            Ok(_) => {
+                if !descriptors[0].revents().contains(PollFlags::IN) {
+                    return false;
+                }
+                let mut bytes = [0u8; 256];
+                match stdin.lock().read(&mut bytes) {
+                    // EOF: stdin is gone, nothing to poll for any more.
+                    Ok(0) => {
+                        std::thread::sleep(remaining);
+                        return false;
+                    }
+                    Ok(count) if bytes[..count].contains(&CTRL_C) => return true,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn reconnect_wait_aborted(delay: Duration) -> bool {
+    // The Windows console loop owns stdin; a Ctrl-C abort would need a
+    // console reader here. Sleep and retry: the process can still be killed.
+    std::thread::sleep(delay);
+    false
 }
 
 /// Configure logging like upstream `TerminalClientMain`: files land in
@@ -266,6 +377,80 @@ fn validate_jumphost(jumphost: &str) -> Result<(), ClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_transient_retries_until_success() {
+        let mut attempts = 0;
+        let result = retry_transient(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(ClientError::DnsTimeout("host:2022".to_owned()))
+                } else {
+                    Ok(7)
+                }
+            },
+            |error| {
+                assert!(error.is_transient_reconnect());
+                false
+            },
+        );
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn retry_transient_gives_up_when_wait_aborts() {
+        let mut attempts = 0;
+        let result = retry_transient(
+            || -> Result<(), ClientError> {
+                attempts += 1;
+                Err(ClientError::UnreachableEndpoint {
+                    endpoint: "10.10.10.10:2022".to_owned(),
+                    source: std::io::Error::from(std::io::ErrorKind::TimedOut),
+                })
+            },
+            |_| true,
+        );
+        assert!(matches!(
+            result,
+            Err(ClientError::UnreachableEndpoint { .. })
+        ));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn retry_transient_propagates_fatal_errors_immediately() {
+        let mut attempts = 0;
+        let result = retry_transient(
+            || -> Result<(), ClientError> {
+                attempts += 1;
+                Err(ClientError::ProtocolMismatch(None))
+            },
+            |_| panic!("fatal errors must not wait for a retry"),
+        );
+        assert!(matches!(result, Err(ClientError::ProtocolMismatch(None))));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn transient_reconnect_classification() {
+        assert!(ClientError::DnsTimeout("h:1".to_owned()).is_transient_reconnect());
+        assert!(ClientError::BootstrapTimeout("x").is_transient_reconnect());
+        assert!(
+            ClientError::Transport(et_net::connection::ConnError::Io(std::io::Error::from(
+                std::io::ErrorKind::ConnectionReset
+            )))
+            .is_transient_reconnect()
+        );
+        assert!(!ClientError::ProtocolMismatch(None).is_transient_reconnect());
+        assert!(!ClientError::ServerRejected {
+            status: None,
+            message: None
+        }
+        .is_transient_reconnect());
+        assert!(!ClientError::InvalidPasskey.is_transient_reconnect());
+    }
 
     #[test]
     fn username_precedence_matches_upstream() {

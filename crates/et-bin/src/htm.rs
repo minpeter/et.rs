@@ -11,7 +11,8 @@ use et_htm::server::{pipe_name, HtmServer};
 #[derive(Debug, Parser)]
 #[command(
     name = "htm",
-    version = concat!("version ", env!("CARGO_PKG_VERSION")),
+    version = et_cli::VERSION,
+    long_version = et_cli::LONG_VERSION,
     about = "Headless terminal multiplexer"
 )]
 struct HtmArgs {
@@ -29,7 +30,8 @@ struct HtmArgs {
 #[derive(Debug, Parser)]
 #[command(
     name = "htmd",
-    version = concat!("version ", env!("CARGO_PKG_VERSION")),
+    version = et_cli::VERSION,
+    long_version = et_cli::LONG_VERSION,
     about = "Headless terminal multiplexer daemon"
 )]
 struct HtmdArgs {}

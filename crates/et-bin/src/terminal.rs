@@ -18,7 +18,11 @@ use crate::terminal_pty;
 const MAX_CREDENTIAL_INPUT: u64 = 4096;
 
 #[derive(Debug, Parser)]
-#[command(name = "etterminal")]
+#[command(
+    name = "etterminal",
+    version = et_cli::VERSION,
+    long_version = et_cli::LONG_VERSION
+)]
 struct TerminalArgs {
     #[arg(long)]
     serverfifo: Option<PathBuf>,

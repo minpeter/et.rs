@@ -12,7 +12,8 @@ pub const DEFAULT_CONFIG_PATH: &str = "/etc/et/config";
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "etserver",
-    version = concat!("version ", env!("CARGO_PKG_VERSION")),
+    version = crate::VERSION,
+    long_version = crate::LONG_VERSION,
     about = "Remote shell for the busy and impatient",
     long_about = "Listen for ET client connections and spawn terminal sessions."
 )]

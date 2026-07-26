@@ -11,7 +11,8 @@ pub const MAX_KEEPALIVE: u32 = 5;
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "et",
-    version = concat!("version ", env!("CARGO_PKG_VERSION")),
+    version = crate::VERSION,
+    long_version = crate::LONG_VERSION,
     about = "Remote shell for the busy and impatient",
     long_about = "Connect to a remote shell over a persistent, reconnectable session."
 )]

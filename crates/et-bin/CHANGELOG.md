@@ -1,9 +1,6 @@
----
-packages:
-  et: patch
----
+## et@0.0.1
 
-## Initial release
+### Initial release
 
 First automated release of et.rs: a single telemetry-free EternalTerminal binary (Rust port).
 

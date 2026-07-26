@@ -8,6 +8,7 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -16,6 +17,7 @@ use reconnect_stack::{mkfifo, shell_quote, Stack};
 use tunnel_support::SingleCutProxy;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+static NEXT_SOURCE_PORT: AtomicU16 = AtomicU16::new(0);
 
 #[test]
 fn cli_local_and_reverse_tunnels_relay_real_tcp_payloads() {
@@ -216,6 +218,7 @@ fn spawn_tcp_echo(listener: TcpListener) -> thread::JoinHandle<()> {
                     if let Ok(count) = stream.read(&mut payload) {
                         if count > 0 {
                             let _ = stream.write_all(&payload[..count]);
+                            return;
                         }
                     }
                 }
@@ -293,11 +296,16 @@ fn assert_stream_round_trip(stream: &mut TcpStream, payload: &[u8]) {
 }
 
 fn reserve_port() -> u16 {
-    TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    // Avoid the OS ephemeral range: after this probe is dropped, bootstrap
+    // connections may otherwise consume the same port before the tunnel binds.
+    for _ in 0..20_000 {
+        let offset = NEXT_SOURCE_PORT.fetch_add(1, Ordering::Relaxed);
+        let port = 20_000 + (u16::try_from(std::process::id() % 20_000).unwrap() + offset) % 20_000;
+        if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("could not reserve a non-ephemeral tunnel source port");
 }
 
 fn await_fifo(path: &std::path::Path) -> String {

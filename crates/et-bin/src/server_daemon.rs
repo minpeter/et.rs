@@ -22,8 +22,14 @@ pub const DEFAULT_PID_FILE: &str = "etserver.pid";
 /// The child receives the original arguments with `--daemon` replaced by the
 /// internal `--daemon-child` marker so it knows to finish detaching.
 pub fn spawn_detached(args: &[std::ffi::OsString]) -> Result<(), String> {
+    // `current_exe()` can preserve the `etserver` busybox-style symlink on
+    // macOS. Re-executing that path with the explicit `server` subcommand
+    // would then parse as `etserver server …`; use the real binary so the
+    // explicit role selection below is unambiguous on every Unix platform.
     let executable = std::env::current_exe()
-        .map_err(|error| format!("could not locate etserver executable: {error}"))?;
+        .map_err(|error| format!("could not locate etserver executable: {error}"))?
+        .canonicalize()
+        .map_err(|error| format!("could not resolve etserver executable: {error}"))?;
     let mut child = Command::new(executable);
     child.arg("server");
     for argument in args {

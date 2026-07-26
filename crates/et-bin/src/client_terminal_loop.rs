@@ -86,12 +86,13 @@ where
             }
             // poll() is never auto-restarted by SA_RESTART, so any signal
             // delivered to this thread (e.g. SIGWINCH from a window resize,
-            // SIGCONT after job control) interrupts it with EINTR. Retry with
-            // a freshly computed timeout so the keepalive deadline stays
-            // absolute instead of treating the interruption as fatal.
+            // SIGCONT after job control) interrupts it with EINTR. The 100ms
+            // cap also lets the nonblocking read below detect closed sockets
+            // when Darwin omits the expected readiness bit.
             loop {
+                let poll_deadline = deadline.min(Instant::now() + Duration::from_millis(100));
                 let timeout =
-                    Timespec::try_from(deadline.saturating_duration_since(Instant::now()))
+                    Timespec::try_from(poll_deadline.saturating_duration_since(Instant::now()))
                         .map_err(|_| terminal_text("keepalive deadline exceeds poll range"))?;
                 match poll(&mut descriptors, Some(&timeout)) {
                     Ok(_) => break,
@@ -129,27 +130,23 @@ where
                 Err(error) => return Err(error),
             }
         }
-        if network.contains(PollFlags::IN) {
-            loop {
-                match connection.try_read_packet() {
-                    Ok(Some(packet)) => {
-                        last_received = Instant::now();
-                        if route_server_packet(packet, forwarder, terminal_enabled)?
-                            && auto_cursor_report
-                        {
-                            let _ = send_buffer(
-                                connection,
-                                crate::client_terminal::CURSOR_REPORT_REPLY,
-                            );
-                        }
+        loop {
+            match connection.try_read_packet() {
+                Ok(Some(packet)) => {
+                    last_received = Instant::now();
+                    if route_server_packet(packet, forwarder, terminal_enabled)?
+                        && auto_cursor_report
+                    {
+                        let _ =
+                            send_buffer(connection, crate::client_terminal::CURSOR_REPORT_REPLY);
                     }
-                    Ok(None) => break,
-                    Err(error) if connection_ended(&error) => {
-                        reconnect_needed = true;
-                        break;
-                    }
-                    Err(error) => return Err(terminal_error(error)),
                 }
+                Ok(None) => break,
+                Err(error) if connection_ended(&error) => {
+                    reconnect_needed = true;
+                    break;
+                }
+                Err(error) => return Err(terminal_error(error)),
             }
         }
         if forwarding.intersects(PollFlags::IN | PollFlags::HUP) {

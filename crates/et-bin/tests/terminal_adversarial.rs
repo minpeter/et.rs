@@ -65,12 +65,23 @@ fn malformed_initialization_and_shell_spawn_failure_are_typed() {
 #[test]
 fn shell_exit_reaps_background_process_group() {
     let fixture = Fixture::new("process-group");
-    let mut child = fixture.spawn();
+    let shell = fixture.directory.join("background-shell");
+    fs::write(&shell, "#!/bin/sh\nsleep 30 & printf 'BG:%s\\n' \"$!\"\n").unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut child = fixture.spawn_with_shell(shell.to_str().unwrap());
     write_credentials(&mut child);
     let (mut router, _) = fixture.listener.accept().unwrap();
-    router.set_read_timeout(Some(TIMEOUT)).unwrap();
     let _ = read_local_packet(&mut router).unwrap();
     fixture.wait_ready();
+    let mut output_reader = router.try_clone().unwrap();
+    let (output_tx, output_rx) = mpsc::sync_channel(64);
+    std::thread::spawn(move || {
+        while let Ok(packet) = read_local_packet(&mut output_reader) {
+            if output_tx.send(packet).is_err() {
+                break;
+            }
+        }
+    });
     send(
         &mut router,
         TerminalPacketType::TerminalInit,
@@ -79,16 +90,9 @@ fn shell_exit_reaps_background_process_group() {
             environmentvalues: Vec::new(),
         },
     );
-    send(
-        &mut router,
-        TerminalPacketType::TerminalBuffer,
-        &TerminalBuffer {
-            buffer: Some(b"sleep 30 & printf 'BG:%s\\n' \"$!\"; exit\n".to_vec()),
-        },
-    );
     let mut output = String::new();
     let pid = loop {
-        let packet = read_local_packet(&mut router).unwrap();
+        let packet = output_rx.recv_timeout(TIMEOUT).unwrap();
         let bytes = TerminalBuffer::decode(packet.payload())
             .unwrap()
             .buffer

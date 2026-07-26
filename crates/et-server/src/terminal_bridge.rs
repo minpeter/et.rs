@@ -294,7 +294,15 @@ fn wait(
             PollFlags::IN | PollFlags::HUP | PollFlags::ERR,
         ));
     }
-    poll(&mut descriptors, None).map_err(|error| SessionError::Io(io::Error::from(error)))?;
+    // poll() is never restarted by SA_RESTART; retry on EINTR instead of
+    // tearing the session down when a signal interrupts the wait.
+    loop {
+        match poll(&mut descriptors, None) {
+            Ok(_) => break,
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(error) => return Err(SessionError::Io(io::Error::from(error))),
+        }
+    }
     Ok((
         descriptors[0].revents(),
         descriptors[1].revents(),

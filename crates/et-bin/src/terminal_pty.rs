@@ -194,8 +194,17 @@ fn pump_poll(
                 PollFd::new(&*router, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
                 PollFd::new(&wake_reader, PollFlags::IN | PollFlags::HUP),
             ];
-            poll(&mut descriptors, None)
-                .map_err(|error| format!("could not poll terminal session: {error}"))?;
+            // poll() is never restarted by SA_RESTART; retry on EINTR so a
+            // stray signal cannot kill the terminal session.
+            loop {
+                match poll(&mut descriptors, None) {
+                    Ok(_) => break,
+                    Err(error) if error == rustix::io::Errno::INTR => {}
+                    Err(error) => {
+                        return Err(format!("could not poll terminal session: {error}"));
+                    }
+                }
+            }
             (descriptors[0].revents(), descriptors[1].revents())
         };
         if wake_events.intersects(PollFlags::IN | PollFlags::HUP) {

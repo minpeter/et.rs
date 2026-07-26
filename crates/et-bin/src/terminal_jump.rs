@@ -206,7 +206,15 @@ fn relay(mut router: LocalStream, destination: &mut Connection) -> Result<i32, S
             PollFd::new(&router, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
             PollFd::new(&client, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
         ];
-        poll(&mut descriptors, None).map_err(|error| format!("poll failed: {error}"))?;
+        // poll() is never restarted by SA_RESTART; retry on EINTR so a stray
+        // signal cannot kill the jump-host bridge.
+        loop {
+            match poll(&mut descriptors, None) {
+                Ok(_) => break,
+                Err(error) if error == rustix::io::Errno::INTR => {}
+                Err(error) => return Err(format!("poll failed: {error}")),
+            }
+        }
         let router_events = descriptors[0].revents();
         let client_events = descriptors[1].revents();
         drop(client);

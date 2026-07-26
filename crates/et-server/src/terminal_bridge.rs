@@ -406,10 +406,7 @@ fn validate_terminal_output(packet: &Packet) -> Result<(), SessionError> {
 /// refers to this hop's connection, so apply it here and relay a payload-less
 /// keep-alive. The next hop (`etterminal --jump`) attaches its own sequence
 /// for the destination, and a foreign sequence never crosses a hop.
-fn jumphost_client_packet(
-    session: &ActiveSession,
-    packet: Packet,
-) -> Result<Packet, SessionError> {
+fn jumphost_client_packet(session: &ActiveSession, packet: Packet) -> Result<Packet, SessionError> {
     if packet.header() != TerminalPacketType::KeepAlive as u8 {
         return Ok(packet);
     }

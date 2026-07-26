@@ -9,6 +9,8 @@ use et_net::forward::{is_forward_packet, Forwarder};
 use et_net::local_packet::{write_local_packet, LocalPacketDecoder};
 #[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags};
+#[cfg(unix)]
+use rustix::time::Timespec;
 
 use crate::session::{ActiveSession, SessionError};
 
@@ -59,9 +61,19 @@ fn run_mode_poll(
     wake.set_nonblocking(true).map_err(SessionError::Io)?;
     let mut decoder = LocalPacketDecoder::new();
     let mut connected = session.connected()?;
+    // A forwarding packet the worker had no room for. While it is held, no
+    // further client packets are read (ordering) and the client socket is not
+    // watched for readability (it would busy-loop the poll).
+    let mut pending_forward: Option<Packet> = None;
     loop {
         if session.is_shutting_down() {
             return Ok(());
+        }
+        // Retry the held packet first: draining the forwarder's outbound
+        // queue below is what frees worker capacity, so this makes progress
+        // every iteration instead of deadlocking on a blocking send.
+        if let Some(packet) = pending_forward.take() {
+            pending_forward = forwarder.try_receive(packet).map_err(forward_error)?;
         }
         let client = connected.then(|| session.try_clone_stream()).transpose()?;
         let accept_terminal = session.can_buffer_write((READ_BUFFER * 2) as i64)?;
@@ -71,6 +83,7 @@ fn run_mode_poll(
             forwarder.wake().map_err(forward_error)?,
             client.as_ref(),
             accept_terminal,
+            pending_forward.is_some(),
         )?;
         let client_events_are_stale = wake_events.intersects(PollFlags::IN | PollFlags::HUP);
         if client_events_are_stale {
@@ -101,7 +114,7 @@ fn run_mode_poll(
             }
         }
         if !client_events_are_stale && client_events.contains(PollFlags::IN) {
-            loop {
+            while pending_forward.is_none() {
                 match session.try_read_packet() {
                     // Jumphost relays every packet verbatim to the jump
                     // terminal, which owns the destination connection.
@@ -109,7 +122,8 @@ fn run_mode_poll(
                         write_local_packet(&mut terminal, &packet).map_err(SessionError::Io)?;
                     }
                     Ok(Some(packet)) if is_forward_packet(packet.header()) => {
-                        forwarder.receive(packet).map_err(forward_error)?;
+                        pending_forward =
+                            forwarder.try_receive(packet).map_err(forward_error)?;
                     }
                     Ok(Some(packet)) => forward_client_packet(&session, &mut terminal, packet)?,
                     Ok(None) => break,
@@ -161,11 +175,24 @@ fn run_mode_windows(
     wake.set_nonblocking(true).map_err(SessionError::Io)?;
     let mut decoder = LocalPacketDecoder::new();
     let mut connected = session.connected()?;
+    // A forwarding packet the worker had no room for; while it is held, no
+    // further client packets are read so forwarding data stays ordered.
+    let mut pending_forward: Option<Packet> = None;
     loop {
         if session.is_shutting_down() {
             return Ok(());
         }
         let mut progress = false;
+
+        // Retry the held packet first: draining the forwarder's outbound
+        // queue below is what frees worker capacity, so this makes progress
+        // every 10ms tick instead of deadlocking on a blocking send.
+        if let Some(packet) = pending_forward.take() {
+            match forwarder.try_receive(packet).map_err(forward_error)? {
+                Some(held) => pending_forward = Some(held),
+                None => progress = true,
+            }
+        }
 
         // Connection state changes are announced through the wake channel.
         if drain_available(&mut wake)? {
@@ -202,14 +229,15 @@ fn run_mode_windows(
 
         // Client -> terminal / forwarder.
         if connected {
-            loop {
+            while pending_forward.is_none() {
                 match session.try_read_packet() {
                     Ok(Some(packet)) => {
                         progress = true;
                         if mode == BridgeMode::Jumphost {
                             write_local_packet(&mut terminal, &packet).map_err(SessionError::Io)?;
                         } else if is_forward_packet(packet.header()) {
-                            forwarder.receive(packet).map_err(forward_error)?;
+                            pending_forward =
+                                forwarder.try_receive(packet).map_err(forward_error)?;
                         } else {
                             forward_client_packet(&session, &mut terminal, packet)?;
                         }
@@ -277,11 +305,27 @@ fn wait(
     forward_wake: &LocalStream,
     client: Option<&std::net::TcpStream>,
     accept_terminal: bool,
+    forward_blocked: bool,
 ) -> Result<(PollFlags, PollFlags, PollFlags, PollFlags), SessionError> {
     let terminal_flags = if accept_terminal {
         PollFlags::IN | PollFlags::HUP | PollFlags::ERR
     } else {
         PollFlags::HUP | PollFlags::ERR
+    };
+    // While a forwarding packet is held for worker capacity the client is not
+    // read, so do not watch it for readability, and wake on a 10ms cadence to
+    // retry the held packet even when nothing else becomes ready.
+    let client_flags = if forward_blocked {
+        PollFlags::HUP | PollFlags::ERR
+    } else {
+        PollFlags::IN | PollFlags::HUP | PollFlags::ERR
+    };
+    let timeout = if forward_blocked {
+        Some(
+            Timespec::try_from(std::time::Duration::from_millis(10)).expect("10ms fits timespec"),
+        )
+    } else {
+        None
     };
     let mut descriptors = vec![
         PollFd::new(terminal, terminal_flags),
@@ -289,15 +333,12 @@ fn wait(
         PollFd::new(forward_wake, PollFlags::IN | PollFlags::HUP),
     ];
     if let Some(client) = client {
-        descriptors.push(PollFd::new(
-            client,
-            PollFlags::IN | PollFlags::HUP | PollFlags::ERR,
-        ));
+        descriptors.push(PollFd::new(client, client_flags));
     }
     // poll() is never restarted by SA_RESTART; retry on EINTR instead of
     // tearing the session down when a signal interrupts the wait.
     loop {
-        match poll(&mut descriptors, None) {
+        match poll(&mut descriptors, timeout.as_ref()) {
             Ok(_) => break,
             Err(error) if error == rustix::io::Errno::INTR => {}
             Err(error) => return Err(SessionError::Io(io::Error::from(error))),

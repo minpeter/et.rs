@@ -123,10 +123,35 @@ impl Forwarder {
         Ok(&self.wake)
     }
 
+    /// Hand a forwarding packet to the worker, blocking when its command
+    /// queue is full.
+    ///
+    /// Only safe for callers that never also drain [`Forwarder::try_outbound`]
+    /// on the same thread (e.g. tests). Session loops must use
+    /// [`Forwarder::try_receive`] instead: the worker can itself be blocked
+    /// emitting outbound packets, which only the session loop drains, so a
+    /// blocking send from the session loop closes a cycle and deadlocks the
+    /// session permanently.
     pub fn receive(&self, packet: Packet) -> Result<(), ForwardError> {
         self.commands
             .send(Command::Packet(packet))
             .map_err(|_| ForwardError::Unavailable)
+    }
+
+    /// Hand a forwarding packet to the worker without blocking.
+    ///
+    /// Returns the packet back when the worker's command queue is full so the
+    /// caller can drain outbound packets (which is what unblocks the worker)
+    /// and retry later. Callers must not read further session packets while
+    /// holding a returned packet, or forwarding data would be reordered.
+    pub fn try_receive(&self, packet: Packet) -> Result<Option<Packet>, ForwardError> {
+        match self.commands.try_send(Command::Packet(packet)) {
+            Ok(()) => Ok(None),
+            Err(mpsc::TrySendError::Full(Command::Packet(packet))) => Ok(Some(packet)),
+            Err(mpsc::TrySendError::Full(_)) | Err(mpsc::TrySendError::Disconnected(_)) => {
+                Err(ForwardError::Unavailable)
+            }
+        }
     }
 
     pub fn try_outbound(&self) -> Result<Option<Packet>, ForwardError> {

@@ -11,12 +11,57 @@ Windows meant running the POSIX server inside WSL and landing in a WSL shell. et
 and the per-session terminal natively on Windows using ConPTY, so `et` gives you a real `cmd.exe` or
 PowerShell — no WSL involved.
 
-## Build
+## Install
+
+### Homebrew (macOS, Linux)
+
+```sh
+brew install minpeter/tap/et-rs
+```
+
+Installs `et` plus the `etserver`, `etterminal`, `htm`, and `htmd` role symlinks. The formula
+conflicts with the upstream `et` formula — et.rs is a drop-in replacement, so uninstall one before
+installing the other. Upgrade later with `brew upgrade et-rs`.
+
+### Prebuilt binaries
+
+Every [release](https://github.com/minpeter/et.rs/releases) ships archives (with `.sha256`
+checksums) for Linux (gnu/musl, x86_64/aarch64), macOS (x86_64/aarch64), and Windows (x86_64).
+The tarballs already contain the role symlinks:
+
+```sh
+curl -LO "https://github.com/minpeter/et.rs/releases/latest/download/et-VERSION-TARGET.tar.gz"
+sudo tar -xzf et-VERSION-TARGET.tar.gz -C /usr/local/bin --strip-components=1
+```
+
+To run the server on boot (Linux):
+
+```ini
+# /etc/systemd/system/et.service
+[Unit]
+Description=EternalTerminal server (et.rs)
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/etserver
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+sudo systemctl enable --now et    # and open 2022/tcp in your firewall
+```
+
+### Build from source
 
 ```sh
 cargo build --release                                  # host
 cargo build --release --target x86_64-pc-windows-gnu -p et   # et.exe
 ```
+
+Requires `protoc` (Protocol Buffers compiler) on the build host.
 
 ## Roles
 

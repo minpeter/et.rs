@@ -1,3 +1,36 @@
+## et@0.0.6
+
+### Fix a port-forwarding deadlock under bidirectional load
+
+The session loops handed inbound tunnel packets to the forwarding worker with
+a blocking send, while the worker hands outbound tunnel packets back through a
+bounded queue that only those same session loops drain. Under sustained
+bulk transfers in both directions the two bounded queues could fill at the
+same time, leaving the session loop and the worker each waiting on the other —
+a permanent wedge that also stopped keepalives and made reconnects impossible.
+
+Session loops (client, server bridge, on both Unix and Windows) now hand
+packets to the worker without blocking: when the worker is at capacity the
+packet is held, no further session packets are read (preserving order), and
+the loop keeps draining the worker's outbound queue — which is exactly what
+frees the worker — retrying on a 10ms cadence.
+
+### Fix session teardown under local IPC backpressure
+
+`set_nonblocking(true)` applies to the socket, not the handle: every
+`try_clone()` of a local stream shares the flag. The readiness-driven session
+loops flip their local streams to non-blocking for reads, which silently made
+the packet writers on cloned handles non-blocking too. When the kernel socket
+buffer filled (a shell that stops reading input during a large paste, or a
+bridge pausing terminal output while a client reconnects), `write_all` failed
+with `WouldBlock` and tore the whole session down — killing the shell, failing
+the server bridge, or silently ending a jump-host relay — and could leave a
+truncated frame that corrupted the local packet stream.
+
+`write_local_packet` now treats `WouldBlock` as backpressure: it resumes from
+the partial write and retries until the peer drains, matching upstream's
+blocking-write semantics on both Unix and Windows.
+
 ## et@0.0.5
 
 ### Fix macOS reconnect and PTY end-to-end failures

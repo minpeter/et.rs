@@ -102,6 +102,11 @@ where
             match connection.try_read_packet() {
                 Ok(Some(packet)) => {
                     last_received = Instant::now();
+                    if packet.header() == TerminalPacketType::KeepAlive as u8 {
+                        if let Some(ack) = et_core::keepalive::decode_ack(packet.payload()) {
+                            connection.acknowledge_delivery(ack);
+                        }
+                    }
                     if is_forward_packet(packet.header()) {
                         pending_forward = forwarder
                             .try_receive(packet)
@@ -153,8 +158,11 @@ where
             }
         }
         if Instant::now() >= next_keepalive {
+            // The payload acknowledges everything read so far, so the server
+            // can trim its replay backup; legacy servers ignore it.
+            let ack = connection.keepalive_ack();
             if connection
-                .write_packet(TerminalPacketType::KeepAlive as u8, &[])
+                .write_packet(TerminalPacketType::KeepAlive as u8, &ack)
                 .is_err()
             {
                 match reconnect(connection)? {

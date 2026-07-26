@@ -108,6 +108,41 @@ fn returning_client_receives_exact_buffered_server_catchup() {
 }
 
 #[test]
+fn keepalive_echo_acknowledges_everything_read_from_the_client() {
+    let mut server = TestRuntime::start();
+    let _terminal = server.register(ID_A, KEY_A);
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let key = passkey_to_key(KEY_A).unwrap();
+    let (mut client, initial) = initialize(stream, &key, default_payload());
+    assert_eq!(initial.error, None);
+    server
+        .handle
+        .wait_for_state(ID_A, SessionState::Active, TIMEOUT)
+        .unwrap();
+
+    // An acknowledging keep-alive is echoed with the server's own ack: the
+    // count of every packet the client has written (the server processes
+    // packets in order, so by the time it echoes it has read them all).
+    let ack = client.keepalive_ack();
+    client
+        .write_packet(TerminalPacketType::KeepAlive as u8, &ack)
+        .unwrap();
+    let written = client.writer_sequence();
+    let echo = client.read_packet().unwrap();
+    assert_eq!(echo.header(), TerminalPacketType::KeepAlive as u8);
+    assert_eq!(et_core::keepalive::decode_ack(echo.payload()), Some(written));
+
+    // A legacy empty keep-alive still gets an echo.
+    client
+        .write_packet(TerminalPacketType::KeepAlive as u8, &[])
+        .unwrap();
+    let echo = client.read_packet().unwrap();
+    assert_eq!(echo.header(), TerminalPacketType::KeepAlive as u8);
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
 fn library_shutdown_interrupts_partial_handshakes_and_joins_workers() {
     let mut server = TestRuntime::start();
     let path = server.dir.socket();

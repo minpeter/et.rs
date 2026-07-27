@@ -18,8 +18,8 @@ use rustix::time::Timespec;
 
 #[cfg(unix)]
 use crate::client_terminal::{
-    connection_ended, display_packet, send_buffer, send_size, terminal_error, terminal_io,
-    terminal_text,
+    connection_ended, display_packet, recover_transport, send_buffer, send_size, terminal_error,
+    terminal_io, terminal_text,
 };
 #[cfg(unix)]
 use crate::error::ClientError;
@@ -275,16 +275,11 @@ fn recover<F>(
 where
     F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
 {
-    match reconnect(connection)? {
-        ReconnectOutcome::Recovered => {
-            *stream = connection.try_clone_stream().map_err(terminal_error)?;
-            if send_terminal_size {
-                send_size(connection)?;
-            }
-            Ok(true)
-        }
-        ReconnectOutcome::SessionEnded => Ok(false),
+    if !recover_transport(connection, reconnect, send_terminal_size)? {
+        return Ok(false);
     }
+    *stream = connection.try_clone_stream().map_err(terminal_error)?;
+    Ok(true)
 }
 
 #[cfg(unix)]

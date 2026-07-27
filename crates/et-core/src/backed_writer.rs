@@ -29,6 +29,14 @@ pub const MAX_DISCONNECT_PACKETS: usize = 262_144;
 /// (socket send buffer + in flight, <= 4 MiB on default Linux autotuning).
 pub const CONNECTED_BACKUP_BYTES: i64 = 8 * 1024 * 1024;
 pub const CONNECTED_BACKUP_PACKETS: usize = 32_768;
+/// Packets retained beyond an acknowledged sequence. Jumphosts (upstream C++
+/// and released et.rs) relay keep-alives verbatim, so an acknowledgement can
+/// arrive carrying the sequence of a *different* hop's connection. The two
+/// domains only drift by packets a relay injects outside the relayed stream
+/// (one keep-alive per recovery), so retaining a generous fixed slack makes a
+/// foreign acknowledgement unable to trim away packets a genuine recovery
+/// could still request.
+pub const ACK_RETAIN_SLACK_PACKETS: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriterOutcome {
@@ -113,13 +121,8 @@ impl BackedWriter {
                 self.backup_size -= old.wire_len() as i64;
             }
         }
-        // A disconnect can balloon the deque to the 64 MiB catchup cap;
-        // return that slack once the trimmed length no longer needs it.
-        if self.connected
-            && self.backup.capacity() > 4096
-            && self.backup.capacity() / 4 > self.backup.len()
-        {
-            self.backup.shrink_to(self.backup.len() * 2);
+        if self.connected {
+            self.release_slack_capacity();
         }
         if !self.connected {
             self.disconnected_bytes += packet.wire_len() as i64;
@@ -147,6 +150,36 @@ impl BackedWriter {
         }
         out.reverse();
         Ok(out)
+    }
+
+    /// Drop backup packets the peer has confirmed it consumed.
+    ///
+    /// `acknowledged` is the peer's reader sequence, delivered on a
+    /// keep-alive payload (see [`crate::keepalive`]). Only the
+    /// still-unacknowledged tail plus [`ACK_RETAIN_SLACK_PACKETS`] is kept,
+    /// so an idle session's backup stays near-empty instead of pinning the
+    /// full connected cap. Ignored while disconnected (a reconnect may
+    /// replay any of it) and for implausible sequences.
+    pub fn acknowledge(&mut self, acknowledged: i64) {
+        if !self.connected || acknowledged < 0 || acknowledged > self.sequence {
+            return;
+        }
+        let unacknowledged = usize::try_from(self.sequence - acknowledged).unwrap_or(usize::MAX);
+        let keep = unacknowledged.saturating_add(ACK_RETAIN_SLACK_PACKETS);
+        while self.backup.len() > keep {
+            if let Some(old) = self.backup.pop_back() {
+                self.backup_size -= old.wire_len() as i64;
+            }
+        }
+        self.release_slack_capacity();
+    }
+
+    /// A disconnect can balloon the deque to the 64 MiB catchup cap; return
+    /// that slack once the trimmed length no longer needs it.
+    fn release_slack_capacity(&mut self) {
+        if self.backup.capacity() > 4096 && self.backup.capacity() / 4 > self.backup.len() {
+            self.backup.shrink_to(self.backup.len() * 2);
+        }
     }
 
     pub fn revive(&mut self) {
@@ -273,6 +306,55 @@ mod tests {
             CONNECTED_BACKUP_PACKETS
         );
         assert_eq!(w.recover(extra as i64 - 1), Err(RecoverError::TooFarBehind));
+    }
+
+    #[test]
+    fn acknowledge_trims_to_the_unacknowledged_tail_plus_slack() {
+        let mut w = writer(true);
+        let total = ACK_RETAIN_SLACK_PACKETS + 100;
+        for _ in 0..total {
+            w.write_packet(0, b"x").unwrap();
+        }
+        w.acknowledge(w.sequence());
+        // Everything is acknowledged; only the slack margin remains.
+        let oldest_recoverable = (total - ACK_RETAIN_SLACK_PACKETS) as i64;
+        assert_eq!(
+            w.recover(oldest_recoverable).unwrap().len(),
+            ACK_RETAIN_SLACK_PACKETS
+        );
+        assert_eq!(
+            w.recover(oldest_recoverable - 1),
+            Err(RecoverError::TooFarBehind)
+        );
+    }
+
+    #[test]
+    fn acknowledge_keeps_unacknowledged_packets() {
+        let mut w = writer(true);
+        for _ in 0..10 {
+            w.write_packet(0, b"x").unwrap();
+        }
+        w.acknowledge(4);
+        // Nothing may be dropped: 6 unacknowledged + slack exceeds the 10 kept.
+        assert_eq!(w.recover(0).unwrap().len(), 10);
+    }
+
+    #[test]
+    fn acknowledge_ignores_implausible_and_disconnected_states() {
+        let mut w = writer(true);
+        for _ in 0..ACK_RETAIN_SLACK_PACKETS + 50 {
+            w.write_packet(0, b"x").unwrap();
+        }
+        let len = |w: &BackedWriter| w.recover(0).map(|out| out.len());
+        let full = len(&w).unwrap();
+        w.acknowledge(w.sequence() + 1); // ahead of what was written
+        assert_eq!(len(&w), Ok(full));
+        w.acknowledge(-1);
+        assert_eq!(len(&w), Ok(full));
+        w.invalidate();
+        w.acknowledge(w.sequence());
+        w.revive();
+        assert_eq!(len(&w), Ok(full));
     }
 
     #[test]

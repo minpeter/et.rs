@@ -172,6 +172,7 @@ fn relay(mut router: LocalStream, destination: &mut Connection) -> Result<i32, S
             Some(packet) => {
                 progress = true;
                 decoder = LocalPacketDecoder::new();
+                let packet = destination_packet(destination, packet);
                 if destination
                     .write_packet(packet.header(), packet.payload())
                     .is_err()
@@ -185,6 +186,7 @@ fn relay(mut router: LocalStream, destination: &mut Connection) -> Result<i32, S
             match destination.try_read_packet() {
                 Ok(Some(packet)) => {
                     progress = true;
+                    let packet = router_packet(destination, packet);
                     if write_local_packet(&mut router, &packet).is_err() {
                         return Ok(0);
                     }
@@ -225,6 +227,7 @@ fn relay(mut router: LocalStream, destination: &mut Connection) -> Result<i32, S
         if router_events.contains(PollFlags::IN) {
             if let Some(packet) = read_router_packet(&mut router, &mut decoder)? {
                 decoder = LocalPacketDecoder::new();
+                let packet = destination_packet(destination, packet);
                 if destination
                     .write_packet(packet.header(), packet.payload())
                     .is_err()
@@ -237,6 +240,7 @@ fn relay(mut router: LocalStream, destination: &mut Connection) -> Result<i32, S
             loop {
                 match destination.try_read_packet() {
                     Ok(Some(packet)) => {
+                        let packet = router_packet(destination, packet);
                         if write_local_packet(&mut router, &packet).is_err() {
                             return Ok(0);
                         }
@@ -250,6 +254,36 @@ fn relay(mut router: LocalStream, destination: &mut Connection) -> Result<i32, S
             return Ok(0);
         }
     }
+}
+
+/// Normalize a packet relayed towards the destination.
+///
+/// Keep-alive acknowledgements are per-hop: any payload the client attached
+/// was already consumed by the jumphost etserver, so replace it with this
+/// hop's own reader sequence, letting the destination trim its replay backup.
+fn destination_packet(destination: &Connection, packet: Packet) -> Packet {
+    if packet.header() != TerminalPacketType::KeepAlive as u8 {
+        return packet;
+    }
+    Packet::new(
+        TerminalPacketType::KeepAlive as u8,
+        destination.keepalive_ack().to_vec(),
+    )
+}
+
+/// Normalize a packet relayed towards the local router.
+///
+/// A keep-alive echo from the destination acknowledges this hop's writer;
+/// consume it and relay a payload-less keep-alive (the jumphost etserver
+/// attaches the client-facing acknowledgement).
+fn router_packet(destination: &mut Connection, packet: Packet) -> Packet {
+    if packet.header() != TerminalPacketType::KeepAlive as u8 {
+        return packet;
+    }
+    if let Some(ack) = et_core::keepalive::decode_ack(packet.payload()) {
+        destination.acknowledge_delivery(ack);
+    }
+    Packet::new(TerminalPacketType::KeepAlive as u8, Vec::new())
 }
 
 fn read_router_packet(

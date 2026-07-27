@@ -139,6 +139,17 @@ impl Connection {
         self.writer.has_capacity(bytes)
     }
 
+    /// Apply a peer delivery acknowledgement (keep-alive payload) to the
+    /// replay backup. Implausible values are ignored.
+    pub fn acknowledge_delivery(&mut self, sequence: i64) {
+        self.writer.acknowledge(sequence);
+    }
+
+    /// Keep-alive payload acknowledging everything read so far.
+    pub fn keepalive_ack(&self) -> [u8; et_core::keepalive::ACK_PAYLOAD_LEN] {
+        et_core::keepalive::encode_ack(self.reader.sequence())
+    }
+
     pub fn set_io_timeout(&self, timeout: Option<Duration>) -> Result<(), ConnError> {
         self.stream.set_read_timeout(timeout)?;
         self.stream.set_write_timeout(timeout)?;

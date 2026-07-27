@@ -98,9 +98,12 @@ fn run_mode_poll(
         }
         if terminal_events.contains(PollFlags::IN) {
             if let Some(packet) = read_terminal_packet(&mut terminal, &mut decoder)? {
-                if mode == BridgeMode::Terminal {
+                let packet = if mode == BridgeMode::Terminal {
                     validate_terminal_output(&packet)?;
-                }
+                    packet
+                } else {
+                    jumphost_terminal_packet(&session, packet)?
+                };
                 decoder = LocalPacketDecoder::new();
                 match session.send_packet(packet.header(), packet.payload()) {
                     Ok(()) => {}
@@ -119,6 +122,7 @@ fn run_mode_poll(
                     // Jumphost relays every packet verbatim to the jump
                     // terminal, which owns the destination connection.
                     Ok(Some(packet)) if mode == BridgeMode::Jumphost => {
+                        let packet = jumphost_client_packet(&session, packet)?;
                         write_local_packet(&mut terminal, &packet).map_err(SessionError::Io)?;
                     }
                     Ok(Some(packet)) if is_forward_packet(packet.header()) => {
@@ -207,9 +211,12 @@ fn run_mode_windows(
             match read_terminal_packet(&mut terminal, &mut decoder) {
                 Ok(Some(packet)) => {
                     progress = true;
-                    if mode == BridgeMode::Terminal {
+                    let packet = if mode == BridgeMode::Terminal {
                         validate_terminal_output(&packet)?;
-                    }
+                        packet
+                    } else {
+                        jumphost_terminal_packet(&session, packet)?
+                    };
                     decoder = LocalPacketDecoder::new();
                     match session.send_packet(packet.header(), packet.payload()) {
                         Ok(()) => {}
@@ -233,6 +240,7 @@ fn run_mode_windows(
                     Ok(Some(packet)) => {
                         progress = true;
                         if mode == BridgeMode::Jumphost {
+                            let packet = jumphost_client_packet(&session, packet)?;
                             write_local_packet(&mut terminal, &packet).map_err(SessionError::Io)?;
                         } else if is_forward_packet(packet.header()) {
                             pending_forward =
@@ -392,6 +400,40 @@ fn validate_terminal_output(packet: &Packet) -> Result<(), SessionError> {
     Ok(())
 }
 
+/// Normalize a client packet relayed towards the jump terminal.
+///
+/// Keep-alive acknowledgements are per-hop: the payload the client sent
+/// refers to this hop's connection, so apply it here and relay a payload-less
+/// keep-alive. The next hop (`etterminal --jump`) attaches its own sequence
+/// for the destination, and a foreign sequence never crosses a hop.
+fn jumphost_client_packet(session: &ActiveSession, packet: Packet) -> Result<Packet, SessionError> {
+    if packet.header() != TerminalPacketType::KeepAlive as u8 {
+        return Ok(packet);
+    }
+    if let Some(ack) = et_core::keepalive::decode_ack(packet.payload()) {
+        session.acknowledge_delivery(ack)?;
+    }
+    Ok(Packet::new(TerminalPacketType::KeepAlive as u8, Vec::new()))
+}
+
+/// Normalize a jump-terminal packet relayed towards the client.
+///
+/// A keep-alive echo returning from the destination acknowledges the previous
+/// hop; replace its payload with this hop's reader sequence so the client can
+/// trim its own replay backup.
+fn jumphost_terminal_packet(
+    session: &ActiveSession,
+    packet: Packet,
+) -> Result<Packet, SessionError> {
+    if packet.header() != TerminalPacketType::KeepAlive as u8 {
+        return Ok(packet);
+    }
+    Ok(Packet::new(
+        TerminalPacketType::KeepAlive as u8,
+        session.keepalive_ack()?.to_vec(),
+    ))
+}
+
 fn forward_client_packet(
     session: &ActiveSession,
     terminal: &mut LocalStream,
@@ -405,7 +447,16 @@ fn forward_client_packet(
             write_local_packet(terminal, &packet).map_err(SessionError::Io)
         }
         header if header == TerminalPacketType::KeepAlive as u8 => {
-            session.send_packet(TerminalPacketType::KeepAlive as u8, &[])
+            if let Some(ack) = et_core::keepalive::decode_ack(packet.payload()) {
+                session.acknowledge_delivery(ack)?;
+            }
+            // The echo acknowledges everything read from the client, letting
+            // an et.rs client trim its own replay backup. Legacy peers
+            // (upstream C++, released et.rs) ignore the payload.
+            session.send_packet(
+                TerminalPacketType::KeepAlive as u8,
+                &session.keepalive_ack()?,
+            )
         }
         _ => Err(SessionError::Io(io::Error::new(
             io::ErrorKind::InvalidData,

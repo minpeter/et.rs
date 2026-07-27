@@ -1,3 +1,46 @@
+## et@0.0.8
+
+### Trim replay backups with delivery acknowledgements on keep-alives
+
+Replay backups previously only shrank at a fixed cap, so a single burst of
+output (`cat` a large file) pinned the cap's worth of memory per session for
+the rest of the daemon's uptime, and idle sessions slowly accumulated
+keep-alive echoes.
+
+Keep-alives now carry the sender's reader sequence as an 8-byte payload.
+Every implementation ignores keep-alive payloads on receipt (verified
+against upstream C++ `TerminalServer`/`TerminalClient` and released et.rs),
+so the extension is invisible to legacy peers. An et.rs receiver uses it to
+drop backup packets the peer has already consumed, keeping only the
+unacknowledged tail plus a fixed slack — a session's replay backup now
+returns to near-empty within one keep-alive interval instead of pinning the
+connected cap forever.
+
+Acknowledgements are strictly per-hop. Jumphosts relay packets verbatim
+(upstream and et.rs alike), so the jumphost etserver consumes the client's
+acknowledgement for its own connection and forwards a payload-less
+keep-alive, and `etterminal --jump` attaches its own sequence towards the
+destination. A foreign sequence that still arrives through a legacy C++
+jumphost is absorbed by the retention slack.
+
+### Stop the daemon from retaining 64 MiB of replay history per live session
+
+Every packet written to a client is kept in a per-session replay backup so a
+reconnecting peer can catch up. That backup was only trimmed at upstream's
+64 MiB / 262,144-packet cap and never expired otherwise, so a long-lived
+`etserver` slowly pinned up to 64 MiB per session — with a couple dozen
+sessions the daemon grew towards multiple gigabytes, exactly like the C++
+server it replaces.
+
+While the transport is connected, a reconnecting peer can only be missing
+data that was in flight, which is bounded by kernel socket buffering
+(≤ 4 MiB on default Linux autotuning). The connected backup is now trimmed
+to 8 MiB / 32,768 packets and the deque returns its slack capacity after a
+reconnect. The disconnected catch-up buffer keeps upstream's full 64 MiB,
+and nothing on the wire changes: recovery, the handshake, and the
+receive-side catch-up validation limits all stay byte-compatible with
+upstream C++ peers.
+
 ## et@0.0.7
 
 ### Survive network outages during reconnect and restore leaked terminal modes

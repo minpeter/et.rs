@@ -5,8 +5,10 @@ use et_core::proto::{TerminalBuffer, TerminalPacketType};
 use et_net::connection::{ConnError, Connection};
 use prost::Message;
 
-use super::send_command;
+use super::{recover_initial_transport, recover_transport, send_command};
 use crate::client_terminal::{connection_ended, RemoteLines};
+use crate::error::ClientError;
+use crate::initial_connect::ReconnectOutcome;
 
 #[test]
 fn command_exit_suffix_matches_no_exit_flag_and_remote_shell() {
@@ -38,11 +40,61 @@ fn command_exit_suffix_matches_no_exit_flag_and_remote_shell() {
 }
 
 #[test]
-fn only_terminal_connection_end_errors_are_clean() {
-    assert!(connection_ended(&ConnError::Io(
-        std::io::ErrorKind::UnexpectedEof.into()
-    )));
+fn every_socket_error_reconnects_including_sleep_timeout() {
+    // macOS reports a stale post-sleep TCP flow as ETIMEDOUT (os error 60).
+    // It must not become `terminal transport: io: Operation timed out`.
+    for kind in [
+        std::io::ErrorKind::UnexpectedEof,
+        std::io::ErrorKind::ConnectionReset,
+        std::io::ErrorKind::TimedOut,
+        std::io::ErrorKind::HostUnreachable,
+        std::io::ErrorKind::NetworkUnreachable,
+    ] {
+        assert!(connection_ended(&ConnError::Io(kind.into())), "{kind:?}");
+    }
     assert!(!connection_ended(&ConnError::Backpressure));
+}
+
+#[test]
+fn initial_socket_timeout_enters_recovery_instead_of_exiting() {
+    let (stream, _peer) = tcp_pair();
+    let mut connection = Connection::new_client(stream, &[7u8; KEY_LEN]);
+    let mut attempts = 0;
+    let recovered = recover_initial_transport(
+        &mut connection,
+        &mut |_| {
+            attempts += 1;
+            Ok(ReconnectOutcome::SessionEnded)
+        },
+        true,
+        Err(ClientError::Transport(ConnError::Io(
+            std::io::ErrorKind::TimedOut.into(),
+        ))),
+    )
+    .unwrap();
+    assert!(!recovered);
+    assert_eq!(attempts, 1);
+}
+
+#[test]
+fn recovery_rechecks_terminal_setup_before_returning_to_the_pump() {
+    let (stream, _peer) = tcp_pair();
+    let mut connection = Connection::new_client(stream, &[7u8; KEY_LEN]);
+    let mut attempts = 0;
+    let recovered = recover_transport(
+        &mut connection,
+        &mut |_| {
+            attempts += 1;
+            Ok(ReconnectOutcome::Recovered)
+        },
+        true,
+    )
+    .unwrap();
+    // Unit-test stdout is not a TTY, so the terminal-size operation is a
+    // successful no-op. The important invariant is that recovery owns that
+    // operation before it declares the socket usable to the pump.
+    assert!(recovered);
+    assert_eq!(attempts, 1);
 }
 
 fn tcp_pair() -> (TcpStream, TcpStream) {

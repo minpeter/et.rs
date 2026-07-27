@@ -67,6 +67,7 @@ jobs:
         run: >-
           cargo test -p et
           --test reconnect_end_to_end
+          --test reconnect_outage_end_to_end
           --test server_runtime
           --test terminal_adversarial
           --test terminal_end_to_end

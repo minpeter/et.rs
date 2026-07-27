@@ -19,7 +19,8 @@ use et_net::connection::Connection;
 use et_net::forward::{is_forward_packet, Forwarder};
 
 use crate::client_terminal::{
-    connection_ended, display_packet, send_buffer, send_size, terminal_error, terminal_text,
+    connection_ended, display_packet, recover_transport, send_buffer, send_size, terminal_error,
+    terminal_text,
 };
 use crate::error::ClientError;
 use crate::initial_connect::ReconnectOutcome;
@@ -145,17 +146,12 @@ where
             reconnect_needed = true;
         }
         if reconnect_needed {
-            match reconnect(connection)? {
-                ReconnectOutcome::Recovered => {
-                    if terminal_enabled {
-                        send_size(connection)?;
-                    }
-                    last_received = Instant::now();
-                    next_keepalive = last_received + interval;
-                    continue;
-                }
-                ReconnectOutcome::SessionEnded => return Ok(()),
+            if !recover_transport(connection, &mut reconnect, terminal_enabled)? {
+                return Ok(());
             }
+            last_received = Instant::now();
+            next_keepalive = last_received + interval;
+            continue;
         }
         if Instant::now() >= next_keepalive {
             // The payload acknowledges everything read so far, so the server
@@ -164,11 +160,9 @@ where
             if connection
                 .write_packet(TerminalPacketType::KeepAlive as u8, &ack)
                 .is_err()
+                && !recover_transport(connection, &mut reconnect, terminal_enabled)?
             {
-                match reconnect(connection)? {
-                    ReconnectOutcome::Recovered => {}
-                    ReconnectOutcome::SessionEnded => return Ok(()),
-                }
+                return Ok(());
             }
             next_keepalive = Instant::now() + interval;
         }

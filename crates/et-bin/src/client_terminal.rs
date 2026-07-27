@@ -52,7 +52,7 @@ pub fn run<F>(
     mut connection: Connection,
     options: TerminalOptions<'_>,
     forwarder: Forwarder,
-    reconnect: F,
+    mut reconnect: F,
 ) -> Result<(), ClientError>
 where
     F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
@@ -69,12 +69,33 @@ where
     } else {
         RawMode { enabled: false }
     };
+    // The network can disappear immediately after the initial handshake (a
+    // laptop waking up is particularly prone to this).  These writes are
+    // replay-buffered by `Connection`, so once recovery succeeds they must
+    // not be sent again; doing so would duplicate a `--command`.  Recover the
+    // transport and let the buffered packet be replayed instead.
     if terminal_enabled {
-        send_size(&mut connection)?;
+        let initial_size = send_size(&mut connection);
+        if !recover_initial_transport(
+            &mut connection,
+            &mut reconnect,
+            terminal_enabled,
+            initial_size,
+        )? {
+            return Ok(());
+        }
     }
     if terminal_enabled {
         if let Some(command) = command {
-            send_command(&mut connection, command, no_exit, lines)?;
+            let initial_command = send_command(&mut connection, command, no_exit, lines);
+            if !recover_initial_transport(
+                &mut connection,
+                &mut reconnect,
+                terminal_enabled,
+                initial_command,
+            )? {
+                return Ok(());
+            }
         }
     }
     let read_stdin = terminal_enabled && (command.is_none() || io::stdin().is_terminal());
@@ -217,7 +238,7 @@ pub(crate) fn send_buffer(connection: &mut Connection, bytes: &[u8]) -> Result<(
 }
 
 fn send_buffer_checked(connection: &mut Connection, bytes: &[u8]) -> Result<(), ClientError> {
-    send_buffer(connection, bytes).map_err(terminal_error)
+    send_buffer(connection, bytes).map_err(ClientError::Transport)
 }
 
 pub(crate) fn send_size(connection: &mut Connection) -> Result<(), ClientError> {
@@ -237,7 +258,60 @@ pub(crate) fn send_size(connection: &mut Connection) -> Result<(), ClientError> 
             TerminalPacketType::TerminalInfo as u8,
             &message.encode_to_vec(),
         )
-        .map_err(terminal_error)
+        .map_err(ClientError::Transport)
+}
+
+/// Finish an initial client write without losing a session to a race between
+/// the handshake and the first terminal packet.
+///
+/// `Connection` has already retained a packet whose socket write failed.
+/// Recovery replays that exact packet, so this deliberately does not retry
+/// `result` after reconnecting (retrying a command could execute it twice).
+fn recover_initial_transport<F>(
+    connection: &mut Connection,
+    reconnect: &mut F,
+    send_terminal_size: bool,
+    result: Result<(), ClientError>,
+) -> Result<bool, ClientError>
+where
+    F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
+{
+    match result {
+        Ok(()) => Ok(true),
+        Err(ClientError::Transport(error)) if connection_ended(&error) => {
+            recover_transport(connection, reconnect, send_terminal_size)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Recover a broken live transport, including a connection that fails again
+/// while its post-recovery terminal-size packet is being sent.
+///
+/// The latter race is common after laptop wake: Wi-Fi can become routable long
+/// enough for TCP recovery and then lose the first application packet.  Keep
+/// recovery inside the reconnect loop until a live terminal-size update has
+/// been sent, just as upstream reconnects after every socket read/write
+/// error.
+pub(crate) fn recover_transport<F>(
+    connection: &mut Connection,
+    reconnect: &mut F,
+    send_terminal_size: bool,
+) -> Result<bool, ClientError>
+where
+    F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
+{
+    loop {
+        match reconnect(connection)? {
+            ReconnectOutcome::SessionEnded => return Ok(false),
+            ReconnectOutcome::Recovered if !send_terminal_size => return Ok(true),
+            ReconnectOutcome::Recovered => match send_size(connection) {
+                Ok(()) => return Ok(true),
+                Err(ClientError::Transport(error)) if connection_ended(&error) => {}
+                Err(error) => return Err(error),
+            },
+        }
+    }
 }
 
 /// Reset sequences for terminal modes a remote application may have enabled
@@ -281,20 +355,20 @@ impl Drop for RawMode {
     }
 }
 
-/// Errors that mean the session must reconnect rather than fail.
+/// Errors that mean the TCP transport is no longer usable and the session
+/// must reconnect rather than exit.
+///
+/// In particular, macOS reports a stale TCP flow after sleep as `ETIMEDOUT`
+/// (`io::ErrorKind::TimedOut`), not necessarily as EOF or reset.  There is no
+/// actionable socket I/O failure for the terminal loop: the connection state
+/// is preserved in the backed reader/writer, so every socket I/O error enters
+/// recovery.  Protocol, crypto, framing, backpressure, and local-terminal
+/// errors use other `ConnError` variants and still remain fatal.
+///
+/// This matches upstream `Connection::read`/`write`, which closes and starts
+/// its reconnect loop for both skippable and "serious" socket errors.
 pub(crate) fn connection_ended(error: &ConnError) -> bool {
-    matches!(
-        error,
-        ConnError::Io(source)
-            if matches!(
-                source.kind(),
-                io::ErrorKind::UnexpectedEof
-                    | io::ErrorKind::BrokenPipe
-                    | io::ErrorKind::ConnectionAborted
-                    | io::ErrorKind::ConnectionReset
-                    | io::ErrorKind::NotConnected
-            )
-    )
+    matches!(error, ConnError::Io(_))
 }
 
 pub(crate) fn terminal_error(error: ConnError) -> ClientError {

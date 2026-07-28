@@ -18,19 +18,47 @@ pub(crate) fn run(
     while let Ok(event) = events.recv() {
         match event {
             LifecycleEvent::TerminalDisconnected(identity) => {
+                crate::diag::info(format!(
+                    "terminal disconnected for registration id={}",
+                    identity.id()
+                ));
                 if let Err(error) = core.raw_sockets.shutdown_registration(&identity) {
+                    crate::diag::info(format!(
+                        "id={}: error shutting down raw sockets: {error}",
+                        identity.id()
+                    ));
                     first_error.get_or_insert(error);
                 }
                 match core.sessions.remove_registration(&identity) {
                     Ok(Some(removed)) => {
+                        crate::diag::info(format!(
+                            "id={}: removed session after terminal disconnect",
+                            identity.id()
+                        ));
                         if let Some(connection) = removed.connection {
                             if let Err(error) = connection.shutdown() {
+                                crate::diag::info(format!(
+                                    "id={}: error shutting down session connection: {error}",
+                                    identity.id()
+                                ));
                                 first_error.get_or_insert(RuntimeError::Session(error));
                             }
                         }
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        crate::diag::verbose(
+                            1,
+                            &format!(
+                                "id={}: terminal disconnect with no active session slot",
+                                identity.id()
+                            ),
+                        );
+                    }
                     Err(error) => {
+                        crate::diag::info(format!(
+                            "id={}: session table error on terminal disconnect: {error}",
+                            identity.id()
+                        ));
                         first_error.get_or_insert(RuntimeError::SessionTable(error));
                     }
                 }

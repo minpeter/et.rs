@@ -2,6 +2,7 @@
 
 //! Secure server listeners, local terminal registration, and encrypted session routing.
 
+pub mod diag;
 pub mod path;
 mod registry;
 mod registry_validation;

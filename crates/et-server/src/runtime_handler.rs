@@ -15,14 +15,22 @@ use crate::session::ActiveSession;
 use crate::session_table::SessionClaim;
 
 pub(crate) fn handle(stream: TcpStream, core: Arc<RuntimeCore>, mut guard: RawSocketGuard) {
+    let peer = stream
+        .peer_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| "unknown".to_owned());
+    crate::diag::verbose(1, &format!("accepted TCP connection from {peer}"));
     let mut stream = stream;
     let request = match read_request(&mut stream) {
         Ok(request) => request,
-        Err(_) => {
+        Err(error) => {
+            crate::diag::verbose(1, &format!("malformed ConnectRequest from {peer}: {error}"));
             reject(
                 &mut stream,
                 ConnectStatus::InvalidKey,
                 "malformed ConnectRequest",
+                &peer,
+                None,
             );
             return;
         }
@@ -32,11 +40,19 @@ pub(crate) fn handle(stream: TcpStream, core: Arc<RuntimeCore>, mut guard: RawSo
             &mut stream,
             ConnectStatus::MismatchedProtocol,
             "protocol version does not match server version 6",
+            &peer,
+            request.client_id.as_deref(),
         );
         return;
     }
     let Some(id) = request.client_id.filter(|id| valid_id(id)) else {
-        reject(&mut stream, ConnectStatus::InvalidKey, "invalid client id");
+        reject(
+            &mut stream,
+            ConnectStatus::InvalidKey,
+            "invalid client id",
+            &peer,
+            None,
+        );
         return;
     };
     let registration = match core.registry.get(&id) {
@@ -46,11 +62,16 @@ pub(crate) fn handle(stream: TcpStream, core: Arc<RuntimeCore>, mut guard: RawSo
                 &mut stream,
                 ConnectStatus::InvalidKey,
                 "client is not registered",
+                &peer,
+                Some(&id),
             );
             return;
         }
     };
     if guard.assign(registration.identity()).is_err() {
+        crate::diag::info(format!(
+            "drop {peer} id={id}: could not track raw socket for registration"
+        ));
         return;
     }
     let claim = match core.sessions.claim(registration, &stream, &core.registry) {
@@ -60,34 +81,76 @@ pub(crate) fn handle(stream: TcpStream, core: Arc<RuntimeCore>, mut guard: RawSo
                 &mut stream,
                 ConnectStatus::InvalidKey,
                 "client registration disconnected",
+                &peer,
+                Some(&id),
             );
             return;
         }
-        Err(_) => return,
+        Err(error) => {
+            crate::diag::info(format!(
+                "drop {peer} id={id}: session claim failed: {error}"
+            ));
+            return;
+        }
     };
     match claim {
         SessionClaim::New { start, replaced } => {
+            if replaced.is_some() {
+                crate::diag::info(format!(
+                    "id={id}: replacing existing session for new client from {peer}"
+                ));
+            }
             if replaced.is_some_and(|connection| connection.shutdown().is_err()) {
+                crate::diag::info(format!(
+                    "id={id}: failed to shut down replaced session; aborting new client"
+                ));
                 return;
             }
-            handle_new(stream, start, &core);
+            crate::diag::info(format!("id={id}: new client session from {peer}"));
+            handle_new(stream, start, &core, &id, &peer);
         }
         SessionClaim::Returning(session) => {
+            crate::diag::info(format!("id={id}: returning client reconnect from {peer}"));
             if send_status(&mut stream, ConnectStatus::ReturningClient).is_ok() {
-                let _ = session.recover(stream);
+                match session.recover(stream) {
+                    Ok(()) => {
+                        crate::diag::info(format!("id={id}: session recover accepted from {peer}"))
+                    }
+                    Err(error) => crate::diag::info(format!(
+                        "id={id}: session recover failed from {peer}: {error}"
+                    )),
+                }
+            } else {
+                crate::diag::info(format!(
+                    "id={id}: failed to send ReturningClient status to {peer}"
+                ));
             }
         }
     }
 }
 
-fn handle_new(mut stream: TcpStream, start: crate::session_slot::SessionStart, core: &RuntimeCore) {
+fn handle_new(
+    mut stream: TcpStream,
+    start: crate::session_slot::SessionStart,
+    core: &RuntimeCore,
+    id: &str,
+    peer: &str,
+) {
     if send_status(&mut stream, ConnectStatus::NewClient).is_err() {
+        crate::diag::info(format!(
+            "id={id}: failed to send NewClient status to {peer}"
+        ));
         return;
     }
     let mut connection = Connection::new_server(stream, &start.registration().key);
     let packet = match connection.read_packet() {
         Ok(packet) => packet,
-        Err(_) => return,
+        Err(error) => {
+            crate::diag::info(format!(
+                "id={id}: failed reading INITIAL_PAYLOAD from {peer}: {error}"
+            ));
+            return;
+        }
     };
     let payload = if packet.header() == EtPacketType::InitialPayload as u8 {
         InitialPayload::decode(packet.payload()).map_err(|_| "malformed InitialPayload")
@@ -97,12 +160,16 @@ fn handle_new(mut stream: TcpStream, start: crate::session_slot::SessionStart, c
     let payload = match payload {
         Ok(payload) => payload,
         Err(message) => {
+            crate::diag::info(format!(
+                "id={id}: rejecting InitialPayload from {peer}: {message}"
+            ));
             send_initial_error(&mut connection, message);
             return;
         }
     };
     if payload.jumphost.unwrap_or(false) {
-        run_jumphost(connection, start, core, payload);
+        crate::diag::info(format!("id={id}: jumphost session from {peer}"));
+        run_jumphost(connection, start, core, payload, id, peer);
         return;
     }
     let owner = {
@@ -115,6 +182,9 @@ fn handle_new(mut stream: TcpStream, start: crate::session_slot::SessionStart, c
     ) {
         Ok(started) => started,
         Err(error) => {
+            crate::diag::info(format!(
+                "id={id}: reverse-tunnel setup failed for {peer}: {error}"
+            ));
             send_initial_error(&mut connection, &error.to_string());
             return;
         }
@@ -126,11 +196,17 @@ fn handle_new(mut stream: TcpStream, start: crate::session_slot::SessionStart, c
         )
         .is_err()
     {
+        crate::diag::info(format!(
+            "id={id}: failed writing INITIAL_RESPONSE to {peer}"
+        ));
         return;
     }
     let mut terminal = match core.registry.clone_stream(start.registration()) {
         Ok(terminal) => terminal,
-        Err(_) => return,
+        Err(error) => {
+            crate::diag::info(format!("id={id}: could not clone terminal stream: {error}"));
+            return;
+        }
     };
     // Merge the client-supplied environment with variables created for
     // named-pipe forwards; upstream stores them in a sorted std::map.
@@ -153,13 +229,21 @@ fn handle_new(mut stream: TcpStream, start: crate::session_slot::SessionStart, c
     }
     let active = match ActiveSession::new(connection, &terminal) {
         Ok(active) => active,
-        Err(_) => return,
+        Err(error) => {
+            crate::diag::info(format!(
+                "id={id}: could not create active session for {peer}: {error}"
+            ));
+            return;
+        }
     };
     let active = Arc::new(active);
     if start.activate(active.clone()).is_err() {
+        crate::diag::info(format!("id={id}: could not activate session for {peer}"));
         return;
     }
+    crate::diag::info(format!("id={id}: terminal bridge running for {peer}"));
     let _ = crate::terminal_bridge::run(active.clone(), terminal, forwarder);
+    crate::diag::info(format!("id={id}: terminal bridge ended for {peer}"));
     let _ = active.shutdown();
 }
 
@@ -171,6 +255,8 @@ fn run_jumphost(
     start: crate::session_slot::SessionStart,
     core: &RuntimeCore,
     payload: InitialPayload,
+    id: &str,
+    peer: &str,
 ) {
     if connection
         .write_packet(
@@ -179,38 +265,56 @@ fn run_jumphost(
         )
         .is_err()
     {
+        crate::diag::info(format!(
+            "id={id}: jumphost failed writing INITIAL_RESPONSE to {peer}"
+        ));
         return;
     }
     let mut terminal = match core.registry.clone_stream(start.registration()) {
         Ok(terminal) => terminal,
-        Err(_) => return,
+        Err(error) => {
+            crate::diag::info(format!(
+                "id={id}: jumphost could not clone terminal stream: {error}"
+            ));
+            return;
+        }
     };
     let init_packet = et_core::packet::Packet::new(
         TerminalPacketType::JumphostInit as u8,
         payload.encode_to_vec(),
     );
     if write_local_packet(&mut terminal, &init_packet).is_err() {
+        crate::diag::info(format!("id={id}: jumphost failed sending JUMPHOST_INIT"));
         return;
     }
     let active = match ActiveSession::new(connection, &terminal) {
         Ok(active) => active,
-        Err(_) => return,
+        Err(error) => {
+            crate::diag::info(format!(
+                "id={id}: jumphost could not create active session: {error}"
+            ));
+            return;
+        }
     };
     let active = Arc::new(active);
     if start.activate(active.clone()).is_err() {
+        crate::diag::info(format!("id={id}: jumphost could not activate session"));
         return;
     }
     // A jumphost session owns no local forwarding: the destination side does.
     let Ok(forwarder) = et_net::forward::Forwarder::start(Vec::new()) else {
+        crate::diag::info(format!("id={id}: jumphost forwarder start failed"));
         let _ = active.shutdown();
         return;
     };
+    crate::diag::info(format!("id={id}: jumphost bridge running for {peer}"));
     let _ = crate::terminal_bridge::run_mode(
         active.clone(),
         terminal,
         forwarder,
         crate::terminal_bridge::BridgeMode::Jumphost,
     );
+    crate::diag::info(format!("id={id}: jumphost bridge ended for {peer}"));
     let _ = active.shutdown();
 }
 
@@ -234,7 +338,17 @@ fn send_status(stream: &mut TcpStream, status: ConnectStatus) -> std::io::Result
     )
 }
 
-fn reject(stream: &mut TcpStream, status: ConnectStatus, message: &str) {
+fn reject(
+    stream: &mut TcpStream,
+    status: ConnectStatus,
+    message: &str,
+    peer: &str,
+    client_id: Option<&str>,
+) {
+    let id = client_id.unwrap_or("-");
+    crate::diag::info(format!(
+        "reject {peer} id={id} status={status:?}: {message}"
+    ));
     let _ = write_response(
         stream,
         &ConnectResponse {

@@ -130,7 +130,34 @@ pub fn resolve_config(
     if let Some(directory) = &args.logdir {
         config.log_directory = directory.clone();
     }
+    // Machine-local env overrides (`ET_DEBUG` / `ET_LOGDIR` / `ET_VERBOSE`)
+    // apply only when CLI (and, for logdir, INI) left the field at defaults.
+    // CLI always wins; INI wins over env for values it set.
+    apply_env_debug_overrides(&mut config, args);
     Ok(config)
+}
+
+/// Apply `ET_*` debug env vars after CLI/INI resolution.
+///
+/// - `verbose`: raised only when still 0 (CLI `-v` / INI `verbose` win).
+/// - `log_directory`: replaced only when neither CLI `--logdir` nor INI
+///   `logdirectory` set a path (detected via args + whether the directory is
+///   still the process temp default from construction). Callers that set
+///   `logdir` on args already overwrote `log_directory` above.
+/// - `silent`: forced off under `ET_DEBUG`.
+fn apply_env_debug_overrides(config: &mut ServerConfig, args: &ServerArgs) {
+    config.verbose = crate::logging::effective_verbose(config.verbose);
+    if args.logdir.is_none() {
+        // INI may have set log_directory already; only fall through to env when
+        // the directory is still the construction default (temp). Compare via
+        // the same helper so ET_LOGDIR / ET_DEBUG durable paths apply.
+        let from_env = crate::logging::effective_log_directory(None);
+        // If INI set a custom path, keep it: temp_dir means "unset by INI".
+        if config.log_directory == std::env::temp_dir() {
+            config.log_directory = from_env;
+        }
+    }
+    config.silent = crate::logging::effective_silent(config.silent);
 }
 
 fn apply_ini(config: &mut ServerConfig, args: &ServerArgs, text: &str) -> Result<(), ConfigError> {
@@ -247,5 +274,16 @@ mod tests {
         assert!(args.daemon);
         assert!(!args.daemon_child);
         assert_eq!(args.pidfile, None);
+    }
+
+    #[test]
+    fn apply_env_debug_overrides_leaves_cli_logdir_alone() {
+        // Without mutating process env: CLI logdir is sticky because
+        // `args.logdir` is Some, so `apply_env_debug_overrides` skips the dir.
+        let args = ServerArgs::try_parse_from(["etserver", "-v", "3", "--logdir", "/tmp/cli-wins"])
+            .unwrap();
+        let config = resolve_config(&args, None).unwrap();
+        assert_eq!(config.verbose, 3);
+        assert_eq!(config.log_directory, PathBuf::from("/tmp/cli-wins"));
     }
 }

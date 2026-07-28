@@ -84,6 +84,119 @@ pub fn log_path() -> Option<PathBuf> {
         .and_then(|logger| logger.lock().ok().and_then(|logger| logger.path.clone()))
 }
 
+/// Machine-local debug overrides shared by `et`, `etserver`, and `etterminal`.
+///
+/// | Variable     | Effect |
+/// |--------------|--------|
+/// | `ET_DEBUG=1` | Raise default verbosity to 2, force logging on, prefer a durable logdir |
+/// | `ET_LOGDIR`  | Default log directory when `--logdir` / INI do not set one |
+/// | `ET_VERBOSE` | Default verbosity when `--verbose` / INI leave it at 0 |
+///
+/// Explicit CLI flags and (for the server) INI values always win over these.
+pub fn env_debug_enabled() -> bool {
+    matches!(
+        std::env::var("ET_DEBUG").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES") | Ok("on") | Ok("ON")
+    )
+}
+
+/// Resolve verbosity: CLI/INI value if non-zero, else `ET_VERBOSE`, else 2 when
+/// `ET_DEBUG` is set, else 0.
+pub fn effective_verbose(configured: u8) -> u8 {
+    resolve_verbose(
+        configured,
+        env_debug_enabled(),
+        std::env::var("ET_VERBOSE").ok(),
+    )
+}
+
+/// Pure resolution used by [`effective_verbose`] and unit tests.
+pub fn resolve_verbose(configured: u8, debug: bool, et_verbose: Option<String>) -> u8 {
+    if configured > 0 {
+        return configured;
+    }
+    if let Some(value) = et_verbose {
+        if let Ok(level) = value.parse::<u8>() {
+            return level;
+        }
+    }
+    if debug {
+        2
+    } else {
+        0
+    }
+}
+
+/// Resolve log directory: configured path if present, else `ET_LOGDIR`, else
+/// platform temp (or a durable home logdir when `ET_DEBUG` is set and no path
+/// was configured).
+pub fn effective_log_directory(configured: Option<PathBuf>) -> PathBuf {
+    resolve_log_directory(
+        configured,
+        env_debug_enabled(),
+        std::env::var_os("ET_LOGDIR").map(PathBuf::from),
+        default_debug_log_directory(),
+        std::env::temp_dir(),
+    )
+}
+
+/// Pure resolution used by [`effective_log_directory`] and unit tests.
+pub fn resolve_log_directory(
+    configured: Option<PathBuf>,
+    debug: bool,
+    et_logdir: Option<PathBuf>,
+    debug_default: PathBuf,
+    temp_dir: PathBuf,
+) -> PathBuf {
+    if let Some(directory) = configured {
+        return directory;
+    }
+    if let Some(directory) = et_logdir {
+        return directory;
+    }
+    if debug {
+        debug_default
+    } else {
+        temp_dir
+    }
+}
+
+/// When `ET_DEBUG` is set, logging is never silent. Otherwise keep `configured`.
+pub fn effective_silent(configured: bool) -> bool {
+    resolve_silent(configured, env_debug_enabled())
+}
+
+/// Pure resolution used by [`effective_silent`] and unit tests.
+pub fn resolve_silent(configured: bool, debug: bool) -> bool {
+    if debug {
+        false
+    } else {
+        configured
+    }
+}
+
+/// Durable default under `$HOME/Library/Logs/et-rs` (macOS) or
+/// `$HOME/.local/state/et-rs` / `$XDG_STATE_HOME/et-rs` elsewhere. Falls back
+/// to the process temp dir when `$HOME` is unset.
+pub fn default_debug_log_directory() -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    #[cfg(target_os = "macos")]
+    {
+        return home
+            .unwrap_or_else(std::env::temp_dir)
+            .join("Library/Logs/et-rs");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
+            return PathBuf::from(state).join("et-rs");
+        }
+        return home
+            .map(|home| home.join(".local/state/et-rs"))
+            .unwrap_or_else(std::env::temp_dir);
+    }
+}
+
 fn write_line(level: u8, message: &str) {
     let Some(logger) = LOGGER.get() else {
         return;
@@ -258,6 +371,58 @@ mod tests {
         logger.write(0, "hello");
         assert!(logger.path.is_none());
         assert!(!directory.exists());
+    }
+
+    #[test]
+    fn resolve_verbose_prefers_configured_then_env_then_debug_default() {
+        assert_eq!(resolve_verbose(3, true, Some("1".into())), 3);
+        assert_eq!(resolve_verbose(0, false, Some("4".into())), 4);
+        assert_eq!(resolve_verbose(0, true, None), 2);
+        assert_eq!(resolve_verbose(0, false, None), 0);
+        assert_eq!(resolve_verbose(0, true, Some("nope".into())), 2);
+    }
+
+    #[test]
+    fn resolve_log_directory_prefers_configured_then_env_then_debug_default() {
+        let configured = PathBuf::from("/cli");
+        let env = PathBuf::from("/env");
+        let debug_default = PathBuf::from("/debug");
+        let temp = PathBuf::from("/tmp");
+        assert_eq!(
+            resolve_log_directory(
+                Some(configured.clone()),
+                true,
+                Some(env.clone()),
+                debug_default.clone(),
+                temp.clone()
+            ),
+            configured
+        );
+        assert_eq!(
+            resolve_log_directory(
+                None,
+                false,
+                Some(env.clone()),
+                debug_default.clone(),
+                temp.clone()
+            ),
+            env
+        );
+        assert_eq!(
+            resolve_log_directory(None, true, None, debug_default.clone(), temp.clone()),
+            debug_default
+        );
+        assert_eq!(
+            resolve_log_directory(None, false, None, debug_default, temp.clone()),
+            temp
+        );
+    }
+
+    #[test]
+    fn resolve_silent_forces_logging_under_debug() {
+        assert!(!resolve_silent(true, true));
+        assert!(resolve_silent(true, false));
+        assert!(!resolve_silent(false, false));
     }
 
     #[cfg_attr(windows, ignore = "file mode bits are POSIX-only")]

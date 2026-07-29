@@ -1,9 +1,9 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Add debug diagnostics for dropped server sessions\n\n`ET_DEBUG=1` now gives `etserver` a durable machine-local log destination,\nnon-silent logging, and default verbosity 2. Operators can also use\n`ET_LOGDIR` and `ET_VERBOSE` when CLI or INI settings do not override them.\n\nServer diagnostics now record client accept/reject reasons, reconnect and\nrecovery outcomes, terminal disconnects, and session removal, making long-lived\nsession drops diagnosable from the server host. Client debug logs omit session\ncredentials, malformed handshakes are bounded by a five-second deadline and\n128-connection pre-auth capacity, and completed connection handlers no longer\naccumulate after rapid failed handshakes.\n"
-    filename: server-debug-diagnostics.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Keep server sessions alive across client transport loss\n\n`etserver` now treats laptop sleep, Wi-Fi changes, and other client transport\nloss as a recoverable disconnect instead of terminating the registered\nterminal. Output produced while the client is away remains buffered, and a\nreturning client resumes the same shell without an `InvalidKey` failure.\n\nRecovery handoff now ignores stale events from the replaced socket, drains\npackets read during recovery authentication, and preserves port-forwarding\npackets when the replay buffer is temporarily full.\n"
+    filename: survive-client-disconnect.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - server-debug-diagnostics.md
+      - survive-client-disconnect.md
     id: cargo:et
     updated: true

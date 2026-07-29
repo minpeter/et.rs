@@ -169,6 +169,19 @@ impl ActiveSession {
             .connected())
     }
 
+    /// Soft-drop the encrypted client transport without killing the terminal.
+    ///
+    /// Used when the client TCP path dies (sleep, Wi-Fi, NAT) so terminal
+    /// output keeps buffering and a returning client can recover the same
+    /// session. Does not set the session shutdown flag or close the terminal.
+    pub(crate) fn mark_client_disconnected(&self) -> Result<(), SessionError> {
+        self.connection
+            .lock()
+            .map_err(|_| SessionError::Unavailable)?
+            .disconnect();
+        Ok(())
+    }
+
     /// Apply a client delivery acknowledgement to the replay backup.
     pub(crate) fn acknowledge_delivery(&self, sequence: i64) -> Result<(), SessionError> {
         self.connection

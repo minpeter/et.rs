@@ -108,6 +108,73 @@ fn returning_client_receives_exact_buffered_server_catchup() {
 }
 
 #[test]
+fn hard_client_drop_keeps_session_for_returning_recover() {
+    // Regression: laptop sleep / Wi-Fi drop aborts the TCP socket. The server
+    // used to tear the terminal down (bridge exit → session removed →
+    // InvalidKey on reconnect). The session must stay Active so a returning
+    // client recovers the same shell and any buffered catch-up.
+    use std::net::Shutdown;
+
+    let mut server = TestRuntime::start();
+    let mut terminal = server.register(ID_A, KEY_A);
+    terminal.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let key = passkey_to_key(KEY_A).unwrap();
+    let (mut client, initial) = initialize(stream, &key, default_payload());
+    assert_eq!(initial.error, None);
+    server
+        .handle
+        .wait_for_state(ID_A, SessionState::Active, TIMEOUT)
+        .unwrap();
+    let initial_terminal_packet = read_local_packet(&mut terminal).unwrap();
+    assert_eq!(
+        initial_terminal_packet.header(),
+        TerminalPacketType::TerminalInit as u8
+    );
+
+    // Hard-drop the OS socket (FIN/RST) without Connection::shutdown's local
+    // bookkeeping — closer to what a sleeping laptop's stack does.
+    client
+        .try_clone_stream()
+        .unwrap()
+        .shutdown(Shutdown::Both)
+        .unwrap();
+
+    server.handle.send_packet(ID_A, 31, b"while-away").unwrap();
+    server.handle.send_packet(ID_A, 32, b"still-here").unwrap();
+    // Give the bridge a moment to observe the dead peer and soft-disconnect.
+    thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(
+        server.handle.session_state(ID_A).unwrap(),
+        Some(SessionState::Active),
+        "client transport loss must not remove the session"
+    );
+
+    let (returning, response) = server.handshake(ID_A);
+    assert_eq!(
+        response.status,
+        Some(ConnectStatus::ReturningClient as i32),
+        "expected ReturningClient after hard drop, got {response:?}"
+    );
+    client.recover(returning).unwrap();
+    client
+        .write_packet(TerminalPacketType::KeepAlive as u8, &[])
+        .unwrap();
+    let first = client.read_packet().unwrap();
+    let second = client.read_packet().unwrap();
+    assert_eq!(
+        (first.header(), first.payload()),
+        (31, b"while-away".as_slice())
+    );
+    assert_eq!(
+        (second.header(), second.payload()),
+        (32, b"still-here".as_slice())
+    );
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
 fn keepalive_echo_acknowledges_everything_read_from_the_client() {
     let mut server = TestRuntime::start();
     let _terminal = server.register(ID_A, KEY_A);

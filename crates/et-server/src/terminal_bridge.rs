@@ -49,6 +49,11 @@ pub(crate) fn run_mode(
 }
 
 /// Readiness-driven bridge, mirroring upstream's `select()` loop.
+///
+/// Client TCP loss (sleep, Wi-Fi flap, NAT drop) must **not** end the bridge.
+/// The terminal stays registered and the session stays Active so a returning
+/// client can recover. Only terminal EOF/error or an explicit session shutdown
+/// tears the loop down.
 #[cfg(unix)]
 fn run_mode_poll(
     session: Arc<ActiveSession>,
@@ -75,15 +80,29 @@ fn run_mode_poll(
         if let Some(packet) = pending_forward.take() {
             pending_forward = forwarder.try_receive(packet).map_err(forward_error)?;
         }
-        let client = connected.then(|| session.try_clone_stream()).transpose()?;
+        let client = if connected {
+            match session.try_clone_stream() {
+                Ok(stream) => Some(stream),
+                // Cloning a dead socket is a soft disconnect, not session death.
+                Err(_) => {
+                    note_client_drop(&session, &mut connected);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let accept_terminal = session.can_buffer_write((READ_BUFFER * 2) as i64)?;
+        // When the client is down, poll with a short timeout so recovery wakes
+        // (via the wake pipe) are still processed promptly and we re-check
+        // `session.connected()` after recover installs a new stream.
         let (terminal_events, wake_events, forward_events, client_events) = wait(
             &terminal,
             &wake,
             forwarder.wake().map_err(forward_error)?,
             client.as_ref(),
             accept_terminal,
-            pending_forward.is_some(),
+            pending_forward.is_some() || !connected,
         )?;
         let client_events_are_stale = wake_events.intersects(PollFlags::IN | PollFlags::HUP);
         if client_events_are_stale {
@@ -105,14 +124,10 @@ fn run_mode_poll(
                     jumphost_terminal_packet(&session, packet)?
                 };
                 decoder = LocalPacketDecoder::new();
-                match session.send_packet(packet.header(), packet.payload()) {
-                    Ok(()) => {}
-                    Err(SessionError::Connection(ConnError::Io(error)))
-                        if connection_ended(&error) =>
-                    {
-                        connected = false;
+                if let Err(error) = session.send_packet(packet.header(), packet.payload()) {
+                    if !client_transport_error(&error, &session, &mut connected) {
+                        return Err(error);
                     }
-                    Err(error) => return Err(error),
                 }
             }
         }
@@ -130,28 +145,25 @@ fn run_mode_poll(
                     }
                     Ok(Some(packet)) => forward_client_packet(&session, &mut terminal, packet)?,
                     Ok(None) => break,
-                    Err(SessionError::Connection(_)) => {
-                        connected = false;
-                        break;
+                    Err(error) => {
+                        if client_transport_error(&error, &session, &mut connected) {
+                            break;
+                        }
+                        return Err(error);
                     }
-                    Err(error) => return Err(error),
                 }
             }
         }
         if !client_events_are_stale && client_events.intersects(PollFlags::HUP | PollFlags::ERR) {
-            connected = false;
+            note_client_drop(&session, &mut connected);
         }
         if forward_events.intersects(PollFlags::IN | PollFlags::HUP) {
             while let Some(packet) = forwarder.try_outbound().map_err(forward_error)? {
-                match session.send_packet(packet.header(), packet.payload()) {
-                    Ok(()) => {}
-                    Err(SessionError::Connection(ConnError::Io(error)))
-                        if connection_ended(&error) =>
-                    {
-                        connected = false;
+                if let Err(error) = session.send_packet(packet.header(), packet.payload()) {
+                    if client_transport_error(&error, &session, &mut connected) {
                         break;
                     }
-                    Err(error) => return Err(error),
+                    return Err(error);
                 }
             }
         }
@@ -218,14 +230,10 @@ fn run_mode_windows(
                         jumphost_terminal_packet(&session, packet)?
                     };
                     decoder = LocalPacketDecoder::new();
-                    match session.send_packet(packet.header(), packet.payload()) {
-                        Ok(()) => {}
-                        Err(SessionError::Connection(ConnError::Io(error)))
-                            if connection_ended(&error) =>
-                        {
-                            connected = false;
+                    if let Err(error) = session.send_packet(packet.header(), packet.payload()) {
+                        if !client_transport_error(&error, &session, &mut connected) {
+                            return Err(error);
                         }
-                        Err(error) => return Err(error),
                     }
                 }
                 Ok(None) => {}
@@ -250,11 +258,12 @@ fn run_mode_windows(
                         }
                     }
                     Ok(None) => break,
-                    Err(SessionError::Connection(_)) => {
-                        connected = false;
-                        break;
+                    Err(error) => {
+                        if client_transport_error(&error, &session, &mut connected) {
+                            break;
+                        }
+                        return Err(error);
                     }
-                    Err(error) => return Err(error),
                 }
             }
         }
@@ -262,13 +271,11 @@ fn run_mode_windows(
         // Forwarding -> client.
         while let Some(packet) = forwarder.try_outbound().map_err(forward_error)? {
             progress = true;
-            match session.send_packet(packet.header(), packet.payload()) {
-                Ok(()) => {}
-                Err(SessionError::Connection(ConnError::Io(error))) if connection_ended(&error) => {
-                    connected = false;
+            if let Err(error) = session.send_packet(packet.header(), packet.payload()) {
+                if client_transport_error(&error, &session, &mut connected) {
                     break;
                 }
-                Err(error) => return Err(error),
+                return Err(error);
             }
         }
 
@@ -294,6 +301,39 @@ fn drain_available(wake: &mut LocalStream) -> Result<bool, SessionError> {
     }
 }
 
+/// Client-side transport failures are soft: keep the terminal alive so a
+/// returning client can recover. Terminal / local I/O errors stay fatal.
+fn client_transport_error(
+    error: &SessionError,
+    session: &ActiveSession,
+    connected: &mut bool,
+) -> bool {
+    match error {
+        SessionError::Connection(ConnError::Io(io_error)) if connection_ended(io_error) => {
+            note_client_drop(session, connected);
+            true
+        }
+        SessionError::Connection(ConnError::Io(_))
+        | SessionError::Connection(ConnError::Read(_))
+        | SessionError::Connection(ConnError::Backpressure)
+        | SessionError::Connection(ConnError::Encrypt(_)) => {
+            // Any client-path crypto/read/backpressure failure after a
+            // half-open sleep drop must not kill the shell session.
+            note_client_drop(session, connected);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn note_client_drop(session: &ActiveSession, connected: &mut bool) {
+    if *connected {
+        crate::diag::info("client transport lost; buffering for reconnect");
+    }
+    *connected = false;
+    let _ = session.mark_client_disconnected();
+}
+
 fn connection_ended(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -302,6 +342,7 @@ fn connection_ended(error: &io::Error) -> bool {
             | io::ErrorKind::ConnectionAborted
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::NotConnected
+            | io::ErrorKind::TimedOut
     )
 }
 

@@ -173,6 +173,7 @@ impl HandlerThreads {
     pub(crate) fn push(&self, handle: JoinHandle<()>) -> Result<(), JoinHandle<()>> {
         match self.handles.lock() {
             Ok(mut handles) => {
+                handles.retain(|existing| !existing.is_finished());
                 handles.push(handle);
                 Ok(())
             }
@@ -186,6 +187,54 @@ impl HandlerThreads {
             .lock()
             .map_err(|_| RuntimeError::WorkerUnavailable)?;
         Ok(std::mem::take(&mut *handles))
+    }
+}
+
+#[cfg(test)]
+mod handler_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn unfinished_handlers_remain_owned_until_shutdown() {
+        let workers = HandlerThreads::new();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        workers
+            .push(thread::spawn(move || stop_rx.recv().unwrap()))
+            .unwrap();
+        let mut pending = workers.take().unwrap();
+        assert_eq!(pending.len(), 1);
+        stop_tx.send(()).unwrap();
+        pending.pop().unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn completed_handlers_are_reaped_before_shutdown() {
+        let workers = HandlerThreads::new();
+        for _ in 0..128 {
+            workers.push(completed_handle()).unwrap();
+        }
+        let (stop_tx, stop_rx) = mpsc::channel();
+        workers
+            .push(thread::spawn(move || stop_rx.recv().unwrap()))
+            .unwrap();
+        let observed = workers.handles.lock().unwrap().len();
+        let mut pending = workers.take().unwrap();
+        stop_tx.send(()).unwrap();
+        pending.pop().unwrap().join().unwrap();
+        assert_eq!(observed, 1);
+    }
+
+    fn completed_handle() -> JoinHandle<()> {
+        let handle = thread::spawn(|| ());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        handle
     }
 }
 

@@ -175,6 +175,50 @@ fn hard_client_drop_keeps_session_for_returning_recover() {
 }
 
 #[test]
+fn repeated_recovery_does_not_let_stale_hup_disconnect_the_new_stream() {
+    // Recover can both wake poll() with an old-socket HUP and read the first
+    // post-recovery packets into BackedReader while authenticating the peer.
+    // The stale event must not invalidate the new stream, and buffered input
+    // must be drained even if the new socket has no remaining POLLIN state.
+    let mut server = TestRuntime::start();
+    let mut terminal = server.register(ID_A, KEY_A);
+    terminal.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let key = passkey_to_key(KEY_A).unwrap();
+    let (mut client, initial) = initialize(stream, &key, default_payload());
+    assert_eq!(initial.error, None);
+    server
+        .handle
+        .wait_for_state(ID_A, SessionState::Active, TIMEOUT)
+        .unwrap();
+    let initial_terminal_packet = read_local_packet(&mut terminal).unwrap();
+    assert_eq!(
+        initial_terminal_packet.header(),
+        TerminalPacketType::TerminalInit as u8
+    );
+
+    for iteration in 0..32u8 {
+        client.shutdown().unwrap();
+        let (returning, response) = server.handshake(ID_A);
+        assert_eq!(response.status, Some(ConnectStatus::ReturningClient as i32));
+        client.recover(returning).unwrap();
+        client
+            .write_packet(TerminalPacketType::KeepAlive as u8, &[])
+            .unwrap();
+        client
+            .write_packet(TerminalPacketType::TerminalInfo as u8, &[iteration])
+            .unwrap();
+        let forwarded = read_local_packet(&mut terminal)
+            .unwrap_or_else(|error| panic!("iteration {iteration}: {error}"));
+        assert_eq!(forwarded.header(), TerminalPacketType::TerminalInfo as u8);
+        assert_eq!(forwarded.payload(), &[iteration]);
+    }
+
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
 fn keepalive_echo_acknowledges_everything_read_from_the_client() {
     let mut server = TestRuntime::start();
     let _terminal = server.register(ID_A, KEY_A);

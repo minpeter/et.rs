@@ -48,19 +48,20 @@ impl Connection {
     }
 
     pub fn write_packet(&mut self, header: u8, payload: &[u8]) -> Result<(), ConnError> {
-        if let Err(error) = self.refresh_connectivity() {
+        // Probe first so a half-closed peer (laptop sleep, Wi-Fi drop) moves
+        // the writer into the disconnected catch-up buffer before we try to
+        // push bytes onto a dead socket.
+        if let Err(_error) = self.refresh_connectivity() {
             self.disconnect();
-            return match self.writer.write_packet(header, payload)? {
-                WriterOutcome::BufferedOnly => Err(error),
-                WriterOutcome::Skipped => Err(ConnError::Backpressure),
-                WriterOutcome::Send(_) => Err(error),
-            };
         }
         match self.writer.write_packet(header, payload)? {
             WriterOutcome::Send(frame) => {
-                if let Err(error) = self.stream.write_all(&frame) {
+                if let Err(_error) = self.stream.write_all(&frame) {
+                    // The encrypted packet is already in the replay backup
+                    // (BackedWriter pushes before returning Send). Mark the
+                    // transport disconnected so further writes buffer for a
+                    // returning client instead of tearing the session down.
                     self.disconnect();
-                    return Err(ConnError::Io(error));
                 }
                 Ok(())
             }

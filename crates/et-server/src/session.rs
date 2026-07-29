@@ -1,7 +1,7 @@
 use et_net::local::LocalStream;
 use std::io::{self, Write};
 use std::net::{Shutdown, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use et_core::proto::TerminalPacketType;
@@ -15,6 +15,7 @@ pub(crate) struct ActiveSession {
     wake_writer: Mutex<LocalStream>,
     wake_reader: Mutex<Option<LocalStream>>,
     shutdown: AtomicBool,
+    connection_generation: AtomicU64,
 }
 
 pub(crate) enum SessionConnection {
@@ -66,6 +67,7 @@ impl ActiveSession {
             wake_writer: Mutex::new(wake_writer),
             wake_reader: Mutex::new(Some(wake_reader)),
             shutdown: AtomicBool::new(false),
+            connection_generation: AtomicU64::new(0),
         })
     }
 
@@ -108,6 +110,7 @@ impl ActiveSession {
         let old_control = std::mem::replace(&mut *control, new_control);
         let _ = old_control.shutdown(Shutdown::Both);
         *connection = candidate;
+        self.connection_generation.fetch_add(1, Ordering::Release);
         drop(connection);
         drop(control);
         self.signal()
@@ -145,12 +148,16 @@ impl ActiveSession {
     }
 
     #[cfg_attr(windows, allow(dead_code))]
-    pub(crate) fn try_clone_stream(&self) -> Result<TcpStream, SessionError> {
-        self.connection
+    pub(crate) fn try_clone_stream(&self) -> Result<(TcpStream, u64), SessionError> {
+        let connection = self
+            .connection
             .lock()
-            .map_err(|_| SessionError::Unavailable)?
+            .map_err(|_| SessionError::Unavailable)?;
+        let generation = self.connection_generation.load(Ordering::Acquire);
+        let stream = connection
             .try_clone_stream()
-            .map_err(SessionError::Connection)
+            .map_err(SessionError::Connection)?;
+        Ok((stream, generation))
     }
 
     pub(crate) fn try_read_packet(&self) -> Result<Option<et_core::packet::Packet>, SessionError> {
@@ -161,12 +168,35 @@ impl ActiveSession {
             .map_err(SessionError::Connection)
     }
 
-    pub(crate) fn connected(&self) -> Result<bool, SessionError> {
-        Ok(self
+    pub(crate) fn connection_state(&self) -> Result<(bool, u64), SessionError> {
+        let connection = self
             .connection
             .lock()
-            .map_err(|_| SessionError::Unavailable)?
-            .connected())
+            .map_err(|_| SessionError::Unavailable)?;
+        Ok((
+            connection.connected(),
+            self.connection_generation.load(Ordering::Acquire),
+        ))
+    }
+
+    /// Soft-drop the encrypted client transport without killing the terminal.
+    ///
+    /// Used when the client TCP path dies (sleep, Wi-Fi, NAT) so terminal
+    /// output keeps buffering and a returning client can recover the same
+    /// session. Does not set the session shutdown flag or close the terminal.
+    pub(crate) fn mark_client_disconnected(
+        &self,
+        expected_generation: u64,
+    ) -> Result<bool, SessionError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| SessionError::Unavailable)?;
+        if self.connection_generation.load(Ordering::Acquire) != expected_generation {
+            return Ok(false);
+        }
+        connection.disconnect();
+        Ok(true)
     }
 
     /// Apply a client delivery acknowledgement to the replay backup.

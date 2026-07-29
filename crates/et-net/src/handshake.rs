@@ -3,6 +3,8 @@
 //! INVALID_KEY / MISMATCHED_PROTOCOL).
 
 use std::io;
+use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 use et_core::proto::{ConnectRequest, ConnectResponse, ConnectStatus};
 use et_core::PROTOCOL_VERSION;
@@ -10,6 +12,7 @@ use et_core::PROTOCOL_VERSION;
 use crate::framing_io::{read_proto_limited, write_proto};
 
 const MAX_HANDSHAKE_PROTO_LEN: i64 = 64 * 1024;
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn client_request(client_id: &str) -> ConnectRequest {
     ConnectRequest {
@@ -20,6 +23,13 @@ pub fn client_request(client_id: &str) -> ConnectRequest {
 
 pub fn read_request<R: io::Read>(r: &mut R) -> io::Result<ConnectRequest> {
     read_proto_limited(r, MAX_HANDSHAKE_PROTO_LEN)
+}
+
+pub fn read_request_deadline(
+    stream: &mut TcpStream,
+    deadline: Instant,
+) -> io::Result<ConnectRequest> {
+    crate::framing_io::read_proto_limited_deadline(stream, MAX_HANDSHAKE_PROTO_LEN, deadline)
 }
 
 pub fn write_response<W: io::Write>(w: &mut W, response: &ConnectResponse) -> io::Result<()> {
@@ -42,6 +52,8 @@ mod tests {
     use super::*;
     use crate::framing_io::{read_proto, write_proto};
     use std::io::Cursor;
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Instant;
 
     #[test]
     fn request_carries_protocol_version() {
@@ -94,5 +106,16 @@ mod tests {
             let r = response_status(st);
             assert_eq!(r.status, Some(st as i32));
         }
+    }
+
+    #[test]
+    fn request_deadline_expires_before_reading_an_idle_peer() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let connector = std::thread::spawn(move || TcpStream::connect(address).unwrap());
+        let (mut server, _) = listener.accept().unwrap();
+        let _client = connector.join().unwrap();
+        let error = read_request_deadline(&mut server, Instant::now()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 }

@@ -16,7 +16,9 @@ use crate::runtime_accept;
 use crate::runtime_error::RuntimeError;
 use crate::runtime_handle::RuntimeHandle;
 use crate::runtime_lifecycle::{self, LifecycleEvent};
-use crate::runtime_state::{HandlerThreads, RawSockets, RuntimeCore};
+use crate::runtime_state::{
+    HandlerThreads, PreAuthSlots, RawSockets, RuntimeCore, MAX_PRE_AUTH_CONNECTIONS,
+};
 use crate::session_table::SessionTable;
 
 pub struct Runtime {
@@ -50,6 +52,7 @@ impl Runtime {
             sessions: SessionTable::new(),
             raw_sockets: Arc::new(RawSockets::new()),
             handlers: HandlerThreads::new(),
+            pre_auth_slots: Arc::new(PreAuthSlots::new(MAX_PRE_AUTH_CONNECTIONS)),
             shutdown: AtomicBool::new(false),
         });
         let router_name = router_path.path().to_path_buf();

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{Shutdown, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -13,7 +13,43 @@ pub(crate) struct RuntimeCore {
     pub(crate) sessions: SessionTable,
     pub(crate) raw_sockets: Arc<RawSockets>,
     pub(crate) handlers: HandlerThreads,
+    pub(crate) pre_auth_slots: Arc<PreAuthSlots>,
     pub(crate) shutdown: AtomicBool,
+}
+
+pub(crate) const MAX_PRE_AUTH_CONNECTIONS: usize = 128;
+
+pub(crate) struct PreAuthSlots {
+    active: AtomicUsize,
+    limit: usize,
+}
+
+pub(crate) struct PreAuthGuard {
+    slots: Arc<PreAuthSlots>,
+}
+
+impl PreAuthSlots {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            limit,
+        }
+    }
+
+    pub(crate) fn try_acquire(self: Arc<Self>) -> Option<PreAuthGuard> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.limit).then_some(active + 1)
+            })
+            .ok()?;
+        Some(PreAuthGuard { slots: self })
+    }
+}
+
+impl Drop for PreAuthGuard {
+    fn drop(&mut self) {
+        self.slots.active.fetch_sub(1, Ordering::Release);
+    }
 }
 
 struct TrackedSocket {
@@ -134,13 +170,36 @@ impl HandlerThreads {
         }
     }
 
-    pub(crate) fn push(&self, handle: JoinHandle<()>) -> Result<(), JoinHandle<()>> {
+    pub(crate) fn push(&self, handle: JoinHandle<()>) -> Result<(), RuntimeError> {
+        let mut completed = Vec::new();
         match self.handles.lock() {
             Ok(mut handles) => {
-                handles.push(handle);
-                Ok(())
+                let mut pending = Vec::with_capacity(handles.len() + 1);
+                for existing in handles.drain(..) {
+                    if existing.is_finished() {
+                        completed.push(existing);
+                    } else {
+                        pending.push(existing);
+                    }
+                }
+                pending.push(handle);
+                *handles = pending;
             }
-            Err(_) => Err(handle),
+            Err(_) => {
+                let _ = handle.join();
+                return Err(RuntimeError::WorkerUnavailable);
+            }
+        }
+        let mut panicked = false;
+        for existing in completed {
+            if existing.join().is_err() {
+                panicked = true;
+            }
+        }
+        if panicked {
+            Err(RuntimeError::WorkerPanicked("TCP session handler"))
+        } else {
+            Ok(())
         }
     }
 
@@ -150,5 +209,87 @@ impl HandlerThreads {
             .lock()
             .map_err(|_| RuntimeError::WorkerUnavailable)?;
         Ok(std::mem::take(&mut *handles))
+    }
+}
+
+#[cfg(test)]
+mod handler_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn unfinished_handlers_remain_owned_until_shutdown() {
+        let workers = HandlerThreads::new();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        workers
+            .push(thread::spawn(move || stop_rx.recv().unwrap()))
+            .unwrap();
+        let mut pending = workers.take().unwrap();
+        assert_eq!(pending.len(), 1);
+        stop_tx.send(()).unwrap();
+        pending.pop().unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn completed_handlers_are_reaped_before_shutdown() {
+        let workers = HandlerThreads::new();
+        for _ in 0..128 {
+            workers.push(completed_handle()).unwrap();
+        }
+        let (stop_tx, stop_rx) = mpsc::channel();
+        workers
+            .push(thread::spawn(move || stop_rx.recv().unwrap()))
+            .unwrap();
+        let observed = workers.handles.lock().unwrap().len();
+        let mut pending = workers.take().unwrap();
+        stop_tx.send(()).unwrap();
+        pending.pop().unwrap().join().unwrap();
+        assert_eq!(observed, 1);
+    }
+
+    #[test]
+    fn reaped_panicking_handlers_are_reported_as_worker_panics() {
+        let workers = HandlerThreads::new();
+        workers.push(completed_panicking_handle()).unwrap();
+        let result = workers.push(completed_handle());
+        assert!(matches!(
+            result,
+            Err(RuntimeError::WorkerPanicked("TCP session handler"))
+        ));
+    }
+
+    fn completed_handle() -> JoinHandle<()> {
+        wait_until_finished(thread::spawn(|| ()))
+    }
+
+    fn completed_panicking_handle() -> JoinHandle<()> {
+        wait_until_finished(thread::spawn(|| {
+            panic!("intentional regression-test panic")
+        }))
+    }
+
+    fn wait_until_finished(handle: JoinHandle<()>) -> JoinHandle<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        handle
+    }
+}
+
+#[cfg(test)]
+mod pre_auth_tests {
+    use super::*;
+
+    #[test]
+    fn pre_auth_slots_reject_excess_and_release_on_drop() {
+        let slots = Arc::new(PreAuthSlots::new(1));
+        let first = slots.clone().try_acquire().unwrap();
+        assert!(slots.clone().try_acquire().is_none());
+        drop(first);
+        assert!(slots.try_acquire().is_some());
     }
 }

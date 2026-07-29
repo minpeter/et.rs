@@ -43,7 +43,22 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
         verbose: config.verbose,
         max_size: config.log_size,
     });
+    // Forward server runtime diagnostics into the same file logger.
+    et_server::diag::init(|level, message| {
+        if level == 0 {
+            et_cli::logging::info(message);
+        } else {
+            et_cli::logging::verbose(level, message);
+        }
+    });
     et_cli::logging::info("In child, about to start server.");
+    et_cli::logging::info(format!(
+        "etserver logging enabled (verbose={}, logdir={}, silent={}, ET_DEBUG={})",
+        config.verbose,
+        config.log_directory.display(),
+        config.silent,
+        et_cli::logging::env_debug_enabled()
+    ));
     let shutdown = ShutdownSignal::install()
         .map_err(|error| clap_io("could not install server signal handlers", error))?;
     let router_path = select_router_path(config.server_fifo.as_deref())

@@ -77,6 +77,10 @@ fn accept_ready(listener: &TcpListener, core: &Arc<RuntimeCore>) -> Result<(), R
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                let Some(pre_auth_guard) = core.pre_auth_slots.clone().try_acquire() else {
+                    crate::diag::verbose(1, "reject TCP connection: pre-auth capacity exhausted");
+                    continue;
+                };
                 // Windows inherits the listener's non-blocking mode on accepted
                 // sockets (Unix does not), and the handshake below is blocking.
                 stream
@@ -90,12 +94,11 @@ fn accept_ready(listener: &TcpListener, core: &Arc<RuntimeCore>) -> Result<(), R
                 let worker_core = core.clone();
                 let worker = thread::Builder::new()
                     .name("et-session-handler".to_owned())
-                    .spawn(move || runtime_handler::handle(stream, worker_core, guard))
+                    .spawn(move || {
+                        runtime_handler::handle(stream, worker_core, guard, pre_auth_guard)
+                    })
                     .map_err(RuntimeError::Spawn)?;
-                if let Err(worker) = core.handlers.push(worker) {
-                    let _ = worker.join();
-                    return Err(RuntimeError::WorkerUnavailable);
-                }
+                core.handlers.push(worker)?;
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}

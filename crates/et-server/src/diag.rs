@@ -28,8 +28,45 @@ pub fn verbose(level: u8, message: impl AsRef<str>) {
     write(level, message.as_ref());
 }
 
+/// Escape and bound untrusted text before embedding it in a diagnostic line.
+pub fn sanitize_external_field(value: &str) -> String {
+    const MAX_LEN: usize = 256;
+    const ELLIPSIS: &str = "...";
+
+    let mut sanitized = String::with_capacity(value.len().min(MAX_LEN));
+    let mut truncated = false;
+    for character in value.chars() {
+        let escaped: String = character.escape_default().collect();
+        if sanitized.len() + escaped.len() > MAX_LEN - ELLIPSIS.len() {
+            truncated = true;
+            break;
+        }
+        sanitized.push_str(&escaped);
+    }
+    if truncated {
+        sanitized.push_str(ELLIPSIS);
+    }
+    sanitized
+}
+
 fn write(level: u8, message: &str) {
     if let Some(sink) = SINK.get() {
         sink(level, message);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_fields_escape_control_characters_and_limit_length() {
+        let malicious = format!("client\nforged\rentry\t{}", "x".repeat(300));
+        let sanitized = sanitize_external_field(&malicious);
+        assert_eq!(
+            sanitized,
+            format!("client\\nforged\\rentry\\t{}...", "x".repeat(230))
+        );
+        assert_eq!(sanitized.len(), 256);
     }
 }

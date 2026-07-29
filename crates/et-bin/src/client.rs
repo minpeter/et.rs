@@ -22,12 +22,14 @@ const RECONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
-    let parsed = ClientArgs::try_parse_from(
+    let mut parsed = ClientArgs::try_parse_from(
         ["et"]
             .iter()
             .map(|value| OsString::from(*value))
             .chain(args.iter().cloned()),
     )?;
+    parsed.verbose = et_cli::logging::effective_verbose(parsed.verbose);
+    parsed.silent = et_cli::logging::effective_silent(parsed.silent);
     // `--telemetry` is accepted for upstream compatibility and ignored:
     // et.rs never collects telemetry, and upstream prints nothing here.
     init_logging(&parsed);
@@ -105,10 +107,7 @@ fn run_client(
         }
     }
     let invocation = build_invocation(&request, &provisional);
-    et_cli::logging::verbose(
-        1,
-        format!("Trying ssh with args: {}", invocation.args.join(" ")),
-    );
+    et_cli::logging::verbose(1, bootstrap_log_message(&request));
     let mut credentials = run_bootstrap(runner, &invocation, deadline)?;
     et_cli::logging::info("etserver started");
     // Without a jumphost the ET connection goes straight to the destination.
@@ -301,11 +300,9 @@ fn reconnect_wait_aborted(delay: Duration) -> bool {
 fn init_logging(args: &ClientArgs) {
     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_owned());
     et_cli::logging::init(et_cli::logging::LogOptions {
-        directory: args
-            .logdir
-            .as_deref()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir),
+        directory: et_cli::logging::effective_log_directory(
+            args.logdir.as_deref().map(std::path::PathBuf::from),
+        ),
         prefix: format!("etclient-{user}"),
         to_stdout: args.logtostdout,
         silent: args.silent,
@@ -313,6 +310,14 @@ fn init_logging(args: &ClientArgs) {
         verbose: args.verbose,
         max_size: et_cli::logging::DEFAULT_MAX_LOG_SIZE,
     });
+}
+
+fn bootstrap_log_message(request: &BootstrapRequest) -> String {
+    format!(
+        "starting SSH bootstrap host={} options={}",
+        request.host_alias,
+        request.ssh_options.len()
+    )
 }
 
 fn command_user(positional: Option<String>, option: Option<String>) -> Option<String> {
@@ -501,5 +506,32 @@ mod tests {
             validate_jumphost("good,"),
             Err(ClientError::Unsupported("empty hop in --jumphost"))
         ));
+    }
+
+    #[test]
+    fn bootstrap_log_message_never_contains_credentials() {
+        let request = BootstrapRequest {
+            user: Some("user".to_owned()),
+            host_alias: "host.example".to_owned(),
+            jumphost: None,
+            terminal_path: None,
+            server_fifo: None,
+            kill_other_sessions: false,
+            verbose: 2,
+            ssh_options: vec!["Compression=yes".to_owned()],
+            term: "xterm".to_owned(),
+            remote_shell: RemoteShell::Posix,
+        };
+        let credentials = Credentials {
+            id: "abcdefghijklmnop".to_owned(),
+            passkey: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef".to_owned(),
+        };
+        let message = bootstrap_log_message(&request);
+        assert!(!message.contains(&credentials.id));
+        assert!(!message.contains(&credentials.passkey));
+        assert_eq!(
+            message,
+            "starting SSH bootstrap host=host.example options=1"
+        );
     }
 }

@@ -92,7 +92,8 @@ pub fn log_path() -> Option<PathBuf> {
 /// | `ET_LOGDIR`  | Default log directory when `--logdir` / INI do not set one |
 /// | `ET_VERBOSE` | Default verbosity when `--verbose` / INI leave it at 0 |
 ///
-/// Explicit CLI flags and (for the server) INI values always win over these.
+/// Non-zero CLI/INI verbosity and explicit log directories win over these.
+/// Verbosity 0 means "use the environment/default verbosity".
 pub fn env_debug_enabled() -> bool {
     matches!(
         std::env::var("ET_DEBUG").as_deref(),
@@ -176,24 +177,45 @@ pub fn resolve_silent(configured: bool, debug: bool) -> bool {
 }
 
 /// Durable default under `$HOME/Library/Logs/et-rs` (macOS) or
-/// `$HOME/.local/state/et-rs` / `$XDG_STATE_HOME/et-rs` elsewhere. Falls back
-/// to the process temp dir when `$HOME` is unset.
+/// `%LOCALAPPDATA%\et-rs` (Windows), or `$XDG_STATE_HOME/et-rs` /
+/// `$HOME/.local/state/et-rs` elsewhere. Falls back to the process temp dir.
 pub fn default_debug_log_directory() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    #[cfg(target_os = "macos")]
-    {
-        return home
-            .unwrap_or_else(std::env::temp_dir)
-            .join("Library/Logs/et-rs");
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
-            return PathBuf::from(state).join("et-rs");
-        }
-        return home
-            .map(|home| home.join(".local/state/et-rs"))
-            .unwrap_or_else(std::env::temp_dir);
+    resolve_default_debug_log_directory(
+        cfg!(target_os = "macos"),
+        cfg!(target_os = "windows"),
+        std::env::var_os("HOME").map(PathBuf::from),
+        std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        std::env::temp_dir(),
+    )
+}
+
+fn resolve_default_debug_log_directory(
+    is_macos: bool,
+    is_windows: bool,
+    home: Option<PathBuf>,
+    xdg_state_home: Option<PathBuf>,
+    local_app_data: Option<PathBuf>,
+    temp_dir: PathBuf,
+) -> PathBuf {
+    if is_macos {
+        home.filter(|path| path.is_absolute())
+            .map(|path| path.join("Library/Logs/et-rs"))
+            .unwrap_or(temp_dir)
+    } else if is_windows {
+        local_app_data
+            .filter(|path| path.is_absolute())
+            .map(|path| path.join("et-rs"))
+            .unwrap_or(temp_dir)
+    } else {
+        xdg_state_home
+            .filter(|path| path.is_absolute())
+            .map(|path| path.join("et-rs"))
+            .or_else(|| {
+                home.filter(|path| path.is_absolute())
+                    .map(|path| path.join(".local/state/et-rs"))
+            })
+            .unwrap_or(temp_dir)
     }
 }
 
@@ -383,6 +405,12 @@ mod tests {
     }
 
     #[test]
+    fn zero_verbosity_uses_environment_semantics() {
+        assert_eq!(resolve_verbose(0, true, None), 2);
+        assert_eq!(resolve_verbose(0, true, Some("0".into())), 0);
+    }
+
+    #[test]
     fn resolve_log_directory_prefers_configured_then_env_then_debug_default() {
         let configured = PathBuf::from("/cli");
         let env = PathBuf::from("/env");
@@ -423,6 +451,54 @@ mod tests {
         assert!(!resolve_silent(true, true));
         assert!(resolve_silent(true, false));
         assert!(!resolve_silent(false, false));
+    }
+
+    #[test]
+    fn platform_debug_directory_uses_only_absolute_durable_roots() {
+        assert_eq!(
+            resolve_default_debug_log_directory(
+                true,
+                false,
+                Some(PathBuf::from("/home/test")),
+                None,
+                None,
+                PathBuf::from("/tmp"),
+            ),
+            PathBuf::from("/home/test/Library/Logs/et-rs")
+        );
+        assert_eq!(
+            resolve_default_debug_log_directory(
+                false,
+                false,
+                Some(PathBuf::from("/home/test")),
+                Some(PathBuf::from("/state")),
+                None,
+                PathBuf::from("/tmp"),
+            ),
+            PathBuf::from("/state/et-rs")
+        );
+        assert_eq!(
+            resolve_default_debug_log_directory(
+                false,
+                false,
+                Some(PathBuf::from("/home/test")),
+                Some(PathBuf::from("relative")),
+                None,
+                PathBuf::from("/tmp"),
+            ),
+            PathBuf::from("/home/test/.local/state/et-rs")
+        );
+        assert_eq!(
+            resolve_default_debug_log_directory(
+                false,
+                true,
+                None,
+                None,
+                Some(PathBuf::from("/local")),
+                PathBuf::from("/tmp"),
+            ),
+            PathBuf::from("/local/et-rs")
+        );
     }
 
     #[cfg_attr(windows, ignore = "file mode bits are POSIX-only")]

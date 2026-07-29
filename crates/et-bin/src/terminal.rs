@@ -53,17 +53,19 @@ struct TerminalArgs {
 }
 
 pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
-    let parsed = TerminalArgs::try_parse_from(
+    let mut parsed = TerminalArgs::try_parse_from(
         ["etterminal"]
             .iter()
             .map(|value| OsString::from(*value))
             .chain(args.iter().cloned()),
     )?;
+    parsed.verbose = et_cli::logging::effective_verbose(parsed.verbose);
+    let log_directory = et_cli::logging::effective_log_directory(parsed.logdir.clone());
     let input = load_credentials(&parsed).map_err(clap_error)?;
     // Upstream names these logs `etterminal-<user>-<id>` (or `etjump-...`).
     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_owned());
     et_cli::logging::init(et_cli::logging::LogOptions {
-        directory: parsed.logdir.clone().unwrap_or_else(std::env::temp_dir),
+        directory: log_directory,
         prefix: format!(
             "{}-{user}-{}",
             if parsed.jump { "etjump" } else { "etterminal" },

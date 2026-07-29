@@ -112,9 +112,11 @@ pub fn resolve_config(
         log_size: DEFAULT_LOG_SIZE,
         telemetry: false,
     };
-    if let Some(text) = ini_text {
-        apply_ini(&mut config, args, text)?;
-    }
+    let ini_log_directory_set = if let Some(text) = ini_text {
+        apply_ini(&mut config, args, text)?
+    } else {
+        false
+    };
     if let Some(port) = args.port {
         config.port = port;
     }
@@ -133,7 +135,7 @@ pub fn resolve_config(
     // Machine-local env overrides (`ET_DEBUG` / `ET_LOGDIR` / `ET_VERBOSE`)
     // apply only when CLI (and, for logdir, INI) left the field at defaults.
     // CLI always wins; INI wins over env for values it set.
-    apply_env_debug_overrides(&mut config, args);
+    apply_env_debug_overrides(&mut config, args, ini_log_directory_set);
     Ok(config)
 }
 
@@ -145,23 +147,41 @@ pub fn resolve_config(
 ///   still the process temp default from construction). Callers that set
 ///   `logdir` on args already overwrote `log_directory` above.
 /// - `silent`: forced off under `ET_DEBUG`.
-fn apply_env_debug_overrides(config: &mut ServerConfig, args: &ServerArgs) {
+fn apply_env_debug_overrides(
+    config: &mut ServerConfig,
+    args: &ServerArgs,
+    ini_log_directory_set: bool,
+) {
     config.verbose = crate::logging::effective_verbose(config.verbose);
-    if args.logdir.is_none() {
-        // INI may have set log_directory already; only fall through to env when
-        // the directory is still the construction default (temp). Compare via
-        // the same helper so ET_LOGDIR / ET_DEBUG durable paths apply.
-        let from_env = crate::logging::effective_log_directory(None);
-        // If INI set a custom path, keep it: temp_dir means "unset by INI".
-        if config.log_directory == std::env::temp_dir() {
-            config.log_directory = from_env;
-        }
-    }
+    config.log_directory = resolve_server_log_directory(
+        config.log_directory.clone(),
+        args.logdir.is_some(),
+        ini_log_directory_set,
+        crate::logging::effective_log_directory(None),
+    );
     config.silent = crate::logging::effective_silent(config.silent);
 }
 
-fn apply_ini(config: &mut ServerConfig, args: &ServerArgs, text: &str) -> Result<(), ConfigError> {
+fn resolve_server_log_directory(
+    configured: PathBuf,
+    cli_log_directory_set: bool,
+    ini_log_directory_set: bool,
+    environment_default: PathBuf,
+) -> PathBuf {
+    if cli_log_directory_set || ini_log_directory_set {
+        configured
+    } else {
+        environment_default
+    }
+}
+
+fn apply_ini(
+    config: &mut ServerConfig,
+    args: &ServerArgs,
+    text: &str,
+) -> Result<bool, ConfigError> {
     let mut section = String::new();
+    let mut log_directory_set = false;
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
@@ -193,6 +213,7 @@ fn apply_ini(config: &mut ServerConfig, args: &ServerArgs, text: &str) -> Result
             }
             ("debug", "logdirectory") if args.logdir.is_none() => {
                 config.log_directory = PathBuf::from(value);
+                log_directory_set = true;
             }
             ("debug", "silent") => {
                 config.silent = value.parse::<i64>().is_ok_and(|value| value != 0);
@@ -207,7 +228,7 @@ fn apply_ini(config: &mut ServerConfig, args: &ServerArgs, text: &str) -> Result
             _ => {}
         }
     }
-    Ok(())
+    Ok(log_directory_set)
 }
 
 fn parse_port(value: &str) -> Result<u16, String> {
@@ -285,5 +306,18 @@ mod tests {
         let config = resolve_config(&args, None).unwrap();
         assert_eq!(config.verbose, 3);
         assert_eq!(config.log_directory, PathBuf::from("/tmp/cli-wins"));
+    }
+
+    #[test]
+    fn explicit_ini_temp_logdir_wins_over_environment() {
+        assert_eq!(
+            resolve_server_log_directory(
+                PathBuf::from("/tmp"),
+                false,
+                true,
+                PathBuf::from("/environment"),
+            ),
+            PathBuf::from("/tmp")
+        );
     }
 }

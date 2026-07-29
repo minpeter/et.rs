@@ -6,42 +6,56 @@ use et_core::proto::{
     TerminalPacketType,
 };
 use et_net::connection::Connection;
-use et_net::handshake::{protocol_matches, read_request, write_response};
+use et_net::handshake::{
+    protocol_matches, read_request_deadline, write_response, HANDSHAKE_TIMEOUT,
+};
 use et_net::local_packet::write_local_packet;
 use prost::Message;
 
-use crate::runtime_state::{RawSocketGuard, RuntimeCore};
+use crate::runtime_state::{PreAuthGuard, RawSocketGuard, RuntimeCore};
 use crate::session::ActiveSession;
 use crate::session_table::SessionClaim;
 
-pub(crate) fn handle(stream: TcpStream, core: Arc<RuntimeCore>, mut guard: RawSocketGuard) {
+pub(crate) fn handle(
+    stream: TcpStream,
+    core: Arc<RuntimeCore>,
+    mut guard: RawSocketGuard,
+    pre_auth_guard: PreAuthGuard,
+) {
     let peer = stream
         .peer_addr()
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| "unknown".to_owned());
-    crate::diag::verbose(1, &format!("accepted TCP connection from {peer}"));
+    crate::diag::verbose(1, format!("accepted TCP connection from {peer}"));
     let mut stream = stream;
-    let request = match read_request(&mut stream) {
-        Ok(request) => request,
-        Err(error) => {
-            crate::diag::verbose(1, &format!("malformed ConnectRequest from {peer}: {error}"));
-            reject(
-                &mut stream,
-                ConnectStatus::InvalidKey,
-                "malformed ConnectRequest",
-                &peer,
-                None,
-            );
-            return;
-        }
-    };
+    let request =
+        match read_request_deadline(&mut stream, std::time::Instant::now() + HANDSHAKE_TIMEOUT) {
+            Ok(request) => request,
+            Err(error) => {
+                crate::diag::verbose(1, format!("malformed ConnectRequest from {peer}: {error}"));
+                reject(
+                    &mut stream,
+                    ConnectStatus::InvalidKey,
+                    "malformed ConnectRequest",
+                    &peer,
+                    None,
+                );
+                return;
+            }
+        };
+    drop(pre_auth_guard);
     if !protocol_matches(&request) {
+        let client_id = request
+            .client_id
+            .as_deref()
+            .filter(|id| valid_id(id))
+            .map(crate::diag::sanitize_external_field);
         reject(
             &mut stream,
             ConnectStatus::MismatchedProtocol,
             "protocol version does not match server version 6",
             &peer,
-            request.client_id.as_deref(),
+            client_id.as_deref(),
         );
         return;
     }

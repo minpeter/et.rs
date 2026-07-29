@@ -48,7 +48,7 @@ pub(crate) fn run(
                     Ok(None) => {
                         crate::diag::verbose(
                             1,
-                            &format!(
+                            format!(
                                 "id={}: terminal disconnect with no active session slot",
                                 identity.id()
                             ),

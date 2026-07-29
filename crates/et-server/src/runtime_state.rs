@@ -170,14 +170,36 @@ impl HandlerThreads {
         }
     }
 
-    pub(crate) fn push(&self, handle: JoinHandle<()>) -> Result<(), JoinHandle<()>> {
+    pub(crate) fn push(&self, handle: JoinHandle<()>) -> Result<(), RuntimeError> {
+        let mut completed = Vec::new();
         match self.handles.lock() {
             Ok(mut handles) => {
-                handles.retain(|existing| !existing.is_finished());
-                handles.push(handle);
-                Ok(())
+                let mut pending = Vec::with_capacity(handles.len() + 1);
+                for existing in handles.drain(..) {
+                    if existing.is_finished() {
+                        completed.push(existing);
+                    } else {
+                        pending.push(existing);
+                    }
+                }
+                pending.push(handle);
+                *handles = pending;
             }
-            Err(_) => Err(handle),
+            Err(_) => {
+                let _ = handle.join();
+                return Err(RuntimeError::WorkerUnavailable);
+            }
+        }
+        let mut panicked = false;
+        for existing in completed {
+            if existing.join().is_err() {
+                panicked = true;
+            }
+        }
+        if panicked {
+            Err(RuntimeError::WorkerPanicked("TCP session handler"))
+        } else {
+            Ok(())
         }
     }
 
@@ -227,8 +249,28 @@ mod handler_tests {
         assert_eq!(observed, 1);
     }
 
+    #[test]
+    fn reaped_panicking_handlers_are_reported_as_worker_panics() {
+        let workers = HandlerThreads::new();
+        workers.push(completed_panicking_handle()).unwrap();
+        let result = workers.push(completed_handle());
+        assert!(matches!(
+            result,
+            Err(RuntimeError::WorkerPanicked("TCP session handler"))
+        ));
+    }
+
     fn completed_handle() -> JoinHandle<()> {
-        let handle = thread::spawn(|| ());
+        wait_until_finished(thread::spawn(|| ()))
+    }
+
+    fn completed_panicking_handle() -> JoinHandle<()> {
+        wait_until_finished(thread::spawn(|| {
+            panic!("intentional regression-test panic")
+        }))
+    }
+
+    fn wait_until_finished(handle: JoinHandle<()>) -> JoinHandle<()> {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !handle.is_finished() {
             assert!(Instant::now() < deadline);

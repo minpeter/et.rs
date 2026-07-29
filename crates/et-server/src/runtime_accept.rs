@@ -98,10 +98,7 @@ fn accept_ready(listener: &TcpListener, core: &Arc<RuntimeCore>) -> Result<(), R
                         runtime_handler::handle(stream, worker_core, guard, pre_auth_guard)
                     })
                     .map_err(RuntimeError::Spawn)?;
-                if let Err(worker) = core.handlers.push(worker) {
-                    let _ = worker.join();
-                    return Err(RuntimeError::WorkerUnavailable);
-                }
+                core.handlers.push(worker)?;
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}

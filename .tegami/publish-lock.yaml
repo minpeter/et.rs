@@ -1,9 +1,9 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Recover from macOS post-sleep socket timeouts\n\nChanging networks or waking a MacBook can leave the existing TCP connection in\nan unusable state. macOS reports some of those stale connections as\n`ETIMEDOUT` (`Operation timed out`, os error 60) rather than EOF or a reset.\nThe client previously treated that live-transport error as fatal and exited,\nwhich also exposed any terminal mode left by the remote program.\n\nEvery socket I/O failure from the live ET transport now enters the normal\nreconnect path. Recovery retains the same remote session and keeps retrying\nwhile Wi-Fi or routing returns; protocol, crypto, framing, backpressure, and\nlocal-terminal failures remain fatal. This matches upstream Eternal Terminal's\nbehavior of reconnecting after any socket read/write error.\n"
-    filename: reconnect-sleep-timeout.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Add debug diagnostics for dropped server sessions\n\n`ET_DEBUG=1` now gives `etserver` a durable machine-local log destination,\nnon-silent logging, and default verbosity 2. Operators can also use\n`ET_LOGDIR` and `ET_VERBOSE` when CLI or INI settings do not override them.\n\nServer diagnostics now record client accept/reject reasons, reconnect and\nrecovery outcomes, terminal disconnects, and session removal, making long-lived\nsession drops diagnosable from the server host. Client debug logs omit session\ncredentials, malformed handshakes are bounded by a five-second deadline and\n128-connection pre-auth capacity, and completed connection handlers no longer\naccumulate after rapid failed handshakes.\n"
+    filename: server-debug-diagnostics.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - reconnect-sleep-timeout.md
+      - server-debug-diagnostics.md
     id: cargo:et
     updated: true

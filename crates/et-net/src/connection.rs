@@ -13,13 +13,14 @@ mod recovery;
 
 pub use recovery::{DEFAULT_RECOVERY_TIMEOUT, MAX_RECOVERY_PROTO_LEN};
 
-/// Upper bound on how long a live `write_all` may block.
+/// Upper bound on how long a live socket write may block.
 ///
 /// A blackholed peer (laptop sleep, silent NAT drop, Wi-Fi loss without FIN)
-/// used to make `write_all` hang for minutes while holding the server
-/// session's connection mutex. That blocked `ActiveSession::recover` and
-/// left clients stuck after `ReturningClient`. Bound the write so the
-/// transport soft-disconnects and recovery can proceed.
+/// used to make an unbounded write hang for minutes while holding the server
+/// session's connection mutex. That blocked `ActiveSession::recover` and left
+/// clients stuck after `ReturningClient`. Live frames go through
+/// [`write_all_until`] with this deadline so the transport soft-disconnects
+/// and recovery can proceed.
 pub const DEFAULT_LIVE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]

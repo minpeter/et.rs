@@ -90,7 +90,7 @@ fn blackholed_peer_write_soft_disconnects_within_live_timeout() {
     // Further output buffers for reconnect instead of hanging.
     connection.write_packet(8, b"buffered").unwrap();
     assert!(!connection.connected());
-    assert_eq!(connection.writer_sequence() >= 1, true);
+    assert!(connection.writer_sequence() >= 1);
     sink.thread().unpark();
     let _ = sink.join();
 }

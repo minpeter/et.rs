@@ -1,6 +1,6 @@
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use et_core::backed_reader::{BackedReader, ReadError, ReadItem};
 use et_core::backed_writer::{BackedWriter, RecoverError, WriterOutcome};
@@ -81,17 +81,29 @@ impl Connection {
 
     /// Write a framed packet to a still-connected peer with a bounded timeout.
     ///
+    /// Uses a write loop (not bare `write_all`) so each `write` is capped by
+    /// the remaining deadline. On any incomplete write we error out and the
+    /// caller soft-disconnects: the old TCP path is abandoned (and shut down
+    /// by the soft-disconnect path) so a partial frame left on the wire cannot
+    /// desync a later recovery, which always uses a new stream.
+    ///
     /// Restores a cleared write timeout afterwards so recovery / handshake
     /// code that sets its own deadlines is not left with a stale value.
     fn write_live_frame(&mut self, frame: &[u8]) -> io::Result<()> {
-        self.stream
-            .set_write_timeout(Some(DEFAULT_LIVE_WRITE_TIMEOUT))?;
-        let result = self.stream.write_all(frame);
+        let deadline = Instant::now()
+            .checked_add(DEFAULT_LIVE_WRITE_TIMEOUT)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "live write deadline"))?;
+        let result = write_all_until(&mut self.stream, frame, deadline);
         // Best-effort restore: a failed clear must not hide a write error.
         let clear = self.stream.set_write_timeout(None);
         match (result, clear) {
             (Ok(()), Ok(())) => Ok(()),
-            (Err(error), _) => Err(error),
+            (Err(error), _) => {
+                // Force the peer off the half-written frame so it reconnects
+                // rather than blocking on the rest of a truncated record.
+                let _ = self.stream.shutdown(Shutdown::Both);
+                Err(error)
+            }
             (Ok(()), Err(error)) => Err(error),
         }
     }
@@ -228,4 +240,25 @@ impl Connection {
         }
         Ok(())
     }
+}
+
+/// Write the full buffer before `deadline`, refreshing the socket write
+/// timeout on each attempt so a blackholed peer cannot pin the caller.
+fn write_all_until(stream: &mut TcpStream, mut buffer: &[u8], deadline: Instant) -> io::Result<()> {
+    while !buffer.is_empty() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::TimedOut, "live write deadline elapsed")
+            })?;
+        stream.set_write_timeout(Some(remaining))?;
+        match stream.write(buffer) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(count) => buffer = &buffer[count..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }

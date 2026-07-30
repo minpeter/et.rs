@@ -334,21 +334,30 @@ fn concurrent_returning_recover_does_not_block_accept_path() {
     // Give the stalled recover a moment to enter ActiveSession::recover.
     thread::sleep(std::time::Duration::from_millis(50));
 
-    // Second returning client must still be accepted promptly. We only assert
-    // the handshake (ReturningClient): the recovery body may return Busy while
-    // the first recover holds the flag, which is the behaviour under test.
+    // Second returning client must finish promptly. While the first recover
+    // holds the single-flight permit the server drops the connection *without*
+    // ReturningClient so the peer retries instead of entering sequence exchange.
     let second_started = Instant::now();
-    let (second_stream, response) = server.handshake(ID_A);
-    assert_eq!(
-        response.status,
-        Some(ConnectStatus::ReturningClient as i32),
-        "second returning client must still receive ReturningClient promptly"
-    );
+    let mut second_stream = std::net::TcpStream::connect(server.address).unwrap();
+    runtime_support::bound(&second_stream);
+    write_proto(&mut second_stream, &client_request(ID_A)).unwrap();
+    let second_response: Result<ConnectResponse, _> =
+        read_proto_limited(&mut second_stream, 64 * 1024);
     assert!(
         second_started.elapsed() < std::time::Duration::from_secs(2),
-        "second ReturningClient took {:?} — accept path blocked behind recover",
+        "second reconnect attempt took {:?} — accept path blocked behind recover",
         second_started.elapsed()
     );
+    // Either a fast ReturningClient (stall already finished) or a short-read /
+    // error from the busy drop is acceptable; hanging is not.
+    match second_response {
+        Ok(response) => assert_eq!(
+            response.status,
+            Some(ConnectStatus::ReturningClient as i32),
+            "unexpected ConnectStatus for concurrent recover: {response:?}"
+        ),
+        Err(_) => {}
+    }
     drop(second_stream);
 
     stall.join().unwrap();

@@ -102,10 +102,13 @@ impl ActiveSession {
             .map_err(SessionError::Connection)
     }
 
-    pub(crate) fn recover(&self, stream: TcpStream) -> Result<(), SessionError> {
-        // Fail concurrent recovers immediately so accept threads do not stack
-        // behind a single blackholed write that still holds the connection
-        // mutex. The client will retry with a fresh TCP connection.
+    /// Acquire the single-flight recover permit without speaking on the wire.
+    ///
+    /// Callers must send `ReturningClient` only after this succeeds, so a
+    /// concurrent recover does not commit the peer to sequence exchange and
+    /// then fail with `RecoverBusy`. The permit releases the flag on drop
+    /// (including panic unwind).
+    pub(crate) fn try_begin_recover(&self) -> Result<RecoverPermit<'_>, SessionError> {
         if self
             .recovering
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -113,11 +116,7 @@ impl ActiveSession {
         {
             return Err(SessionError::RecoverBusy);
         }
-        let result = self.recover_locked(stream);
-        self.recovering.store(false, Ordering::Release);
-        // Wake the bridge even on failure so it re-checks connection state.
-        let _ = self.signal();
-        result
+        Ok(RecoverPermit { session: self })
     }
 
     fn recover_locked(&self, stream: TcpStream) -> Result<(), SessionError> {
@@ -280,6 +279,28 @@ impl ActiveSession {
             .map_err(|_| SessionError::Unavailable)?
             .write_all(&[1])
             .map_err(SessionError::Io)
+    }
+}
+
+/// Single-flight recover permit. Dropping it (normally or on panic) always
+/// clears [`ActiveSession::recovering`] and wakes the terminal bridge.
+pub(crate) struct RecoverPermit<'a> {
+    session: &'a ActiveSession,
+}
+
+impl RecoverPermit<'_> {
+    /// Run the recovery handshake and install the new stream.
+    pub(crate) fn complete(self, stream: TcpStream) -> Result<(), SessionError> {
+        // `self` drops after this returns (or panics), clearing `recovering`.
+        self.session.recover_locked(stream)
+    }
+}
+
+impl Drop for RecoverPermit<'_> {
+    fn drop(&mut self) {
+        self.session.recovering.store(false, Ordering::Release);
+        // Wake the bridge even on failure so it re-checks connection state.
+        let _ = self.session.signal();
     }
 }
 

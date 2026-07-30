@@ -4,12 +4,15 @@
 
 `etserver` no longer lets a blackholed client TCP path (peer stops reading
 without FIN/RST) hold the session connection mutex inside an unbounded
-`write_all`. Live writes are bounded by a two-second timeout and soft-
-disconnect into the reconnect buffer; `ActiveSession::recover` acquires its
-session locks with the same recovery deadline and rejects concurrent recovers
-with a busy error instead of queuing for minutes. Returning clients that
-previously saw `ReturningClient` then hung with `ET bootstrap timed out while
-recovering ET session` can complete recovery again.
+`write_all`. Live writes are bounded by a two-second write loop and soft-
+disconnect (with socket shutdown) into the reconnect buffer so partial frames
+cannot desync a later recovery on a new stream. `ActiveSession::recover`
+acquires its session locks with the same recovery deadline, uses a panic-safe
+single-flight permit (`RecoverPermit`), and only sends `ReturningClient` after
+that permit is held — concurrent recovers are dropped without a handshake so
+clients retry instead of burning a sequence-exchange timeout. Returning clients
+that previously saw `ReturningClient` then hung with `ET bootstrap timed out
+while recovering ET session` can complete recovery again.
 
 ## et@0.0.11
 

@@ -1,3 +1,16 @@
+## et@0.0.12
+
+### Unblock session recovery after blackholed client writes
+
+`etserver` no longer lets a blackholed client TCP path (peer stops reading
+without FIN/RST) hold the session connection mutex inside an unbounded
+`write_all`. Live writes are bounded by a two-second timeout and soft-
+disconnect into the reconnect buffer; `ActiveSession::recover` acquires its
+session locks with the same recovery deadline and rejects concurrent recovers
+with a busy error instead of queuing for minutes. Returning clients that
+previously saw `ReturningClient` then hung with `ET bootstrap timed out while
+recovering ET session` can complete recovery again.
+
 ## et@0.0.11
 
 ### Keep server sessions alive across client transport loss

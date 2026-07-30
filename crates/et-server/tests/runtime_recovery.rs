@@ -218,6 +218,158 @@ fn repeated_recovery_does_not_let_stale_hup_disconnect_the_new_stream() {
     server.runtime.shutdown().unwrap();
 }
 
+/// Regression: when the live client path blackholes (peer stops reading, no
+/// FIN), terminal output used to block forever inside `write_all` while holding
+/// the session mutex. Returning clients then sat behind that lock after
+/// `ReturningClient` and timed out with "bootstrap timed out while recovering".
+///
+/// Flood the live socket without draining it, then recover on a new stream —
+/// both the soft-disconnect write path and recover must finish within a tight
+/// bound, proving the shipped mutex/write timeout path works end-to-end.
+#[test]
+fn recover_succeeds_while_old_peer_blackholes_writes() {
+    use std::time::Instant;
+
+    let mut server = TestRuntime::start();
+    let mut terminal = server.register(ID_A, KEY_A);
+    terminal.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let key = passkey_to_key(KEY_A).unwrap();
+    let (mut client, initial) = initialize(stream, &key, default_payload());
+    assert_eq!(initial.error, None);
+    server
+        .handle
+        .wait_for_state(ID_A, SessionState::Active, TIMEOUT)
+        .unwrap();
+    let initial_terminal_packet = read_local_packet(&mut terminal).unwrap();
+    assert_eq!(
+        initial_terminal_packet.header(),
+        TerminalPacketType::TerminalInit as u8
+    );
+
+    // Keep the client socket open but stop reading so the server's send buffer
+    // fills and the bounded live write path soft-disconnects.
+    let _live = client.try_clone_stream().unwrap();
+
+    let payload = vec![b'x'; 32 * 1024];
+    let flood_started = Instant::now();
+    for round in 0..1_024u32 {
+        server
+            .handle
+            .send_packet(ID_A, 40, &payload)
+            .unwrap_or_else(|error| panic!("flood round {round}: {error}"));
+        assert!(
+            flood_started.elapsed() < std::time::Duration::from_secs(12),
+            "send_packet blocked for {:?} — live write timeout not applied",
+            flood_started.elapsed()
+        );
+    }
+
+    let recover_started = Instant::now();
+    let (returning, response) = server.handshake(ID_A);
+    assert_eq!(
+        response.status,
+        Some(ConnectStatus::ReturningClient as i32),
+        "expected ReturningClient after blackhole, got {response:?}"
+    );
+    client.recover(returning).unwrap();
+    client
+        .write_packet(TerminalPacketType::KeepAlive as u8, &[])
+        .unwrap();
+    assert!(
+        recover_started.elapsed() < std::time::Duration::from_secs(8),
+        "recover took {:?} — session mutex still blocked by live write",
+        recover_started.elapsed()
+    );
+
+    // Post-recovery traffic must flow on the new stream.
+    client
+        .write_packet(TerminalPacketType::TerminalInfo as u8, b"after-blackhole")
+        .unwrap();
+    let forwarded = read_local_packet(&mut terminal).unwrap();
+    assert_eq!(forwarded.header(), TerminalPacketType::TerminalInfo as u8);
+    assert_eq!(forwarded.payload(), b"after-blackhole");
+    server.runtime.shutdown().unwrap();
+}
+
+/// Concurrent returning clients must not stack for minutes on one recover.
+/// While the first recover is mid-handshake (peer deliberately stalls after
+/// ReturningClient), a second returning connection should still get a
+/// response promptly instead of parking behind the session mutex forever.
+#[test]
+fn concurrent_returning_recover_does_not_block_accept_path() {
+    use std::time::Instant;
+
+    let mut server = TestRuntime::start();
+    let mut terminal = server.register(ID_A, KEY_A);
+    terminal.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let key = passkey_to_key(KEY_A).unwrap();
+    let (mut client, initial) = initialize(stream, &key, default_payload());
+    assert_eq!(initial.error, None);
+    server
+        .handle
+        .wait_for_state(ID_A, SessionState::Active, TIMEOUT)
+        .unwrap();
+    let _ = read_local_packet(&mut terminal).unwrap();
+
+    // First returning client: complete handshake to ReturningClient, then
+    // stall without speaking recovery so the server is inside
+    // ActiveSession::recover / exchange_recovery.
+    let address = server.address;
+    let stall = thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        runtime_support::bound(&stream);
+        write_proto(&mut stream, &client_request(ID_A)).unwrap();
+        let response: ConnectResponse = read_proto_limited(&mut stream, 64 * 1024).unwrap();
+        assert_eq!(response.status, Some(ConnectStatus::ReturningClient as i32));
+        // Hold the TCP connection open without speaking recovery.
+        thread::sleep(std::time::Duration::from_millis(500));
+        // Closing ends the server's stalled recover promptly.
+        drop(stream);
+    });
+
+    // Give the stalled recover a moment to enter ActiveSession::recover.
+    thread::sleep(std::time::Duration::from_millis(50));
+
+    // Second returning client must still be accepted promptly. We only assert
+    // the handshake (ReturningClient): the recovery body may return Busy while
+    // the first recover holds the flag, which is the behaviour under test.
+    let second_started = Instant::now();
+    let (second_stream, response) = server.handshake(ID_A);
+    assert_eq!(
+        response.status,
+        Some(ConnectStatus::ReturningClient as i32),
+        "second returning client must still receive ReturningClient promptly"
+    );
+    assert!(
+        second_started.elapsed() < std::time::Duration::from_secs(2),
+        "second ReturningClient took {:?} — accept path blocked behind recover",
+        second_started.elapsed()
+    );
+    drop(second_stream);
+
+    stall.join().unwrap();
+    // Allow the server recover worker to observe EOF and clear `recovering`.
+    thread::sleep(std::time::Duration::from_millis(100));
+
+    // A clean recover after the stall ends must still work on the shipped path.
+    let (returning, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::ReturningClient as i32));
+    client.recover(returning).unwrap();
+    client
+        .write_packet(TerminalPacketType::KeepAlive as u8, &[])
+        .unwrap();
+    client
+        .write_packet(TerminalPacketType::TerminalInfo as u8, b"post-concurrent")
+        .unwrap();
+    let forwarded = read_local_packet(&mut terminal).unwrap();
+    assert_eq!(forwarded.payload(), b"post-concurrent");
+    server.runtime.shutdown().unwrap();
+}
+
 #[test]
 fn keepalive_echo_acknowledges_everything_read_from_the_client() {
     let mut server = TestRuntime::start();

@@ -13,6 +13,15 @@ mod recovery;
 
 pub use recovery::{DEFAULT_RECOVERY_TIMEOUT, MAX_RECOVERY_PROTO_LEN};
 
+/// Upper bound on how long a live `write_all` may block.
+///
+/// A blackholed peer (laptop sleep, silent NAT drop, Wi-Fi loss without FIN)
+/// used to make `write_all` hang for minutes while holding the server
+/// session's connection mutex. That blocked `ActiveSession::recover` and
+/// left clients stuck after `ReturningClient`. Bound the write so the
+/// transport soft-disconnects and recovery can proceed.
+pub const DEFAULT_LIVE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Debug)]
 pub enum ConnError {
     Io(io::Error),
@@ -56,7 +65,7 @@ impl Connection {
         }
         match self.writer.write_packet(header, payload)? {
             WriterOutcome::Send(frame) => {
-                if let Err(_error) = self.stream.write_all(&frame) {
+                if let Err(_error) = self.write_live_frame(&frame) {
                     // The encrypted packet is already in the replay backup
                     // (BackedWriter pushes before returning Send). Mark the
                     // transport disconnected so further writes buffer for a
@@ -67,6 +76,23 @@ impl Connection {
             }
             WriterOutcome::BufferedOnly => Ok(()),
             WriterOutcome::Skipped => Err(ConnError::Backpressure),
+        }
+    }
+
+    /// Write a framed packet to a still-connected peer with a bounded timeout.
+    ///
+    /// Restores a cleared write timeout afterwards so recovery / handshake
+    /// code that sets its own deadlines is not left with a stale value.
+    fn write_live_frame(&mut self, frame: &[u8]) -> io::Result<()> {
+        self.stream
+            .set_write_timeout(Some(DEFAULT_LIVE_WRITE_TIMEOUT))?;
+        let result = self.stream.write_all(frame);
+        // Best-effort restore: a failed clear must not hide a write error.
+        let clear = self.stream.set_write_timeout(None);
+        match (result, clear) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
         }
     }
 

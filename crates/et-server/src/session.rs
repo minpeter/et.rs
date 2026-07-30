@@ -2,11 +2,21 @@ use et_net::local::LocalStream;
 use std::io::{self, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 use et_core::proto::TerminalPacketType;
 use et_net::connection::DEFAULT_RECOVERY_TIMEOUT;
 use et_net::connection::{ConnError, Connection};
+
+/// How long `recover` may wait for the session mutexes.
+///
+/// Must stay at or below [`DEFAULT_RECOVERY_TIMEOUT`]: if the terminal bridge
+/// is mid-`write_all` on a blackholed socket, recover used to park forever on
+/// `connection.lock()`. With a bounded live write timeout plus this lock
+/// deadline, piled-up returning clients fail fast and retry instead of
+/// blocking the accept path for minutes.
+const RECOVERY_LOCK_TIMEOUT: Duration = DEFAULT_RECOVERY_TIMEOUT;
 
 pub(crate) struct ActiveSession {
     connection: Mutex<Connection>,
@@ -15,6 +25,9 @@ pub(crate) struct ActiveSession {
     wake_writer: Mutex<LocalStream>,
     wake_reader: Mutex<Option<LocalStream>>,
     shutdown: AtomicBool,
+    /// Only one recover may run at a time. Concurrent returning clients used
+    /// to queue on the connection mutex for minutes after a blackhole write.
+    recovering: AtomicBool,
     connection_generation: AtomicU64,
 }
 
@@ -28,6 +41,9 @@ pub enum SessionError {
     Connection(ConnError),
     Io(io::Error),
     Unavailable,
+    /// Another recover is already in progress, or a session lock could not
+    /// be acquired before [`RECOVERY_LOCK_TIMEOUT`].
+    RecoverBusy,
 }
 
 impl std::fmt::Display for SessionError {
@@ -36,6 +52,10 @@ impl std::fmt::Display for SessionError {
             Self::Connection(error) => write!(f, "session connection: {error}"),
             Self::Io(error) => write!(f, "session socket: {error}"),
             Self::Unavailable => write!(f, "session is unavailable"),
+            Self::RecoverBusy => write!(
+                f,
+                "session recover busy (lock contention or concurrent recover)"
+            ),
         }
     }
 }
@@ -45,7 +65,7 @@ impl std::error::Error for SessionError {
         match self {
             Self::Connection(error) => Some(error),
             Self::Io(error) => Some(error),
-            Self::Unavailable => None,
+            Self::Unavailable | Self::RecoverBusy => None,
         }
     }
 }
@@ -67,6 +87,7 @@ impl ActiveSession {
             wake_writer: Mutex::new(wake_writer),
             wake_reader: Mutex::new(Some(wake_reader)),
             shutdown: AtomicBool::new(false),
+            recovering: AtomicBool::new(false),
             connection_generation: AtomicU64::new(0),
         })
     }
@@ -82,11 +103,33 @@ impl ActiveSession {
     }
 
     pub(crate) fn recover(&self, stream: TcpStream) -> Result<(), SessionError> {
-        let mut control = self.control.lock().map_err(|_| SessionError::Unavailable)?;
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| SessionError::Unavailable)?;
+        // Fail concurrent recovers immediately so accept threads do not stack
+        // behind a single blackholed write that still holds the connection
+        // mutex. The client will retry with a fresh TCP connection.
+        if self
+            .recovering
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(SessionError::RecoverBusy);
+        }
+        let result = self.recover_locked(stream);
+        self.recovering.store(false, Ordering::Release);
+        // Wake the bridge even on failure so it re-checks connection state.
+        let _ = self.signal();
+        result
+    }
+
+    fn recover_locked(&self, stream: TcpStream) -> Result<(), SessionError> {
+        let mut control = lock_timeout(&self.control, RECOVERY_LOCK_TIMEOUT)?;
+        let mut connection = lock_timeout(&self.connection, RECOVERY_LOCK_TIMEOUT)?;
+        // Hold the session lock for the whole recover. Live writes are bounded
+        // by DEFAULT_LIVE_WRITE_TIMEOUT so a blackholed peer cannot pin this
+        // mutex indefinitely; lock_timeout above bounds waiters that arrive
+        // while a recover (or a timed-out write) is still in progress.
+        //
+        // Do not soft-disconnect the incumbent transport until the candidate
+        // authenticates: a failed recover must leave a healthy session alone.
         let mut candidate = connection
             .recovery_candidate(stream, DEFAULT_RECOVERY_TIMEOUT)
             .map_err(SessionError::Connection)?;
@@ -113,7 +156,7 @@ impl ActiveSession {
         self.connection_generation.fetch_add(1, Ordering::Release);
         drop(connection);
         drop(control);
-        self.signal()
+        Ok(())
     }
 
     pub(crate) fn shutdown(&self) -> Result<(), SessionError> {
@@ -237,6 +280,29 @@ impl ActiveSession {
             .map_err(|_| SessionError::Unavailable)?
             .write_all(&[1])
             .map_err(SessionError::Io)
+    }
+}
+
+/// Acquire a [`Mutex`] with a deadline so recover cannot park forever behind a
+/// bridge thread blocked in a live write.
+fn lock_timeout<T>(
+    mutex: &Mutex<T>,
+    timeout: Duration,
+) -> Result<MutexGuard<'_, T>, SessionError> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(SessionError::RecoverBusy)?;
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(_)) => return Err(SessionError::Unavailable),
+            Err(TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(SessionError::RecoverBusy);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
 }
 

@@ -350,13 +350,12 @@ fn concurrent_returning_recover_does_not_block_accept_path() {
     );
     // Either a fast ReturningClient (stall already finished) or a short-read /
     // error from the busy drop is acceptable; hanging is not.
-    match second_response {
-        Ok(response) => assert_eq!(
+    if let Ok(response) = second_response {
+        assert_eq!(
             response.status,
             Some(ConnectStatus::ReturningClient as i32),
             "unexpected ConnectStatus for concurrent recover: {response:?}"
-        ),
-        Err(_) => {}
+        );
     }
     drop(second_stream);
 

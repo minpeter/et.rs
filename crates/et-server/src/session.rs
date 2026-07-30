@@ -398,10 +398,7 @@ impl Drop for RecoverPermit<'_> {
 
 /// Acquire a [`Mutex`] with a deadline so recover cannot park forever behind a
 /// bridge thread blocked in a live write.
-fn lock_timeout<T>(
-    mutex: &Mutex<T>,
-    timeout: Duration,
-) -> Result<MutexGuard<'_, T>, SessionError> {
+fn lock_timeout<T>(mutex: &Mutex<T>, timeout: Duration) -> Result<MutexGuard<'_, T>, SessionError> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(SessionError::RecoverBusy)?;

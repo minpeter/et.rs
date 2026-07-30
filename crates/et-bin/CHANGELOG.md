@@ -1,3 +1,20 @@
+## et@0.0.12
+
+### Unblock session recovery after blackholed client writes
+
+`etserver` no longer lets a blackholed client TCP path (peer stops reading
+without FIN/RST) hold the session connection mutex inside an unbounded
+socket write. Live writes use a two-second deadline loop and soft-disconnect
+(with socket shutdown) into the reconnect buffer so partial frames cannot
+desync a later recovery on a new stream. Session recovery runs sequence
+exchange and peer auth *without* holding the connection mutex (terminal
+output is queued and flushed after install), uses a panic-safe single-flight
+permit (`RecoverPermit`), and only sends `ReturningClient` after that permit
+is held — concurrent recovers are dropped without a handshake so clients
+retry instead of burning a sequence-exchange timeout. Returning clients that
+previously saw `ReturningClient` then hung with `ET bootstrap timed out while
+recovering ET session` can complete recovery again.
+
 ## et@0.0.11
 
 ### Keep server sessions alive across client transport loss

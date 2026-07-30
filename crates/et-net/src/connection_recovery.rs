@@ -33,30 +33,46 @@ impl Connection {
         Ok(())
     }
 
-    pub fn recovery_candidate(
-        &self,
-        new_stream: TcpStream,
-        timeout: Duration,
-    ) -> Result<Self, ConnError> {
+    /// Snapshot writer/reader state onto `new_stream` without network I/O.
+    ///
+    /// Used by the server session path so the connection mutex can be released
+    /// for the duration of [`Self::run_recovery_handshake`].
+    pub fn prepare_recovery_candidate(&self, new_stream: TcpStream) -> Self {
         let mut candidate = Self {
             stream: new_stream,
             writer: self.writer.clone(),
             reader: self.reader.clone(),
         };
         candidate.disconnect();
+        candidate
+    }
+
+    /// Sequence exchange, catchup transfer, and stream revive on a prepared
+    /// recovery candidate. Safe to run without holding the session mutex.
+    pub fn run_recovery_handshake(&mut self, timeout: Duration) -> Result<(), ConnError> {
         let deadline = recovery_deadline(timeout)?;
-        match candidate.exchange_recovery(deadline) {
+        match self.exchange_recovery(deadline) {
             Ok(remote_catchup) => {
-                candidate.reader.revive(remote_catchup.buffer)?;
-                candidate.writer.revive();
-                candidate.set_io_timeout(None)?;
-                Ok(candidate)
+                self.reader.revive(remote_catchup.buffer)?;
+                self.writer.revive();
+                self.set_io_timeout(None)?;
+                Ok(())
             }
             Err(error) => {
-                let _ = candidate.stream.shutdown(Shutdown::Both);
+                let _ = self.stream.shutdown(Shutdown::Both);
                 Err(error)
             }
         }
+    }
+
+    pub fn recovery_candidate(
+        &self,
+        new_stream: TcpStream,
+        timeout: Duration,
+    ) -> Result<Self, ConnError> {
+        let mut candidate = self.prepare_recovery_candidate(new_stream);
+        candidate.run_recovery_handshake(timeout)?;
+        Ok(candidate)
     }
 
     /// Wait for one live packet on the revived stream and requeue it for the

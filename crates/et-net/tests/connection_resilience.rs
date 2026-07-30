@@ -3,8 +3,9 @@
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::thread;
+use std::time::{Duration, Instant};
 
-use et_net::connection::{Connection, MAX_RECOVERY_PROTO_LEN};
+use et_net::connection::{Connection, DEFAULT_LIVE_WRITE_TIMEOUT, MAX_RECOVERY_PROTO_LEN};
 
 #[test]
 fn eof_invalidates_connection_so_future_output_is_buffered() {
@@ -43,6 +44,62 @@ fn recovery_protobuf_limit_is_explicit_and_enforced() {
     let stream = TcpStream::connect(address).unwrap();
     assert!(connection.recover(stream).is_err());
     peer.join().unwrap();
+}
+
+/// Regression: a blackholed peer (no FIN/RST, peer stops reading) used to make
+/// `write_all` block for minutes while the server session lock was held,
+/// which prevented `ActiveSession::recover` from starting. Live writes must
+/// soft-disconnect within roughly [`DEFAULT_LIVE_WRITE_TIMEOUT`].
+#[test]
+fn blackholed_peer_write_soft_disconnects_within_live_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    // Peer that accepts but never reads — fills the sender's TCP buffer.
+    let sink = thread::spawn(move || {
+        let (_stream, _) = listener.accept().unwrap();
+        thread::park();
+    });
+    let stream = TcpStream::connect(address).unwrap();
+    shrink_send_buffer(&stream);
+    let mut connection = Connection::new_server(stream, &[9; 32]);
+    let payload = vec![0u8; 32 * 1024];
+    let started = Instant::now();
+    let mut disconnected = false;
+    // Fill the socket send buffer until the bounded write times out.
+    for _ in 0..4_096 {
+        connection.write_packet(7, &payload).unwrap();
+        if !connection.connected() {
+            disconnected = true;
+            break;
+        }
+        assert!(
+            started.elapsed() < DEFAULT_LIVE_WRITE_TIMEOUT + Duration::from_secs(3),
+            "write_packet blocked for {:?} without soft-disconnect",
+            started.elapsed()
+        );
+    }
+    assert!(
+        disconnected,
+        "expected soft-disconnect after blackhole write timeout"
+    );
+    assert!(
+        started.elapsed() < DEFAULT_LIVE_WRITE_TIMEOUT + Duration::from_secs(3),
+        "soft-disconnect took {:?}, longer than live write bound",
+        started.elapsed()
+    );
+    // Further output buffers for reconnect instead of hanging.
+    connection.write_packet(8, b"buffered").unwrap();
+    assert!(!connection.connected());
+    assert!(connection.writer_sequence() >= 1);
+    sink.thread().unpark();
+    let _ = sink.join();
+}
+
+fn shrink_send_buffer(stream: &TcpStream) {
+    // 4 KiB send buffer so the blackhole fills quickly under CI load.
+    socket2::SockRef::from(stream)
+        .set_send_buffer_size(4 * 1024)
+        .unwrap();
 }
 
 #[test]

@@ -125,19 +125,39 @@ pub(crate) fn handle(
         }
         SessionClaim::Returning(session) => {
             crate::diag::info(format!("id={id}: returning client reconnect from {peer}"));
-            if send_status(&mut stream, ConnectStatus::ReturningClient).is_ok() {
-                match session.recover(stream) {
-                    Ok(()) => {
-                        crate::diag::info(format!("id={id}: session recover accepted from {peer}"))
-                    }
-                    Err(error) => crate::diag::info(format!(
-                        "id={id}: session recover failed from {peer}: {error}"
-                    )),
+            // Take the single-flight permit *before* ReturningClient so a
+            // concurrent recover does not commit the client to sequence
+            // exchange and then fail with RecoverBusy / silent hang.
+            let permit = match session.try_begin_recover() {
+                Ok(permit) => permit,
+                Err(crate::session::SessionError::RecoverBusy) => {
+                    crate::diag::info(format!(
+                        "id={id}: drop concurrent recover from {peer}: session recover busy"
+                    ));
+                    // No ConnectResponse: the client sees EOF/reset and
+                    // retries without burning a recovery exchange timeout.
+                    return;
                 }
-            } else {
+                Err(error) => {
+                    crate::diag::info(format!(
+                        "id={id}: drop recover from {peer}: could not begin recover: {error}"
+                    ));
+                    return;
+                }
+            };
+            if send_status(&mut stream, ConnectStatus::ReturningClient).is_err() {
                 crate::diag::info(format!(
                     "id={id}: failed to send ReturningClient status to {peer}"
                 ));
+                return;
+            }
+            match permit.complete(stream) {
+                Ok(()) => {
+                    crate::diag::info(format!("id={id}: session recover accepted from {peer}"))
+                }
+                Err(error) => crate::diag::info(format!(
+                    "id={id}: session recover failed from {peer}: {error}"
+                )),
             }
         }
     }

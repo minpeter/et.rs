@@ -169,7 +169,7 @@ impl ActiveSession {
         // Phase 1: soft-disconnect and snapshot under a short lock.
         let mut candidate = {
             let mut connection = lock_timeout(&self.connection, RECOVERY_LOCK_TIMEOUT)?;
-            // Stop live write_all on the old path; terminal output during the
+            // Soft-disconnect the old live path; terminal output during the
             // off-lock handshake is queued in `recover_hold`.
             connection.disconnect();
             connection.prepare_recovery_candidate(stream)
@@ -221,10 +221,24 @@ impl ActiveSession {
                 std::mem::take(&mut *hold)
             };
             let mut connection = lock_timeout(&self.connection, RECOVERY_LOCK_TIMEOUT)?;
-            for (header, payload) in batch {
-                connection
-                    .write_packet(header, &payload)
-                    .map_err(SessionError::Connection)?;
+            let mut remaining = batch.into_iter();
+            while let Some((header, payload)) = remaining.next() {
+                if let Err(error) = connection.write_packet(header, &payload) {
+                    // Release the connection lock before taking `recover_hold`
+                    // (send_packet may hold hold → connection; reverse deadlocks).
+                    drop(connection);
+                    // Put the failed packet and unwritten tail back ahead of
+                    // anything concurrent senders queued after we took `batch`.
+                    let mut hold = self
+                        .recover_hold
+                        .lock()
+                        .map_err(|_| SessionError::Unavailable)?;
+                    let concurrent = std::mem::take(&mut *hold);
+                    hold.push((header, payload));
+                    hold.extend(remaining);
+                    hold.extend(concurrent);
+                    return Err(SessionError::Connection(error));
+                }
             }
         }
     }

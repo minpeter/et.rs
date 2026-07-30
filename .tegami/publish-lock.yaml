@@ -1,9 +1,9 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Keep server sessions alive across client transport loss\n\n`etserver` now treats laptop sleep, Wi-Fi changes, and other client transport\nloss as a recoverable disconnect instead of terminating the registered\nterminal. Output produced while the client is away remains buffered, and a\nreturning client resumes the same shell without an `InvalidKey` failure.\n\nRecovery handoff now ignores stale events from the replaced socket, drains\npackets read during recovery authentication, and preserves port-forwarding\npackets when the replay buffer is temporarily full.\n"
-    filename: survive-client-disconnect.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Unblock session recovery after blackholed client writes\n\n`etserver` no longer lets a blackholed client TCP path (peer stops reading\nwithout FIN/RST) hold the session connection mutex inside an unbounded\nsocket write. Live writes use a two-second deadline loop and soft-disconnect\n(with socket shutdown) into the reconnect buffer so partial frames cannot\ndesync a later recovery on a new stream. Session recovery runs sequence\nexchange and peer auth *without* holding the connection mutex (terminal\noutput is queued and flushed after install), uses a panic-safe single-flight\npermit (`RecoverPermit`), and only sends `ReturningClient` after that permit\nis held — concurrent recovers are dropped without a handshake so clients\nretry instead of burning a sequence-exchange timeout. Returning clients that\npreviously saw `ReturningClient` then hung with `ET bootstrap timed out while\nrecovering ET session` can complete recovery again.\n"
+    filename: recover-hang-write-timeout.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - survive-client-disconnect.md
+      - recover-hang-write-timeout.md
     id: cargo:et
     updated: true

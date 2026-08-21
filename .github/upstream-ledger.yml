@@ -1,0 +1,79 @@
+# Machine ledger: every EternalTerminal master commit after baseline.
+# Unclassified SHA from compare(baseline...master) = drift.
+# Pin tip != ported. See docs/upstream-factory.md
+#
+# Schema (one map per commit; parseable without PyYAML):
+#   sha: 40-char hex
+#   date: YYYY-MM-DD
+#   kind: security | protocol | product | ci | docs | other
+#   status: skip | backlog | porting | ported
+#   note: short string
+#   et_pr: optional upstream PR number
+#
+# Classified 2026-08-22. Do not mark #784 ported here.
+
+baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
+classified: "2026-08-22"
+
+commits:
+  - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
+    date: "2026-07-08"
+    kind: ci
+    status: skip
+    note: "deployment fixes"
+  - sha: dfc75d6638c653249a2e4f6f1c27f665ca693420
+    date: "2026-07-09"
+    kind: ci
+    status: skip
+    note: "#771 cowbuilder"
+    et_pr: 771
+  - sha: 27a7db658e21ee9f9c1bff68db1c2cb241481b5e
+    date: "2026-07-10"
+    kind: ci
+    status: skip
+    note: "debian signing"
+  - sha: 3698116f764bc1868c179e4756eb0dabe7340827
+    date: "2026-07-10"
+    kind: ci
+    status: skip
+    note: "debian fix"
+  - sha: cd5b530d18affe7d77c290e3af8035700275cb51
+    date: "2026-07-12"
+    kind: ci
+    status: skip
+    note: "debian"
+  - sha: fb9ef1da67eb8e1cd1a30fdd9a4a5b6415e7a440
+    date: "2026-07-13"
+    kind: ci
+    status: skip
+    note: "debian deploy SSH"
+  - sha: 3dd946d7128ea98653bbbab2f454706aa66d9893
+    date: "2026-07-13"
+    kind: ci
+    status: skip
+    note: "#774 GCC 15"
+    et_pr: 774
+  - sha: 12889c5bfbf1ece81d45b4834f9b05254e723e1e
+    date: "2026-07-21"
+    kind: ci
+    status: skip
+    note: "#776 GCC-16 CI"
+    et_pr: 776
+  - sha: 90711ad421264db30dc5d05df4a37452b41a7667
+    date: "2026-07-21"
+    kind: ci
+    status: skip
+    note: "#777 windows deploy"
+    et_pr: 777
+  - sha: 69b33537ab12f324cf619aca04dc483728dc30c3
+    date: "2026-07-30"
+    kind: security
+    status: backlog
+    note: "#784 handshake 4KiB, recover, unix-socket LPE. Do not mark ported in this PR — a sibling port PR owns the code."
+    et_pr: 784
+  - sha: b74a12efc567dbc1360ac0846f889c945a2eba60
+    date: "2026-08-07"
+    kind: product
+    status: skip
+    note: "#788 non-tty console keep-alive; not wire/security"
+    et_pr: 788

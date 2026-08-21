@@ -1,6 +1,7 @@
 # Last *reviewed* MisterTea/EternalTerminal refs.
-# This is not a claim that et.rs has ported them.
-# Human record + FACTORY BACKLOG: docs/upstream-pin.md
+# This is not a claim that et.rs has ported them. Pin != ported.
+# Commit ledger (every master SHA after baseline): .github/upstream-ledger.yml
+# Human record: docs/upstream-pin.md
 # Policy: docs/upstream-factory.md
 
 upstream_owner: MisterTea

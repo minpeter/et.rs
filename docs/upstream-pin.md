@@ -11,6 +11,7 @@ Canonical machine files:
   [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml)
 
 Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-08-22.
+`#784` marked `ported` after et.rs [#31](https://github.com/minpeter/et.rs/pull/31) / `906a7ca86691f00a82f88b99b21d7afceb07bf97`.
 
 | Field | Value |
 | --- | --- |
@@ -37,20 +38,27 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-08-22.
 | [`3dd946d`](https://github.com/MisterTea/EternalTerminal/commit/3dd946d7128ea98653bbbab2f454706aa66d9893) | 2026-07-13 | ci | skip | #774 GCC 15 |
 | [`12889c5`](https://github.com/MisterTea/EternalTerminal/commit/12889c5bfbf1ece81d45b4834f9b05254e723e1e) | 2026-07-21 | ci | skip | #776 GCC-16 CI |
 | [`90711ad`](https://github.com/MisterTea/EternalTerminal/commit/90711ad421264db30dc5d05df4a37452b41a7667) | 2026-07-21 | ci | skip | #777 windows deploy |
-| [`69b3353`](https://github.com/MisterTea/EternalTerminal/commit/69b33537ab12f324cf619aca04dc483728dc30c3) | 2026-07-30 | security | **backlog** | #784 handshake 4KiB, recover, unix-socket LPE |
+| [`69b3353`](https://github.com/MisterTea/EternalTerminal/commit/69b33537ab12f324cf619aca04dc483728dc30c3) | 2026-07-30 | security | **ported** | #784 handshake 4KiB, recover, unix-socket LPE. Landed in et.rs via #31 / 906a7ca. |
 | [`b74a12e`](https://github.com/MisterTea/EternalTerminal/commit/b74a12efc567dbc1360ac0846f889c945a2eba60) | 2026-08-07 | product | skip | #788 non-tty console keep-alive; not wire/security |
 
-## FACTORY BACKLOG (not ported here)
+## Ported and residual
+
+[`69b3353`](https://github.com/MisterTea/EternalTerminal/commit/69b33537ab12f324cf619aca04dc483728dc30c3) (`#784`) is `status: ported`.
+It landed in et.rs via [#31](https://github.com/minpeter/et.rs/pull/31) /
+[`906a7ca86691f00a82f88b99b21d7afceb07bf97`](https://github.com/minpeter/et.rs/commit/906a7ca86691f00a82f88b99b21d7afceb07bf97)
+(handshake 4 KiB cap + idle/absolute read deadlines; recover does not
+displace on failure; unix-socket listen/connect as the session user).
+Wire stays protocol v6.
+
+Upstream left reconnect passkey-before-recover for a future
+`PROTOCOL_VERSION` bump; that residual is still unported. Do **not** treat
+this pin as a green light to bump `PROTOCOL_VERSION` or land a v7 port.
+
+[`b74a12e`](https://github.com/MisterTea/EternalTerminal/commit/b74a12efc567dbc1360ac0846f889c945a2eba60) (`#788`) stays `status: skip`
+(product, not wire/security).
 
 et.rs still claims **protocol v6**. EternalTerminal’s latest product release is
-**v7.0.0**, and `master` is eleven classified commits past that tag — including
-post-v7 security work. That gap is backlog. Do **not** treat this pin as a
-green light to bump `PROTOCOL_VERSION` or land a v7 port.
-
-[`69b3353`](https://github.com/MisterTea/EternalTerminal/commit/69b33537ab12f324cf619aca04dc483728dc30c3) (`#784`) stays `status: backlog`.
-A sibling port PR owns the Rust code. Do not mark it `ported` in a factory-only
-change. Upstream left reconnect passkey-before-recover for a future
-`PROTOCOL_VERSION` bump.
+**v7.0.0**, and `master` is eleven classified commits past that tag.
 
 Review ports against the conflict policy in
 [`docs/upstream-factory.md`](upstream-factory.md). Gate any later port with

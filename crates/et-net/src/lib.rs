@@ -15,3 +15,5 @@ pub mod handshake;
 pub mod listener;
 pub mod local;
 pub mod local_packet;
+#[cfg(unix)]
+pub mod user_socket_ops;

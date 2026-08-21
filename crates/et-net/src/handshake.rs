@@ -11,7 +11,11 @@ use et_core::PROTOCOL_VERSION;
 
 use crate::framing_io::{read_proto_limited, write_proto};
 
-const MAX_HANDSHAKE_PROTO_LEN: i64 = 64 * 1024;
+/// Max length for pre-auth / handshake protos (ConnectRequest, ConnectResponse,
+/// SequenceHeader). Matches EternalTerminal `MAX_HANDSHAKE_PROTO_LENGTH` from
+/// #784 (ANT-2026-5PETM5BV): a large declared length would pin memory on a
+/// handler thread before any auth.
+pub const MAX_HANDSHAKE_PROTO_LEN: i64 = 4 * 1024;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn client_request(client_id: &str) -> ConnectRequest {
@@ -89,9 +93,14 @@ mod tests {
 
     #[test]
     fn oversized_request_is_rejected_before_allocation() {
-        let frame = (65_537i64).to_le_bytes();
-        let error = read_request(&mut Cursor::new(frame)).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        for length in [
+            MAX_HANDSHAKE_PROTO_LEN + 1,
+            64 * 1024 + 1,
+            128 * 1024 * 1024,
+        ] {
+            let error = read_request(&mut Cursor::new(length.to_le_bytes())).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
     }
 
     #[test]

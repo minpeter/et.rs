@@ -401,6 +401,7 @@ name = "et-net"
 version = "0.0.12"
 dependencies = [
  "et-core",
+ "nix 0.31.3",
  "prost",
  "rustix",
  "socket2",

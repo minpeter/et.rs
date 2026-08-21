@@ -378,6 +378,62 @@ fn concurrent_returning_recover_does_not_block_accept_path() {
     server.runtime.shutdown().unwrap();
 }
 
+/// ANT-2026-VAMER5RC: a returning client that supplies an ahead-of-server
+/// sequence must not close or displace the live victim session.
+#[test]
+fn failed_recover_leaves_live_session_intact() {
+    use et_core::proto::SequenceHeader;
+    use std::io::Write;
+
+    let mut server = TestRuntime::start();
+    let mut terminal = server.register(ID_A, KEY_A);
+    terminal.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let key = passkey_to_key(KEY_A).unwrap();
+    let (mut client, initial) = initialize(stream, &key, default_payload());
+    assert_eq!(initial.error, None);
+    server
+        .handle
+        .wait_for_state(ID_A, SessionState::Active, TIMEOUT)
+        .unwrap();
+    let _ = read_local_packet(&mut terminal).unwrap();
+
+    let address = server.address;
+    let attacker = thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        runtime_support::bound(&stream);
+        write_proto(&mut stream, &client_request(ID_A)).unwrap();
+        let response: ConnectResponse = read_proto_limited(&mut stream, 4 * 1024).unwrap();
+        assert_eq!(response.status, Some(ConnectStatus::ReturningClient as i32));
+        let _: SequenceHeader = read_proto_limited(&mut stream, 4 * 1024).unwrap();
+        write_proto(
+            &mut stream,
+            &SequenceHeader {
+                sequence_number: Some(999_999),
+            },
+        )
+        .unwrap();
+        // Hold the attack socket briefly so the server observes the bad sequence.
+        thread::sleep(std::time::Duration::from_millis(200));
+        let _ = stream.write(&[]);
+    });
+
+    attacker.join().unwrap();
+    thread::sleep(std::time::Duration::from_millis(150));
+    assert_eq!(
+        server.handle.session_state(ID_A).unwrap(),
+        Some(SessionState::Active)
+    );
+
+    client
+        .write_packet(TerminalPacketType::TerminalInfo as u8, b"still-live")
+        .unwrap();
+    let forwarded = read_local_packet(&mut terminal).unwrap();
+    assert_eq!(forwarded.payload(), b"still-live");
+    server.runtime.shutdown().unwrap();
+}
+
 #[test]
 fn keepalive_echo_acknowledges_everything_read_from_the_client() {
     let mut server = TestRuntime::start();

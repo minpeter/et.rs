@@ -1,9 +1,17 @@
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use et_core::framing::MAX_PROTO_LEN;
 use prost::Message;
+
+/// Idle-gap timeout used by [`read_exact_with_deadlines`] when the caller
+/// asks for EternalTerminal `readAll(..., true)` behavior. Progress resets
+/// this timer; a slow trickle can keep it from firing.
+pub const SOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Absolute read deadline used with [`SOCKET_IDLE_TIMEOUT`]. Unlike the idle
+/// timeout, this is never reset when bytes arrive (ANT-2026-5PETM5BV).
+pub const SOCKET_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub fn write_proto<W: Write, M: Message>(writer: &mut W, message: &M) -> io::Result<()> {
     write_proto_limited(writer, message, MAX_PROTO_LEN)
@@ -105,15 +113,56 @@ pub fn read_frame_limited_deadline(
 
 fn read_exact_deadline(
     stream: &mut TcpStream,
-    mut buffer: &mut [u8],
+    buffer: &mut [u8],
     deadline: Instant,
 ) -> io::Result<()> {
+    read_exact_with_deadlines(stream, buffer, Some(SOCKET_IDLE_TIMEOUT), Some(deadline))
+}
+
+/// Read exactly `buffer.len()` bytes, enforcing an idle-gap timeout and/or an
+/// absolute deadline on every loop iteration so a slow trickle cannot reset
+/// the timer forever (EternalTerminal #784 / ANT-2026-5PETM5BV).
+pub fn read_exact_with_deadlines(
+    stream: &mut TcpStream,
+    mut buffer: &mut [u8],
+    idle: Option<Duration>,
+    absolute: Option<Instant>,
+) -> io::Result<()> {
+    let mut idle_deadline = idle.and_then(|idle| Instant::now().checked_add(idle));
     while !buffer.is_empty() {
-        set_deadline_timeout(stream, deadline)?;
+        let now = Instant::now();
+        if idle_deadline.is_some_and(|idle| now >= idle)
+            || absolute.is_some_and(|absolute| now >= absolute)
+        {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "socket timeout"));
+        }
+        let next = match (idle_deadline, absolute) {
+            (Some(idle), Some(absolute)) => Some(idle.min(absolute)),
+            (Some(idle), None) => Some(idle),
+            (None, Some(absolute)) => Some(absolute),
+            (None, None) => None,
+        };
+        if let Some(next) = next {
+            set_deadline_timeout(stream, next)?;
+        }
         match stream.read(buffer) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-            Ok(count) => buffer = &mut buffer[count..],
+            Ok(count) => {
+                buffer = &mut buffer[count..];
+                idle_deadline = idle.and_then(|idle| Instant::now().checked_add(idle));
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error)
+                if next.is_some()
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+            {
+                // SO_RCVTIMEO and non-blocking reads surface as WouldBlock /
+                // TimedOut. Recheck Instant deadlines on the next iteration
+                // so a trickle cannot reset the absolute timer (ET #784).
+            }
             Err(error) => return Err(error),
         }
     }
@@ -215,6 +264,43 @@ mod tests {
         ));
         assert!(started.elapsed() < Duration::from_millis(200));
         release_tx.send(()).unwrap();
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn absolute_deadline_fires_under_per_byte_trickle() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let trickle_stop = stop.clone();
+        let writer = thread::spawn(move || {
+            while !trickle_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if client.write_all(b"x").is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(80));
+            }
+        });
+        let started = Instant::now();
+        let mut buffer = [0u8; 256];
+        let error = read_exact_with_deadlines(
+            &mut server,
+            &mut buffer,
+            Some(Duration::from_secs(30)),
+            Some(Instant::now() + Duration::from_millis(400)),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "absolute deadline waited {:?}; trickle reset the idle timer",
+            started.elapsed()
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
         writer.join().unwrap();
     }
 }

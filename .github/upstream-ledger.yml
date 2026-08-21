@@ -10,7 +10,7 @@
 #   note: short string
 #   et_pr: optional upstream PR number
 #
-# Classified 2026-08-22. Do not mark #784 ported here.
+# Classified 2026-08-22. #784 marked ported after et.rs #31 / 906a7ca.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
 classified: "2026-08-22"
@@ -68,8 +68,8 @@ commits:
   - sha: 69b33537ab12f324cf619aca04dc483728dc30c3
     date: "2026-07-30"
     kind: security
-    status: backlog
-    note: "#784 handshake 4KiB, recover, unix-socket LPE. Do not mark ported in this PR — a sibling port PR owns the code."
+    status: ported
+    note: "#784 handshake 4KiB, recover, unix-socket LPE. Landed in et.rs via #31 / 906a7ca."
     et_pr: 784
   - sha: b74a12efc567dbc1360ac0846f889c945a2eba60
     date: "2026-08-07"

@@ -19,7 +19,7 @@ This is a hybrid of three real rewrite factories — not a fourth invention:
 | --- | --- |
 | [`.github/upstream-pin.yml`](../.github/upstream-pin.yml) | Last reviewed release tag/SHA, default-branch **name**, protocol versions, last classified tip. **Pin ≠ ported.** |
 | [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml) | Every ET `master` commit after baseline `et-v7.0.0` / `7656a32a5bc15c6746726a27a5a4ba1e468fab6e`. |
-| [`docs/upstream-pin.md`](upstream-pin.md) | Human record of the pin and the current ledger. |
+| [`docs/upstream-pin.md`](upstream-pin.md) | Human record of the pin and the current ledger. `#784` / `69b3353` is `ported` (et.rs [#31](https://github.com/minpeter/et.rs/pull/31) / `906a7ca`). `#788` / `b74a12e` stays `skip`. |
 
 ## Shape
 

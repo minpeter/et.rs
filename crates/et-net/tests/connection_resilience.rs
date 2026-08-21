@@ -130,3 +130,44 @@ fn detected_disconnect_buffers_write_exactly_once() {
     assert_eq!(packet.payload(), b"once");
     assert_eq!(server.writer_sequence(), 1);
 }
+
+/// ANT-2026-VAMER5RC: a bad attacker-supplied sequence is a caught error, and
+/// the live victim socket is not closed before recover succeeds.
+#[test]
+fn recover_does_not_displace_live_session_on_bad_sequence() {
+    use std::io::Write;
+
+    let live_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let live_client = TcpStream::connect(live_listener.local_addr().unwrap()).unwrap();
+    let (live_server, _) = live_listener.accept().unwrap();
+    let mut server = Connection::new_server(live_server, &[6; 32]);
+    let mut client = Connection::new_client(live_client, &[6; 32]);
+    client.write_packet(1, b"hello").unwrap();
+    let hello = server.read_packet().unwrap();
+    assert_eq!(hello.payload(), b"hello");
+    assert!(server.connected());
+
+    let attack_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let attack_address = attack_listener.local_addr().unwrap();
+    let attacker = thread::spawn(move || {
+        let (mut stream, _) = attack_listener.accept().unwrap();
+        let _: et_core::proto::SequenceHeader =
+            et_net::framing_io::read_proto_limited(&mut stream, 4 * 1024).unwrap();
+        let bad = et_core::proto::SequenceHeader {
+            sequence_number: Some(999_999),
+        };
+        et_net::framing_io::write_proto(&mut stream, &bad).unwrap();
+        stream
+    });
+    let attack = TcpStream::connect(attack_address).unwrap();
+    assert!(server.recover(attack).is_err());
+    assert!(
+        server.connected(),
+        "failed recover must leave the live session connected"
+    );
+    let _ = attacker.join();
+
+    client.write_packet(2, b"still-here").unwrap();
+    let still = server.read_packet().unwrap();
+    assert_eq!(still.payload(), b"still-here");
+}

@@ -109,7 +109,9 @@ fn capped_malformed_unknown_and_mismatched_handshakes_are_typed() {
 
     let cases = [
         (
-            (64 * 1024 + 1i64).to_le_bytes().to_vec(),
+            (et_net::handshake::MAX_HANDSHAKE_PROTO_LEN + 1)
+                .to_le_bytes()
+                .to_vec(),
             ConnectStatus::InvalidKey,
         ),
         (

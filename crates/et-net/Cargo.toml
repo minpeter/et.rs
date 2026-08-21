@@ -16,3 +16,11 @@ et-core = { path = "../et-core" }
 prost = "0.13"
 rustix = { version = "1.1.4", features = ["event"] }
 socket2 = "0.6.1"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["user"] }
+rustix = { version = "1.1.4", features = ["event", "fs", "net", "process"] }
+
+[[bin]]
+name = "et-user-socket-helper"
+path = "src/bin/et_user_socket_helper.rs"

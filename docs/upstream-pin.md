@@ -27,7 +27,7 @@ green light to bump `PROTOCOL_VERSION` or land a v7 port.
 
 Notable unported `master` work after `et-v7.0.0`:
 
-- [`69b3353`](https://github.com/MisterTea/EternalTerminal/commit/69b33537ab12f324cf619aca04dc483728dc30c3) (`#784`) — four pre-auth / privilege-escalation fixes (handshake size + absolute read deadlines; reconnect recover crash; unix-socket LPE). Upstream left reconnect passkey-before-recover for a future `PROTOCOL_VERSION` bump.
+- [`69b3353`](https://github.com/MisterTea/EternalTerminal/commit/69b33537ab12f324cf619aca04dc483728dc30c3) (`#784`) — **ported in et.rs** (handshake 4 KiB cap + idle/absolute read deadlines; recover does not displace on failure; unix-socket listen/connect as the session user). Upstream left reconnect passkey-before-recover for a future `PROTOCOL_VERSION` bump; that residual is still unported.
 - [`b74a12e`](https://github.com/MisterTea/EternalTerminal/commit/b74a12efc567dbc1360ac0846f889c945a2eba60) (`#788`) — keep the client alive when the console fd is not a tty.
 
 Review those against the conflict policy in

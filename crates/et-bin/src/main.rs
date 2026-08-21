@@ -16,6 +16,10 @@
 use std::ffi::OsString;
 
 fn main() {
+    #[cfg(unix)]
+    if let Some(code) = et_net::user_socket_ops::maybe_run_helper() {
+        std::process::exit(code);
+    }
     let argv: Vec<OsString> = std::env::args_os().collect();
     let prog = argv
         .first()

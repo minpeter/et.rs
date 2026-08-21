@@ -1,0 +1,17 @@
+# Last *reviewed* MisterTea/EternalTerminal refs.
+# This is not a claim that et.rs has ported them.
+# Human record + FACTORY BACKLOG: docs/upstream-pin.md
+# Policy: docs/upstream-factory.md
+
+upstream_owner: MisterTea
+upstream_repo: EternalTerminal
+
+reviewed_release_tag: et-v7.0.0
+reviewed_release_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
+reviewed_default_branch: master
+reviewed_default_branch_sha: b74a12efc567dbc1360ac0846f889c945a2eba60
+reviewed_date: "2026-08-21"
+
+# et.rs still claims protocol v6. ET product is v7.0.0; ET wire is still v6.
+et_rs_protocol_version: 6
+et_wire_protocol_version: 6

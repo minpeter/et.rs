@@ -135,8 +135,6 @@ fn detected_disconnect_buffers_write_exactly_once() {
 /// the live victim socket is not closed before recover succeeds.
 #[test]
 fn recover_does_not_displace_live_session_on_bad_sequence() {
-    use std::io::Write;
-
     let live_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let live_client = TcpStream::connect(live_listener.local_addr().unwrap()).unwrap();
     let (live_server, _) = live_listener.accept().unwrap();

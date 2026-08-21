@@ -275,9 +275,8 @@ mod tests {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let trickle_stop = stop.clone();
         let writer = thread::spawn(move || {
-            let byte = [b'x'];
             while !trickle_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                if client.write_all(&byte).is_err() {
+                if client.write_all(b"x").is_err() {
                     return;
                 }
                 thread::sleep(Duration::from_millis(80));

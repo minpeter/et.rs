@@ -56,9 +56,7 @@ impl Op {
 /// Run the helper if this process was spawned by [`listen_unix_as_user`] or
 /// [`connect_unix_as_user`]. Returns `Some(exit_code)` when handled.
 pub fn maybe_run_helper() -> Option<i32> {
-    if std::env::var_os(OP_ENV).is_none() {
-        return None;
-    }
+    std::env::var_os(OP_ENV)?;
     Some(run_helper())
 }
 

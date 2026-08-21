@@ -8,10 +8,13 @@ on:
   pull_request:
     paths:
       - .github/upstream-pin.yml
+      - .github/upstream-ledger.yml
       - .github/workflows/upstream-watch.yml
+      - scripts/check-upstream-ledger.py
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   watch:
@@ -19,62 +22,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compare EternalTerminal to pin
+      - name: Check ledger schema
+        run: python3 scripts/check-upstream-ledger.py --self-test
+
+      - name: Compare EternalTerminal to pin + ledger
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          pin=".github/upstream-pin.yml"
-          pin_get() {
-            awk -F': *' -v k="$1" '$1 == k { gsub(/[" ]/, "", $2); print $2; exit }' "$pin"
-          }
-
-          owner="$(pin_get upstream_owner)"
-          repo="$(pin_get upstream_repo)"
-          pin_tag="$(pin_get reviewed_release_tag)"
-          pin_release_sha="$(pin_get reviewed_release_sha)"
-          pin_branch="$(pin_get reviewed_default_branch)"
-          pin_tip="$(pin_get reviewed_default_branch_sha)"
-
-          latest_tag="$(gh api "repos/${owner}/${repo}/releases/latest" --jq .tag_name)"
-          latest_release_sha="$(gh api "repos/${owner}/${repo}/commits/${latest_tag}" --jq .sha)"
-          default_branch="$(gh api "repos/${owner}/${repo}" --jq .default_branch)"
-          tip_sha="$(gh api "repos/${owner}/${repo}/commits/${default_branch}" --jq .sha)"
-
-          {
-            echo "## EternalTerminal vs pin"
-            echo
-            echo "| | pin | live |"
-            echo "| --- | --- | --- |"
-            echo "| release tag | \`${pin_tag}\` | \`${latest_tag}\` |"
-            echo "| release SHA | \`${pin_release_sha}\` | \`${latest_release_sha}\` |"
-            echo "| default branch | \`${pin_branch}\` | \`${default_branch}\` |"
-            echo "| default-branch SHA | \`${pin_tip}\` | \`${tip_sha}\` |"
-            echo
-            echo "Pin = last reviewed, not already ported. See docs/upstream-factory.md."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          drift=0
-          if [ "$latest_tag" != "$pin_tag" ]; then
-            echo "drift: latest release tag moved past pin ($pin_tag -> $latest_tag)"
-            drift=1
+          extra=()
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            extra+=(--file-issue)
           fi
-          if [ "$latest_release_sha" != "$pin_release_sha" ]; then
-            echo "drift: latest release SHA moved past pin ($pin_release_sha -> $latest_release_sha)"
-            drift=1
-          fi
-          if [ "$default_branch" != "$pin_branch" ]; then
-            echo "drift: default branch name changed ($pin_branch -> $default_branch)"
-            drift=1
-          fi
-          if [ "$tip_sha" != "$pin_tip" ]; then
-            echo "drift: default-branch tip moved past pin ($pin_tip -> $tip_sha)"
-            drift=1
-          fi
-
-          if [ "$drift" -ne 0 ]; then
-            echo "Upstream moved past the reviewed pin. Update .github/upstream-pin.yml after review." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          echo "Pin still matches live EternalTerminal release + default-branch tip." >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/check-upstream-ledger.py "${extra[@]}"

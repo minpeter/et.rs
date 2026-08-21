@@ -19,7 +19,7 @@ use et_core::proto::{
 };
 use et_net::connection::Connection;
 use et_net::framing_io::{read_proto_limited, write_proto};
-use et_net::handshake::client_request;
+use et_net::handshake::{client_request, MAX_HANDSHAKE_PROTO_LEN};
 use et_net::local_packet::{write_local_packet, LocalPacketDecoder};
 use prost::Message;
 #[cfg(unix)]
@@ -27,7 +27,6 @@ use rustix::event::{poll, PollFd, PollFlags};
 
 use crate::terminal_credentials::CredentialInput;
 
-const MAX_HANDSHAKE_PROTO_LEN: i64 = 64 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const READ_BUFFER: usize = 16 * 1024;
 /// Upstream retries the destination connection three times before failing.

@@ -168,10 +168,12 @@ impl ActiveSession {
     fn recover_body(&self, stream: TcpStream) -> Result<(), SessionError> {
         // Phase 1: soft-disconnect and snapshot under a short lock.
         let mut candidate = {
-            let mut connection = lock_timeout(&self.connection, RECOVERY_LOCK_TIMEOUT)?;
-            // Soft-disconnect the old live path; terminal output during the
-            // off-lock handshake is queued in `recover_hold`.
-            connection.disconnect();
+            let connection = lock_timeout(&self.connection, RECOVERY_LOCK_TIMEOUT)?;
+            // Snapshot onto the new stream without closing or disconnecting
+            // the live victim socket (ET #784 / ANT-2026-VAMER5RC). Terminal
+            // output during the off-lock handshake is queued in
+            // `recover_hold` because `recovering` is set. A failed recover
+            // must leave the existing session intact.
             connection.prepare_recovery_candidate(stream)
         };
 

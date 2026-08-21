@@ -109,6 +109,7 @@ impl Worker {
             socket_id,
             destination,
             self.commands.clone(),
+            self.session_user,
         ));
         Ok(())
     }

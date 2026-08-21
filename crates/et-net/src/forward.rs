@@ -65,13 +65,14 @@ impl Forwarder {
     /// Bind all forwarding sources and return the forwarder together with the
     /// environment variables created for named-pipe requests, mirroring the
     /// upstream server (`PortForwardHandler::createSource` +
-    /// `TerminalServer::runTerminal`). `owner` is the terminal user that
-    /// created pipes are chowned to.
+    /// `TerminalServer::runTerminal`). `owner` is the session user: UNIX
+    /// listen/connect drop to that user (ET #784).
     pub fn start_with_user(
         sources: Vec<PortForwardSourceRequest>,
         owner: Option<(u32, u32)>,
     ) -> Result<(Self, ForwardEnvironment), ForwardError> {
         let (sources, environment) = bind_sources(sources, owner)?;
+        let session_user = owner;
         let (commands_tx, commands_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let (outbound_tx, outbound_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         #[cfg(unix)]
@@ -98,6 +99,7 @@ impl Forwarder {
                     #[cfg(unix)]
                     wake_writer,
                     listener_stop_reader,
+                    session_user,
                 );
                 #[cfg(unix)]
                 drop(listener_stop);
@@ -218,8 +220,9 @@ fn bind_sources(
             #[cfg(unix)]
             {
                 let path = create_forward_pipe(owner)?;
-                let mut listeners = Endpoint::Unix(path.clone()).bind()?;
-                apply_pipe_ownership(&path, owner)?;
+                // Bind as the session user (ET #784). Do not chmod/chown the
+                // client-visible socket path as root after bind.
+                let mut listeners = Endpoint::Unix(path.clone()).bind_with_user(owner)?;
                 environment.push((variable, path.to_string_lossy().into_owned()));
                 for mut listener in listeners.drain(..) {
                     if let Some(directory) = path.parent() {
@@ -241,7 +244,7 @@ fn bind_sources(
             }
         }
         let source = Endpoint::parse(request.source)?;
-        for listener in source.bind()? {
+        for listener in source.bind_with_user(owner)? {
             bound.push(BoundSource {
                 listener,
                 destination: destination.clone(),
@@ -266,20 +269,6 @@ fn create_forward_pipe(owner: Option<(u32, u32)>) -> Result<std::path::PathBuf, 
         std::os::unix::fs::chown(&directory, Some(uid), Some(gid)).map_err(ForwardError::Io)?;
     }
     Ok(directory.join("sock"))
-}
-
-#[cfg(unix)]
-fn apply_pipe_ownership(
-    path: &std::path::Path,
-    owner: Option<(u32, u32)>,
-) -> Result<(), ForwardError> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-        .map_err(ForwardError::Io)?;
-    if let Some((uid, gid)) = owner {
-        std::os::unix::fs::chown(path, Some(uid), Some(gid)).map_err(ForwardError::Io)?;
-    }
-    Ok(())
 }
 
 #[cfg(unix)]

@@ -8,7 +8,7 @@ use et_core::proto::{
 };
 use et_net::connection::Connection;
 use et_net::framing_io::{read_proto_limited, write_proto};
-use et_net::handshake::client_request;
+use et_net::handshake::{client_request, MAX_HANDSHAKE_PROTO_LEN};
 use prost::Message;
 
 use crate::bootstrap::Credentials;
@@ -16,7 +16,6 @@ use crate::deadline::Deadline;
 use crate::error::ClientError;
 use crate::resolver::EndpointResolver;
 
-const MAX_HANDSHAKE_PROTO_LEN: i64 = 64 * 1024;
 const MAX_ENDPOINT_ADDRESSES: usize = 16;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);

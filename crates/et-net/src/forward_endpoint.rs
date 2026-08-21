@@ -115,6 +115,17 @@ impl Endpoint {
         }
     }
 
+    pub(crate) fn connect_with_user(&self, user: Option<(u32, u32)>) -> io::Result<ForwardStream> {
+        match (self, user) {
+            #[cfg(unix)]
+            (Self::Unix(path), Some((uid, gid))) => {
+                crate::user_socket_ops::connect_unix_as_user(path, uid, gid)
+                    .map(ForwardStream::Unix)
+            }
+            _ => self.connect(),
+        }
+    }
+
     pub(crate) fn connect(&self) -> io::Result<ForwardStream> {
         match self {
             Self::Tcp { host, port } => {
@@ -145,6 +156,25 @@ impl Endpoint {
             }
             #[cfg(unix)]
             Self::Unix(path) => UnixStream::connect(path).map(ForwardStream::Unix),
+        }
+    }
+
+    pub(crate) fn bind_with_user(
+        &self,
+        user: Option<(u32, u32)>,
+    ) -> io::Result<Vec<ForwardListener>> {
+        match (self, user) {
+            #[cfg(unix)]
+            (Self::Unix(path), Some((uid, gid))) => {
+                let listener = crate::user_socket_ops::listen_unix_as_user(path, uid, gid)?;
+                listener.set_nonblocking(true)?;
+                Ok(vec![ForwardListener {
+                    inner: ListenerKind::Unix(listener),
+                    cleanup: Some(path.clone()),
+                    cleanup_dir: None,
+                }])
+            }
+            _ => self.bind(),
         }
     }
 

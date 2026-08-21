@@ -12,10 +12,10 @@ use super::{ConnError, Connection};
 use crate::framing_io::{
     read_frame_limited_deadline, read_proto_limited_deadline, write_proto_limited_deadline,
 };
+use crate::handshake::MAX_HANDSHAKE_PROTO_LEN;
 
 pub const MAX_RECOVERY_PROTO_LEN: i64 = 80 * 1024 * 1024;
 pub const DEFAULT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_RECOVERY_HEADER_LEN: i64 = 64 * 1024;
 
 impl Connection {
     pub fn recover(&mut self, new_stream: TcpStream) -> Result<(), ConnError> {
@@ -98,11 +98,11 @@ impl Connection {
             &SequenceHeader {
                 sequence_number: Some(wire_sequence),
             },
-            MAX_RECOVERY_HEADER_LEN,
+            MAX_HANDSHAKE_PROTO_LEN,
             deadline,
         )?;
         let remote: SequenceHeader =
-            read_proto_limited_deadline(&mut stream, MAX_RECOVERY_HEADER_LEN, deadline)?;
+            read_proto_limited_deadline(&mut stream, MAX_HANDSHAKE_PROTO_LEN, deadline)?;
         let remote_sequence = match remote.sequence_number {
             Some(sequence) if sequence >= 0 => i64::from(sequence),
             value => return Err(ConnError::InvalidRecoverySequence(value)),

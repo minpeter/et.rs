@@ -126,9 +126,10 @@ pub(crate) fn spawn_connector(
     socket_id: i32,
     destination: Endpoint,
     commands: mpsc::SyncSender<Command>,
+    session_user: Option<(u32, u32)>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let result = destination.connect();
+        let result = destination.connect_with_user(session_user);
         let _ = commands.send(Command::Connected {
             client_fd,
             socket_id,

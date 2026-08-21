@@ -62,6 +62,7 @@ pub(crate) fn run(
     outbound: mpsc::SyncSender<Outbound>,
     #[cfg(unix)] mut outbound_wake: UnixStream,
     listener_stop: ListenerStop,
+    session_user: Option<(u32, u32)>,
 ) {
     #[cfg(unix)]
     let result = Worker::new(
@@ -69,10 +70,10 @@ pub(crate) fn run(
         outbound.clone(),
         outbound_wake.try_clone().ok(),
     )
-    .and_then(|mut worker| worker.run(sources, commands, listener_stop));
+    .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user));
     #[cfg(windows)]
     let result = Worker::new(command_sender, outbound.clone())
-        .and_then(|mut worker| worker.run(sources, commands, listener_stop));
+        .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user));
     if let Err(error) = result {
         let _ = outbound.send(Err(error));
         #[cfg(unix)]
@@ -90,6 +91,7 @@ struct Worker {
     destinations: HashMap<i32, ActiveIo>,
     threads: Vec<JoinHandle<()>>,
     next_socket_id: i32,
+    session_user: Option<(u32, u32)>,
 }
 
 impl Worker {
@@ -114,6 +116,7 @@ impl Worker {
             destinations: HashMap::new(),
             threads: Vec::new(),
             next_socket_id: 1,
+            session_user: None,
         })
     }
 
@@ -122,7 +125,9 @@ impl Worker {
         sources: Vec<BoundSource>,
         commands: mpsc::Receiver<Command>,
         listener_stop: ListenerStop,
+        session_user: Option<(u32, u32)>,
     ) -> Result<(), ForwardError> {
+        self.session_user = session_user;
         let next_client_fd = Arc::new(AtomicI32::new(1));
         for source in sources {
             #[cfg(unix)]

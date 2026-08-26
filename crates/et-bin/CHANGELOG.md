@@ -1,4 +1,4 @@
-## et@0.0.12
+## et@0.0.13
 
 ### Port EternalTerminal #784 pre-auth / LPE fixes
 
@@ -11,6 +11,8 @@ connect on client-chosen paths drop to the session user (helper +
 `SCM_RIGHTS`) instead of unlink/bind/chown/connect as root. Reconnect
 passkey-before-recover is still omitted: that needs a `PROTOCOL_VERSION`
 bump.
+
+## et@0.0.12
 
 ### Unblock session recovery after blackholed client writes
 

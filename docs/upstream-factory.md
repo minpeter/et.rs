@@ -21,6 +21,13 @@ This is a hybrid of three real rewrite factories — not a fourth invention:
 | [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml) | Every ET `master` commit after baseline `et-v7.0.0` / `7656a32a5bc15c6746726a27a5a4ba1e468fab6e`. |
 | [`docs/upstream-pin.md`](upstream-pin.md) | Human record of the pin and the current ledger. `#784` / `69b3353` is `ported` (et.rs [#31](https://github.com/minpeter/et.rs/pull/31) / `906a7ca`). `#788` / `b74a12e` stays `skip`. |
 
+## Release
+
+[`release.yml`](../.github/workflows/release.yml) runs on push to `main` and
+opens a Version Packages PR when changelog has an unreleased `## et@x.y.z`
+heading. Merges by the Cursor GitHub App do not enqueue Actions; a
+`minpeter`-path push to `main` is required to kick tegami.
+
 ## Shape
 
 1. **Watch** — weekday 09:30 KST (`30 0 * * 1-5` UTC) via

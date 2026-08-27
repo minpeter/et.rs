@@ -22,6 +22,7 @@ use wait_timeout::ChildExt;
 const ID: &str = "abcdefghijklmnop";
 const KEY: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
 const TIMEOUT: Duration = Duration::from_secs(5);
+const LOGIN_TERM_COMPLETION: &[u8] = b"__ET_LOGIN_TERM_COMPLETE__\r\n";
 
 #[test]
 fn bootstrap_parent_reports_marker_and_leaves_registered_session_running() {
@@ -202,7 +203,8 @@ fn real_terminal_starts_login_shell_and_loads_profile_color() {
     let output = collect_until(&mut router, |output| {
         contains(output, LOGIN_COLOR_MARKER) || contains(output, NON_LOGIN_MARKER)
     });
-    let _ = child.wait_timeout(TIMEOUT).unwrap();
+    let status = child.wait_timeout(TIMEOUT).unwrap().unwrap();
+    assert!(status.success());
     assert!(
         contains(&output, LOGIN_COLOR_MARKER),
         "expected ANSI login-shell color marker when SHELL receives -l; got {:?}",
@@ -238,28 +240,34 @@ fn real_terminal_login_shell_preserves_term_without_colorterm() {
         TerminalPacketType::TerminalBuffer,
         &TerminalBuffer {
             buffer: Some(
-                b"printf 'TERM=%s\nCOLORTERM=%s\n' \"$TERM\" \"${COLORTERM-}\"; exit\n".to_vec(),
+                b"printf '\\nTERM=%s\\nCOLORTERM=%s\\n' \"$TERM\" \"${COLORTERM-}\"; printf '__ET_LOGIN_TERM_%s__\\n' COMPLETE; exit\n".to_vec(),
             ),
         },
     );
     let output = collect_until(&mut router, |output| {
-        (contains(output, LOGIN_COLOR_MARKER) || contains(output, NON_LOGIN_MARKER))
-            && contains(output, b"TERM=xterm-256color\r\nCOLORTERM=\r\n")
+        contains(output, LOGIN_TERM_COMPLETION)
     });
-    let _ = child.wait_timeout(TIMEOUT).unwrap();
+    let status = child.wait_timeout(TIMEOUT).unwrap().unwrap();
+    assert!(status.success());
     assert!(
         contains(&output, LOGIN_COLOR_MARKER),
         "expected ANSI login-shell color marker when SHELL receives -l; got {:?}",
         String::from_utf8_lossy(&output),
     );
+    let lines: Vec<&[u8]> = output
+        .split(|byte| *byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .collect();
     assert!(
-        contains(&output, b"TERM=xterm-256color\r\nCOLORTERM=\r\n"),
-        "TERM=xterm-256color must survive empty TermInit with COLORTERM unset; got {:?}",
-        String::from_utf8_lossy(&output),
-    );
-    assert!(
-        !contains(&output, b"COLORTERM=truecolor"),
-        "COLORTERM must remain unset under empty TermInit; got {:?}",
+        lines.windows(3).any(|record| {
+            record
+                == [
+                    b"TERM=xterm-256color".as_slice(),
+                    b"COLORTERM=".as_slice(),
+                    b"__ET_LOGIN_TERM_COMPLETE__".as_slice(),
+                ]
+        }),
+        "expected complete TERM/COLORTERM record; got {:?}",
         String::from_utf8_lossy(&output),
     );
 }

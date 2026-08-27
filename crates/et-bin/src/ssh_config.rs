@@ -1,4 +1,4 @@
-use crate::bootstrap::{validate_ssh_destination, SshInvocation};
+use crate::bootstrap::{validate_ssh_destination, InvocationCompletion, SshInvocation};
 use crate::deadline::Deadline;
 use crate::error::ClientError;
 use crate::ssh_process::{run_checked, SshRunner};
@@ -28,6 +28,7 @@ pub fn resolve_ssh_config(
         program: "ssh".to_string(),
         args,
         operation: "resolving SSH configuration",
+        completion: InvocationCompletion::Exit,
     };
     parse_ssh_config(&run_checked(runner, &invocation, deadline)?)
 }

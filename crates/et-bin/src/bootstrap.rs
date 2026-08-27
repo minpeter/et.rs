@@ -84,6 +84,7 @@ pub fn build_jump_invocation(
         program: "ssh".to_string(),
         args,
         operation: "starting the jumphost etterminal",
+        completion: InvocationCompletion::Credentials,
     }
 }
 
@@ -125,11 +126,19 @@ fn jump_remote_command(request: &JumpBootstrapRequest, credentials: &Credentials
     command
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvocationCompletion {
+    Exit,
+    Credentials,
+    ShellProbe,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshInvocation {
     pub program: String,
     pub args: Vec<String>,
     pub operation: &'static str,
+    pub completion: InvocationCompletion,
 }
 
 pub fn provisional_credentials() -> Result<Credentials, ClientError> {
@@ -165,6 +174,7 @@ pub fn build_invocation(request: &BootstrapRequest, credentials: &Credentials) -
         program: "ssh".to_string(),
         args,
         operation: "starting the remote etterminal",
+        completion: InvocationCompletion::Credentials,
     }
 }
 
@@ -191,11 +201,16 @@ pub fn build_shell_probe(request: &BootstrapRequest) -> SshInvocation {
         program: "ssh".to_owned(),
         args,
         operation: "detecting the remote login shell",
+        completion: InvocationCompletion::ShellProbe,
     }
 }
 
 pub fn parse_shell_probe(stdout: &[u8]) -> Result<RemoteShell, ClientError> {
-    for line in String::from_utf8_lossy(stdout).lines() {
+    let stdout = String::from_utf8_lossy(stdout);
+    for line in stdout.split_inclusive('\n') {
+        if !line.ends_with('\n') {
+            continue;
+        }
         let Some(value) = line.trim().strip_prefix(WINDOWS_SHELL_PROBE_SENTINEL) else {
             continue;
         };
@@ -455,6 +470,10 @@ mod tests {
         );
         assert!(matches!(
             parse_shell_probe(b"__ET_COMSPEC__powershell\n"),
+            Err(ClientError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_shell_probe(b"__ET_COMSPEC__C:\\Windows\\System32\\cmd.exe"),
             Err(ClientError::Unsupported(_))
         ));
     }

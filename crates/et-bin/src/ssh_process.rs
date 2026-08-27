@@ -7,7 +7,8 @@ use std::time::Duration;
 use wait_timeout::ChildExt;
 
 use crate::bootstrap::{
-    parse_id_passkey, parse_shell_probe, Credentials, RemoteShell, SshInvocation,
+    parse_id_passkey, parse_shell_probe, Credentials, InvocationCompletion, RemoteShell,
+    SshInvocation,
 };
 use crate::deadline::Deadline;
 use crate::error::ClientError;
@@ -17,8 +18,8 @@ pub const DEFAULT_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 pub struct SshOutput {
-    /// Exit status, or `None` when the bootstrap finished early because the
-    /// `IDPASSKEY:` marker had already arrived.
+    /// Exit status, or `None` when an invocation-specific completion marker
+    /// arrived before the SSH process exited.
     pub status: Option<ExitStatus>,
     pub stdout: Vec<u8>,
 }
@@ -84,7 +85,7 @@ impl SshRunner for SystemSsh {
         // Identify the stdout pipe so descendants that outlive ssh while still
         // holding it can be found even after they re-parent to init.
         let pipe = pipe_identity(&stdout);
-        let (receiver, reader) = match spawn_reader(stdout) {
+        let (receiver, reader) = match spawn_reader(stdout, invocation.completion) {
             Ok(reader) => reader,
             Err(error) => {
                 terminate_and_reap(&mut child, child_pid, pipe)?;
@@ -113,13 +114,19 @@ impl SshRunner for SystemSsh {
                 })
             }
             Ok(Capture::Marker(stdout)) => {
+                // Preserve a direct child's status when it exited before a
+                // pipe-holding descendant emitted the completion marker.
+                let status = match child.try_wait() {
+                    Ok(status) => status,
+                    Err(error) => {
+                        stop_child(&mut child, child_pid, pipe, reader)?;
+                        return Err(ClientError::SshWait(error));
+                    }
+                };
                 // The remote terminal is registered and detached; stop waiting
                 // on a channel a detached child may keep open.
                 stop_child(&mut child, child_pid, pipe, reader)?;
-                Ok(SshOutput {
-                    status: None,
-                    stdout,
-                })
+                Ok(SshOutput { status, stdout })
             }
             Ok(Capture::TooLarge) => {
                 stop_child(&mut child, child_pid, pipe, reader)?;
@@ -164,11 +171,12 @@ pub fn run_shell_probe<R: SshRunner + ?Sized>(
     deadline: Deadline,
 ) -> Result<RemoteShell, ClientError> {
     let output = runner.run(invocation, deadline)?;
-    let status = output.status.ok_or(ClientError::SshNonZero(None))?;
-    if status.success() {
-        return parse_shell_probe(&output.stdout);
+    if let Some(status) = output.status {
+        if !status.success() {
+            return Err(ClientError::SshNonZero(status.code()));
+        }
     }
-    Err(ClientError::SshNonZero(status.code()))
+    parse_shell_probe(&output.stdout)
 }
 
 pub fn run_bootstrap<R: SshRunner + ?Sized>(
@@ -181,8 +189,8 @@ pub fn run_bootstrap<R: SshRunner + ?Sized>(
 
 enum Capture {
     Complete(Vec<u8>),
-    /// The credential marker arrived, so the remote terminal is registered and
-    /// detached; nothing else on that channel matters.
+    /// The invocation-specific completion marker arrived, so a descendant
+    /// holding stdout open cannot delay completion.
     Marker(Vec<u8>),
     TooLarge,
     Failed(io::Error),
@@ -201,19 +209,45 @@ fn marker_end(captured: &[u8]) -> Option<usize> {
         .filter(|end| *end <= captured.len())
 }
 
-fn spawn_reader(mut stdout: ChildStdout) -> io::Result<(mpsc::Receiver<Capture>, JoinHandle<()>)> {
+fn shell_probe_end(captured: &[u8]) -> Option<usize> {
+    let mut line_start = 0;
+    for line_end in captured
+        .iter()
+        .enumerate()
+        .filter_map(|(index, byte)| (*byte == b'\n').then_some(index + 1))
+    {
+        if parse_shell_probe(&captured[line_start..line_end]).is_ok() {
+            return Some(line_end);
+        }
+        line_start = line_end;
+    }
+    None
+}
+
+fn completion_end(captured: &[u8], completion: InvocationCompletion) -> Option<usize> {
+    match completion {
+        InvocationCompletion::Exit => None,
+        InvocationCompletion::Credentials => marker_end(captured),
+        InvocationCompletion::ShellProbe => shell_probe_end(captured),
+    }
+}
+
+fn spawn_reader(
+    mut stdout: ChildStdout,
+    completion: InvocationCompletion,
+) -> io::Result<(mpsc::Receiver<Capture>, JoinHandle<()>)> {
     let (sender, receiver) = mpsc::sync_channel(1);
     let reader = thread::Builder::new()
         .name("ssh-stdout".to_string())
         .spawn(move || {
-            let capture = capture_bounded(&mut stdout);
+            let capture = capture_bounded(&mut stdout, completion);
             drop(stdout);
             let _ = sender.send(capture);
         })?;
     Ok((receiver, reader))
 }
 
-fn capture_bounded(reader: &mut impl Read) -> Capture {
+fn capture_bounded(reader: &mut impl Read, completion: InvocationCompletion) -> Capture {
     let mut captured = Vec::new();
     let mut buffer = [0u8; 8192];
     loop {
@@ -227,7 +261,7 @@ fn capture_bounded(reader: &mut impl Read) -> Capture {
                 // Waiting for EOF is not reliable everywhere: on Windows the
                 // detached session process can inherit this pipe, so the
                 // channel never closes even though the session is ready.
-                if marker_end(&captured).is_some() {
+                if completion_end(&captured, completion).is_some() {
                     return Capture::Marker(captured);
                 }
             }
@@ -523,6 +557,7 @@ mod tests {
             program: "ssh".into(),
             args: Vec::new(),
             operation: "probe",
+            completion: InvocationCompletion::ShellProbe,
         };
         assert_eq!(
             run_shell_probe(
@@ -545,6 +580,7 @@ mod tests {
             program: "ssh".into(),
             args: Vec::new(),
             operation: "probe",
+            completion: InvocationCompletion::ShellProbe,
         };
         assert_eq!(
             run_shell_probe(
@@ -567,6 +603,7 @@ mod tests {
             program: "ssh".into(),
             args: Vec::new(),
             operation: "probe",
+            completion: InvocationCompletion::ShellProbe,
         };
         assert!(matches!(
             run_shell_probe(
@@ -640,6 +677,7 @@ mod tests {
             program: program.into(),
             args: args.iter().map(|arg| (*arg).to_string()).collect(),
             operation: "testing bootstrap",
+            completion: InvocationCompletion::Exit,
         }
     }
 
@@ -800,6 +838,164 @@ exit 0
             descendant_exited,
             "SSH descendant survived process-group cleanup"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shell_probe_preserves_naturally_completed_nonzero_status() {
+        const SCRIPT: &str = r#"
+(IFS= read -r _ < "$3"; printf '__ET_COMSPEC__C:\\Windows\\System32\\cmd.exe\n') &
+descendant=$!
+printf '%s %s\n' "$$" "$descendant" > "$1"
+IFS= read -r _ < "$2"
+exit 255
+"#;
+
+        let dir = ProcessGroupTestDir::new();
+        let pid_fifo = dir.fifo("probe-status-pid");
+        let exit_fifo = dir.fifo("probe-status-exit");
+        let release_fifo = dir.fifo("probe-status-release");
+        let _pid_control = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pid_fifo)
+            .unwrap();
+        let pid_pipe = File::open(&pid_fifo).unwrap();
+        let _exit_control = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&exit_fifo)
+            .unwrap();
+        let mut exit_pipe = OpenOptions::new().write(true).open(&exit_fifo).unwrap();
+        let _release_control = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&release_fifo)
+            .unwrap();
+        let mut release_pipe = OpenOptions::new().write(true).open(&release_fifo).unwrap();
+        let runner = SystemSsh::with_timeout(Duration::from_secs(3));
+        let mut invocation = invocation(
+            "/bin/sh",
+            &[
+                "-c",
+                SCRIPT,
+                "shell-probe-status-test",
+                pid_fifo.to_str().unwrap(),
+                exit_fifo.to_str().unwrap(),
+                release_fifo.to_str().unwrap(),
+            ],
+        );
+        invocation.completion = InvocationCompletion::ShellProbe;
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let result = run_shell_probe(&runner, &invocation, runner.deadline());
+            let _ = result_sender.send(result);
+        });
+
+        assert!(
+            poll_readable(&pid_pipe),
+            "probe processes were not reported"
+        );
+        let mut process_ids = String::new();
+        assert_ne!(
+            BufReader::new(pid_pipe)
+                .read_line(&mut process_ids)
+                .unwrap(),
+            0
+        );
+        let mut process_ids = process_ids.split_whitespace();
+        let direct_pid = process_ids.next().unwrap().parse::<i32>().unwrap();
+        let descendant_pid = process_ids.next().unwrap().parse::<i32>().unwrap();
+        assert_eq!(process_ids.next(), None);
+        let direct_pidfd = pidfd_open(
+            RustixPid::from_raw(direct_pid).unwrap(),
+            PidfdFlags::empty(),
+        )
+        .unwrap();
+        let descendant_pidfd = pidfd_open(
+            RustixPid::from_raw(descendant_pid).unwrap(),
+            PidfdFlags::empty(),
+        )
+        .unwrap();
+
+        exit_pipe.write_all(b"exit\n").unwrap();
+        drop(exit_pipe);
+        assert!(
+            poll_readable(&direct_pidfd),
+            "direct SSH child did not exit before the sentinel"
+        );
+        release_pipe.write_all(b"emit\n").unwrap();
+        drop(release_pipe);
+        let result = result_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("probe did not complete after the descendant sentinel");
+        worker.join().unwrap();
+        let descendant_exited = poll_readable(&descendant_pidfd);
+        if !descendant_exited {
+            pidfd_send_signal(&descendant_pidfd, RustixSignal::KILL).unwrap();
+        }
+
+        assert!(
+            descendant_exited,
+            "stdout-holding descendant survived cleanup"
+        );
+        assert!(matches!(result, Err(ClientError::SshNonZero(Some(255)))));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shell_probe_completes_when_descendant_holds_stdout_open() {
+        const SCRIPT: &str = r#"
+(IFS= read -r _ < "$1") &
+printf '__ET_COMSPEC__C:\\Windows\\System32\\cmd.exe\n'
+exit 0
+"#;
+
+        let dir = ProcessGroupTestDir::new();
+        let hold_fifo = dir.fifo("probe-hold");
+        let hold_control = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&hold_fifo)
+            .unwrap();
+        let runner = SystemSsh::with_timeout(Duration::from_secs(2));
+        let mut invocation = invocation(
+            "/bin/sh",
+            &[
+                "-c",
+                SCRIPT,
+                "shell-probe-test",
+                hold_fifo.to_str().unwrap(),
+            ],
+        );
+        invocation.completion = InvocationCompletion::ShellProbe;
+
+        let result = run_shell_probe(&runner, &invocation, runner.deadline());
+        drop(hold_control);
+
+        assert_eq!(result.unwrap(), RemoteShell::Cmd);
+    }
+
+    #[test]
+    fn shell_probe_matcher_ignores_complete_decoy_line() {
+        let captured = b"audit: echo __ET_COMSPEC__%ComSpec%\n";
+
+        assert_eq!(shell_probe_end(captured), None);
+    }
+
+    #[test]
+    fn shell_probe_matcher_returns_end_of_valid_line_after_decoy() {
+        let captured = b"audit: echo __ET_COMSPEC__%ComSpec%\n\
+                         __ET_COMSPEC__C:\\Windows\\System32\\cmd.exe\n";
+
+        assert_eq!(shell_probe_end(captured), Some(captured.len()));
+    }
+
+    #[test]
+    fn shell_probe_matcher_rejects_partial_valid_line() {
+        let captured = b"__ET_COMSPEC__C:\\Windows\\System32\\cmd.exe";
+
+        assert_eq!(shell_probe_end(captured), None);
     }
 
     #[test]

@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "et"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "clap",
  "crossterm",
@@ -367,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "et-cli"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "clap",
  "et-core",
@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "et-core"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "crypto_secretbox",
  "hex",
@@ -387,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "et-htm"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "base64",
  "portable-pty",
@@ -398,7 +398,7 @@ dependencies = [
 
 [[package]]
 name = "et-net"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "et-core",
  "nix 0.31.3",
@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "et-server"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "et-core",
  "et-net",

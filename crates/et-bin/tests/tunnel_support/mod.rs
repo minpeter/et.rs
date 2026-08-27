@@ -11,6 +11,7 @@ pub struct SingleCutProxy {
     cut: mpsc::SyncSender<()>,
     waiting: mpsc::Receiver<()>,
     resume: mpsc::SyncSender<()>,
+    stop: mpsc::SyncSender<()>,
     worker: Option<thread::JoinHandle<io::Result<()>>>,
 }
 
@@ -21,6 +22,7 @@ impl SingleCutProxy {
         let (cut_tx, cut_rx) = mpsc::sync_channel(1);
         let (waiting_tx, waiting_rx) = mpsc::sync_channel(1);
         let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+        let (stop_tx, stop_rx) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || {
             let (first, _) = listener.accept()?;
             let backend = TcpStream::connect((Ipv4Addr::LOCALHOST, backend_port))?;
@@ -40,13 +42,20 @@ impl SingleCutProxy {
                 .recv_timeout(TIMEOUT)
                 .map_err(|error| io::Error::other(error.to_string()))?;
             let recovered = TcpStream::connect((Ipv4Addr::LOCALHOST, backend_port))?;
-            join(relay(&second, &recovered)?)
+            let relays = relay(&second, &recovered)?;
+            stop_rx
+                .recv_timeout(TIMEOUT)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            let _ = second.shutdown(Shutdown::Both);
+            let _ = recovered.shutdown(Shutdown::Both);
+            join(relays)
         });
         Self {
             port,
             cut: cut_tx,
             waiting: waiting_rx,
             resume: resume_tx,
+            stop: stop_tx,
             worker: Some(worker),
         }
     }
@@ -61,6 +70,7 @@ impl SingleCutProxy {
     }
 
     pub fn join(mut self) {
+        self.stop.send(()).unwrap();
         self.worker.take().unwrap().join().unwrap().unwrap();
     }
 }

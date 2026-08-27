@@ -1,3 +1,12 @@
+## et@0.0.16
+
+### Restore remote colors for Ghostty clients
+
+ET clients launched from Ghostty now send the widely supported
+`TERM=xterm-256color` fallback instead of `xterm-ghostty`. This restores
+ordinary remote prompt and application colors on hosts without Ghostty's
+terminfo entry. Other terminal types remain unchanged.
+
 ## et@0.0.15
 
 ### Stabilize remote shell detection

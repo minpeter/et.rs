@@ -70,7 +70,7 @@ impl SingleCutProxy {
     }
 
     pub fn join(mut self) {
-        self.stop.send(()).unwrap();
+        let _ = self.stop.send(());
         self.worker.take().unwrap().join().unwrap().unwrap();
     }
 }

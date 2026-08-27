@@ -253,16 +253,16 @@ fn recover_succeeds_while_old_peer_blackholes_writes() {
     let _live = client.try_clone_stream().unwrap();
 
     let payload = vec![b'x'; 32 * 1024];
-    let flood_started = Instant::now();
     for round in 0..1_024u32 {
+        let send_started = Instant::now();
         server
             .handle
             .send_packet(ID_A, 40, &payload)
             .unwrap_or_else(|error| panic!("flood round {round}: {error}"));
         assert!(
-            flood_started.elapsed() < std::time::Duration::from_secs(12),
-            "send_packet blocked for {:?} — live write timeout not applied",
-            flood_started.elapsed()
+            send_started.elapsed() < std::time::Duration::from_secs(8),
+            "send_packet round {round} blocked for {:?} — live write timeout not applied",
+            send_started.elapsed()
         );
     }
 

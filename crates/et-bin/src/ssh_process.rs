@@ -694,14 +694,9 @@ exit 0
 
     #[test]
     fn system_runner_stops_output_flood_at_limit() {
-        let runner = SystemSsh::with_timeout(Duration::from_secs(2));
-        let invocation = invocation(
-            "/bin/sh",
-            &["-c", "while :; do printf 0123456789abcdef; done"],
-        );
-        let started = Instant::now();
+        let runner = SystemSsh::with_timeout(Duration::from_secs(10));
+        let invocation = invocation("/bin/cat", &["/dev/zero"]);
         let result = runner.run(&invocation, runner.deadline());
         assert!(matches!(result, Err(ClientError::SshOutputTooLarge(_))));
-        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

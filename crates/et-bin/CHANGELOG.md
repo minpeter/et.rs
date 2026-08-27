@@ -1,3 +1,26 @@
+## et@0.0.14
+
+### Restore colorful shell startup in ET sessions
+
+Unix ET sessions now start the user's shell as a login shell, matching SSH,
+upstream EternalTerminal, and ET's own headless terminal multiplexer. This
+restores profile-provided prompts, aliases, `dircolors`, and other color setup
+that was skipped when ET launched an interactive non-login shell.
+
+Native Windows terminal startup, protocol-v6 bytes, and reconnect behavior are
+unchanged.
+
+### Auto-detect Windows OpenSSH bootstrap
+
+Bare `et user@windows-host` connections now probe the login shell without
+including session credentials. Expanded `%ComSpec%` selects the existing
+Cmd-compatible bootstrap and `et.exe` terminal path automatically, while
+POSIX hosts preserve their existing bootstrap.
+
+Explicit `--winserver` and `--remote-shell` overrides remain authoritative.
+PowerShell sessions now pass `ET_SHELL=powershell.exe` only to the remote
+`etterminal` process.
+
 ## et@0.0.13
 
 ### Port EternalTerminal #784 pre-auth / LPE fixes

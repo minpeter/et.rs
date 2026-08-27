@@ -37,6 +37,8 @@ pub fn run(mut router: LocalStream, term: &str) -> Result<i32, String> {
         })
         .map_err(|error| format!("could not open PTY: {error}"))?;
     let mut command = CommandBuilder::new(default_shell());
+    #[cfg(unix)]
+    command.arg("-l");
     command.env("TERM", term);
     for (name, value) in environment {
         command.env(name, value);

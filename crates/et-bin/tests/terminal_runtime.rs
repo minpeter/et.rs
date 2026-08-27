@@ -13,7 +13,10 @@ use et_core::proto::{
 };
 use et_net::local_packet::{read_local_packet, write_local_packet};
 use prost::Message;
-use terminal_runtime_support::{read_line_timeout, write_credentials, Fixture};
+use terminal_runtime_support::{
+    collect_until, contains, read_line_timeout, write_credentials, Fixture, LOGIN_COLOR_MARKER,
+    NON_LOGIN_MARKER,
+};
 use wait_timeout::ChildExt;
 
 const ID: &str = "abcdefghijklmnop";
@@ -169,6 +172,97 @@ fn router_disconnect_terminates_the_shell() {
     drop(router);
     let status = child.wait_timeout(TIMEOUT).unwrap().unwrap();
     assert!(!status.success());
+}
+
+#[test]
+fn real_terminal_starts_login_shell_and_loads_profile_color() {
+    let fixture = Fixture::new("login-color");
+    let shell = fixture.login_probe_shell();
+    let mut child = fixture.spawn_with_shell(shell.to_str().unwrap());
+    write_credentials(&mut child);
+    let (mut router, _) = fixture.listener.accept().unwrap();
+    router.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let _ = read_local_packet(&mut router).unwrap();
+    fixture.wait_ready();
+    send(
+        &mut router,
+        TerminalPacketType::TerminalInit,
+        &TermInit {
+            environmentnames: Vec::new(),
+            environmentvalues: Vec::new(),
+        },
+    );
+    send(
+        &mut router,
+        TerminalPacketType::TerminalBuffer,
+        &TerminalBuffer {
+            buffer: Some(b"exit\n".to_vec()),
+        },
+    );
+    let output = collect_until(&mut router, |output| {
+        contains(output, LOGIN_COLOR_MARKER) || contains(output, NON_LOGIN_MARKER)
+    });
+    let _ = child.wait_timeout(TIMEOUT).unwrap();
+    assert!(
+        contains(&output, LOGIN_COLOR_MARKER),
+        "expected ANSI login-shell color marker when SHELL receives -l; got {:?}",
+        String::from_utf8_lossy(&output),
+    );
+    assert!(
+        !contains(&output, NON_LOGIN_MARKER),
+        "login-shell color marker must be emitted only when SHELL receives -l; got {:?}",
+        String::from_utf8_lossy(&output),
+    );
+}
+
+#[test]
+fn real_terminal_login_shell_preserves_term_without_colorterm() {
+    let fixture = Fixture::new("login-term");
+    let shell = fixture.login_probe_shell();
+    let mut child = fixture.spawn_with_shell(shell.to_str().unwrap());
+    write_credentials(&mut child);
+    let (mut router, _) = fixture.listener.accept().unwrap();
+    router.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let _ = read_local_packet(&mut router).unwrap();
+    fixture.wait_ready();
+    send(
+        &mut router,
+        TerminalPacketType::TerminalInit,
+        &TermInit {
+            environmentnames: Vec::new(),
+            environmentvalues: Vec::new(),
+        },
+    );
+    send(
+        &mut router,
+        TerminalPacketType::TerminalBuffer,
+        &TerminalBuffer {
+            buffer: Some(
+                b"printf 'TERM=%s\nCOLORTERM=%s\n' \"$TERM\" \"${COLORTERM-}\"; exit\n".to_vec(),
+            ),
+        },
+    );
+    let output = collect_until(&mut router, |output| {
+        (contains(output, LOGIN_COLOR_MARKER) || contains(output, NON_LOGIN_MARKER))
+            && contains(output, b"TERM=xterm-256color")
+            && contains(output, b"COLORTERM=")
+    });
+    let _ = child.wait_timeout(TIMEOUT).unwrap();
+    assert!(
+        contains(&output, LOGIN_COLOR_MARKER),
+        "expected ANSI login-shell color marker when SHELL receives -l; got {:?}",
+        String::from_utf8_lossy(&output),
+    );
+    assert!(
+        contains(&output, b"TERM=xterm-256color\r\nCOLORTERM=\r\n"),
+        "TERM=xterm-256color must survive empty TermInit with COLORTERM unset; got {:?}",
+        String::from_utf8_lossy(&output),
+    );
+    assert!(
+        !contains(&output, b"COLORTERM=truecolor"),
+        "COLORTERM must remain unset under empty TermInit; got {:?}",
+        String::from_utf8_lossy(&output),
+    );
 }
 
 fn send<M: Message>(router: &mut impl Write, kind: TerminalPacketType, message: &M) {

@@ -130,6 +130,13 @@ path selects the Windows bootstrap (no `printf`, CRLF lines, `&` separator) and 
 remains the explicit override. The session shell follows `%COMSPEC%`, or `ET_SHELL` if set on the
 server. OpenSSH on Windows must be reachable.
 
+### Connecting from Ghostty
+
+Ghostty identifies itself as `TERM=xterm-ghostty`, but many remote hosts do not have that terminfo
+entry and stock shell profiles may not recognize it as color-capable. ET sends
+`TERM=xterm-256color` for Ghostty clients so remote prompts and applications retain broadly
+supported 256-color behavior. Other terminal types are forwarded unchanged.
+
 ## Feature set
 
 - Protocol v6 handshake, `crypto_secretbox` (XSalsa20-Poly1305) framing, sequence numbers, and

@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use wait_timeout::ChildExt;
 
-use crate::bootstrap::{parse_id_passkey, Credentials, SshInvocation};
+use crate::bootstrap::{
+    parse_id_passkey, parse_shell_probe, Credentials, RemoteShell, SshInvocation,
+};
 use crate::deadline::Deadline;
 use crate::error::ClientError;
 
@@ -154,6 +156,19 @@ pub fn run_checked<R: SshRunner + ?Sized>(
         }
     }
     Ok(output.stdout)
+}
+
+pub fn run_shell_probe<R: SshRunner + ?Sized>(
+    runner: &R,
+    invocation: &SshInvocation,
+    deadline: Deadline,
+) -> Result<RemoteShell, ClientError> {
+    let output = runner.run(invocation, deadline)?;
+    let status = output.status.ok_or(ClientError::SshNonZero(None))?;
+    if status.success() {
+        return parse_shell_probe(&output.stdout);
+    }
+    Err(ClientError::SshNonZero(status.code()))
 }
 
 pub fn run_bootstrap<R: SshRunner + ?Sized>(
@@ -467,6 +482,101 @@ mod tests {
     };
 
     use super::*;
+
+    #[cfg(unix)]
+    fn exit_status(code: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(windows)]
+    fn exit_status(code: i32) -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(code as u32)
+    }
+
+    struct ProbeRunner {
+        status: i32,
+        stdout: &'static [u8],
+    }
+
+    impl SshRunner for ProbeRunner {
+        fn run(
+            &self,
+            _invocation: &SshInvocation,
+            _deadline: Deadline,
+        ) -> Result<SshOutput, ClientError> {
+            Ok(SshOutput {
+                status: Some(exit_status(self.status)),
+                stdout: self.stdout.to_vec(),
+            })
+        }
+    }
+
+    #[test]
+    fn shell_probe_detects_windows_cmd() {
+        let runner = ProbeRunner {
+            status: 0,
+            stdout: b"__ET_COMSPEC__C:\\WINDOWS\\system32\\cmd.exe\r\n",
+        };
+        let invocation = SshInvocation {
+            program: "ssh".into(),
+            args: Vec::new(),
+            operation: "probe",
+        };
+        assert_eq!(
+            run_shell_probe(
+                &runner,
+                &invocation,
+                Deadline::after(Duration::from_secs(1)),
+            )
+            .unwrap(),
+            RemoteShell::Cmd
+        );
+    }
+
+    #[test]
+    fn shell_probe_detects_posix_literal() {
+        let runner = ProbeRunner {
+            status: 0,
+            stdout: b"__ET_COMSPEC__%ComSpec%\n",
+        };
+        let invocation = SshInvocation {
+            program: "ssh".into(),
+            args: Vec::new(),
+            operation: "probe",
+        };
+        assert_eq!(
+            run_shell_probe(
+                &runner,
+                &invocation,
+                Deadline::after(Duration::from_secs(1)),
+            )
+            .unwrap(),
+            RemoteShell::Posix
+        );
+    }
+
+    #[test]
+    fn shell_probe_propagates_ssh_255() {
+        let runner = ProbeRunner {
+            status: 255,
+            stdout: b"",
+        };
+        let invocation = SshInvocation {
+            program: "ssh".into(),
+            args: Vec::new(),
+            operation: "probe",
+        };
+        assert!(matches!(
+            run_shell_probe(
+                &runner,
+                &invocation,
+                Deadline::after(Duration::from_secs(1))
+            ),
+            Err(ClientError::SshNonZero(Some(255)))
+        ));
+    }
 
     #[cfg(target_os = "linux")]
     const EVENT_WAIT_MILLIS: u16 = 1_000;

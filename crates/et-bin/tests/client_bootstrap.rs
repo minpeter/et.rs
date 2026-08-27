@@ -60,6 +60,14 @@ if [ "$1" = "-G" ]; then
   printf "%s" "$ET_FAKE_CONFIG"
   exit 0
 fi
+last=
+for arg in "$@"; do last=$arg; done
+case "$last" in
+  *"__ET_COMSPEC__"*)
+    printf "%s" "$ET_FAKE_PROBE_STDOUT"
+    exit "$ET_FAKE_PROBE_EXIT"
+    ;;
+esac
 /bin/cat > "$ET_FAKE_STDIN"
 printf "%s" "$ET_FAKE_STDOUT"
 printf "%s" "$ET_FAKE_STDERR" >&2
@@ -84,6 +92,8 @@ exit "$ET_FAKE_EXIT"
             .env("ET_FAKE_STDOUT", stdout)
             .env("ET_FAKE_STDERR", stderr)
             .env("ET_FAKE_EXIT", exit.to_string())
+            .env("ET_FAKE_PROBE_STDOUT", "__ET_COMSPEC__%ComSpec%\n")
+            .env("ET_FAKE_PROBE_EXIT", "0")
             .stdin(Stdio::null());
         command
     }
@@ -167,12 +177,13 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
     assert!(fs::read(&fake.stdin).unwrap().is_empty());
 
     let invocations = fake.invocations();
-    assert_eq!(invocations.len(), 2);
+    assert_eq!(invocations.len(), 3);
     assert_eq!(
         invocations[0],
         ["-G", "-oStrictHostKeyChecking=no", "test-user@server-alias"]
     );
-    let argv = &invocations[1];
+    assert!(invocations[1].last().unwrap().contains("__ET_COMSPEC__"));
+    let argv = &invocations[2];
     assert_eq!(
         &argv[..2],
         ["test-user@server-alias", "-oStrictHostKeyChecking=no"]
@@ -190,6 +201,50 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
             "printf '%s\\n' '{provisional}_xterm-test' | '/opt/et terminal' '--verbose=2' '--serverfifo=/tmp/server fifo'"
         )
     );
+}
+
+#[test]
+fn bare_windows_login_shell_is_detected_before_bootstrap() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        bound(&stream);
+        assert_eq!(read_request(&mut stream).unwrap().version, Some(6));
+        write_response(&mut stream, &response_status(ConnectStatus::NewClient)).unwrap();
+        let key = passkey_to_key(SERVER_KEY).unwrap();
+        let mut connection = Connection::new_server(stream, &key);
+        let packet = connection.read_packet().unwrap();
+        assert_eq!(packet.header(), EtPacketType::InitialPayload as u8);
+        connection
+            .write_packet(
+                EtPacketType::InitialResponse as u8,
+                &InitialResponse { error: None }.encode_to_vec(),
+            )
+            .unwrap();
+    });
+
+    let fake = FakeSsh::new();
+    let output = fake
+        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
+        .env(
+            "ET_FAKE_PROBE_STDOUT",
+            "__ET_COMSPEC__C:\\WINDOWS\\system32\\cmd.exe\r\n",
+        )
+        .env("ET_FAKE_PROBE_EXIT", "0")
+        .args(["-N".to_owned(), address.to_string()])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let invocations = fake.invocations();
+    assert_eq!(invocations.len(), 3, "{invocations:?}");
+    assert!(invocations[1].last().unwrap().contains("__ET_COMSPEC__"));
+    let bootstrap = invocations[2].last().unwrap();
+    assert!(bootstrap.starts_with("echo "), "{bootstrap}");
+    assert!(bootstrap.contains("\"et.exe\""), "{bootstrap}");
+    assert!(!bootstrap.contains("printf"), "{bootstrap}");
 }
 
 #[test]
@@ -384,10 +439,12 @@ fn jumphost_starts_a_jump_terminal_and_connects_to_the_jumphost() {
     assert!(output.status.success(), "{}", stderr(&output));
 
     let invocations = fake.invocations();
-    // -G dst, dst bootstrap through -J, -G jumphost, jump bootstrap.
-    assert_eq!(invocations.len(), 4, "{invocations:?}");
+    // -G dst, login-shell probe, dst bootstrap through -J, -G jumphost,
+    // jump bootstrap.
+    assert_eq!(invocations.len(), 5, "{invocations:?}");
     assert_eq!(invocations[0], ["-G", "test-user@server-alias"]);
-    let destination = &invocations[1];
+    assert!(invocations[1].last().unwrap().contains("__ET_COMSPEC__"));
+    let destination = &invocations[2];
     assert_eq!(destination[0], "-J");
     assert_eq!(destination[1], "jump.example");
     assert_eq!(destination[2], "test-user@server-alias");
@@ -396,8 +453,8 @@ fn jumphost_starts_a_jump_terminal_and_connects_to_the_jumphost() {
         "remote command missing: {:?}",
         destination[3]
     );
-    assert_eq!(invocations[2], ["-G", "jump.example"]);
-    let jump = &invocations[3];
+    assert_eq!(invocations[3], ["-G", "jump.example"]);
+    let jump = &invocations[4];
     assert_eq!(jump[0], "jump.example");
     // The jump terminal receives the relay destination and its own fifo.
     assert!(jump[1].contains("'--jump'"), "{:?}", jump[1]);

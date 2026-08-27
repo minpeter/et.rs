@@ -51,6 +51,13 @@ fn resolve_remote_mode(args: &ClientArgs, detected_shell: Option<RemoteShell>) -
     }
 }
 
+fn normalize_terminal_type(term: Option<&str>) -> String {
+    match term {
+        None | Some("xterm-ghostty") => "xterm-256color".to_owned(),
+        Some(term) => term.to_owned(),
+    }
+}
+
 pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
     let mut parsed = ClientArgs::try_parse_from(
         ["et"]
@@ -102,7 +109,8 @@ fn run_client(
     )?;
     let user = requested_user.or(resolved.user);
     validate_ssh_destination(&destination.host, user.as_deref())?;
-    let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
+    let local_term = std::env::var("TERM").ok();
+    let term = normalize_terminal_type(local_term.as_deref());
     let probe_request = BootstrapRequest {
         user: user.clone(),
         host_alias: destination.host.clone(),
@@ -648,5 +656,23 @@ mod tests {
                 terminal_path: None,
             }
         );
+    }
+
+    #[test]
+    fn ghostty_term_uses_compatible_remote_fallback() {
+        assert_eq!(normalize_terminal_type(None), "xterm-256color");
+        assert_eq!(
+            normalize_terminal_type(Some("xterm-ghostty")),
+            "xterm-256color"
+        );
+        for term in [
+            "xterm-256color",
+            "screen-256color",
+            "linux",
+            "xterm-kitty",
+            "arbitrary-term",
+        ] {
+            assert_eq!(normalize_terminal_type(Some(term)), term);
+        }
     }
 }

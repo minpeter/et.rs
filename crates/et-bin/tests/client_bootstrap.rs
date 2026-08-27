@@ -227,6 +227,7 @@ fn bare_windows_login_shell_is_detected_before_bootstrap() {
     let fake = FakeSsh::new();
     let output = fake
         .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
+        .env("TERM", "xterm-ghostty")
         .env(
             "ET_FAKE_PROBE_STDOUT",
             "__ET_COMSPEC__C:\\WINDOWS\\system32\\cmd.exe\r\n",
@@ -244,6 +245,8 @@ fn bare_windows_login_shell_is_detected_before_bootstrap() {
     let bootstrap = invocations[2].last().unwrap();
     assert!(bootstrap.starts_with("echo "), "{bootstrap}");
     assert!(bootstrap.contains("\"et.exe\""), "{bootstrap}");
+    assert!(bootstrap.contains("_xterm-256color|"), "{bootstrap}");
+    assert!(!bootstrap.contains("_xterm-ghostty"), "{bootstrap}");
     assert!(!bootstrap.contains("printf"), "{bootstrap}");
 }
 
@@ -271,7 +274,7 @@ fn explicit_posix_shell_skips_probe_and_uses_exact_posix_bootstrap() {
     let fake = FakeSsh::new();
     let output = fake
         .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
-        .env("TERM", "xterm-256color")
+        .env("TERM", "xterm-ghostty")
         .env(
             "ET_FAKE_PROBE_STDOUT",
             "__ET_COMSPEC__C:\\WINDOWS\\system32\\cmd.exe\r\n",
@@ -479,6 +482,7 @@ fn jumphost_starts_a_jump_terminal_and_connects_to_the_jumphost() {
     let fake = FakeSsh::new();
     let output = fake
         .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
+        .env("TERM", "xterm-ghostty")
         .env(
             "ET_FAKE_PROBE_STDOUT",
             "__ET_COMSPEC__C:\\WINDOWS\\system32\\cmd.exe\r\n",
@@ -513,12 +517,24 @@ fn jumphost_starts_a_jump_terminal_and_connects_to_the_jumphost() {
         "{:?}",
         destination[3]
     );
+    assert!(
+        destination[3].contains("_xterm-256color|"),
+        "{:?}",
+        destination[3]
+    );
+    assert!(
+        !destination[3].contains("_xterm-ghostty"),
+        "{:?}",
+        destination[3]
+    );
     assert_eq!(invocations[3], ["-G", "jump.example"]);
     let jump = &invocations[4];
     assert_eq!(jump[0], "jump.example");
     // The jumphost remains POSIX even when the destination probe selects Cmd.
     assert!(jump[1].contains("'etterminal'"), "{:?}", jump[1]);
     assert!(!jump[1].contains("et.exe"), "{:?}", jump[1]);
+    assert!(jump[1].contains("_xterm-256color'"), "{:?}", jump[1]);
+    assert!(!jump[1].contains("_xterm-ghostty"), "{:?}", jump[1]);
     assert!(jump[1].contains("'--jump'"), "{:?}", jump[1]);
     assert!(jump[1].contains("'--dsthost=127.0.0.1'"), "{:?}", jump[1]);
     assert!(jump[1].contains("'--dstport=2022'"), "{:?}", jump[1]);

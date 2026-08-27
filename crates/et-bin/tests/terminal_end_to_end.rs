@@ -15,7 +15,7 @@ use wait_timeout::ChildExt;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 #[test]
-fn real_client_bootstrap_server_bridge_and_pty_execute_command() {
+fn real_client_ghostty_fallback_bootstrap_server_bridge_and_pty_emit_color() {
     let directory = std::env::temp_dir().join(format!("et-rs-terminal-e2e-{}", std::process::id()));
     let _ = fs::remove_dir_all(&directory);
     fs::create_dir(&directory).unwrap();
@@ -60,14 +60,18 @@ fn real_client_bootstrap_server_bridge_and_pty_execute_command() {
     let existing_path = std::env::var("PATH").unwrap();
     let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
         .env("PATH", format!("{}:{existing_path}", directory.display()))
-        .env("TERM", "xterm-256color")
+        .env("TERM", "xterm-ghostty")
         .args(["--terminal-path"])
         .arg(&terminal)
         .args(["--serverfifo"])
         .arg(&router)
         .arg("-p")
         .arg(port.to_string())
-        .args(["-c", "printf 'FULL-PTY:%s\\n' \"$TERM\"", "127.0.0.1"])
+        .args([
+            "-c",
+            "case \"$TERM\" in xterm-color|*-256color) printf '\\033[01;32mGHOSTTY-GREEN\\033[00m:\\033[01;34mGHOSTTY-BLUE\\033[00m\\n';; esac; printf 'FULL-PTY:%s\\n' \"$TERM\"",
+            "127.0.0.1",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -91,6 +95,14 @@ fn real_client_bootstrap_server_bridge_and_pty_execute_command() {
     assert!(status.success(), "{stderr_text}");
     assert!(
         stdout_text.contains("FULL-PTY:xterm-256color"),
+        "{stdout_text:?}"
+    );
+    assert!(
+        stdout_text.contains("\u{1b}[01;32mGHOSTTY-GREEN\u{1b}[00m"),
+        "{stdout_text:?}"
+    );
+    assert!(
+        stdout_text.contains("\u{1b}[01;34mGHOSTTY-BLUE\u{1b}[00m"),
         "{stdout_text:?}"
     );
 

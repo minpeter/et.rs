@@ -244,8 +244,7 @@ fn real_terminal_login_shell_preserves_term_without_colorterm() {
     );
     let output = collect_until(&mut router, |output| {
         (contains(output, LOGIN_COLOR_MARKER) || contains(output, NON_LOGIN_MARKER))
-            && contains(output, b"TERM=xterm-256color")
-            && contains(output, b"COLORTERM=")
+            && contains(output, b"TERM=xterm-256color\r\nCOLORTERM=\r\n")
     });
     let _ = child.wait_timeout(TIMEOUT).unwrap();
     assert!(

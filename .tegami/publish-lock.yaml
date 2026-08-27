@@ -1,9 +1,13 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Port EternalTerminal #784 pre-auth / LPE fixes\n\nHandshake protos are now capped at 4 KiB (was 64 KiB), matching ET\n`MAX_HANDSHAKE_PROTO_LENGTH`. Length-prefixed reads enforce both an idle\ngap and an absolute deadline so a slow trickle cannot reset the timer\nforever. Failed reconnect recover no longer disconnects the live victim\nsession before recover succeeds. When `etserver` is root, UNIX listen and\nconnect on client-chosen paths drop to the session user (helper +\n`SCM_RIGHTS`) instead of unlink/bind/chown/connect as root. Reconnect\npasskey-before-recover is still omitted: that needs a `PROTOCOL_VERSION`\nbump.\n"
-    filename: et-784-preauth-lpe.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Restore colorful shell startup in ET sessions\n\nUnix ET sessions now start the user's shell as a login shell, matching SSH,\nupstream EternalTerminal, and ET's own headless terminal multiplexer. This\nrestores profile-provided prompts, aliases, `dircolors`, and other color setup\nthat was skipped when ET launched an interactive non-login shell.\n\nNative Windows terminal startup, protocol-v6 bytes, and reconnect behavior are\nunchanged.\n"
+    filename: fix-terminal-login-colors.md
+    v: 0.0.0
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Auto-detect Windows OpenSSH bootstrap\n\nBare `et user@windows-host` connections now probe the login shell without\nincluding session credentials. Expanded `%ComSpec%` selects the existing\nCmd-compatible bootstrap and `et.exe` terminal path automatically, while\nPOSIX hosts preserve their existing bootstrap.\n\nExplicit `--winserver` and `--remote-shell` overrides remain authoritative.\nPowerShell sessions now pass `ET_SHELL=powershell.exe` only to the remote\n`etterminal` process.\n"
+    filename: fix-windows-bootstrap-autodetect.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - et-784-preauth-lpe.md
+      - fix-terminal-login-colors.md
+      - fix-windows-bootstrap-autodetect.md
     id: cargo:et
     updated: true

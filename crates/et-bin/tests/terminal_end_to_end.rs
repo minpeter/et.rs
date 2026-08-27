@@ -22,6 +22,8 @@ fn real_client_ghostty_fallback_bootstrap_server_bridge_and_pty_emit_color() {
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
     let router = directory.join("router.sock");
     let config = directory.join("et.cfg");
+    let home = directory.join("home");
+    fs::create_dir(&home).unwrap();
     let reserved = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = reserved.local_addr().unwrap().port();
     drop(reserved);
@@ -34,6 +36,8 @@ fn real_client_ghostty_fallback_bootstrap_server_bridge_and_pty_emit_color() {
     )
     .unwrap();
     let mut server = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env_remove("COLORTERM")
+        .env("HOME", &home)
         .args(["server", "--cfgfile"])
         .arg(&config)
         .stdout(Stdio::piped())
@@ -51,6 +55,7 @@ fn real_client_ghostty_fallback_bootstrap_server_bridge_and_pty_emit_color() {
            exit 0\n\
          fi\n\
          for last do :; done\n\
+         unset COLORTERM\n\
          exec /bin/sh -c \"$last\"\n",
     )
     .unwrap();
@@ -60,7 +65,9 @@ fn real_client_ghostty_fallback_bootstrap_server_bridge_and_pty_emit_color() {
     let existing_path = std::env::var("PATH").unwrap();
     let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
         .env("PATH", format!("{}:{existing_path}", directory.display()))
+        .env("HOME", &home)
         .env("TERM", "xterm-ghostty")
+        .env("COLORTERM", "truecolor")
         .args(["--terminal-path"])
         .arg(&terminal)
         .args(["--serverfifo"])
@@ -69,7 +76,7 @@ fn real_client_ghostty_fallback_bootstrap_server_bridge_and_pty_emit_color() {
         .arg(port.to_string())
         .args([
             "-c",
-            "case \"$TERM\" in xterm-color|*-256color) printf '\\033[01;32mGHOSTTY-GREEN\\033[00m:\\033[01;34mGHOSTTY-BLUE\\033[00m\\n';; esac; printf 'FULL-PTY:%s\\n' \"$TERM\"",
+            "case \"$TERM\" in xterm-color|*-256color) printf '\\033[01;32mGHOSTTY-GREEN\\033[00m:\\033[01;34mGHOSTTY-BLUE\\033[00m\\n';; esac; printf 'FULL-PTY:%s:%s\\n' \"$TERM\" \"${COLORTERM-}\"",
             "127.0.0.1",
         ])
         .stdin(Stdio::null())
@@ -94,7 +101,7 @@ fn real_client_ghostty_fallback_bootstrap_server_bridge_and_pty_emit_color() {
     stderr.read_to_string(&mut stderr_text).unwrap();
     assert!(status.success(), "{stderr_text}");
     assert!(
-        stdout_text.contains("FULL-PTY:xterm-256color"),
+        stdout_text.contains("FULL-PTY:xterm-256color:truecolor"),
         "{stdout_text:?}"
     );
     assert!(

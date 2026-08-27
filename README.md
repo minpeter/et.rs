@@ -135,7 +135,9 @@ server. OpenSSH on Windows must be reachable.
 Ghostty identifies itself as `TERM=xterm-ghostty`, but many remote hosts do not have that terminfo
 entry and stock shell profiles may not recognize it as color-capable. ET sends
 `TERM=xterm-256color` for Ghostty clients so remote prompts and applications retain broadly
-supported 256-color behavior. Other terminal types are forwarded unchanged.
+supported 256-color behavior. Ghostty's standard `COLORTERM=truecolor` hint is also forwarded to
+POSIX sessions so applications that use it for 24-bit color detection do not downgrade. Other
+terminal types are forwarded unchanged.
 
 ## Feature set
 

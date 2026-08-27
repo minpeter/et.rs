@@ -58,6 +58,13 @@ fn normalize_terminal_type(term: Option<&str>) -> String {
     }
 }
 
+fn ghostty_colorterm<'a>(term: Option<&str>, colorterm: Option<&'a str>) -> Option<&'a str> {
+    match (term, colorterm) {
+        (Some("xterm-ghostty"), Some(value @ ("truecolor" | "24bit"))) => Some(value),
+        _ => None,
+    }
+}
+
 pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
     let mut parsed = ClientArgs::try_parse_from(
         ["et"]
@@ -110,7 +117,9 @@ fn run_client(
     let user = requested_user.or(resolved.user);
     validate_ssh_destination(&destination.host, user.as_deref())?;
     let local_term = std::env::var("TERM").ok();
+    let local_colorterm = std::env::var("COLORTERM").ok();
     let term = normalize_terminal_type(local_term.as_deref());
+    let colorterm = ghostty_colorterm(local_term.as_deref(), local_colorterm.as_deref());
     let probe_request = BootstrapRequest {
         user: user.clone(),
         host_alias: destination.host.clone(),
@@ -205,6 +214,13 @@ fn run_client(
         // The jumphost etserver dispatches on this flag and hands the payload
         // to the jump terminal instead of starting a shell.
         initial_payload.jumphost = Some(true);
+    }
+    if remote_mode.terminal_shell == RemoteShellKind::Posix {
+        if let Some(value) = colorterm {
+            initial_payload
+                .environmentvariables
+                .insert("COLORTERM".to_owned(), value.to_owned());
+        }
     }
     et_cli::logging::info(format!("Connecting to {endpoint}"));
     let connection = connect_initial(
@@ -674,5 +690,26 @@ mod tests {
         ] {
             assert_eq!(normalize_terminal_type(Some(term)), term);
         }
+    }
+
+    #[test]
+    fn ghostty_truecolor_hint_is_forwarded_only_for_known_values() {
+        assert_eq!(
+            ghostty_colorterm(Some("xterm-ghostty"), Some("truecolor")),
+            Some("truecolor")
+        );
+        assert_eq!(
+            ghostty_colorterm(Some("xterm-ghostty"), Some("24bit")),
+            Some("24bit")
+        );
+        assert_eq!(
+            ghostty_colorterm(Some("xterm-ghostty"), Some("unexpected")),
+            None
+        );
+        assert_eq!(
+            ghostty_colorterm(Some("xterm-256color"), Some("truecolor")),
+            None
+        );
+        assert_eq!(ghostty_colorterm(Some("xterm-ghostty"), None), None);
     }
 }

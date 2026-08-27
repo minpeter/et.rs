@@ -1,13 +1,3 @@
-## Unreleased
-
-### Auto-detect Windows OpenSSH bootstrap
-
-Bare `et user@windows-host` connections now probe the login shell without
-session credentials. Expanded `%ComSpec%` selects the existing `cmd.exe`
-bootstrap and `et.exe` terminal path automatically; POSIX hosts retain their
-existing bootstrap. Explicit `--winserver` and `--remote-shell` overrides keep
-their prior behavior.
-
 ## et@0.0.13
 
 ### Port EternalTerminal #784 pre-auth / LPE fixes

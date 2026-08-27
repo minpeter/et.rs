@@ -1,13 +1,9 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Restore colorful shell startup in ET sessions\n\nUnix ET sessions now start the user's shell as a login shell, matching SSH,\nupstream EternalTerminal, and ET's own headless terminal multiplexer. This\nrestores profile-provided prompts, aliases, `dircolors`, and other color setup\nthat was skipped when ET launched an interactive non-login shell.\n\nNative Windows terminal startup, protocol-v6 bytes, and reconnect behavior are\nunchanged.\n"
-    filename: fix-terminal-login-colors.md
-    v: 0.0.0
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Auto-detect Windows OpenSSH bootstrap\n\nBare `et user@windows-host` connections now probe the login shell without\nincluding session credentials. Expanded `%ComSpec%` selects the existing\nCmd-compatible bootstrap and `et.exe` terminal path automatically, while\nPOSIX hosts preserve their existing bootstrap.\n\nExplicit `--winserver` and `--remote-shell` overrides remain authoritative.\nPowerShell sessions now pass `ET_SHELL=powershell.exe` only to the remote\n`etterminal` process.\n"
-    filename: fix-windows-bootstrap-autodetect.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Stabilize remote shell detection\n\nRemote shell probing now ignores sentinel text embedded in banner lines,\nfinishes as soon as a complete valid sentinel line arrives, and preserves a\nnonzero SSH exit status observed before that line.\n\nExplicit `--remote-shell` choices remain authoritative, and Windows\ndestinations no longer pass their `et.exe` default to POSIX jumphosts.\n"
+    filename: fix-shell-probe-completion.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - fix-terminal-login-colors.md
-      - fix-windows-bootstrap-autodetect.md
+      - fix-shell-probe-completion.md
     id: cargo:et
     updated: true

@@ -116,7 +116,7 @@ fn run_client(
         remote_shell: RemoteShell::Posix,
         session_shell: None,
     };
-    let detected_shell = if args.remote_is_windows() {
+    let detected_shell = if args.remote_shell.is_some() || args.winserver {
         None
     } else {
         let probe = build_shell_probe(&probe_request);
@@ -182,7 +182,7 @@ fn run_client(
             destination_host: endpoint.host.clone(),
             destination_port: endpoint.port,
             jump_server_fifo: args.jserverfifo.clone(),
-            terminal_path: remote_mode.terminal_path.clone(),
+            terminal_path: args.terminal_path.clone(),
             kill_other_sessions: args.kill_other_sessions,
             verbose: args.verbose,
             ssh_options: args.ssh_option.clone(),

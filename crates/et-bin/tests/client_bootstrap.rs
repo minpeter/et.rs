@@ -248,6 +248,61 @@ fn bare_windows_login_shell_is_detected_before_bootstrap() {
 }
 
 #[test]
+fn explicit_posix_shell_skips_probe_and_uses_exact_posix_bootstrap() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        bound(&stream);
+        assert_eq!(read_request(&mut stream).unwrap().version, Some(6));
+        write_response(&mut stream, &response_status(ConnectStatus::NewClient)).unwrap();
+        let key = passkey_to_key(SERVER_KEY).unwrap();
+        let mut connection = Connection::new_server(stream, &key);
+        let packet = connection.read_packet().unwrap();
+        assert_eq!(packet.header(), EtPacketType::InitialPayload as u8);
+        connection
+            .write_packet(
+                EtPacketType::InitialResponse as u8,
+                &InitialResponse { error: None }.encode_to_vec(),
+            )
+            .unwrap();
+    });
+
+    let fake = FakeSsh::new();
+    let output = fake
+        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
+        .env("TERM", "xterm-256color")
+        .env(
+            "ET_FAKE_PROBE_STDOUT",
+            "__ET_COMSPEC__C:\\WINDOWS\\system32\\cmd.exe\r\n",
+        )
+        .args([
+            "-N".to_owned(),
+            "--remote-shell=posix".to_owned(),
+            address.to_string(),
+        ])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let invocations = fake.invocations();
+    assert_eq!(invocations.len(), 2, "{invocations:?}");
+    assert_eq!(invocations[0], ["-G", "127.0.0.1"]);
+    let bootstrap = &invocations[1];
+    assert_eq!(bootstrap[0], "config-user@127.0.0.1");
+    let input = bootstrap[1]
+        .strip_prefix("printf '%s\\n' '")
+        .unwrap()
+        .strip_suffix("_xterm-256color' | 'etterminal' '--verbose=0'")
+        .unwrap();
+    let (id, passkey) = parse_id_passkey(input).unwrap();
+    assert!(id.starts_with("XXX"));
+    assert_eq!(id.len(), 16);
+    assert_eq!(passkey.len(), 32);
+}
+
+#[test]
 fn ssh_process_failures_are_typed() {
     let no_ssh = TestDir::new("no-ssh");
     let output = Command::new(env!("CARGO_BIN_EXE_et"))
@@ -424,6 +479,10 @@ fn jumphost_starts_a_jump_terminal_and_connects_to_the_jumphost() {
     let fake = FakeSsh::new();
     let output = fake
         .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
+        .env(
+            "ET_FAKE_PROBE_STDOUT",
+            "__ET_COMSPEC__C:\\WINDOWS\\system32\\cmd.exe\r\n",
+        )
         .args([
             "-N",
             "--jumphost",
@@ -448,15 +507,18 @@ fn jumphost_starts_a_jump_terminal_and_connects_to_the_jumphost() {
     assert_eq!(destination[0], "-J");
     assert_eq!(destination[1], "jump.example");
     assert_eq!(destination[2], "test-user@server-alias");
+    assert!(destination[3].starts_with("echo "), "{:?}", destination[3]);
     assert!(
-        destination[3].contains("etterminal") || destination[3].starts_with("printf"),
-        "remote command missing: {:?}",
+        destination[3].contains("\"et.exe\""),
+        "{:?}",
         destination[3]
     );
     assert_eq!(invocations[3], ["-G", "jump.example"]);
     let jump = &invocations[4];
     assert_eq!(jump[0], "jump.example");
-    // The jump terminal receives the relay destination and its own fifo.
+    // The jumphost remains POSIX even when the destination probe selects Cmd.
+    assert!(jump[1].contains("'etterminal'"), "{:?}", jump[1]);
+    assert!(!jump[1].contains("et.exe"), "{:?}", jump[1]);
     assert!(jump[1].contains("'--jump'"), "{:?}", jump[1]);
     assert!(jump[1].contains("'--dsthost=127.0.0.1'"), "{:?}", jump[1]);
     assert!(jump[1].contains("'--dstport=2022'"), "{:?}", jump[1]);

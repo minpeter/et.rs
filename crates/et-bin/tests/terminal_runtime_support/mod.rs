@@ -1,14 +1,21 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use et_core::proto::TerminalBuffer;
+use et_net::local_packet::read_local_packet;
+use prost::Message;
+
 const ID: &str = "abcdefghijklmnop";
 const KEY: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
 const TIMEOUT: Duration = Duration::from_secs(5);
+
+pub const LOGIN_COLOR_MARKER: &[u8] = b"\x1b[31mET-LOGIN-COLOR\x1b[0m";
+pub const NON_LOGIN_MARKER: &[u8] = b"ET-NON-LOGIN";
 
 pub struct Fixture {
     directory: std::path::PathBuf,
@@ -53,11 +60,31 @@ impl Fixture {
             ])
             .arg(&self.socket)
             .env("SHELL", shell)
+            .env_remove("COLORTERM")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap()
+    }
+
+    /// Wrapper that emits an ANSI palette color marker only when argv[1] is `-l`.
+    pub fn login_probe_shell(&self) -> std::path::PathBuf {
+        let path = self.directory.join("login-probe-shell");
+        fs::write(
+            &path,
+            "#!/bin/sh\n\
+             if [ \"${1-}\" = \"-l\" ]; then\n\
+             printf '\\033[31mET-LOGIN-COLOR\\033[0m\\n'\n\
+             shift\n\
+             exec /bin/sh \"$@\"\n\
+             fi\n\
+             printf 'ET-NON-LOGIN\\n'\n\
+             exec /bin/sh \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
     }
 
     pub fn spawn_parent(&self) -> std::process::Child {
@@ -106,4 +133,22 @@ pub fn read_line_timeout(stdout: impl std::io::Read + Send + 'static) -> String 
         let _ = sender.send(result);
     });
     receiver.recv_timeout(TIMEOUT).unwrap().unwrap()
+}
+
+pub fn contains(output: &[u8], marker: &[u8]) -> bool {
+    output.windows(marker.len()).any(|window| window == marker)
+}
+
+pub fn collect_until(router: &mut impl Read, done: impl Fn(&[u8]) -> bool) -> Vec<u8> {
+    let mut output = Vec::new();
+    while !done(&output) {
+        let packet = read_local_packet(router).unwrap();
+        output.extend(
+            TerminalBuffer::decode(packet.payload())
+                .unwrap()
+                .buffer
+                .unwrap(),
+        );
+    }
+    output
 }

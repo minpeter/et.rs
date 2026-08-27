@@ -2,13 +2,13 @@ use std::ffi::OsString;
 use std::time::Duration;
 
 use clap::Parser;
-use et_cli::client::ClientArgs;
+use et_cli::client::{ClientArgs, RemoteShellKind};
 use et_cli::host::parse_positional_host;
 
 use et_net::connection::Connection;
 
 use crate::bootstrap::{
-    build_invocation, build_jump_invocation, cmd_safe, provisional_credentials,
+    build_invocation, build_jump_invocation, build_shell_probe, cmd_safe, provisional_credentials,
     validate_ssh_destination, BootstrapRequest, Credentials, JumpBootstrapRequest, RemoteShell,
 };
 use crate::deadline::Deadline;
@@ -16,10 +16,40 @@ use crate::error::ClientError;
 use crate::initial_connect::{connect_initial, reconnect, Endpoint, ReconnectOutcome};
 use crate::resolver::{EndpointResolver, SystemResolver};
 use crate::ssh_config::resolve_ssh_config;
-use crate::ssh_process::{run_bootstrap, SshRunner, SystemSsh};
+use crate::ssh_process::{run_bootstrap, run_shell_probe, SshRunner, SystemSsh};
 
 const RECONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteMode {
+    bootstrap_shell: RemoteShell,
+    terminal_shell: RemoteShellKind,
+    terminal_path: Option<String>,
+}
+
+fn resolve_remote_mode(args: &ClientArgs, detected_shell: Option<RemoteShell>) -> RemoteMode {
+    let bootstrap_shell = if args.remote_is_windows() {
+        RemoteShell::Cmd
+    } else {
+        detected_shell.unwrap_or(RemoteShell::Posix)
+    };
+    let terminal_shell = if args.remote_shell.is_some() || args.winserver {
+        args.effective_remote_shell()
+    } else {
+        match bootstrap_shell {
+            RemoteShell::Posix => RemoteShellKind::Posix,
+            RemoteShell::Cmd => RemoteShellKind::Cmd,
+        }
+    };
+    RemoteMode {
+        bootstrap_shell,
+        terminal_shell,
+        terminal_path: args
+            .effective_terminal_path()
+            .or_else(|| (bootstrap_shell == RemoteShell::Cmd).then(|| "et.exe".to_owned())),
+    }
+}
 
 pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
     let mut parsed = ClientArgs::try_parse_from(
@@ -53,7 +83,6 @@ fn run_client(
 ) -> Result<(), ClientError> {
     let destination = parse_positional_host(&args.host, args.port)?;
     validate_bootstrap_mode(args)?;
-    let provisional = provisional_credentials()?;
     let forward_config =
         crate::forward_config::build(args, std::env::var("SSH_AUTH_SOCK").ok().as_deref())?;
     let has_forwarding = !forward_config.local_sources.is_empty()
@@ -73,25 +102,44 @@ fn run_client(
     )?;
     let user = requested_user.or(resolved.user);
     validate_ssh_destination(&destination.host, user.as_deref())?;
-
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
+    let probe_request = BootstrapRequest {
+        user: user.clone(),
+        host_alias: destination.host.clone(),
+        jumphost: args.jumphost.clone(),
+        terminal_path: None,
+        server_fifo: None,
+        kill_other_sessions: false,
+        verbose: args.verbose,
+        ssh_options: args.ssh_option.clone(),
+        term: term.clone(),
+        remote_shell: RemoteShell::Posix,
+        session_shell: None,
+    };
+    let detected_shell = if args.remote_is_windows() {
+        None
+    } else {
+        let probe = build_shell_probe(&probe_request);
+        Some(run_shell_probe(runner, &probe, deadline)?)
+    };
+    let remote_mode = resolve_remote_mode(args, detected_shell);
+    let provisional = provisional_credentials()?;
+
     let request = BootstrapRequest {
         user,
         host_alias: destination.host,
         jumphost: args.jumphost.clone(),
-        terminal_path: args.effective_terminal_path(),
+        terminal_path: remote_mode.terminal_path.clone(),
         server_fifo: args.serverfifo.clone(),
         kill_other_sessions: args.kill_other_sessions,
         verbose: args.verbose,
         ssh_options: args.ssh_option.clone(),
         term,
-        remote_shell: if args.remote_is_windows() {
-            RemoteShell::Cmd
-        } else {
-            RemoteShell::Posix
-        },
+        remote_shell: remote_mode.bootstrap_shell,
+        session_shell: (remote_mode.terminal_shell == RemoteShellKind::Powershell)
+            .then(|| "powershell.exe".to_owned()),
     };
-    if args.remote_is_windows() {
+    if remote_mode.bootstrap_shell == RemoteShell::Cmd {
         // cmd.exe cannot quote the credential line, so anything unusual in
         // TERM or the paths must be rejected before it reaches the remote.
         for value in [
@@ -134,7 +182,7 @@ fn run_client(
             destination_host: endpoint.host.clone(),
             destination_port: endpoint.port,
             jump_server_fifo: args.jserverfifo.clone(),
-            terminal_path: args.effective_terminal_path(),
+            terminal_path: remote_mode.terminal_path.clone(),
             kill_other_sessions: args.kill_other_sessions,
             verbose: args.verbose,
             ssh_options: args.ssh_option.clone(),
@@ -171,7 +219,7 @@ fn run_client(
             no_exit: args.no_exit,
             keepalive: args.keepalive,
             terminal_enabled: !args.no_terminal,
-            lines: crate::client_terminal::RemoteLines::from(args.effective_remote_shell()),
+            lines: crate::client_terminal::RemoteLines::from(remote_mode.terminal_shell),
         },
         forwarder,
         |connection| reconnect_with_retry(connection, &endpoint, &credentials, resolver),
@@ -521,6 +569,7 @@ mod tests {
             ssh_options: vec!["Compression=yes".to_owned()],
             term: "xterm".to_owned(),
             remote_shell: RemoteShell::Posix,
+            session_shell: None,
         };
         let credentials = Credentials {
             id: "abcdefghijklmnop".to_owned(),
@@ -532,6 +581,72 @@ mod tests {
         assert_eq!(
             message,
             "starting SSH bootstrap host=host.example options=1"
+        );
+    }
+
+    #[test]
+    fn remote_mode_refactor_preserves_bare_posix_defaults() {
+        let args = ClientArgs::try_parse_from(["et", "host"]).unwrap();
+        assert_eq!(
+            resolve_remote_mode(&args, None),
+            RemoteMode {
+                bootstrap_shell: RemoteShell::Posix,
+                terminal_shell: RemoteShellKind::Posix,
+                terminal_path: None,
+            }
+        );
+    }
+
+    #[test]
+    fn remote_mode_refactor_preserves_explicit_windows_defaults() {
+        let args = ClientArgs::try_parse_from(["et", "host", "--winserver"]).unwrap();
+        assert_eq!(
+            resolve_remote_mode(&args, Some(RemoteShell::Posix)),
+            RemoteMode {
+                bootstrap_shell: RemoteShell::Cmd,
+                terminal_shell: RemoteShellKind::Cmd,
+                terminal_path: Some("et.exe".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_powershell_preserves_terminal_override() {
+        let args =
+            ClientArgs::try_parse_from(["et", "host", "--remote-shell", "powershell"]).unwrap();
+        assert_eq!(
+            resolve_remote_mode(&args, Some(RemoteShell::Posix)),
+            RemoteMode {
+                bootstrap_shell: RemoteShell::Cmd,
+                terminal_shell: RemoteShellKind::Powershell,
+                terminal_path: Some("et.exe".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn bare_detected_windows_uses_cmd_defaults() {
+        let args = ClientArgs::try_parse_from(["et", "host"]).unwrap();
+        assert_eq!(
+            resolve_remote_mode(&args, Some(RemoteShell::Cmd)),
+            RemoteMode {
+                bootstrap_shell: RemoteShell::Cmd,
+                terminal_shell: RemoteShellKind::Cmd,
+                terminal_path: Some("et.exe".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn bare_detected_posix_preserves_posix_defaults() {
+        let args = ClientArgs::try_parse_from(["et", "host"]).unwrap();
+        assert_eq!(
+            resolve_remote_mode(&args, Some(RemoteShell::Posix)),
+            RemoteMode {
+                bootstrap_shell: RemoteShell::Posix,
+                terminal_shell: RemoteShellKind::Posix,
+                terminal_path: None,
+            }
         );
     }
 }

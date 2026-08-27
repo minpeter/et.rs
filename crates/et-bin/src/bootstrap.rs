@@ -4,6 +4,7 @@ use crate::error::ClientError;
 
 const MARKER: &[u8] = b"IDPASSKEY:";
 const CREDENTIAL_LEN: usize = 16 + 1 + 32;
+pub const WINDOWS_SHELL_PROBE_SENTINEL: &str = "__ET_COMSPEC__";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Credentials {
@@ -34,6 +35,7 @@ pub struct BootstrapRequest {
     pub ssh_options: Vec<String>,
     pub term: String,
     pub remote_shell: RemoteShell,
+    pub session_shell: Option<String>,
 }
 
 /// Second bootstrap hop for ET-native jumphosts, mirroring the
@@ -166,6 +168,50 @@ pub fn build_invocation(request: &BootstrapRequest, credentials: &Credentials) -
     }
 }
 
+pub fn build_shell_probe(request: &BootstrapRequest) -> SshInvocation {
+    let mut args = Vec::new();
+    if let Some(jumphost) = request.jumphost.as_deref() {
+        args.push("-J".to_string());
+        args.push(jumphost.to_string());
+    }
+    let destination = match request.user.as_deref() {
+        Some(user) => format!("{user}@{}", request.host_alias),
+        None => request.host_alias.clone(),
+    };
+    args.push(destination);
+    args.extend(
+        request
+            .ssh_options
+            .iter()
+            .map(|option| format!("-o{option}")),
+    );
+    args.push("-oLogLevel=ERROR".to_owned());
+    args.push(format!("echo {WINDOWS_SHELL_PROBE_SENTINEL}%ComSpec%"));
+    SshInvocation {
+        program: "ssh".to_owned(),
+        args,
+        operation: "detecting the remote login shell",
+    }
+}
+
+pub fn parse_shell_probe(stdout: &[u8]) -> Result<RemoteShell, ClientError> {
+    for line in String::from_utf8_lossy(stdout).lines() {
+        let Some(value) = line.trim().strip_prefix(WINDOWS_SHELL_PROBE_SENTINEL) else {
+            continue;
+        };
+        if value.eq_ignore_ascii_case("%ComSpec%") {
+            return Ok(RemoteShell::Posix);
+        }
+        if value.to_ascii_lowercase().ends_with("cmd.exe") {
+            return Ok(RemoteShell::Cmd);
+        }
+        break;
+    }
+    Err(ClientError::Unsupported(
+        "remote shell probe returned unexpected output",
+    ))
+}
+
 pub fn validate_ssh_destination(host: &str, user: Option<&str>) -> Result<(), ClientError> {
     if host.starts_with('-') {
         return Err(ClientError::InvalidSshComponent("host"));
@@ -275,6 +321,9 @@ fn remote_command(request: &BootstrapRequest, credentials: &Credentials) -> Stri
 /// escaped: everything in it is ASCII-alphanumeric plus `/`, `_`, `-`, and `.`.
 fn cmd_remote_command(request: &BootstrapRequest, terminal: &str, input: &str) -> String {
     let mut command = String::new();
+    if let Some(shell) = request.session_shell.as_deref() {
+        command.push_str(&format!("set \"ET_SHELL={shell}\" & "));
+    }
     if request.kill_other_sessions {
         // Best-effort equivalent of `pkill etterminal -u <user>`.
         command.push_str("taskkill /F /FI \"USERNAME eq %USERNAME%\" /IM et.exe >nul 2>&1 & ");
@@ -339,6 +388,7 @@ mod tests {
             ssh_options: vec!["Port=2222".into()],
             term: "xterm-256color".into(),
             remote_shell: RemoteShell::Posix,
+            session_shell: None,
         }
     }
 
@@ -375,6 +425,38 @@ mod tests {
                 "-oPort=2222"
             ]
         );
+    }
+
+    #[test]
+    fn shell_probe_has_no_credentials_and_uses_cmd_sentinel() {
+        let credentials = Credentials {
+            id: "XXXdefghijklmnop".into(),
+            passkey: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef".into(),
+        };
+        let invocation = build_shell_probe(&request());
+        let command = invocation.args.last().unwrap();
+        assert_eq!(command, "echo __ET_COMSPEC__%ComSpec%");
+        assert!(!command.contains(&credentials.id));
+        assert!(!command.contains(&credentials.passkey));
+        assert!(invocation.args.iter().any(|arg| arg == "-oLogLevel=ERROR"));
+        assert_eq!(invocation.operation, "detecting the remote login shell");
+    }
+
+    #[test]
+    fn shell_probe_parser_requires_exact_sentinel_line() {
+        assert_eq!(
+            parse_shell_probe(b"banner\r\n__ET_COMSPEC__C:\\Windows\\System32\\cmd.exe\r\n")
+                .unwrap(),
+            RemoteShell::Cmd
+        );
+        assert_eq!(
+            parse_shell_probe(b"__ET_COMSPEC__%ComSpec%\n").unwrap(),
+            RemoteShell::Posix
+        );
+        assert!(matches!(
+            parse_shell_probe(b"__ET_COMSPEC__powershell\n"),
+            Err(ClientError::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -442,6 +524,22 @@ mod tests {
         request.terminal_path = Some("C:\\tools\\etterminal.exe".into());
         let command = build_invocation(&request, &credentials).args.pop().unwrap();
         assert!(!command.contains(" terminal \""), "{command}");
+    }
+
+    #[test]
+    fn cmd_bootstrap_exports_requested_session_shell() {
+        let credentials = Credentials {
+            id: "XXXdefghijklmnop".into(),
+            passkey: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef".into(),
+        };
+        let mut request = request();
+        request.remote_shell = RemoteShell::Cmd;
+        request.session_shell = Some("powershell.exe".to_owned());
+        let command = build_invocation(&request, &credentials).args.pop().unwrap();
+        assert_eq!(
+            command,
+            "set \"ET_SHELL=powershell.exe\" & echo XXXdefghijklmnop/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef_xterm-256color| \"et.exe\" terminal \"--verbose=2\""
+        );
     }
 
     #[test]

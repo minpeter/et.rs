@@ -162,7 +162,9 @@ fn real_client_recovers_same_shell_and_once_only_buffered_output() {
     assert!(text.contains("RECONNECT-TERMIOS:"), "output={text}");
     assert!(text.contains(":CODE:0:"), "output={text}");
     assert!(termios_restored(&text), "output={text}");
-    assert_eq!(fs::read_to_string(&stack.ssh_count).unwrap(), "x");
+    // One credential-free login-shell probe plus one credential bootstrap.
+    // Reconnects stay on the encrypted ET transport and must not invoke SSH.
+    assert_eq!(fs::read_to_string(&stack.ssh_count).unwrap(), "xx");
     proxy.join();
     stack.shutdown();
 }

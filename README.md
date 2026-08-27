@@ -119,13 +119,16 @@ netsh advfirewall firewall add rule name="et" dir=in action=allow protocol=TCP l
 
 ```sh
 # from anywhere
-et --winserver user@windows-host:2022                   # cmd.exe session
+et user@windows-host:2022                               # auto-detects cmd.exe login shell
+et --winserver user@windows-host:2022                   # explicitly force cmd.exe bootstrap
 et --remote-shell powershell user@windows-host:2022     # PowerShell session
 ```
 
-`--winserver` selects a `cmd.exe`-compatible ssh bootstrap (no `printf`, CRLF lines, `&` separator)
-and defaults `--terminal-path` to `et.exe`. The session shell follows `%COMSPEC%`, or `ET_SHELL` if
-set on the server. OpenSSH on Windows must be reachable and its default shell should be `cmd.exe`.
+Bare clients run a credential-free `%ComSpec%` SSH probe before bootstrap. An expanded `cmd.exe`
+path selects the Windows bootstrap (no `printf`, CRLF lines, `&` separator) and defaults
+`--terminal-path` to `et.exe`; a literal `%ComSpec%` preserves POSIX behavior. `--winserver`
+remains the explicit override. The session shell follows `%COMSPEC%`, or `ET_SHELL` if set on the
+server. OpenSSH on Windows must be reachable.
 
 ## Feature set
 

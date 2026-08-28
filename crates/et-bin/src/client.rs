@@ -98,7 +98,12 @@ fn run_client(
     let local_term = std::env::var("TERM").ok();
     let local_colorterm = std::env::var("COLORTERM").ok();
     let term = normalize_terminal_type(local_term.as_deref());
-    let colorterm = ghostty_colorterm(local_term.as_deref(), local_colorterm.as_deref());
+    // Explicit non-POSIX modes never transmit locale or COLORTERM. A bare
+    // destination remains potentially POSIX until the credential-free probe.
+    let may_send_posix_environment = !args.remote_is_windows();
+    let colorterm = may_send_posix_environment
+        .then(|| ghostty_colorterm(local_term.as_deref(), local_colorterm.as_deref()))
+        .flatten();
     let reserved_environment = reserved_environment_value_lengths(
         initial_payload
             .environmentvariables

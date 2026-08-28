@@ -282,6 +282,57 @@ fn posix_client_forwards_only_ssh_locale_environment() {
 }
 
 #[test]
+fn posix_client_filters_locale_to_terminal_environment_limits() {
+    let (port, server) = initial_payload_server();
+    let fake = FakeSsh::new();
+    let mut command = fake.command(RESOLVED_CONFIG, VALID_MARKER, 0, "");
+    command
+        .env("TERM", "xterm-ghostty")
+        .env("COLORTERM", "truecolor")
+        .env("LANG", "ko_KR.UTF-8")
+        .env("LC_ALL", "C")
+        .env("LC_\u{1f4a5}", "C.UTF-8")
+        .env("LC_OVERSIZED", "x".repeat(4097));
+    for index in 0..130 {
+        command.env(format!("LC_BOUNDARY_{index:03}"), "C.UTF-8");
+    }
+    let output = command
+        .args(["-N", &format!("server-alias:{port}")])
+        .output()
+        .unwrap();
+    let payload = server.join().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    assert_eq!(
+        payload.environmentvariables.get("LANG").map(String::as_str),
+        Some("ko_KR.UTF-8")
+    );
+    assert_eq!(
+        payload
+            .environmentvariables
+            .get("LC_ALL")
+            .map(String::as_str),
+        Some("C")
+    );
+    assert_eq!(
+        payload
+            .environmentvariables
+            .get("COLORTERM")
+            .map(String::as_str),
+        Some("truecolor")
+    );
+    assert!(!payload.environmentvariables.contains_key("LC_\u{1f4a5}"));
+    assert!(!payload.environmentvariables.contains_key("LC_OVERSIZED"));
+    assert_eq!(payload.environmentvariables.len(), 128);
+    assert!(payload.environmentvariables.iter().all(|(name, value)| {
+        let mut bytes = name.bytes();
+        matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+            && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            && value.len() <= 4096
+    }));
+}
+
+#[test]
 fn bare_windows_login_shell_is_detected_before_bootstrap() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();

@@ -1,3 +1,5 @@
+use crate::terminal_protocol::{valid_environment_name, MAX_ENVIRONMENT, MAX_ENV_VALUE};
+
 pub(crate) fn normalize_terminal_type(term: Option<&str>) -> String {
     match term {
         None | Some("xterm-ghostty") => "xterm-256color".to_owned(),
@@ -17,18 +19,42 @@ pub(crate) fn ghostty_colorterm<'a>(
 
 /// Collect locale variables matched by OpenSSH's `SendEnv LANG LC_*`.
 pub(crate) fn ssh_locale_environment() -> impl Iterator<Item = (String, String)> {
-    std::env::vars_os().filter_map(|(name, value)| {
-        let name = name.into_string().ok()?;
-        if name != "LANG" && !name.starts_with("LC_") {
-            return None;
-        }
-        Some((name, value.into_string().ok()?))
-    })
+    let mut environment: Vec<_> = std::env::vars_os()
+        .filter_map(|(name, value)| {
+            let name = name.into_string().ok()?;
+            if (name != "LANG" && !name.starts_with("LC_")) || !valid_environment_name(&name) {
+                return None;
+            }
+            let value = value.into_string().ok()?;
+            (value.len() <= MAX_ENV_VALUE).then_some((name, value))
+        })
+        .collect();
+    environment.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    environment.into_iter()
+}
+
+pub(crate) fn locale_environment_capacity(
+    existing: usize,
+    has_colorterm: bool,
+    forward_environment: usize,
+) -> usize {
+    let reserved = existing
+        .saturating_add(usize::from(has_colorterm))
+        .saturating_add(forward_environment);
+    MAX_ENVIRONMENT.saturating_sub(reserved)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ghostty_colorterm, normalize_terminal_type};
+    use super::{ghostty_colorterm, locale_environment_capacity, normalize_terminal_type};
+
+    #[test]
+    fn locale_capacity_reserves_terminal_environment_entries() {
+        assert_eq!(locale_environment_capacity(0, false, 0), 128);
+        assert_eq!(locale_environment_capacity(0, true, 1), 126);
+        assert_eq!(locale_environment_capacity(127, false, 1), 0);
+        assert_eq!(locale_environment_capacity(usize::MAX, true, usize::MAX), 0);
+    }
 
     #[test]
     fn ghostty_term_uses_compatible_remote_fallback() {

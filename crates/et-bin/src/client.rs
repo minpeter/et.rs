@@ -12,7 +12,7 @@ use crate::bootstrap::{
     validate_ssh_destination, BootstrapRequest, Credentials, JumpBootstrapRequest, RemoteShell,
 };
 use crate::client_environment::{
-    ghostty_colorterm, normalize_terminal_type, ssh_locale_environment,
+    ghostty_colorterm, locale_environment_capacity, normalize_terminal_type, ssh_locale_environment,
 };
 use crate::deadline::Deadline;
 use crate::error::ClientError;
@@ -205,9 +205,19 @@ fn run_client(
         initial_payload.jumphost = Some(true);
     }
     if remote_mode.terminal_shell == RemoteShellKind::Posix {
+        let forward_environment = initial_payload
+            .reversetunnels
+            .iter()
+            .filter(|request| request.environmentvariable.is_some())
+            .count();
+        let locale_capacity = locale_environment_capacity(
+            initial_payload.environmentvariables.len(),
+            colorterm.is_some(),
+            forward_environment,
+        );
         initial_payload
             .environmentvariables
-            .extend(ssh_locale_environment());
+            .extend(ssh_locale_environment().take(locale_capacity));
         if let Some(value) = colorterm {
             initial_payload
                 .environmentvariables

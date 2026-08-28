@@ -17,7 +17,7 @@
 use et_core::proto::{PortForwardSourceRequest, SocketEndpoint};
 
 pub const MAX_TUNNEL_REQUESTS: usize = 65_535;
-const MAX_UNIX_SOCKET_PATH: usize = 107;
+pub const MAX_UNIX_SOCKET_PATH: usize = 107;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TunnelError {

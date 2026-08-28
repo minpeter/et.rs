@@ -11,9 +11,13 @@ use std::thread;
 use std::time::Duration;
 
 use et_core::keys::{parse_id_passkey, passkey_to_key};
-use et_core::proto::{ConnectStatus, EtPacketType, InitialPayload, InitialResponse};
+use et_core::packet::Packet;
+use et_core::proto::{
+    ConnectStatus, EtPacketType, InitialPayload, InitialResponse, TermInit, TerminalPacketType,
+};
 use et_net::connection::Connection;
 use et_net::handshake::{read_request, response_status, write_response};
+use et_net::local_packet::MAX_LOCAL_PACKET_LEN;
 use prost::Message;
 
 const SERVER_ID: &str = "abcdefghijklmnop";
@@ -127,6 +131,12 @@ fn stderr(output: &Output) -> String {
 }
 
 fn initial_payload_server() -> (u16, thread::JoinHandle<InitialPayload>) {
+    initial_payload_server_with_error(None)
+}
+
+fn initial_payload_server_with_error(
+    error: Option<&'static str>,
+) -> (u16, thread::JoinHandle<InitialPayload>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = thread::spawn(move || {
@@ -144,7 +154,10 @@ fn initial_payload_server() -> (u16, thread::JoinHandle<InitialPayload>) {
         connection
             .write_packet(
                 EtPacketType::InitialResponse as u8,
-                &InitialResponse { error: None }.encode_to_vec(),
+                &InitialResponse {
+                    error: error.map(str::to_owned),
+                }
+                .encode_to_vec(),
             )
             .unwrap();
         payload
@@ -330,6 +343,112 @@ fn posix_client_filters_locale_to_terminal_environment_limits() {
             && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
             && value.len() <= 4096
     }));
+}
+
+#[test]
+fn posix_client_counts_duplicate_tunnel_environment_names_once() {
+    let (port, server) = initial_payload_server_with_error(Some("stop after payload"));
+    let fake = FakeSsh::new();
+    let mut command = fake.command(RESOLVED_CONFIG, VALID_MARKER, 0, "");
+    command
+        .env("TERM", "xterm-ghostty")
+        .env("COLORTERM", "truecolor")
+        .env("LANG", "ko_KR.UTF-8")
+        .env("LC_ALL", "C");
+    for index in 0..130 {
+        command.env(format!("LC_BOUNDARY_{index:03}"), "C.UTF-8");
+    }
+    let mut arguments = vec!["-N".to_owned()];
+    for index in 0..128 {
+        arguments.extend([
+            "--reversetunnel".to_owned(),
+            format!("ET_PIPE:remote-{index}"),
+        ]);
+    }
+    arguments.push(format!("server-alias:{port}"));
+
+    let output = command.args(arguments).output().unwrap();
+    let payload = server.join().unwrap();
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("stop after payload"));
+    assert_eq!(payload.reversetunnels.len(), 128);
+    assert!(payload
+        .reversetunnels
+        .iter()
+        .all(|request| { request.environmentvariable.as_deref() == Some("ET_PIPE") }));
+    assert_eq!(
+        payload.environmentvariables.get("LANG").map(String::as_str),
+        Some("ko_KR.UTF-8")
+    );
+    assert_eq!(
+        payload
+            .environmentvariables
+            .get("LC_ALL")
+            .map(String::as_str),
+        Some("C")
+    );
+    assert_eq!(
+        payload
+            .environmentvariables
+            .get("COLORTERM")
+            .map(String::as_str),
+        Some("truecolor")
+    );
+    assert_eq!(payload.environmentvariables.len(), 127);
+}
+
+#[test]
+fn posix_client_bounds_locale_to_local_terminal_packet() {
+    let (port, server) = initial_payload_server();
+    let fake = FakeSsh::new();
+    let mut command = fake.command(RESOLVED_CONFIG, VALID_MARKER, 0, "");
+    command
+        .env("TERM", "xterm-256color")
+        .env("LANG", "ko_KR.UTF-8")
+        .env("LC_ALL", "C")
+        .env("LC_CTYPE", "C.UTF-8");
+    for index in 0..20 {
+        command.env(format!("LC_000_{index:03}"), "x".repeat(4096));
+    }
+    let output = command
+        .args(["-N", &format!("server-alias:{port}")])
+        .output()
+        .unwrap();
+    let payload = server.join().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        payload.environmentvariables.get("LANG").map(String::as_str),
+        Some("ko_KR.UTF-8")
+    );
+    assert_eq!(
+        payload
+            .environmentvariables
+            .get("LC_ALL")
+            .map(String::as_str),
+        Some("C")
+    );
+    assert_eq!(
+        payload
+            .environmentvariables
+            .get("LC_CTYPE")
+            .map(String::as_str),
+        Some("C.UTF-8")
+    );
+    let environment: std::collections::BTreeMap<_, _> =
+        payload.environmentvariables.into_iter().collect();
+    let term_init = TermInit {
+        environmentnames: environment.keys().cloned().collect(),
+        environmentvalues: environment.values().cloned().collect(),
+    };
+    let packet = Packet::new(
+        TerminalPacketType::TerminalInit as u8,
+        term_init.encode_to_vec(),
+    );
+    assert!(
+        packet.wire_len() <= MAX_LOCAL_PACKET_LEN,
+        "{} > {MAX_LOCAL_PACKET_LEN}",
+        packet.wire_len()
+    );
 }
 
 #[test]
@@ -563,9 +682,19 @@ fn leading_hyphen_destination_components_are_rejected_before_spawn() {
 #[test]
 fn invalid_client_modes_fail_before_ssh_bootstrap() {
     let no_ssh = TestDir::new("honest");
-    for args in [
-        vec!["-N", "-t", "0:80", "example.test"],
-        vec!["--no-exit", "example.test"],
+    for (args, message) in [
+        (
+            vec!["-N", "-t", "0:80", "example.test"],
+            "invalid tunnel endpoint",
+        ),
+        (
+            vec!["--no-exit", "example.test"],
+            "--no-exit requires --command",
+        ),
+        (
+            vec!["-N", "-r", "BAD-NAME:remote", "example.test"],
+            "invalid reverse-tunnel environment variable name",
+        ),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_et"))
             .env("PATH", &no_ssh.0)
@@ -573,11 +702,81 @@ fn invalid_client_modes_fail_before_ssh_bootstrap() {
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(2));
-        assert!(
-            stderr(&output).contains("invalid tunnel endpoint")
-                || stderr(&output).contains("--no-exit requires --command")
-        );
+        assert!(stderr(&output).contains(message), "{}", stderr(&output));
     }
+}
+
+#[test]
+fn excessive_unique_tunnel_environment_names_fail_before_ssh_bootstrap() {
+    let no_ssh = TestDir::new("honest");
+    let mut arguments = vec!["-N".to_owned()];
+    for index in 0..129 {
+        arguments.extend([
+            "-r".to_owned(),
+            format!("ET_PIPE_{index:03}:remote-{index}"),
+        ]);
+    }
+    arguments.push("example.test".to_owned());
+    let output = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env("PATH", &no_ssh.0)
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("terminal environment has 129 reserved names; maximum is 128"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn colorterm_counts_toward_the_tunnel_environment_limit() {
+    let no_ssh = TestDir::new("honest");
+    let mut arguments = vec!["-N".to_owned()];
+    for index in 0..128 {
+        arguments.extend([
+            "-r".to_owned(),
+            format!("ET_PIPE_{index:03}:remote-{index}"),
+        ]);
+    }
+    arguments.push("server-alias:1".to_owned());
+    let output = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env("PATH", &no_ssh.0)
+        .env("TERM", "xterm-ghostty")
+        .env("COLORTERM", "truecolor")
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("terminal environment has 129 reserved names; maximum is 128"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn oversized_tunnel_environment_name_exceeds_local_packet_limit() {
+    let no_ssh = TestDir::new("honest");
+    let environment_name = format!("E{}", "T".repeat(MAX_LOCAL_PACKET_LEN));
+    let output = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env("PATH", &no_ssh.0)
+        .env("TERM", "xterm-256color")
+        .args([
+            "-N",
+            "-r",
+            &format!("{environment_name}:remote"),
+            "server-alias:1",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("terminal environment packet needs at least"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[test]

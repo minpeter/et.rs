@@ -1,4 +1,12 @@
+use std::collections::BTreeMap;
+
+use et_cli::tunnel::MAX_UNIX_SOCKET_PATH;
+use et_core::packet::HEADER_LEN;
+use et_net::local_packet::MAX_LOCAL_PACKET_LEN;
+
 use crate::terminal_protocol::{valid_environment_name, MAX_ENVIRONMENT, MAX_ENV_VALUE};
+
+const MAX_LOSSY_FORWARD_ENV_VALUE: usize = MAX_UNIX_SOCKET_PATH * 3;
 
 pub(crate) fn normalize_terminal_type(term: Option<&str>) -> String {
     match term {
@@ -29,31 +37,132 @@ pub(crate) fn ssh_locale_environment() -> impl Iterator<Item = (String, String)>
             (value.len() <= MAX_ENV_VALUE).then_some((name, value))
         })
         .collect();
-    environment.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    environment.sort_unstable_by(|(left, _), (right, _)| {
+        locale_priority(left)
+            .cmp(&locale_priority(right))
+            .then_with(|| left.cmp(right))
+    });
     environment.into_iter()
 }
 
-pub(crate) fn locale_environment_capacity(
-    existing: usize,
-    has_colorterm: bool,
-    forward_environment: usize,
-) -> usize {
-    let reserved = existing
-        .saturating_add(usize::from(has_colorterm))
-        .saturating_add(forward_environment);
+fn locale_priority(name: &str) -> u8 {
+    match name {
+        "LANG" => 0,
+        "LC_ALL" => 1,
+        "LC_CTYPE" => 2,
+        _ => 3,
+    }
+}
+
+pub(crate) fn reserved_environment_value_lengths<'a>(
+    existing: impl IntoIterator<Item = (&'a str, usize)>,
+    colorterm: Option<&str>,
+    forward_environment: impl IntoIterator<Item = &'a str>,
+) -> BTreeMap<String, usize> {
+    let mut reserved: BTreeMap<_, _> = existing
+        .into_iter()
+        .map(|(name, value_len)| (name.to_owned(), value_len))
+        .collect();
+    if let Some(value) = colorterm {
+        reserved.insert("COLORTERM".to_owned(), value.len());
+    }
+    for name in forward_environment {
+        // A successfully bound Unix socket path is at most 107 raw bytes, but
+        // `to_string_lossy()` can expand each non-UTF-8 byte to U+FFFD.
+        reserved.insert(name.to_owned(), MAX_LOSSY_FORWARD_ENV_VALUE);
+    }
+    reserved
+}
+
+pub(crate) fn locale_environment_capacity(reserved: usize) -> usize {
     MAX_ENVIRONMENT.saturating_sub(reserved)
+}
+
+pub(crate) fn bounded_locale_environment(
+    candidates: impl IntoIterator<Item = (String, String)>,
+    reserved: &BTreeMap<String, usize>,
+) -> Result<Vec<(String, String)>, usize> {
+    let mut packet_len = HEADER_LEN;
+    for (name, value_len) in reserved {
+        packet_len = packet_len
+            .saturating_add(encoded_string_field_len(name.len()))
+            .saturating_add(encoded_string_field_len(*value_len));
+    }
+    if packet_len > MAX_LOCAL_PACKET_LEN {
+        return Err(packet_len);
+    }
+
+    let capacity = locale_environment_capacity(reserved.len());
+    let mut selected = Vec::with_capacity(capacity);
+    for (name, value) in candidates {
+        if reserved.contains_key(&name) || selected.len() == capacity {
+            continue;
+        }
+        let addition = encoded_string_field_len(name.len()) + encoded_string_field_len(value.len());
+        if packet_len.saturating_add(addition) <= MAX_LOCAL_PACKET_LEN {
+            packet_len += addition;
+            selected.push((name, value));
+        }
+    }
+    Ok(selected)
+}
+
+fn encoded_string_field_len(value_len: usize) -> usize {
+    1usize
+        .saturating_add(varint_len(value_len))
+        .saturating_add(value_len)
+}
+
+fn varint_len(mut value: usize) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ghostty_colorterm, locale_environment_capacity, normalize_terminal_type};
+    use super::{
+        ghostty_colorterm, locale_environment_capacity, locale_priority, normalize_terminal_type,
+        reserved_environment_value_lengths, MAX_LOSSY_FORWARD_ENV_VALUE,
+    };
+
+    #[test]
+    fn effective_locale_controls_precede_other_categories() {
+        for name in ["LANG", "LC_ALL", "LC_CTYPE"] {
+            assert!(locale_priority(name) < locale_priority("LC_000"));
+        }
+    }
 
     #[test]
     fn locale_capacity_reserves_terminal_environment_entries() {
-        assert_eq!(locale_environment_capacity(0, false, 0), 128);
-        assert_eq!(locale_environment_capacity(0, true, 1), 126);
-        assert_eq!(locale_environment_capacity(127, false, 1), 0);
-        assert_eq!(locale_environment_capacity(usize::MAX, true, usize::MAX), 0);
+        assert_eq!(locale_environment_capacity(0), 128);
+        assert_eq!(locale_environment_capacity(2), 126);
+        assert_eq!(locale_environment_capacity(128), 0);
+        assert_eq!(locale_environment_capacity(usize::MAX), 0);
+    }
+
+    #[test]
+    fn locale_capacity_counts_distinct_reserved_names() {
+        let reserved = reserved_environment_value_lengths(
+            [("COLORTERM", 4), ("LC_COLLISION", 1)],
+            Some("truecolor"),
+            ["ET_PIPE", "ET_PIPE", "LC_COLLISION"],
+        );
+        assert_eq!(
+            reserved.into_keys().collect::<Vec<_>>(),
+            ["COLORTERM", "ET_PIPE", "LC_COLLISION"],
+        );
+        let reserved = reserved_environment_value_lengths(
+            [("COLORTERM", 4), ("LC_COLLISION", 1)],
+            Some("truecolor"),
+            ["ET_PIPE", "ET_PIPE", "LC_COLLISION"],
+        );
+        assert_eq!(reserved["COLORTERM"], "truecolor".len());
+        assert_eq!(reserved["ET_PIPE"], MAX_LOSSY_FORWARD_ENV_VALUE);
+        assert_eq!(reserved["LC_COLLISION"], MAX_LOSSY_FORWARD_ENV_VALUE);
     }
 
     #[test]

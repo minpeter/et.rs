@@ -5,7 +5,10 @@ use et_core::proto::{TerminalBuffer, TerminalPacketType};
 use et_net::connection::{ConnError, Connection};
 use prost::Message;
 
-use super::{recover_initial_transport, recover_transport, send_command};
+use super::{
+    recover_initial_transport, recover_transport, send_command, TerminalModeState, TerminalReset,
+    GRACEFUL_TERMINAL_MODE_RESET, TERMINAL_MODE_RESET,
+};
 use crate::client_terminal::{connection_ended, RemoteLines};
 use crate::error::ClientError;
 use crate::initial_connect::ReconnectOutcome;
@@ -95,6 +98,61 @@ fn recovery_rechecks_terminal_setup_before_returning_to_the_pump() {
     // operation before it declares the socket usable to the pump.
     assert!(recovered);
     assert_eq!(attempts, 1);
+}
+
+#[test]
+fn abrupt_terminal_mode_reset_leaves_the_alternate_screen() {
+    assert!(TERMINAL_MODE_RESET
+        .windows(b"\x1b[?1049l".len())
+        .any(|window| window == b"\x1b[?1049l"));
+}
+
+#[test]
+fn graceful_terminal_mode_reset_keeps_the_main_screen() {
+    assert!(!GRACEFUL_TERMINAL_MODE_RESET
+        .windows(b"\x1b[?1049l".len())
+        .any(|window| window == b"\x1b[?1049l"));
+    for sequence in [
+        b"\x1b[<64u".as_slice(),
+        b"\x1b[=0;1u".as_slice(),
+        b"\x1b[>4;0m".as_slice(),
+        b"\x1b[?2004l".as_slice(),
+        b"\x1b[?1004l".as_slice(),
+        b"\x1b[?1000l".as_slice(),
+        b"\x1b[?1002l".as_slice(),
+        b"\x1b[?1003l".as_slice(),
+        b"\x1b[?1006l".as_slice(),
+        b"\x1b[?25h".as_slice(),
+    ] {
+        assert!(GRACEFUL_TERMINAL_MODE_RESET
+            .windows(sequence.len())
+            .any(|window| window == sequence));
+    }
+}
+
+#[test]
+fn observed_alternate_screen_selects_graceful_or_abrupt_reset() {
+    assert_eq!(
+        TerminalReset::for_alternate_screen(false),
+        TerminalReset::KeepCurrentScreen
+    );
+    assert_eq!(
+        TerminalReset::for_alternate_screen(true),
+        TerminalReset::LeaveAlternate
+    );
+}
+
+#[test]
+fn alternate_screen_tracking_handles_split_enter_and_leave_sequences() {
+    let mut modes = TerminalModeState::default();
+    modes.observe(b"before\x1b[?10");
+    assert!(!modes.alternate_screen);
+    modes.observe(b"49hinside");
+    assert!(modes.alternate_screen);
+    modes.observe(b"\x1b[?104");
+    assert!(modes.alternate_screen);
+    modes.observe(b"9lafter");
+    assert!(!modes.alternate_screen);
 }
 
 fn tcp_pair() -> (TcpStream, TcpStream) {

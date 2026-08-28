@@ -20,7 +20,7 @@ use et_net::forward::{is_forward_packet, Forwarder};
 
 use crate::client_terminal::{
     connection_ended, display_packet, recover_transport, send_buffer, send_size, terminal_error,
-    terminal_text,
+    terminal_text, TerminalModeState,
 };
 use crate::error::ClientError;
 use crate::initial_connect::ReconnectOutcome;
@@ -31,7 +31,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 pub fn pump<F>(
     connection: &mut Connection,
-    options: crate::client_terminal_loop::PumpOptions,
+    options: crate::client_terminal_loop::PumpOptions<'_>,
     forwarder: &Forwarder,
     mut reconnect: F,
 ) -> Result<(), ClientError>
@@ -43,6 +43,7 @@ where
         keepalive_seconds,
         terminal_enabled,
         auto_cursor_report,
+        terminal_modes,
     } = options;
     let interval = Duration::from_secs(u64::from(keepalive_seconds.max(1)));
     let silence = interval.saturating_mul(MISSED_KEEPALIVES);
@@ -112,7 +113,9 @@ where
                         pending_forward = forwarder
                             .try_receive(packet)
                             .map_err(|error| terminal_text(error.to_string()))?;
-                    } else if route_server_packet(packet, terminal_enabled)? && auto_cursor_report {
+                    } else if route_server_packet(packet, terminal_enabled, terminal_modes)?
+                        && auto_cursor_report
+                    {
                         let _ =
                             send_buffer(connection, crate::client_terminal::CURSOR_REPORT_REPLY);
                     }
@@ -181,9 +184,10 @@ where
 fn route_server_packet(
     packet: et_core::packet::Packet,
     terminal_enabled: bool,
+    terminal_modes: &mut TerminalModeState,
 ) -> Result<bool, ClientError> {
     if terminal_enabled || packet.header() == TerminalPacketType::KeepAlive as u8 {
-        return display_packet(packet);
+        return display_packet(packet, terminal_modes);
     }
     if packet.header() == TerminalPacketType::TerminalBuffer as u8 {
         return Ok(false);

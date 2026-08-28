@@ -23,6 +23,27 @@ pub(crate) fn run(
                     "terminal disconnected for registration id={}",
                     identity.id()
                 ));
+                let shutdown_raw_sockets = match core.sessions.active(identity.id()) {
+                    Ok(Some(_)) => false,
+                    Ok(None) => true,
+                    Err(error) => {
+                        crate::diag::info(format!(
+                            "id={}: session table error checking active session: {error}",
+                            identity.id()
+                        ));
+                        first_error.get_or_insert(RuntimeError::SessionTable(error));
+                        true
+                    }
+                };
+                if shutdown_raw_sockets {
+                    if let Err(error) = core.raw_sockets.shutdown_registration(&identity) {
+                        crate::diag::info(format!(
+                            "id={}: error shutting down raw sockets: {error}",
+                            identity.id()
+                        ));
+                        first_error.get_or_insert(error);
+                    }
+                }
                 match core.sessions.remove_registration(&identity) {
                     Ok(Some(removed)) => {
                         crate::diag::info(format!(
@@ -30,13 +51,6 @@ pub(crate) fn run(
                             identity.id()
                         ));
                         if let Some(SessionConnection::Starting(stream)) = removed.connection {
-                            if let Err(error) = core.raw_sockets.shutdown_registration(&identity) {
-                                crate::diag::info(format!(
-                                    "id={}: error shutting down raw sockets: {error}",
-                                    identity.id()
-                                ));
-                                first_error.get_or_insert(error);
-                            }
                             if let Err(error) = stream.shutdown(std::net::Shutdown::Both) {
                                 crate::diag::info(format!(
                                     "id={}: error shutting down session connection: {error}",

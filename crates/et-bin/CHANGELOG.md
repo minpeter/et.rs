@@ -1,3 +1,26 @@
+## et@0.0.17
+
+### Return cleanly to the local prompt after exit
+
+Interactive sessions now finish with an SSH-style `Connection to … closed.`
+line and keep the local prompt on the current screen. Graceful shell exits no
+longer issue an unmatched alternate-screen restore that could move the cursor
+to an old position, while abrupt failures retain the stronger terminal-mode
+cleanup needed for crashed full-screen applications.
+
+### Preserve Ghostty truecolor detection
+
+Ghostty clients now forward the standard `COLORTERM=truecolor` hint to POSIX
+sessions while continuing to use the compatible `TERM=xterm-256color`
+fallback. Applications such as Neovim and tmux can retain automatic 24-bit
+color detection on remote hosts without Ghostty's terminfo entry.
+
+### Preserve client locales in POSIX sessions
+
+Clients now forward `LANG` and `LC_*` values to each new POSIX session, matching
+the environment behavior users expect from SSH. Locale-sensitive applications
+such as btop can detect UTF-8 without changing Windows session environments.
+
 ## et@0.0.16
 
 ### Restore remote colors for Ghostty clients

@@ -1,9 +1,17 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Restore remote colors for Ghostty clients\n\nET clients launched from Ghostty now send the widely supported\n`TERM=xterm-256color` fallback instead of `xterm-ghostty`. This restores\nordinary remote prompt and application colors on hosts without Ghostty's\nterminfo entry. Other terminal types remain unchanged.\n"
-    filename: fix-ghostty-term-fallback.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Return cleanly to the local prompt after exit\n\nInteractive sessions now finish with an SSH-style `Connection to … closed.`\nline and keep the local prompt on the current screen. Graceful shell exits no\nlonger issue an unmatched alternate-screen restore that could move the cursor\nto an old position, while abrupt failures retain the stronger terminal-mode\ncleanup needed for crashed full-screen applications.\n"
+    filename: fix-clean-terminal-exit.md
+    v: 0.0.0
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Preserve Ghostty truecolor detection\n\nGhostty clients now forward the standard `COLORTERM=truecolor` hint to POSIX\nsessions while continuing to use the compatible `TERM=xterm-256color`\nfallback. Applications such as Neovim and tmux can retain automatic 24-bit\ncolor detection on remote hosts without Ghostty's terminfo entry.\n"
+    filename: fix-ghostty-colorterm.md
+    v: 0.0.0
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Preserve client locales in POSIX sessions\n\nClients now forward `LANG` and `LC_*` values to each new POSIX session, matching\nthe environment behavior users expect from SSH. Locale-sensitive applications\nsuch as btop can detect UTF-8 without changing Windows session environments.\n"
+    filename: fix-posix-locale-forwarding.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - fix-ghostty-term-fallback.md
+      - fix-clean-terminal-exit.md
+      - fix-ghostty-colorterm.md
+      - fix-posix-locale-forwarding.md
     id: cargo:et
     updated: true

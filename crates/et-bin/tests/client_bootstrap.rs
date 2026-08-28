@@ -780,6 +780,33 @@ fn oversized_tunnel_environment_name_exceeds_local_packet_limit() {
 }
 
 #[test]
+fn oversized_jumphost_initialization_fails_before_ssh_bootstrap() {
+    let no_ssh = TestDir::new("honest");
+    let mut arguments = vec![
+        "-N".to_owned(),
+        "--jumphost".to_owned(),
+        "jump-alias".to_owned(),
+    ];
+    let destination = format!("remote-{}", "x".repeat(500));
+    for _ in 0..128 {
+        arguments.extend(["-r".to_owned(), format!("ET_PIPE:{destination}")]);
+    }
+    arguments.push("example.test".to_owned());
+    let output = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env("PATH", &no_ssh.0)
+        .env("TERM", "xterm-256color")
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("jumphost initialization packet needs at least"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn jumphost_starts_a_jump_terminal_and_connects_to_the_jumphost() {
     // Upstream `--jumphost` is an ET-native relay: the destination terminal is
     // started through `ssh -J`, a second `etterminal --jump` is started on the

@@ -104,6 +104,60 @@ fn encrypted_client_and_registered_terminal_exchange_packets() {
 }
 
 #[test]
+fn terminal_hup_still_delivers_buffered_final_packet() {
+    use std::net::Shutdown;
+
+    let mut server = TestRuntime::start();
+    let mut terminal = server.register(ID_A, KEY_A);
+    terminal.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let key = passkey_to_key(KEY_A).unwrap();
+    let (mut client, initial) = initialize(stream, &key, default_payload());
+    assert_eq!(initial.error, None);
+
+    let init = read_local_packet(&mut terminal).unwrap();
+    assert_eq!(init.header(), TerminalPacketType::TerminalInit as u8);
+
+    client
+        .write_packet(TerminalPacketType::TerminalInfo as u8, b"bridge-ready")
+        .unwrap();
+    let readiness = read_local_packet(&mut terminal).unwrap();
+    assert_eq!(readiness.payload(), b"bridge-ready");
+
+    let final_packets = [
+        TerminalBuffer {
+            buffer: Some(b"final-terminal-packet-one".to_vec()),
+        },
+        TerminalBuffer {
+            buffer: Some(b"final-terminal-packet-two".to_vec()),
+        },
+    ];
+    for packet in &final_packets {
+        write_local_packet(
+            &mut terminal,
+            &Packet::new(
+                TerminalPacketType::TerminalBuffer as u8,
+                packet.encode_to_vec(),
+            ),
+        )
+        .unwrap();
+    }
+    terminal.shutdown(Shutdown::Both).unwrap();
+
+    for expected in &final_packets {
+        let received = client.read_packet().unwrap();
+        assert_eq!(received.header(), TerminalPacketType::TerminalBuffer as u8);
+        assert_eq!(
+            TerminalBuffer::decode(received.payload()).unwrap(),
+            *expected
+        );
+    }
+
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
 fn terminal_environment_is_forwarded_without_interpolation() {
     let mut server = TestRuntime::start();
     let mut terminal = server.register(ID_A, KEY_A);

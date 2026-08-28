@@ -127,28 +127,44 @@ fn run_mode_poll(
             }
             (connected, connection_generation) = session.connection_state()?;
         }
-        if terminal_events.intersects(PollFlags::HUP | PollFlags::ERR) {
-            return Err(SessionError::Io(io::ErrorKind::UnexpectedEof.into()));
-        }
-        if terminal_events.contains(PollFlags::IN) {
-            if let Some(packet) = read_terminal_packet(&mut terminal, &mut decoder)? {
-                let packet = if mode == BridgeMode::Terminal {
-                    validate_terminal_output(&packet)?;
-                    packet
-                } else {
-                    jumphost_terminal_packet(&session, packet)?
-                };
-                decoder = LocalPacketDecoder::new();
-                if let Err(error) = session.send_packet(packet.header(), packet.payload()) {
-                    if !client_transport_error(
-                        &error,
-                        &session,
-                        &mut connected,
-                        &mut connection_generation,
-                    )? {
-                        return Err(error);
+        let terminal_closed = terminal_events.intersects(PollFlags::HUP | PollFlags::ERR);
+        if terminal_closed || terminal_events.contains(PollFlags::IN) {
+            loop {
+                match read_terminal_packet(&mut terminal, &mut decoder) {
+                    Ok(Some(packet)) => {
+                        let packet = if mode == BridgeMode::Terminal {
+                            validate_terminal_output(&packet)?;
+                            packet
+                        } else {
+                            jumphost_terminal_packet(&session, packet)?
+                        };
+                        decoder = LocalPacketDecoder::new();
+                        if let Err(error) = session.send_packet(packet.header(), packet.payload()) {
+                            if !client_transport_error(
+                                &error,
+                                &session,
+                                &mut connected,
+                                &mut connection_generation,
+                            )? {
+                                return Err(error);
+                            }
+                        }
                     }
+                    Ok(None) if terminal_closed => continue,
+                    Ok(None) => break,
+                    Err(SessionError::Io(error))
+                        if terminal_closed && error.kind() == io::ErrorKind::UnexpectedEof =>
+                    {
+                        break;
+                    }
+                    Err(error) => return Err(error),
                 }
+                if !terminal_closed {
+                    break;
+                }
+            }
+            if terminal_closed {
+                return Ok(());
             }
         }
         // Recovery authentication may read more than its proof packet into

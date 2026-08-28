@@ -245,6 +245,23 @@ impl ActiveSession {
         }
     }
 
+    pub(crate) fn finish_terminal(&self) -> Result<(), SessionError> {
+        self.shutdown.store(true, Ordering::Release);
+        let _ = self.signal();
+        let terminal = self
+            .terminal_control
+            .lock()
+            .map_err(|_| SessionError::Unavailable)?;
+        let _ = terminal.shutdown(Shutdown::Both);
+        drop(terminal);
+        let control = self.control.lock().map_err(|_| SessionError::Unavailable)?;
+        match control.shutdown(Shutdown::Write) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
+            Err(error) => Err(SessionError::Io(error)),
+        }
+    }
+
     pub(crate) fn shutdown(&self) -> Result<(), SessionError> {
         self.shutdown.store(true, Ordering::Release);
         let _ = self.signal();

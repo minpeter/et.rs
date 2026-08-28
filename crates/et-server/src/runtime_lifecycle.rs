@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::registry::RegistrationIdentity;
 use crate::runtime_error::RuntimeError;
 use crate::runtime_state::RuntimeCore;
+use crate::session::SessionConnection;
 
 pub(crate) enum LifecycleEvent {
     TerminalDisconnected(RegistrationIdentity),
@@ -22,26 +23,38 @@ pub(crate) fn run(
                     "terminal disconnected for registration id={}",
                     identity.id()
                 ));
-                if let Err(error) = core.raw_sockets.shutdown_registration(&identity) {
-                    crate::diag::info(format!(
-                        "id={}: error shutting down raw sockets: {error}",
-                        identity.id()
-                    ));
-                    first_error.get_or_insert(error);
-                }
-                match core.sessions.remove_registration(&identity) {
+                let removed = core
+                    .sessions
+                    .remove_registration_with(&identity, |shutdown_raw| {
+                        if shutdown_raw {
+                            if let Err(error) = core.raw_sockets.shutdown_registration(&identity) {
+                                crate::diag::info(format!(
+                                    "id={}: error shutting down raw sockets: {error}",
+                                    identity.id()
+                                ));
+                                first_error.get_or_insert(error);
+                            }
+                        }
+                    });
+                match removed {
                     Ok(Some(removed)) => {
                         crate::diag::info(format!(
                             "id={}: removed session after terminal disconnect",
                             identity.id()
                         ));
-                        if let Some(connection) = removed.connection {
-                            if let Err(error) = connection.shutdown() {
-                                crate::diag::info(format!(
-                                    "id={}: error shutting down session connection: {error}",
-                                    identity.id()
-                                ));
-                                first_error.get_or_insert(RuntimeError::Session(error));
+                        if let Some(SessionConnection::Starting(stream)) = removed.connection {
+                            match stream.shutdown(std::net::Shutdown::Both) {
+                                Ok(()) => {}
+                                Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
+                                Err(error) => {
+                                    crate::diag::info(format!(
+                                        "id={}: error shutting down session connection: {error}",
+                                        identity.id()
+                                    ));
+                                    first_error.get_or_insert(RuntimeError::Session(
+                                        crate::session::SessionError::Io(error),
+                                    ));
+                                }
                             }
                         }
                     }

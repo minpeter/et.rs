@@ -181,6 +181,63 @@ fn real_tty_forwards_input_control_bytes_and_live_resize() {
     assert!(output.windows(4).any(|window| window == b"CTRL"));
 }
 
+#[test]
+fn real_tty_graceful_exit_keeps_the_main_screen_and_reports_close() {
+    let stack = Stack::start();
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+        })
+        .unwrap();
+    let mut client = CommandBuilder::new(env!("CARGO_BIN_EXE_et"));
+    client.args([
+        "--terminal-path",
+        stack.terminal.to_str().unwrap(),
+        "--serverfifo",
+        stack.router.to_str().unwrap(),
+        "-p",
+        &stack.port.to_string(),
+        "127.0.0.1",
+    ]);
+    client.env(
+        "PATH",
+        format!(
+            "{}:{}",
+            stack.directory.display(),
+            std::env::var("PATH").unwrap()
+        ),
+    );
+    client.env("TERM", "xterm-256color");
+    let mut child = pair.slave.spawn_command(client).unwrap();
+    drop(pair.slave);
+    let mut writer = pair.master.take_writer().unwrap();
+    let mut output = Vec::new();
+    writer.write_all(b"exit\n").unwrap();
+    drop(writer);
+    pair.master
+        .try_clone_reader()
+        .unwrap()
+        .read_to_end(&mut output)
+        .unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "status={status:?} output={output:?}");
+    assert!(
+        !output
+            .windows(b"\x1b[?1049l".len())
+            .any(|window| window == b"\x1b[?1049l"),
+        "graceful exit must not restore a stale alternate-screen cursor: {output:?}"
+    );
+    assert!(
+        output
+            .windows(b"Connection to 127.0.0.1 closed.\r\n".len())
+            .any(|window| window == b"Connection to 127.0.0.1 closed.\r\n"),
+        "graceful exit must visibly separate the remote session: {output:?}"
+    );
+}
+
 fn receive_until(
     receiver: &mpsc::Receiver<Vec<u8>>,
     mut output: Vec<u8>,

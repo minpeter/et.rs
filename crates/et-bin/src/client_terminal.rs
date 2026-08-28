@@ -46,6 +46,7 @@ pub struct TerminalOptions<'a> {
     pub keepalive: u32,
     pub terminal_enabled: bool,
     pub lines: RemoteLines,
+    pub connection_name: &'a str,
 }
 
 pub fn run<F>(
@@ -63,12 +64,17 @@ where
         keepalive,
         terminal_enabled,
         lines,
+        connection_name,
     } = options;
     let raw_mode = if terminal_enabled {
         RawMode::enter()?
     } else {
-        RawMode { enabled: false }
+        RawMode {
+            enabled: false,
+            reset: TerminalReset::Abrupt,
+        }
     };
+    let close_message = (raw_mode.enabled && command.is_none()).then_some(connection_name);
     // The network can disappear immediately after the initial handshake (a
     // laptop waking up is particularly prone to this).  These writes are
     // replay-buffered by `Connection`, so once recovery succeeds they must
@@ -82,7 +88,7 @@ where
             terminal_enabled,
             initial_size,
         )? {
-            return Ok(());
+            return raw_mode.finish(Ok(()), close_message);
         }
     }
     if terminal_enabled {
@@ -94,7 +100,7 @@ where
                 terminal_enabled,
                 initial_command,
             )? {
-                return Ok(());
+                return raw_mode.finish(Ok(()), close_message);
             }
         }
     }
@@ -161,8 +167,7 @@ where
         &forwarder,
         reconnect,
     );
-    drop(raw_mode);
-    result
+    raw_mode.finish(result, close_message)
 }
 
 /// Device Status Report request (`ESC [ 6 n`).
@@ -330,8 +335,39 @@ where
 const TERMINAL_MODE_RESET: &[u8] = b"\x1b[<64u\x1b[=0;1u\x1b[?1049l\x1b[<64u\x1b[=0;1u\
 \x1b[>4;0m\x1b[?2004l\x1b[?1004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h";
 
+/// Normal remote-shell exit. The remote side had an opportunity to restore
+/// its screen, so leaving the alternate screen here would restore an
+/// unrelated saved cursor in the local emulator. Keep the input-mode cleanup
+/// that is safe and idempotent on the current main screen.
+const GRACEFUL_TERMINAL_MODE_RESET: &[u8] = b"\x1b[<64u\x1b[=0;1u\
+\x1b[>4;0m\x1b[?2004l\x1b[?1004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalReset {
+    Abrupt,
+    Graceful,
+}
+
+impl TerminalReset {
+    fn for_result(result: &Result<(), ClientError>) -> Self {
+        if result.is_ok() {
+            Self::Graceful
+        } else {
+            Self::Abrupt
+        }
+    }
+
+    const fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::Abrupt => TERMINAL_MODE_RESET,
+            Self::Graceful => GRACEFUL_TERMINAL_MODE_RESET,
+        }
+    }
+}
+
 struct RawMode {
     enabled: bool,
+    reset: TerminalReset,
 }
 
 impl RawMode {
@@ -340,7 +376,25 @@ impl RawMode {
         if enabled {
             enable_raw_mode().map_err(|error| terminal_io("enabling raw terminal mode", error))?;
         }
-        Ok(Self { enabled })
+        Ok(Self {
+            enabled,
+            reset: TerminalReset::Abrupt,
+        })
+    }
+
+    fn finish(
+        mut self,
+        result: Result<(), ClientError>,
+        connection_name: Option<&str>,
+    ) -> Result<(), ClientError> {
+        self.reset = TerminalReset::for_result(&result);
+        drop(self);
+        if result.is_ok() {
+            if let Some(connection_name) = connection_name {
+                eprintln!("Connection to {connection_name} closed.");
+            }
+        }
+        result
     }
 }
 
@@ -348,7 +402,7 @@ impl Drop for RawMode {
     fn drop(&mut self) {
         if self.enabled {
             let mut stdout = io::stdout().lock();
-            let _ = stdout.write_all(TERMINAL_MODE_RESET);
+            let _ = stdout.write_all(self.reset.bytes());
             let _ = stdout.flush();
             let _ = disable_raw_mode();
         }

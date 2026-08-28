@@ -100,6 +100,7 @@ fn real_client_ghostty_fallback_bootstrap_server_bridge_and_pty_emit_color() {
     stdout.read_to_string(&mut stdout_text).unwrap();
     stderr.read_to_string(&mut stderr_text).unwrap();
     assert!(status.success(), "{stderr_text}");
+    assert!(!stderr_text.contains("Connection to "), "{stderr_text:?}");
     assert!(
         stdout_text.contains("FULL-PTY:xterm-256color:truecolor"),
         "{stdout_text:?}"
@@ -149,6 +150,10 @@ fn real_client_ghostty_fallback_bootstrap_server_bridge_and_pty_emit_color() {
         .read_to_string(&mut no_exit_stderr)
         .unwrap();
     assert!(status.success(), "{no_exit_stderr}");
+    assert!(
+        !no_exit_stderr.contains("Connection to "),
+        "{no_exit_stderr:?}"
+    );
     assert!(
         no_exit_stdout.contains("NOEXIT:xterm-256color"),
         "{no_exit_stdout:?}"

@@ -20,6 +20,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  native-macos-source:
+    name: x86_64-apple-darwin source artifact
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ github.token }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build native source artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(uname -m)" == x86_64 ]]
+          cargo build --release --locked -p et
+          file target/release/et | tee target/release/et.file
+          shasum -a 256 target/release/et > target/release/et.sha256
+          target/release/et --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: et-source-${{ github.sha }}-x86_64-apple-darwin
+          path: |
+            target/release/et
+            target/release/et.file
+            target/release/et.sha256
+          if-no-files-found: error
+
   native-linux-arm64:
     name: ${{ matrix.target }}
     runs-on: ubuntu-24.04-arm

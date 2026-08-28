@@ -12,8 +12,8 @@ use crate::bootstrap::{
     validate_ssh_destination, BootstrapRequest, Credentials, JumpBootstrapRequest, RemoteShell,
 };
 use crate::client_environment::{
-    bounded_locale_environment, ghostty_colorterm, normalize_terminal_type,
-    reserved_environment_value_lengths, ssh_locale_environment,
+    bound_jumphost_locale_environment, bounded_locale_environment, ghostty_colorterm,
+    normalize_terminal_type, reserved_environment_value_lengths, ssh_locale_environment,
 };
 use crate::deadline::Deadline;
 use crate::error::ClientError;
@@ -118,9 +118,13 @@ fn run_client(
             .into(),
         );
     }
-    let locale_environment =
+    let mut locale_environment =
         bounded_locale_environment(ssh_locale_environment(), &reserved_environment)
             .map_err(crate::forward_config::ForwardConfigError::EnvironmentPacketTooLarge)?;
+    if args.jumphost.is_some() {
+        bound_jumphost_locale_environment(&initial_payload, &mut locale_environment, colorterm)
+            .map_err(crate::forward_config::ForwardConfigError::JumphostPacketTooLarge)?;
+    }
 
     let requested_user = command_user(destination.user, args.username.clone());
     validate_ssh_destination(&destination.host, requested_user.as_deref())?;

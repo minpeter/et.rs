@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 
 use et_cli::tunnel::MAX_UNIX_SOCKET_PATH;
-use et_core::packet::HEADER_LEN;
+use et_core::packet::{Packet, HEADER_LEN};
+use et_core::proto::{InitialPayload, TerminalPacketType};
 use et_net::local_packet::MAX_LOCAL_PACKET_LEN;
+use prost::Message;
 
 use crate::terminal_protocol::{valid_environment_name, MAX_ENVIRONMENT, MAX_ENV_VALUE};
 
@@ -47,9 +49,9 @@ pub(crate) fn ssh_locale_environment() -> impl Iterator<Item = (String, String)>
 
 fn locale_priority(name: &str) -> u8 {
     match name {
-        "LANG" => 0,
-        "LC_ALL" => 1,
-        "LC_CTYPE" => 2,
+        "LC_ALL" => 0,
+        "LC_CTYPE" => 1,
+        "LANG" => 2,
         _ => 3,
     }
 }
@@ -107,6 +109,36 @@ pub(crate) fn bounded_locale_environment(
     Ok(selected)
 }
 
+pub(crate) fn bound_jumphost_locale_environment(
+    payload: &InitialPayload,
+    locale: &mut Vec<(String, String)>,
+    colorterm: Option<&str>,
+) -> Result<(), usize> {
+    let mut modeled = payload.clone();
+    modeled.jumphost = Some(true);
+    modeled.environmentvariables.extend(locale.iter().cloned());
+    if let Some(value) = colorterm {
+        modeled
+            .environmentvariables
+            .insert("COLORTERM".to_owned(), value.to_owned());
+    }
+
+    loop {
+        let packet_len = Packet::new(
+            TerminalPacketType::JumphostInit as u8,
+            modeled.encode_to_vec(),
+        )
+        .wire_len();
+        if packet_len <= MAX_LOCAL_PACKET_LEN {
+            return Ok(());
+        }
+        let Some((name, _)) = locale.pop() else {
+            return Err(packet_len);
+        };
+        modeled.environmentvariables.remove(&name);
+    }
+}
+
 fn encoded_string_field_len(value_len: usize) -> usize {
     1usize
         .saturating_add(varint_len(value_len))
@@ -125,15 +157,71 @@ fn varint_len(mut value: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        ghostty_colorterm, locale_environment_capacity, locale_priority, normalize_terminal_type,
-        reserved_environment_value_lengths, MAX_LOSSY_FORWARD_ENV_VALUE,
+        bound_jumphost_locale_environment, ghostty_colorterm, locale_environment_capacity,
+        locale_priority, normalize_terminal_type, reserved_environment_value_lengths,
+        MAX_LOSSY_FORWARD_ENV_VALUE,
     };
+    use et_core::packet::Packet;
+    use et_core::proto::{
+        InitialPayload, PortForwardSourceRequest, SocketEndpoint, TerminalPacketType,
+    };
+    use et_net::local_packet::MAX_LOCAL_PACKET_LEN;
+    use prost::Message;
 
     #[test]
     fn effective_locale_controls_precede_other_categories() {
-        for name in ["LANG", "LC_ALL", "LC_CTYPE"] {
-            assert!(locale_priority(name) < locale_priority("LC_000"));
+        assert!(locale_priority("LC_ALL") < locale_priority("LC_CTYPE"));
+        assert!(locale_priority("LC_CTYPE") < locale_priority("LANG"));
+        assert!(locale_priority("LANG") < locale_priority("LC_000"));
+    }
+
+    #[test]
+    fn jumphost_packet_budget_preserves_effective_locale_controls() {
+        let request = PortForwardSourceRequest {
+            source: None,
+            destination: Some(SocketEndpoint {
+                name: Some("remote-name-padding".to_owned()),
+                port: None,
+            }),
+            environmentvariable: Some("ET_PIPE".to_owned()),
+        };
+        let payload = InitialPayload {
+            jumphost: Some(false),
+            reversetunnels: vec![request; 128],
+            environmentvariables: Default::default(),
+        };
+        let mut locale = vec![
+            ("LC_ALL".to_owned(), "C".to_owned()),
+            ("LC_CTYPE".to_owned(), "C.UTF-8".to_owned()),
+            ("LANG".to_owned(), "ko_KR.UTF-8".to_owned()),
+        ];
+        locale.extend((0..15).map(|index| (format!("LC_000_{index:03}"), "x".repeat(4096))));
+        assert!(jumphost_packet_len(&payload, &locale, Some("truecolor")) > MAX_LOCAL_PACKET_LEN);
+        bound_jumphost_locale_environment(&payload, &mut locale, Some("truecolor")).unwrap();
+        assert!(jumphost_packet_len(&payload, &locale, Some("truecolor")) <= MAX_LOCAL_PACKET_LEN);
+        for name in ["LC_ALL", "LC_CTYPE", "LANG"] {
+            assert!(locale.iter().any(|(candidate, _)| candidate == name));
         }
+    }
+
+    fn jumphost_packet_len(
+        payload: &InitialPayload,
+        locale: &[(String, String)],
+        colorterm: Option<&str>,
+    ) -> usize {
+        let mut modeled = payload.clone();
+        modeled.jumphost = Some(true);
+        modeled.environmentvariables.extend(locale.iter().cloned());
+        if let Some(value) = colorterm {
+            modeled
+                .environmentvariables
+                .insert("COLORTERM".to_owned(), value.to_owned());
+        }
+        Packet::new(
+            TerminalPacketType::JumphostInit as u8,
+            modeled.encode_to_vec(),
+        )
+        .wire_len()
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub enum ForwardConfigError {
     InvalidEnvironmentName(String),
     TooManyEnvironmentNames(usize),
     EnvironmentPacketTooLarge(usize),
+    JumphostPacketTooLarge(usize),
 }
 
 impl std::fmt::Display for ForwardConfigError {
@@ -38,6 +39,11 @@ impl std::fmt::Display for ForwardConfigError {
                 "terminal environment packet needs at least {length} bytes; maximum is {}",
                 et_net::local_packet::MAX_LOCAL_PACKET_LEN
             ),
+            Self::JumphostPacketTooLarge(length) => write!(
+                formatter,
+                "jumphost initialization packet needs at least {length} bytes; maximum is {}",
+                et_net::local_packet::MAX_LOCAL_PACKET_LEN
+            ),
         }
     }
 }
@@ -49,7 +55,8 @@ impl std::error::Error for ForwardConfigError {
             Self::MissingAgentSocket
             | Self::InvalidEnvironmentName(_)
             | Self::TooManyEnvironmentNames(_)
-            | Self::EnvironmentPacketTooLarge(_) => None,
+            | Self::EnvironmentPacketTooLarge(_)
+            | Self::JumphostPacketTooLarge(_) => None,
         }
     }
 }

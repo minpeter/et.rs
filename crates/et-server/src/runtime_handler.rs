@@ -278,7 +278,7 @@ fn handle_new(
     crate::diag::info(format!("id={id}: terminal bridge running for {peer}"));
     let _ = crate::terminal_bridge::run(active.clone(), terminal, forwarder);
     crate::diag::info(format!("id={id}: terminal bridge ended for {peer}"));
-    let _ = active.shutdown();
+    let _ = active.finish_terminal();
 }
 
 /// Upstream `TerminalServer::runJumpHost`: answer the initial response, hand
@@ -349,7 +349,7 @@ fn run_jumphost(
         crate::terminal_bridge::BridgeMode::Jumphost,
     );
     crate::diag::info(format!("id={id}: jumphost bridge ended for {peer}"));
-    let _ = active.shutdown();
+    let _ = active.finish_terminal();
 }
 
 fn send_initial_error(connection: &mut Connection, message: &str) {

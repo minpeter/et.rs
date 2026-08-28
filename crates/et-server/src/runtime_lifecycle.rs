@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::registry::RegistrationIdentity;
 use crate::runtime_error::RuntimeError;
 use crate::runtime_state::RuntimeCore;
+use crate::session::SessionConnection;
 
 pub(crate) enum LifecycleEvent {
     TerminalDisconnected(RegistrationIdentity),
@@ -22,26 +23,28 @@ pub(crate) fn run(
                     "terminal disconnected for registration id={}",
                     identity.id()
                 ));
-                if let Err(error) = core.raw_sockets.shutdown_registration(&identity) {
-                    crate::diag::info(format!(
-                        "id={}: error shutting down raw sockets: {error}",
-                        identity.id()
-                    ));
-                    first_error.get_or_insert(error);
-                }
                 match core.sessions.remove_registration(&identity) {
                     Ok(Some(removed)) => {
                         crate::diag::info(format!(
                             "id={}: removed session after terminal disconnect",
                             identity.id()
                         ));
-                        if let Some(connection) = removed.connection {
-                            if let Err(error) = connection.shutdown() {
+                        if let Some(SessionConnection::Starting(stream)) = removed.connection {
+                            if let Err(error) = core.raw_sockets.shutdown_registration(&identity) {
+                                crate::diag::info(format!(
+                                    "id={}: error shutting down raw sockets: {error}",
+                                    identity.id()
+                                ));
+                                first_error.get_or_insert(error);
+                            }
+                            if let Err(error) = stream.shutdown(std::net::Shutdown::Both) {
                                 crate::diag::info(format!(
                                     "id={}: error shutting down session connection: {error}",
                                     identity.id()
                                 ));
-                                first_error.get_or_insert(RuntimeError::Session(error));
+                                first_error.get_or_insert(RuntimeError::Session(
+                                    crate::session::SessionError::Io(error),
+                                ));
                             }
                         }
                     }

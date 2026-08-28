@@ -43,14 +43,18 @@ pub(crate) fn run(
                             identity.id()
                         ));
                         if let Some(SessionConnection::Starting(stream)) = removed.connection {
-                            if let Err(error) = stream.shutdown(std::net::Shutdown::Both) {
-                                crate::diag::info(format!(
-                                    "id={}: error shutting down session connection: {error}",
-                                    identity.id()
-                                ));
-                                first_error.get_or_insert(RuntimeError::Session(
-                                    crate::session::SessionError::Io(error),
-                                ));
+                            match stream.shutdown(std::net::Shutdown::Both) {
+                                Ok(()) => {}
+                                Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
+                                Err(error) => {
+                                    crate::diag::info(format!(
+                                        "id={}: error shutting down session connection: {error}",
+                                        identity.id()
+                                    ));
+                                    first_error.get_or_insert(RuntimeError::Session(
+                                        crate::session::SessionError::Io(error),
+                                    ));
+                                }
                             }
                         }
                     }

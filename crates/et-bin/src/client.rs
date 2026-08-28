@@ -12,7 +12,8 @@ use crate::bootstrap::{
     validate_ssh_destination, BootstrapRequest, Credentials, JumpBootstrapRequest, RemoteShell,
 };
 use crate::client_environment::{
-    ghostty_colorterm, locale_environment_capacity, normalize_terminal_type, ssh_locale_environment,
+    bounded_locale_environment, ghostty_colorterm, normalize_terminal_type,
+    reserved_environment_value_lengths, ssh_locale_environment,
 };
 use crate::deadline::Deadline;
 use crate::error::ClientError;
@@ -93,6 +94,33 @@ fn run_client(
     // Bind local sources only after the encrypted session exists so accepted
     // tunnels can be multiplexed immediately (avoids pre-handshake accept races).
     let local_sources = forward_config.local_sources;
+    let mut initial_payload = forward_config.initial_payload;
+    let local_term = std::env::var("TERM").ok();
+    let local_colorterm = std::env::var("COLORTERM").ok();
+    let term = normalize_terminal_type(local_term.as_deref());
+    let colorterm = ghostty_colorterm(local_term.as_deref(), local_colorterm.as_deref());
+    let reserved_environment = reserved_environment_value_lengths(
+        initial_payload
+            .environmentvariables
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.len())),
+        colorterm,
+        initial_payload
+            .reversetunnels
+            .iter()
+            .filter_map(|request| request.environmentvariable.as_deref()),
+    );
+    if reserved_environment.len() > crate::terminal_protocol::MAX_ENVIRONMENT {
+        return Err(
+            crate::forward_config::ForwardConfigError::TooManyEnvironmentNames(
+                reserved_environment.len(),
+            )
+            .into(),
+        );
+    }
+    let locale_environment =
+        bounded_locale_environment(ssh_locale_environment(), &reserved_environment)
+            .map_err(crate::forward_config::ForwardConfigError::EnvironmentPacketTooLarge)?;
 
     let requested_user = command_user(destination.user, args.username.clone());
     validate_ssh_destination(&destination.host, requested_user.as_deref())?;
@@ -105,10 +133,6 @@ fn run_client(
     )?;
     let user = requested_user.or(resolved.user);
     validate_ssh_destination(&destination.host, user.as_deref())?;
-    let local_term = std::env::var("TERM").ok();
-    let local_colorterm = std::env::var("COLORTERM").ok();
-    let term = normalize_terminal_type(local_term.as_deref());
-    let colorterm = ghostty_colorterm(local_term.as_deref(), local_colorterm.as_deref());
     let probe_request = BootstrapRequest {
         user: user.clone(),
         host_alias: destination.host.clone(),
@@ -172,7 +196,6 @@ fn run_client(
         host: resolved.hostname,
         port: destination.port,
     };
-    let mut initial_payload = forward_config.initial_payload;
     if let Some(jumphost) = args.jumphost.as_deref() {
         let parsed_jump = et_cli::host::parse_host_string(jumphost);
         let jump_host = parsed_jump
@@ -205,19 +228,9 @@ fn run_client(
         initial_payload.jumphost = Some(true);
     }
     if remote_mode.terminal_shell == RemoteShellKind::Posix {
-        let forward_environment = initial_payload
-            .reversetunnels
-            .iter()
-            .filter(|request| request.environmentvariable.is_some())
-            .count();
-        let locale_capacity = locale_environment_capacity(
-            initial_payload.environmentvariables.len(),
-            colorterm.is_some(),
-            forward_environment,
-        );
         initial_payload
             .environmentvariables
-            .extend(ssh_locale_environment().take(locale_capacity));
+            .extend(locale_environment);
         if let Some(value) = colorterm {
             initial_payload
                 .environmentvariables

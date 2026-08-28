@@ -6,7 +6,7 @@ use et_net::connection::{ConnError, Connection};
 use prost::Message;
 
 use super::{
-    recover_initial_transport, recover_transport, send_command, TerminalReset,
+    recover_initial_transport, recover_transport, send_command, TerminalModeState, TerminalReset,
     GRACEFUL_TERMINAL_MODE_RESET, TERMINAL_MODE_RESET,
 };
 use crate::client_terminal::{connection_ended, RemoteLines};
@@ -131,12 +131,28 @@ fn graceful_terminal_mode_reset_keeps_the_main_screen() {
 }
 
 #[test]
-fn terminal_result_selects_graceful_or_abrupt_reset() {
-    assert_eq!(TerminalReset::for_result(&Ok(())), TerminalReset::Graceful);
+fn observed_alternate_screen_selects_graceful_or_abrupt_reset() {
     assert_eq!(
-        TerminalReset::for_result(&Err(super::terminal_text("broken terminal"))),
-        TerminalReset::Abrupt
+        TerminalReset::for_alternate_screen(false),
+        TerminalReset::KeepCurrentScreen
     );
+    assert_eq!(
+        TerminalReset::for_alternate_screen(true),
+        TerminalReset::LeaveAlternate
+    );
+}
+
+#[test]
+fn alternate_screen_tracking_handles_split_enter_and_leave_sequences() {
+    let mut modes = TerminalModeState::default();
+    modes.observe(b"before\x1b[?10");
+    assert!(!modes.alternate_screen);
+    modes.observe(b"49hinside");
+    assert!(modes.alternate_screen);
+    modes.observe(b"\x1b[?104");
+    assert!(modes.alternate_screen);
+    modes.observe(b"9lafter");
+    assert!(!modes.alternate_screen);
 }
 
 fn tcp_pair() -> (TcpStream, TcpStream) {

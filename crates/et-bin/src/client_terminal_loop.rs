@@ -16,6 +16,7 @@ use rustix::event::{poll, PollFd, PollFlags};
 #[cfg(unix)]
 use rustix::time::Timespec;
 
+use crate::client_terminal::TerminalModeState;
 #[cfg(unix)]
 use crate::client_terminal::{
     connection_ended, display_packet, recover_transport, send_buffer, send_size, terminal_error,
@@ -32,18 +33,19 @@ const INPUT_CHUNK: usize = 16 * 1024;
 const MISSED_KEEPALIVES: u32 = 3;
 
 /// Loop configuration resolved by [`crate::client_terminal::run`].
-pub(crate) struct PumpOptions {
+pub(crate) struct PumpOptions<'a> {
     pub(crate) read_stdin: bool,
     pub(crate) keepalive_seconds: u32,
     pub(crate) terminal_enabled: bool,
     pub(crate) auto_cursor_report: bool,
+    pub(crate) terminal_modes: &'a mut TerminalModeState,
 }
 
 #[cfg(unix)]
 pub fn pump<F>(
     connection: &mut Connection,
     wake: &mut UnixStream,
-    options: PumpOptions,
+    options: PumpOptions<'_>,
     forwarder: &Forwarder,
     mut reconnect: F,
 ) -> Result<(), ClientError>
@@ -55,6 +57,7 @@ where
         keepalive_seconds,
         terminal_enabled,
         auto_cursor_report,
+        terminal_modes,
     } = options;
     let stdin = io::stdin();
     let interval = Duration::from_secs(u64::from(keepalive_seconds.max(1)));
@@ -167,7 +170,9 @@ where
                         pending_forward = forwarder
                             .try_receive(packet)
                             .map_err(|error| terminal_text(error.to_string()))?;
-                    } else if route_server_packet(packet, terminal_enabled)? && auto_cursor_report {
+                    } else if route_server_packet(packet, terminal_enabled, terminal_modes)?
+                        && auto_cursor_report
+                    {
                         let _ =
                             send_buffer(connection, crate::client_terminal::CURSOR_REPORT_REPLY);
                     }
@@ -253,9 +258,10 @@ where
 fn route_server_packet(
     packet: et_core::packet::Packet,
     terminal_enabled: bool,
+    terminal_modes: &mut TerminalModeState,
 ) -> Result<bool, ClientError> {
     if terminal_enabled || packet.header() == TerminalPacketType::KeepAlive as u8 {
-        return display_packet(packet);
+        return display_packet(packet, terminal_modes);
     }
     if packet.header() == TerminalPacketType::TerminalBuffer as u8 {
         return Ok(false);

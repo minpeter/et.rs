@@ -185,18 +185,23 @@ impl SessionTable {
         })
     }
 
-    pub(crate) fn remove_registration(
+    pub(crate) fn remove_registration_with<F>(
         &self,
         identity: &RegistrationIdentity,
-    ) -> Result<Option<RemovedRegistration>, SessionTableError> {
+        before_notify: F,
+    ) -> Result<Option<RemovedRegistration>, SessionTableError>
+    where
+        F: FnOnce(bool),
+    {
         let mut state = self.lock()?;
-        let matches = state
-            .slots
-            .get(identity.id())
-            .is_some_and(|slot| identity.matches(slot.registration()));
-        if !matches {
+        let Some(slot) = state.slots.get(identity.id()) else {
+            return Ok(None);
+        };
+        if !identity.matches(slot.registration()) {
             return Ok(None);
         }
+        let shutdown_raw = !matches!(slot, Slot::Active { .. });
+        before_notify(shutdown_raw);
         let connection = state
             .slots
             .remove(identity.id())

@@ -7,8 +7,8 @@ use et_net::local_packet::{read_local_packet, LocalPacketDecoder};
 use portable_pty::{MasterPty, PtySize};
 use prost::Message;
 
-const MAX_ENVIRONMENT: usize = 128;
-const MAX_ENV_VALUE: usize = 4096;
+pub(crate) const MAX_ENVIRONMENT: usize = 128;
+pub(crate) const MAX_ENV_VALUE: usize = 4096;
 const READ_BUFFER: usize = 16 * 1024;
 
 pub fn read_initial_environment(router: &mut LocalStream) -> Result<Vec<(String, String)>, String> {
@@ -92,7 +92,7 @@ pub fn handle_packet(
     }
 }
 
-fn valid_environment_name(name: &str) -> bool {
+pub(crate) fn valid_environment_name(name: &str) -> bool {
     let mut bytes = name.bytes();
     matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')

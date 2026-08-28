@@ -1,0 +1,106 @@
+name: QA Published Release
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/qa-published-release.yml
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published et release tag to verify
+        required: true
+        default: et@0.0.17
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qa-published-release-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-linux-arm64:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+    env:
+      RELEASE_TAG: ${{ inputs.tag || 'et@0.0.17' }}
+    steps:
+      - name: Verify published archive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^et@[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          version="${RELEASE_TAG#et@}"
+          archive="et-${version}-${{ matrix.target }}.tar.gz"
+          release_url="https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}"
+          work_dir="$(mktemp -d "${RUNNER_TEMP}/qa-published-release.XXXXXX")"
+          start_dir="$PWD"
+
+          cleanup() {
+            cd "$start_dir"
+            rm -rf -- "$work_dir"
+          }
+          trap cleanup EXIT
+
+          cd "$work_dir"
+          curl --fail --location --silent --show-error --remote-name \
+            "${release_url}/${archive}"
+          curl --fail --location --silent --show-error --remote-name \
+            "${release_url}/${archive}.sha256"
+          sha256sum --check "${archive}.sha256"
+          tar --extract --gzip --file "$archive"
+
+          binary_dir="${work_dir}/${archive%.tar.gz}"
+          file_output="$(file "${binary_dir}/et")"
+          echo "$file_output"
+          echo "runner architecture: $(uname -m)"
+          [[ "$(uname -m)" == aarch64 ]]
+          grep --fixed-strings --quiet 'ARM aarch64' <<<"$file_output"
+
+          assert_version() {
+            local binary="$1"
+            local role="$2"
+            local expected_version="$3"
+            local output
+
+            output="$($binary --version)"
+            echo "$output"
+            [[ "${output%%$'\n'*}" == "${role} version ${expected_version} (et.rs)" ]]
+          }
+
+          control_version=0.0.18
+          if [[ "$version" == "$control_version" ]]; then
+            control_version=0.0.17
+          fi
+          if assert_version "${binary_dir}/et" et "$control_version"; then
+            echo "CONTROL_RED failed: wrong version ${control_version} was accepted" >&2
+            exit 1
+          else
+            echo "CONTROL_RED passed: wrong version ${control_version} was rejected"
+          fi
+
+          for role in et etserver etterminal htm htmd; do
+            assert_version "${binary_dir}/${role}" "$role" "$version"
+          done
+
+          cd "$start_dir"
+          cleanup
+          trap - EXIT
+          if [[ -e "$work_dir" ]]; then
+            echo "Runtime cleanup failed: $work_dir still exists" >&2
+            exit 1
+          fi
+          echo "RUNTIME_CLEANUP_PASS: removed $work_dir"

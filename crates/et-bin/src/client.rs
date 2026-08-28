@@ -11,6 +11,9 @@ use crate::bootstrap::{
     build_invocation, build_jump_invocation, build_shell_probe, cmd_safe, provisional_credentials,
     validate_ssh_destination, BootstrapRequest, Credentials, JumpBootstrapRequest, RemoteShell,
 };
+use crate::client_environment::{
+    ghostty_colorterm, normalize_terminal_type, ssh_locale_environment,
+};
 use crate::deadline::Deadline;
 use crate::error::ClientError;
 use crate::initial_connect::{connect_initial, reconnect, Endpoint, ReconnectOutcome};
@@ -48,20 +51,6 @@ fn resolve_remote_mode(args: &ClientArgs, detected_shell: Option<RemoteShell>) -
         terminal_path: args
             .effective_terminal_path()
             .or_else(|| (bootstrap_shell == RemoteShell::Cmd).then(|| "et.exe".to_owned())),
-    }
-}
-
-fn normalize_terminal_type(term: Option<&str>) -> String {
-    match term {
-        None | Some("xterm-ghostty") => "xterm-256color".to_owned(),
-        Some(term) => term.to_owned(),
-    }
-}
-
-fn ghostty_colorterm<'a>(term: Option<&str>, colorterm: Option<&'a str>) -> Option<&'a str> {
-    match (term, colorterm) {
-        (Some("xterm-ghostty"), Some(value @ ("truecolor" | "24bit"))) => Some(value),
-        _ => None,
     }
 }
 
@@ -216,6 +205,9 @@ fn run_client(
         initial_payload.jumphost = Some(true);
     }
     if remote_mode.terminal_shell == RemoteShellKind::Posix {
+        initial_payload
+            .environmentvariables
+            .extend(ssh_locale_environment());
         if let Some(value) = colorterm {
             initial_payload
                 .environmentvariables
@@ -672,44 +664,5 @@ mod tests {
                 terminal_path: None,
             }
         );
-    }
-
-    #[test]
-    fn ghostty_term_uses_compatible_remote_fallback() {
-        assert_eq!(normalize_terminal_type(None), "xterm-256color");
-        assert_eq!(
-            normalize_terminal_type(Some("xterm-ghostty")),
-            "xterm-256color"
-        );
-        for term in [
-            "xterm-256color",
-            "screen-256color",
-            "linux",
-            "xterm-kitty",
-            "arbitrary-term",
-        ] {
-            assert_eq!(normalize_terminal_type(Some(term)), term);
-        }
-    }
-
-    #[test]
-    fn ghostty_truecolor_hint_is_forwarded_only_for_known_values() {
-        assert_eq!(
-            ghostty_colorterm(Some("xterm-ghostty"), Some("truecolor")),
-            Some("truecolor")
-        );
-        assert_eq!(
-            ghostty_colorterm(Some("xterm-ghostty"), Some("24bit")),
-            Some("24bit")
-        );
-        assert_eq!(
-            ghostty_colorterm(Some("xterm-ghostty"), Some("unexpected")),
-            None
-        );
-        assert_eq!(
-            ghostty_colorterm(Some("xterm-256color"), Some("truecolor")),
-            None
-        );
-        assert_eq!(ghostty_colorterm(Some("xterm-ghostty"), None), None);
     }
 }

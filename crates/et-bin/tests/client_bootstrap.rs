@@ -85,6 +85,7 @@ exit "$ET_FAKE_EXIT"
     fn command(&self, config: &str, stdout: &str, exit: i32, stderr: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_et"));
         command
+            .env_clear()
             .env("PATH", &self.dir.0)
             .env("ET_FAKE_ARGV", &self.argv)
             .env("ET_FAKE_STDIN", &self.stdin)
@@ -125,10 +126,9 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-#[test]
-fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
+fn initial_payload_server() -> (u16, thread::JoinHandle<InitialPayload>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
+    let port = listener.local_addr().unwrap().port();
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         bound(&stream);
@@ -141,21 +141,28 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
         let packet = connection.read_packet().unwrap();
         assert_eq!(packet.header(), EtPacketType::InitialPayload as u8);
         let payload = InitialPayload::decode(packet.payload()).unwrap();
-        assert_eq!(payload.jumphost, Some(false));
-        assert!(payload.reversetunnels.is_empty());
-        assert!(payload.environmentvariables.is_empty());
         connection
             .write_packet(
                 EtPacketType::InitialResponse as u8,
                 &InitialResponse { error: None }.encode_to_vec(),
             )
             .unwrap();
+        payload
     });
+    (port, server)
+}
+
+#[test]
+fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
+    let (port, server) = initial_payload_server();
 
     let fake = FakeSsh::new();
     let output = fake
         .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
-        .env("TERM", "xterm-test")
+        .env("TERM", "xterm-ghostty")
+        .env("COLORTERM", "truecolor")
+        .env("LANG", "C.UTF-8")
+        .env("LC_CTYPE", "C.UTF-8")
         .args([
             "-N",
             // Upstream takes an explicit verbosity level, not a repeat count.
@@ -167,14 +174,35 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
             "/tmp/server fifo",
             "--ssh-option",
             "StrictHostKeyChecking=no",
-            &format!("test-user@server-alias:{}", address.port()),
+            &format!("test-user@server-alias:{port}"),
         ])
         .output()
         .unwrap();
-    server.join().unwrap();
+    let payload = server.join().unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(output.stdout.is_empty() && output.stderr.is_empty());
     assert!(fs::read(&fake.stdin).unwrap().is_empty());
+    assert_eq!(payload.jumphost, Some(false));
+    assert!(payload.reversetunnels.is_empty());
+    assert_eq!(
+        payload.environmentvariables.get("LANG").map(String::as_str),
+        Some("C.UTF-8")
+    );
+    assert_eq!(
+        payload
+            .environmentvariables
+            .get("LC_CTYPE")
+            .map(String::as_str),
+        Some("C.UTF-8")
+    );
+    assert_eq!(
+        payload
+            .environmentvariables
+            .get("COLORTERM")
+            .map(String::as_str),
+        Some("truecolor")
+    );
+    assert_eq!(payload.environmentvariables.len(), 3);
 
     let invocations = fake.invocations();
     assert_eq!(invocations.len(), 3);
@@ -190,7 +218,7 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
     );
     let prefix = "printf '%s\\n' '";
     let value = argv[2].strip_prefix(prefix).unwrap();
-    let provisional = value.split_once("_xterm-test'").unwrap().0;
+    let provisional = value.split_once("_xterm-256color'").unwrap().0;
     let (id, key) = parse_id_passkey(provisional).unwrap();
     assert!(id.starts_with("XXX"));
     assert_eq!(id.len(), 16);
@@ -198,9 +226,59 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
     assert_eq!(
         argv[2],
         format!(
-            "printf '%s\\n' '{provisional}_xterm-test' | '/opt/et terminal' '--verbose=2' '--serverfifo=/tmp/server fifo'"
+            "printf '%s\\n' '{provisional}_xterm-256color' | '/opt/et terminal' '--verbose=2' '--serverfifo=/tmp/server fifo'"
         )
     );
+}
+
+#[test]
+fn posix_client_forwards_only_ssh_locale_environment() {
+    let (port, server) = initial_payload_server();
+    let fake = FakeSsh::new();
+    let output = fake
+        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
+        .env("TERM", "xterm-test")
+        .env("LANG", "ko_KR.UTF-8")
+        .env("LC_TEST_SENTINEL", "C.UTF-8")
+        .env("LANGUAGE", "do-not-forward")
+        .env("ET_SECRET", "do-not-forward")
+        .args(["-N", &format!("server-alias:{port}")])
+        .output()
+        .unwrap();
+    let payload = server.join().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        payload.environmentvariables.get("LANG").map(String::as_str),
+        Some("ko_KR.UTF-8")
+    );
+    assert_eq!(
+        payload
+            .environmentvariables
+            .get("LC_TEST_SENTINEL")
+            .map(String::as_str),
+        Some("C.UTF-8")
+    );
+    assert!(!payload.environmentvariables.contains_key("LANGUAGE"));
+    assert!(!payload.environmentvariables.contains_key("ET_SECRET"));
+    assert_eq!(payload.environmentvariables.len(), 2);
+
+    let (windows_port, windows_server) = initial_payload_server();
+    let windows_fake = FakeSsh::new();
+    let windows_output = windows_fake
+        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
+        .env("TERM", "xterm256color")
+        .env("LANG", "ko_KR.UTF-8")
+        .env("LC_TEST_SENTINEL", "C.UTF-8")
+        .args(["-N", "--winserver", &format!("server-alias:{windows_port}")])
+        .output()
+        .unwrap();
+    let windows_payload = windows_server.join().unwrap();
+    assert!(
+        windows_output.status.success(),
+        "{}",
+        stderr(&windows_output)
+    );
+    assert!(windows_payload.environmentvariables.is_empty());
 }
 
 #[test]

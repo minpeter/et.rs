@@ -757,6 +757,39 @@ fn colorterm_counts_toward_the_tunnel_environment_limit() {
 }
 
 #[test]
+fn non_posix_colorterm_does_not_reserve_an_unsent_environment_name() {
+    let no_ssh = TestDir::new("honest");
+    let mut arguments = vec![
+        "-N".to_owned(),
+        "--winserver".to_owned(),
+        "--jumphost".to_owned(),
+        "jump-alias".to_owned(),
+    ];
+    for index in 0..128 {
+        arguments.extend([
+            "-r".to_owned(),
+            format!("ET_PIPE_{index:03}:remote-{index}"),
+        ]);
+    }
+    arguments.push("example.test".to_owned());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env("PATH", &no_ssh.0)
+        .env("TERM", "xterm-ghostty")
+        .env("COLORTERM", "truecolor")
+        .args(arguments)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("could not start system ssh"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn oversized_tunnel_environment_name_exceeds_local_packet_limit() {
     let no_ssh = TestDir::new("honest");
     let environment_name = format!("E{}", "T".repeat(MAX_LOCAL_PACKET_LEN));
@@ -801,6 +834,39 @@ fn oversized_jumphost_initialization_fails_before_ssh_bootstrap() {
     assert_eq!(output.status.code(), Some(2));
     assert!(
         stderr(&output).contains("jumphost initialization packet needs at least"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn non_posix_jumphost_ignores_unsent_colorterm_in_packet_budget() {
+    let no_ssh = TestDir::new("honest");
+    let mut arguments = vec![
+        "-N".to_owned(),
+        "--winserver".to_owned(),
+        "--jumphost".to_owned(),
+        "jump-alias".to_owned(),
+    ];
+    let destination = format!("remote-{}", "x".repeat(486));
+    for _ in 0..127 {
+        arguments.extend(["-r".to_owned(), format!("ET_PIPE:{destination}")]);
+    }
+    let boundary_destination = format!("remote-{}", "x".repeat(587));
+    arguments.extend(["-r".to_owned(), format!("ET_PIPE:{boundary_destination}")]);
+    arguments.push("example.test".to_owned());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env("PATH", &no_ssh.0)
+        .env("TERM", "xterm-ghostty")
+        .env("COLORTERM", "truecolor")
+        .args(arguments)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("could not start system ssh"),
         "{}",
         stderr(&output)
     );

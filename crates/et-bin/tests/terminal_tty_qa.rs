@@ -67,6 +67,10 @@ fn real_tty_restores_termios_and_propagates_resize() {
     assert!(output.contains("TERMIOS-RESTORED:"), "{output:?}");
     assert!(output.contains(":CODE:0:"), "{output:?}");
     assert!(termios_restored(&output), "{output:?}");
+    assert!(
+        !output.contains("Connection to 127.0.0.1 closed."),
+        "command sessions must not print an interactive close banner: {output:?}"
+    );
 }
 
 fn termios_restored(output: &str) -> bool {

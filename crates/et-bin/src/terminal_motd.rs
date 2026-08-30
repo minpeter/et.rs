@@ -170,9 +170,6 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
 
-    use nix::sys::stat::Mode as NixMode;
-    use nix::unistd::mkfifo;
-
     use super::*;
 
     struct Sandbox(PathBuf);
@@ -225,7 +222,11 @@ mod tests {
         let missing = sandbox.0.join("missing");
         let directory = sandbox.directory("directory");
         let fifo = sandbox.0.join("fifo");
-        mkfifo(&fifo, NixMode::S_IRUSR | NixMode::S_IWUSR).unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
 
         for source in [empty, missing, directory, fifo, PathBuf::from("/dev/null")] {
             assert_eq!(load_from(&[], &[], Some(&source), None), None, "{source:?}");

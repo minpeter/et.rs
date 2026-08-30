@@ -101,6 +101,10 @@ mod server_daemon;
 mod terminal;
 mod terminal_credentials;
 mod terminal_daemon;
+// The message of the day comes from `pam_motd`'s files, which exist only on
+// POSIX systems.
+#[cfg(unix)]
+mod terminal_motd;
 mod terminal_protocol;
 mod terminal_pty;
 

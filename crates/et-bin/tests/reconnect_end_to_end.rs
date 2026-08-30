@@ -16,10 +16,13 @@ use reconnect_stack::{mkfifo, shell_quote, Stack};
 use reconnect_support::CutProxy;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+const MOTD_MARKER: &[u8] = b"ET-MOTD-RECONNECT";
 
 #[test]
 fn real_client_recovers_same_shell_and_once_only_buffered_output() {
     let mut stack = Stack::start();
+    let motd = stack.directory.join("motd");
+    fs::write(&motd, b"ET-MOTD-RECONNECT\n").unwrap();
     let proxy = CutProxy::start(stack.port);
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -52,6 +55,7 @@ fn real_client_recovers_same_shell_and_once_only_buffered_output() {
     );
     client.env("TERM", "xterm-256color");
     client.env("ET_SSH_COUNT", &stack.ssh_count);
+    client.env("ET_MOTD_PATH", &motd);
     let client_ready = stack.directory.join("client-ready");
     client.env("ET_SSH_READY", &client_ready);
     let mut child = pair.slave.spawn_command(client).unwrap();
@@ -159,6 +163,7 @@ fn real_client_recovers_same_shell_and_once_only_buffered_output() {
     assert!(output.windows(11).any(|window| window == b"SIZE:44 111"));
     assert_eq!(count(&output, b"BUFFERED-ONCE\r\n"), 1);
     assert_eq!(count(&output, b"BUFFERED-TWICE\r\n"), 1);
+    assert_eq!(count(&output, MOTD_MARKER), 1);
     assert!(text.contains("RECONNECT-TERMIOS:"), "output={text}");
     assert!(text.contains(":CODE:0:"), "output={text}");
     assert!(termios_restored(&text), "output={text}");

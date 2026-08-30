@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
@@ -198,24 +199,8 @@ impl Endpoint {
                 } else {
                     (host.as_str(), *port).to_socket_addrs()?.collect()
                 };
-                let mut listeners = Vec::new();
-                let mut last_error = None;
-                for address in addresses {
-                    match bind_tcp_single_family(address) {
-                        Ok(listener) => listeners.push(ForwardListener {
-                            inner: ListenerKind::Tcp(listener),
-                            cleanup: None,
-                            cleanup_dir: None,
-                        }),
-                        Err(error) => last_error = Some(error),
-                    }
-                }
-                if listeners.is_empty() {
-                    return Err(last_error.unwrap_or_else(|| {
-                        io::Error::new(io::ErrorKind::AddrNotAvailable, "endpoint did not resolve")
-                    }));
-                }
-                Ok(listeners)
+                let addresses = distinct_tcp_addresses(addresses);
+                bind_tcp_addresses(addresses)
             }
             #[cfg(unix)]
             Self::Unix(path) => {
@@ -248,16 +233,63 @@ impl Endpoint {
     }
 }
 
+fn bind_tcp_addresses(
+    addresses: impl IntoIterator<Item = std::net::SocketAddr>,
+) -> io::Result<Vec<ForwardListener>> {
+    bind_tcp_addresses_with(addresses, bind_tcp_single_family)
+}
+
+fn bind_tcp_addresses_with(
+    addresses: impl IntoIterator<Item = std::net::SocketAddr>,
+    mut bind: impl FnMut(std::net::SocketAddr) -> io::Result<Option<TcpListener>>,
+) -> io::Result<Vec<ForwardListener>> {
+    let mut listeners = Vec::new();
+    for address in addresses {
+        if let Some(listener) = bind(address)? {
+            listeners.push(ForwardListener {
+                inner: ListenerKind::Tcp(listener),
+                cleanup: None,
+                cleanup_dir: None,
+            });
+        }
+    }
+    if listeners.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "endpoint did not resolve",
+        ));
+    }
+    Ok(listeners)
+}
+
+fn distinct_tcp_addresses(
+    addresses: impl IntoIterator<Item = std::net::SocketAddr>,
+) -> Vec<std::net::SocketAddr> {
+    let mut seen = HashSet::new();
+    addresses
+        .into_iter()
+        .filter(|address| seen.insert(*address))
+        .collect()
+}
+
 /// Bind one TCP listener for exactly one address family, mirroring upstream
 /// `TcpSocketHandler::listen` (which sets `IPV6_V6ONLY` and binds each
 /// resolved address separately).
-fn bind_tcp_single_family(address: std::net::SocketAddr) -> io::Result<TcpListener> {
+fn bind_tcp_single_family(address: std::net::SocketAddr) -> io::Result<Option<TcpListener>> {
     let domain = if address.is_ipv6() {
         socket2::Domain::IPV6
     } else {
         socket2::Domain::IPV4
     };
-    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None)?;
+    let socket = match socket2::Socket::new(domain, socket2::Type::STREAM, None) {
+        Ok(socket) => socket,
+        Err(error) if is_address_family_unsupported(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    // Match `std::net::TcpListener`: Windows SO_REUSEADDR permits rebinding
+    // sockets that are actively in use, so do not enable it there. Unix needs
+    // reuse for the normal close-and-restart lifecycle.
+    #[cfg(not(windows))]
     socket.set_reuse_address(true)?;
     if address.is_ipv6() {
         socket.set_only_v6(true)?;
@@ -266,7 +298,19 @@ fn bind_tcp_single_family(address: std::net::SocketAddr) -> io::Result<TcpListen
     socket.listen(128)?;
     let listener: TcpListener = socket.into();
     listener.set_nonblocking(true)?;
-    Ok(listener)
+    Ok(Some(listener))
+}
+
+fn is_address_family_unsupported(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(rustix::io::Errno::AFNOSUPPORT.raw_os_error())
+    }
+    #[cfg(windows)]
+    {
+        // Winsock's stable WSAEAFNOSUPPORT value.
+        error.raw_os_error() == Some(10_047)
+    }
 }
 
 pub(crate) enum ForwardStream {
@@ -385,5 +429,80 @@ impl Drop for ForwardListener {
         if let Some(path) = self.cleanup_dir.as_ref() {
             let _ = fs::remove_dir(path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn localhost_bind_rejects_one_occupied_address_family() {
+        let occupied = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let endpoint = Endpoint::Tcp {
+            host: "localhost".to_owned(),
+            port,
+        };
+
+        let error = match endpoint.bind() {
+            Ok(_) => panic!("a partially bound localhost source must fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    #[test]
+    fn failed_address_rolls_back_an_earlier_listener() {
+        let address: std::net::SocketAddr = (std::net::Ipv4Addr::LOCALHOST, 0).into();
+        let mut earlier = None;
+        let mut calls = 0;
+
+        let error = match bind_tcp_addresses_with([address, address], |_| {
+            calls += 1;
+            if calls == 1 {
+                let listener = TcpListener::bind(address)?;
+                listener.set_nonblocking(true)?;
+                earlier = Some(listener.local_addr()?);
+                Ok(Some(listener))
+            } else {
+                Err(io::Error::new(io::ErrorKind::AddrInUse, "occupied"))
+            }
+        }) {
+            Ok(_) => panic!("a partially bound address list must fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        TcpListener::bind(earlier.unwrap())
+            .expect("the earlier listener must be dropped on failure");
+    }
+
+    #[test]
+    fn duplicate_addresses_are_bound_once() {
+        let address: std::net::SocketAddr = (std::net::Ipv4Addr::LOCALHOST, 0).into();
+        let addresses = distinct_tcp_addresses([address, address]);
+
+        assert_eq!(bind_tcp_addresses(addresses).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn address_family_error_classifier_is_platform_specific() {
+        #[cfg(unix)]
+        let unsupported =
+            io::Error::from_raw_os_error(rustix::io::Errno::AFNOSUPPORT.raw_os_error());
+        #[cfg(windows)]
+        let unsupported = io::Error::from_raw_os_error(10_047);
+
+        assert!(is_address_family_unsupported(&unsupported));
+        assert!(!is_address_family_unsupported(&io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "occupied",
+        )));
+        assert!(!is_address_family_unsupported(&io::Error::new(
+            io::ErrorKind::Unsupported,
+            "not an address-family error",
+        )));
     }
 }

@@ -182,18 +182,22 @@ mod tests {
             TermInit {
                 environmentnames: vec!["A".to_owned()],
                 environmentvalues: Vec::new(),
+                flowcontrol: None,
             },
             TermInit {
                 environmentnames: vec!["BAD-NAME".to_owned()],
                 environmentvalues: vec!["value".to_owned()],
+                flowcontrol: None,
             },
             TermInit {
                 environmentnames: vec!["VALID".to_owned()],
                 environmentvalues: vec!["bad\0value".to_owned()],
+                flowcontrol: None,
             },
             TermInit {
                 environmentnames: vec!["VALID".to_owned()],
                 environmentvalues: vec!["x".repeat(MAX_ENV_VALUE + 1)],
+                flowcontrol: None,
             },
         ] {
             let packet = Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec());

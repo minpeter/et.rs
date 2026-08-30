@@ -253,6 +253,7 @@ fn handle_new(
     let term_init = TermInit {
         environmentnames: environment.keys().cloned().collect(),
         environmentvalues: environment.values().cloned().collect(),
+        flowcontrol: payload.flowcontrol,
     };
     let init_packet = et_core::packet::Packet::new(
         TerminalPacketType::TerminalInit as u8,
@@ -261,7 +262,7 @@ fn handle_new(
     if write_local_packet(&mut terminal, &init_packet).is_err() {
         return;
     }
-    let active = match ActiveSession::new(connection, &terminal) {
+    let active = match ActiveSession::new(connection, &terminal, payload.flowcontrol) {
         Ok(active) => active,
         Err(error) => {
             crate::diag::info(format!(
@@ -271,6 +272,7 @@ fn handle_new(
         }
     };
     let active = Arc::new(active);
+    active.start_flow_writer();
     if start.activate(active.clone()).is_err() {
         crate::diag::info(format!("id={id}: could not activate session for {peer}"));
         return;
@@ -321,7 +323,7 @@ fn run_jumphost(
         crate::diag::info(format!("id={id}: jumphost failed sending JUMPHOST_INIT"));
         return;
     }
-    let active = match ActiveSession::new(connection, &terminal) {
+    let active = match ActiveSession::new(connection, &terminal, payload.flowcontrol) {
         Ok(active) => active,
         Err(error) => {
             crate::diag::info(format!(
@@ -331,6 +333,7 @@ fn run_jumphost(
         }
     };
     let active = Arc::new(active);
+    active.start_flow_writer();
     if start.activate(active.clone()).is_err() {
         crate::diag::info(format!("id={id}: jumphost could not activate session"));
         return;

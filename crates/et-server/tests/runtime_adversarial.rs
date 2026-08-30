@@ -9,7 +9,8 @@ use std::net::TcpStream;
 
 use et_core::keys::passkey_to_key;
 use et_core::proto::{
-    ConnectRequest, ConnectResponse, ConnectStatus, InitialPayload, InitialResponse,
+    ConnectRequest, ConnectResponse, ConnectStatus, FlowControlMode, InitialPayload,
+    InitialResponse,
 };
 use et_net::connection::Connection;
 use et_net::framing_io::{read_proto_limited, write_proto};
@@ -64,6 +65,7 @@ fn unbindable_reverse_tunnel_reports_an_error_and_resets_the_slot() {
         jumphost: Some(false),
         reversetunnels: vec![Default::default()],
         environmentvariables: HashMap::new(),
+        flowcontrol: None,
     };
     let (stream, response) = server.handshake(ID_A);
     assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
@@ -85,6 +87,7 @@ fn jumphost_payload_is_relayed_to_the_registered_terminal() {
         jumphost: Some(true),
         reversetunnels: Vec::new(),
         environmentvariables: HashMap::new(),
+        flowcontrol: Some(FlowControlMode::Discard as i32),
     };
     let (stream, response) = server.handshake(ID_A);
     assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
@@ -99,6 +102,7 @@ fn jumphost_payload_is_relayed_to_the_registered_terminal() {
     );
     let relayed = InitialPayload::decode(packet.payload()).unwrap();
     assert_eq!(relayed.jumphost, Some(true));
+    assert_eq!(relayed.flowcontrol, Some(FlowControlMode::Discard as i32));
     server.runtime.shutdown().unwrap();
 }
 

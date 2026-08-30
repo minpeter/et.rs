@@ -47,6 +47,7 @@ fn bootstrap_parent_reports_marker_and_leaves_registered_session_running() {
         &TermInit {
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
+            flowcontrol: None,
         },
     );
     send(
@@ -94,6 +95,7 @@ fn real_terminal_registers_runs_shell_and_resizes_pty() {
         &TermInit {
             environmentnames: vec!["G004_VALUE".to_owned()],
             environmentvalues: vec!["literal-value".to_owned()],
+            flowcontrol: None,
         },
     );
     send(
@@ -168,6 +170,7 @@ fn router_disconnect_terminates_the_shell() {
         &TermInit {
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
+            flowcontrol: None,
         },
     );
     drop(router);
@@ -191,6 +194,7 @@ fn real_terminal_starts_login_shell_and_loads_profile_color() {
         &TermInit {
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
+            flowcontrol: None,
         },
     );
     send(
@@ -233,6 +237,7 @@ fn real_terminal_login_shell_preserves_term_without_colorterm() {
         &TermInit {
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
+            flowcontrol: None,
         },
     );
     send(

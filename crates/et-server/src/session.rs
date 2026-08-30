@@ -2,10 +2,14 @@ use et_net::local::LocalStream;
 use std::io::{self, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 use et_core::proto::TerminalPacketType;
+use et_core::{
+    flow_control::{FlowControlMode as QueueMode, OutputQueue},
+    packet::Packet,
+};
 use et_net::connection::DEFAULT_RECOVERY_TIMEOUT;
 use et_net::connection::{ConnError, Connection};
 
@@ -18,6 +22,14 @@ use et_net::connection::{ConnError, Connection};
 /// blocking the accept path for minutes. Recovery network I/O itself runs
 /// *without* the connection mutex (see [`ActiveSession::recover_body`]).
 const RECOVERY_LOCK_TIMEOUT: Duration = DEFAULT_RECOVERY_TIMEOUT;
+const FLOW_CONTROL_BUFFER_BYTES: usize = 64 * 1024;
+
+struct FlowControlState {
+    queue: Mutex<OutputQueue>,
+    wake: Condvar,
+    connected: AtomicBool,
+    shutdown: AtomicBool,
+}
 
 pub(crate) struct ActiveSession {
     connection: Mutex<Connection>,
@@ -34,6 +46,7 @@ pub(crate) struct ActiveSession {
     /// to queue on the connection mutex for minutes after a blackhole write.
     recovering: AtomicBool,
     connection_generation: AtomicU64,
+    flow_control: Option<Arc<FlowControlState>>,
 }
 
 pub(crate) enum SessionConnection {
@@ -79,7 +92,14 @@ impl ActiveSession {
     pub(crate) fn new(
         connection: Connection,
         terminal: &LocalStream,
+        flow_control: Option<i32>,
     ) -> Result<Self, SessionError> {
+        let queue_mode = queue_mode(flow_control);
+        if queue_mode.is_some() {
+            connection
+                .minimize_output_buffering()
+                .map_err(SessionError::Connection)?;
+        }
         let control = connection
             .try_clone_stream()
             .map_err(SessionError::Connection)?;
@@ -95,10 +115,35 @@ impl ActiveSession {
             shutdown: AtomicBool::new(false),
             recovering: AtomicBool::new(false),
             connection_generation: AtomicU64::new(0),
+            flow_control: queue_mode.map(|mode| {
+                Arc::new(FlowControlState {
+                    queue: Mutex::new(OutputQueue::new(mode, FLOW_CONTROL_BUFFER_BYTES)),
+                    wake: Condvar::new(),
+                    connected: AtomicBool::new(true),
+                    shutdown: AtomicBool::new(false),
+                })
+            }),
         })
     }
 
+    pub(crate) fn start_flow_writer(self: &Arc<Self>) {
+        let Some(state) = self.flow_control.clone() else {
+            return;
+        };
+        let session = Arc::downgrade(self);
+        std::thread::spawn(move || run_flow_writer(session, state));
+    }
+
     pub(crate) fn send_packet(&self, header: u8, payload: &[u8]) -> Result<(), SessionError> {
+        if let Some(state) = &self.flow_control {
+            let mut queue = state.queue.lock().map_err(|_| SessionError::Unavailable)?;
+            queue
+                .push(Packet::new(header, payload))
+                .map_err(|_| SessionError::Connection(ConnError::Backpressure))?;
+            drop(queue);
+            state.wake.notify_one();
+            return Ok(());
+        }
         // While a recover holds the single-flight permit, queue terminal
         // output instead of contending on the connection mutex for the
         // recovery network RTT. Flushed after the new stream is installed.
@@ -186,6 +231,11 @@ impl ActiveSession {
         candidate
             .authenticate_peer(DEFAULT_RECOVERY_TIMEOUT)
             .map_err(SessionError::Connection)?;
+        if self.flow_control.is_some() {
+            candidate
+                .minimize_output_buffering()
+                .map_err(SessionError::Connection)?;
+        }
         let ack = candidate.keepalive_ack();
         candidate
             .write_packet(TerminalPacketType::KeepAlive as u8, &ack)
@@ -202,6 +252,10 @@ impl ActiveSession {
             let _ = old_control.shutdown(Shutdown::Both);
             *connection = candidate;
             self.connection_generation.fetch_add(1, Ordering::Release);
+            if let Some(state) = &self.flow_control {
+                state.connected.store(true, Ordering::Release);
+                state.wake.notify_one();
+            }
         }
 
         // Phase 4: drain terminal output queued while the handshake ran.
@@ -247,6 +301,7 @@ impl ActiveSession {
 
     pub(crate) fn finish_terminal(&self) -> Result<(), SessionError> {
         self.shutdown.store(true, Ordering::Release);
+        self.stop_flow_writer();
         let _ = self.signal();
         let terminal = self
             .terminal_control
@@ -264,6 +319,7 @@ impl ActiveSession {
 
     pub(crate) fn shutdown(&self) -> Result<(), SessionError> {
         self.shutdown.store(true, Ordering::Release);
+        self.stop_flow_writer();
         let _ = self.signal();
         let terminal = self
             .terminal_control
@@ -342,6 +398,10 @@ impl ActiveSession {
             return Ok(false);
         }
         connection.disconnect();
+        if let Some(state) = &self.flow_control {
+            state.connected.store(false, Ordering::Release);
+            state.wake.notify_one();
+        }
         Ok(true)
     }
 
@@ -366,6 +426,14 @@ impl ActiveSession {
     }
 
     pub(crate) fn can_buffer_write(&self, bytes: i64) -> Result<bool, SessionError> {
+        if let Some(state) = &self.flow_control {
+            let bytes = usize::try_from(bytes).map_err(|_| SessionError::Unavailable)?;
+            return Ok(state
+                .queue
+                .lock()
+                .map_err(|_| SessionError::Unavailable)?
+                .can_accept_terminal(bytes));
+        }
         Ok(self
             .connection
             .lock()
@@ -383,6 +451,19 @@ impl ActiveSession {
             .map_err(|_| SessionError::Unavailable)?
             .write_all(&[1])
             .map_err(SessionError::Io)
+    }
+
+    fn stop_flow_writer(&self) {
+        if let Some(state) = &self.flow_control {
+            state.shutdown.store(true, Ordering::Release);
+            state.wake.notify_one();
+        }
+    }
+}
+
+impl Drop for ActiveSession {
+    fn drop(&mut self) {
+        self.stop_flow_writer();
     }
 }
 
@@ -410,8 +491,83 @@ impl Drop for RecoverPermit<'_> {
         // Catch anything that observed `recovering` and queued after the first
         // flush but before the flag cleared (re-check is under the hold lock).
         let _ = self.session.flush_recover_hold();
+        if let Some(state) = &self.session.flow_control {
+            let connected = self
+                .session
+                .connection
+                .lock()
+                .is_ok_and(|connection| connection.connected());
+            state.connected.store(connected, Ordering::Release);
+            state.wake.notify_one();
+        }
         // Wake the bridge even on failure so it re-checks connection state.
         let _ = self.session.signal();
+    }
+}
+
+fn queue_mode(value: Option<i32>) -> Option<QueueMode> {
+    match value.and_then(|value| et_core::proto::FlowControlMode::try_from(value).ok()) {
+        None | Some(et_core::proto::FlowControlMode::None) => None,
+        Some(et_core::proto::FlowControlMode::Backpressure) => Some(QueueMode::Backpressure),
+        Some(et_core::proto::FlowControlMode::Discard) => Some(QueueMode::Discard),
+    }
+}
+
+fn run_flow_writer(session: Weak<ActiveSession>, state: Arc<FlowControlState>) {
+    loop {
+        let packet = {
+            let Ok(queue) = state.queue.lock() else {
+                return;
+            };
+            let Ok(mut queue) = state.wake.wait_while(queue, |queue| {
+                !state.shutdown.load(Ordering::Acquire)
+                    && (!state.connected.load(Ordering::Acquire) || queue.bytes() == 0)
+            }) else {
+                return;
+            };
+            if state.shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            queue.pop()
+        };
+        let Some(packet) = packet else {
+            continue;
+        };
+        let Some(session) = session.upgrade() else {
+            return;
+        };
+        let result = session
+            .connection
+            .lock()
+            .map_err(|_| SessionError::Unavailable)
+            .and_then(|mut connection| {
+                if !connection.connected() {
+                    state.connected.store(false, Ordering::Release);
+                    return Err(SessionError::Connection(ConnError::Backpressure));
+                }
+                let result = connection
+                    .write_packet(packet.header(), packet.payload())
+                    .map_err(SessionError::Connection);
+                state
+                    .connected
+                    .store(connection.connected(), Ordering::Release);
+                result
+            });
+        match result {
+            Ok(()) => {}
+            Err(SessionError::Connection(ConnError::Backpressure)) => {
+                if let Ok(mut queue) = state.queue.lock() {
+                    queue.push_front(packet);
+                } else {
+                    return;
+                }
+            }
+            Err(error) => {
+                crate::diag::info(format!("flow-control writer stopped: {error}"));
+                state.shutdown.store(true, Ordering::Release);
+                return;
+            }
+        }
     }
 }
 

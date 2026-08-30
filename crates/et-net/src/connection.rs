@@ -8,6 +8,7 @@ use et_core::crypto::{
     CryptoHandler, EncryptError, DIR_CLIENT_TO_SERVER, DIR_SERVER_TO_CLIENT, KEY_LEN,
 };
 use et_core::packet::Packet;
+use socket2::SockRef;
 #[path = "connection_recovery.rs"]
 mod recovery;
 
@@ -22,6 +23,7 @@ pub use recovery::{DEFAULT_RECOVERY_TIMEOUT, MAX_RECOVERY_PROTO_LEN};
 /// [`write_all_until`] with this deadline so the transport soft-disconnects
 /// and recovery can proceed.
 pub const DEFAULT_LIVE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+pub const FLOW_CONTROL_SOCKET_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub enum ConnError {
@@ -194,6 +196,14 @@ impl Connection {
         self.stream.set_read_timeout(timeout)?;
         self.stream.set_write_timeout(timeout)?;
         Ok(())
+    }
+
+    /// Keep opt-in flow-control backlog in the application queue instead of
+    /// allowing the kernel send queue to autotune to multiple megabytes.
+    pub fn minimize_output_buffering(&self) -> Result<(), ConnError> {
+        SockRef::from(&self.stream)
+            .set_send_buffer_size(FLOW_CONTROL_SOCKET_BUFFER_BYTES)
+            .map_err(ConnError::Io)
     }
 
     pub fn writer_sequence(&self) -> i64 {

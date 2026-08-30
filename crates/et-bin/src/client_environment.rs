@@ -189,6 +189,7 @@ mod tests {
             jumphost: Some(false),
             reversetunnels: vec![request; 128],
             environmentvariables: Default::default(),
+            flowcontrol: None,
         };
         let mut locale = vec![
             ("LC_ALL".to_owned(), "C".to_owned()),

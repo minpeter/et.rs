@@ -5,7 +5,9 @@ mod support;
 
 use et_core::keys::passkey_to_key;
 use et_core::packet::Packet;
-use et_core::proto::{ConnectStatus, TermInit, TerminalBuffer, TerminalInfo, TerminalPacketType};
+use et_core::proto::{
+    ConnectStatus, FlowControlMode, TermInit, TerminalBuffer, TerminalInfo, TerminalPacketType,
+};
 use et_net::local_packet::{read_local_packet, write_local_packet};
 use prost::Message;
 use runtime_support::{default_payload, initialize, TestRuntime, ID_A, KEY_A, TIMEOUT};
@@ -154,6 +156,46 @@ fn terminal_hup_still_delivers_buffered_final_packet() {
         );
     }
 
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
+fn flow_control_mode_reaches_terminal_and_relays_output() {
+    let mut server = TestRuntime::start();
+    let mut terminal = server.register(ID_A, KEY_A);
+    terminal.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let key = passkey_to_key(KEY_A).unwrap();
+    let mut payload = default_payload();
+    payload.flowcontrol = Some(FlowControlMode::Backpressure as i32);
+    let (mut client, initial) = initialize(stream, &key, payload);
+    assert_eq!(initial.error, None);
+
+    let init = read_local_packet(&mut terminal).unwrap();
+    let term_init = TermInit::decode(init.payload()).unwrap();
+    assert_eq!(
+        term_init.flowcontrol,
+        Some(FlowControlMode::Backpressure as i32)
+    );
+
+    let output = TerminalBuffer {
+        buffer: Some(b"flow-controlled-output".to_vec()),
+    };
+    write_local_packet(
+        &mut terminal,
+        &Packet::new(
+            TerminalPacketType::TerminalBuffer as u8,
+            output.encode_to_vec(),
+        ),
+    )
+    .unwrap();
+
+    let received = client.read_packet().unwrap();
+    assert_eq!(received.header(), TerminalPacketType::TerminalBuffer as u8);
+    assert_eq!(TerminalBuffer::decode(received.payload()).unwrap(), output);
+
+    drop(terminal);
     server.runtime.shutdown().unwrap();
 }
 

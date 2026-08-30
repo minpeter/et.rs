@@ -1,3 +1,21 @@
+## et@0.0.18
+
+### Reject partially unavailable forwarding sources
+
+TCP forwarding now fails when any resolved source address cannot be bound,
+instead of silently listening on only one address family.
+
+### Drain terminal output before disconnect
+
+Terminal sessions now drain final terminal output safely when the terminal
+exits or disconnects, preserving buffered output for the connected client
+before the session closes.
+
+### Fix Windows SSH configuration resolution
+
+SSH configuration expansion now disables PTY allocation, preventing Windows
+OpenSSH from stalling before the client bootstrap.
+
 ## et@0.0.17
 
 ### Return cleanly to the local prompt after exit

@@ -250,10 +250,37 @@ fn ssh_config_malformed_forward_is_rejected() {
 
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
     assert!(
-        stderr(&output).contains("invalid tunnel"),
+        stderr(&output).contains("malformed localforward"),
         "{}",
         stderr(&output)
     );
+    assert_eq!(fake.invocations(), [["-G", "-T", "server-alias"]]);
+}
+
+#[test]
+fn ssh_config_extra_forward_field_is_rejected_before_bootstrap() {
+    let fake = FakeSsh::new();
+    let config = concat!(
+        "host server-alias\n",
+        "user config-user\n",
+        "hostname 127.0.0.1\n",
+        "port 22\n",
+        "localforward 10022 [127.0.0.1]:22 unexpected\n",
+    );
+
+    let output = fake
+        .command(config, VALID_MARKER, 0, "")
+        .args(["-N", "server-alias:1"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("malformed localforward"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fake.invocations(), [["-G", "-T", "server-alias"]]);
 }
 
 #[test]

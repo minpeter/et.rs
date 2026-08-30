@@ -2,13 +2,14 @@ use crate::bootstrap::{validate_ssh_destination, InvocationCompletion, SshInvoca
 use crate::deadline::Deadline;
 use crate::error::ClientError;
 use crate::ssh_process::{run_checked, SshRunner};
+use et_core::proto::{PortForwardSourceRequest, SocketEndpoint};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedSshConfig {
     pub hostname: String,
     pub user: Option<String>,
-    pub local_forwards: Vec<String>,
-    pub remote_forwards: Vec<String>,
+    pub local_forwards: Vec<PortForwardSourceRequest>,
+    pub remote_forwards: Vec<PortForwardSourceRequest>,
 }
 
 pub fn resolve_ssh_config(
@@ -55,10 +56,10 @@ fn parse_ssh_config(stdout: &[u8]) -> Result<ResolvedSshConfig, ClientError> {
                 user = fields.next().map(str::to_string);
             }
             Some(key) if key.eq_ignore_ascii_case("localforward") => {
-                local_forwards.push(parse_forward(fields));
+                local_forwards.push(parse_forward(fields, "localforward")?);
             }
             Some(key) if key.eq_ignore_ascii_case("remoteforward") => {
-                remote_forwards.push(parse_forward(fields));
+                remote_forwards.push(parse_forward(fields, "remoteforward")?);
             }
             _ => {}
         }
@@ -76,16 +77,83 @@ fn parse_ssh_config(stdout: &[u8]) -> Result<ResolvedSshConfig, ClientError> {
     })
 }
 
-fn parse_forward<'a>(fields: impl Iterator<Item = &'a str>) -> String {
+fn parse_forward<'a>(
+    fields: impl Iterator<Item = &'a str>,
+    directive: &'static str,
+) -> Result<PortForwardSourceRequest, ClientError> {
     let fields: Vec<&str> = fields.collect();
     let [source, destination] = fields.as_slice() else {
-        return fields.join(" ");
+        return Err(ClientError::SshConfigMalformedForward {
+            directive,
+            reason: "expected exactly two fields",
+        });
     };
-    if source.starts_with('/') || destination.starts_with('/') || source.contains(':') {
-        format!("{source}:{destination}")
-    } else {
-        format!("localhost:{source}:{destination}")
+    let source = parse_source_endpoint(source).ok_or(ClientError::SshConfigMalformedForward {
+        directive,
+        reason: "invalid source endpoint",
+    })?;
+    let destination =
+        parse_destination_endpoint(destination).ok_or(ClientError::SshConfigMalformedForward {
+            directive,
+            reason: "invalid destination endpoint",
+        })?;
+    Ok(PortForwardSourceRequest {
+        source: Some(source),
+        destination: Some(destination),
+        environmentvariable: None,
+    })
+}
+
+fn parse_source_endpoint(value: &str) -> Option<SocketEndpoint> {
+    if let Some(endpoint) = parse_unix_endpoint(value) {
+        return Some(endpoint);
     }
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(SocketEndpoint {
+            name: Some("localhost".to_owned()),
+            port: Some(parse_port(value)?),
+        });
+    }
+    parse_tcp_endpoint(value)
+}
+
+fn parse_destination_endpoint(value: &str) -> Option<SocketEndpoint> {
+    parse_unix_endpoint(value).or_else(|| parse_tcp_endpoint(value))
+}
+
+fn parse_unix_endpoint(value: &str) -> Option<SocketEndpoint> {
+    if !value.starts_with('/') || value == "/" || value.len() > 107 || value.contains('\0') {
+        return None;
+    }
+    Some(SocketEndpoint {
+        name: Some(value.to_owned()),
+        port: None,
+    })
+}
+
+fn parse_tcp_endpoint(value: &str) -> Option<SocketEndpoint> {
+    let (host, port) = if let Some(bracketed) = value.strip_prefix('[') {
+        let (host, port) = bracketed.split_once("]:")?;
+        if host.is_empty() || port.contains(':') {
+            return None;
+        }
+        (host, port)
+    } else {
+        let (host, port) = value.rsplit_once(':')?;
+        if host.is_empty() || host.contains(':') {
+            return None;
+        }
+        (host, port)
+    };
+    Some(SocketEndpoint {
+        name: Some(host.to_owned()),
+        port: Some(parse_port(port)?),
+    })
+}
+
+fn parse_port(value: &str) -> Option<i32> {
+    let port = value.parse::<u16>().ok()?;
+    (port != 0).then(|| i32::from(port))
 }
 
 #[cfg(test)]
@@ -155,12 +223,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_ordered_tcp_ipv6_and_unix_forwards() {
+    fn parses_ordered_tcp_ipv6_unix_and_mixed_forwards() {
         let resolved = parse_ssh_config(
             b"hostname host\n\
               localforward 10022 [127.0.0.1]:22\n\
               localforward [::1]:18080 [::1]:80\n\
               localforward /tmp/local.sock /tmp/remote.sock\n\
+              localforward /tmp/mixed.sock [127.0.0.1]:8080\n\
+              localforward [127.0.0.1]:9090 /tmp/destination.sock\n\
               remoteforward 1492 [127.0.0.1]:1492\n",
         )
         .unwrap();
@@ -168,14 +238,54 @@ mod tests {
         assert_eq!(
             resolved.local_forwards,
             [
-                "localhost:10022:[127.0.0.1]:22",
-                "[::1]:18080:[::1]:80",
-                "/tmp/local.sock:/tmp/remote.sock",
+                request("localhost", Some(10022), "127.0.0.1", Some(22)),
+                request("::1", Some(18080), "::1", Some(80)),
+                request("/tmp/local.sock", None, "/tmp/remote.sock", None),
+                request("/tmp/mixed.sock", None, "127.0.0.1", Some(8080)),
+                request("127.0.0.1", Some(9090), "/tmp/destination.sock", None,),
             ]
         );
         assert_eq!(
             resolved.remote_forwards,
-            ["localhost:1492:[127.0.0.1]:1492"]
+            [request("localhost", Some(1492), "127.0.0.1", Some(1492))]
         );
+    }
+
+    #[test]
+    fn rejects_forward_records_without_exactly_two_fields() {
+        for (config, directive) in [
+            ("hostname host\nlocalforward only-one\n", "localforward"),
+            (
+                "hostname host\nremoteforward 1000 host:2000 extra\n",
+                "remoteforward",
+            ),
+        ] {
+            assert!(matches!(
+                parse_ssh_config(config.as_bytes()),
+                Err(ClientError::SshConfigMalformedForward {
+                    directive: found,
+                    reason: "expected exactly two fields",
+                }) if found == directive
+            ));
+        }
+    }
+
+    fn request(
+        source_name: &str,
+        source_port: Option<i32>,
+        destination_name: &str,
+        destination_port: Option<i32>,
+    ) -> PortForwardSourceRequest {
+        PortForwardSourceRequest {
+            source: Some(SocketEndpoint {
+                name: Some(source_name.to_owned()),
+                port: source_port,
+            }),
+            destination: Some(SocketEndpoint {
+                name: Some(destination_name.to_owned()),
+                port: destination_port,
+            }),
+            environmentvariable: None,
+        }
     }
 }

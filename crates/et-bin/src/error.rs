@@ -19,6 +19,10 @@ pub enum ClientError {
     SshNonZero(Option<i32>),
     SshOutputTooLarge(usize),
     SshConfigMalformed(&'static str),
+    SshConfigMalformedForward {
+        directive: &'static str,
+        reason: &'static str,
+    },
     MissingIdPasskeyMarker,
     MalformedIdPasskeyMarker,
     InvalidSessionId,
@@ -86,6 +90,9 @@ impl std::fmt::Display for ClientError {
             }
             Self::SshConfigMalformed(field) => {
                 write!(f, "system ssh -G output has no valid {field}")
+            }
+            Self::SshConfigMalformedForward { directive, reason } => {
+                write!(f, "system ssh -G output has a malformed {directive} record: {reason}")
             }
             Self::MissingIdPasskeyMarker => {
                 write!(f, "system ssh output is missing the IDPASSKEY marker")
@@ -178,7 +185,9 @@ impl ClientError {
 
     pub fn exit_code(&self) -> i32 {
         match self {
-            Self::Unsupported(_) | Self::ForwardConfig(_) => 2,
+            Self::Unsupported(_)
+            | Self::ForwardConfig(_)
+            | Self::SshConfigMalformedForward { .. } => 2,
             _ => 1,
         }
     }

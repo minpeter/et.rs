@@ -80,10 +80,10 @@ impl ForwardConfig {
         resolved: &ResolvedSshConfig,
     ) -> Result<(), ForwardConfigError> {
         if args.tunnel.is_empty() {
-            self.local_sources = parse_tunnels(&resolved.local_forwards)?;
+            self.local_sources.clone_from(&resolved.local_forwards);
         }
         if args.reverse_tunnel.is_empty() {
-            let mut configured = parse_tunnels(&resolved.remote_forwards)?;
+            let mut configured = resolved.remote_forwards.clone();
             configured.append(&mut self.initial_payload.reversetunnels);
             self.initial_payload.reversetunnels = configured;
         }

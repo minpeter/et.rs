@@ -63,6 +63,74 @@ fn ssh_config_local_and_remote_tunnels_relay_real_tcp_payloads() {
 }
 
 #[test]
+fn ssh_config_mixed_unix_tcp_tunnels_relay_on_both_axes() {
+    let mut stack = Stack::start();
+
+    let local_unix_source = stack.directory.join("local-unix-source.sock");
+    let local_tcp_destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let local_tcp_destination_port = local_tcp_destination.local_addr().unwrap().port();
+    let local_tcp_echo = spawn_tcp_echo_once(local_tcp_destination, b"local-unix-source");
+
+    let local_tcp_source_port = reserve_port();
+    let local_unix_destination_path = stack.directory.join("local-unix-destination.sock");
+    let local_unix_destination = UnixListener::bind(&local_unix_destination_path).unwrap();
+    let local_unix_echo = spawn_unix_echo(local_unix_destination, b"local-unix-destination");
+
+    let remote_unix_source = stack.directory.join("remote-unix-source.sock");
+    let remote_tcp_destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let remote_tcp_destination_port = remote_tcp_destination.local_addr().unwrap().port();
+    let remote_tcp_echo = spawn_tcp_echo_once(remote_tcp_destination, b"remote-unix-source");
+
+    let remote_tcp_source_port = reserve_port();
+    let remote_unix_destination_path = stack.directory.join("remote-unix-destination.sock");
+    let remote_unix_destination = UnixListener::bind(&remote_unix_destination_path).unwrap();
+    let remote_unix_echo = spawn_unix_echo(remote_unix_destination, b"remote-unix-destination");
+
+    let gate = stack.directory.join("ssh-config-mixed-ready");
+    mkfifo(&gate);
+    let config = format!(
+        "hostname 127.0.0.1\nuser tester\n\
+         localforward {} [127.0.0.1]:{local_tcp_destination_port}\n\
+         localforward [127.0.0.1]:{local_tcp_source_port} {}\n\
+         remoteforward {} [127.0.0.1]:{remote_tcp_destination_port}\n\
+         remoteforward [127.0.0.1]:{remote_tcp_source_port} {}\n",
+        local_unix_source.display(),
+        local_unix_destination_path.display(),
+        remote_unix_source.display(),
+        remote_unix_destination_path.display(),
+    );
+    let mut client = Command::new(env!("CARGO_BIN_EXE_et"));
+    client
+        .env("PATH", &stack.directory)
+        .env("ET_SSH_COUNT", &stack.ssh_count)
+        .env("ET_SSH_CONFIG", config)
+        .env("ET_SSH_READY", &gate)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .args(["--terminal-path"])
+        .arg(&stack.terminal)
+        .args(["--serverfifo"])
+        .arg(&stack.router)
+        .arg("-N")
+        .arg(format!("tester@127.0.0.1:{}", stack.port));
+    let mut client = client.spawn().unwrap();
+
+    await_fifo(&gate);
+    assert_unix_round_trip(&local_unix_source, b"local-unix-source");
+    assert_ready_tcp_round_trip(local_tcp_source_port, b"local-unix-destination");
+    assert_unix_round_trip(&remote_unix_source, b"remote-unix-source");
+    assert_ready_tcp_round_trip(remote_tcp_source_port, b"remote-unix-destination");
+
+    stop(&mut client);
+    local_tcp_echo.join().unwrap();
+    local_unix_echo.join().unwrap();
+    remote_tcp_echo.join().unwrap();
+    remote_unix_echo.join().unwrap();
+    stack.shutdown();
+}
+
+#[test]
 fn cli_local_and_reverse_tunnels_relay_real_tcp_payloads() {
     let mut stack = Stack::start();
     let local_destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -274,6 +342,29 @@ fn spawn_tcp_echo(listener: TcpListener) -> thread::JoinHandle<()> {
     })
 }
 
+fn spawn_tcp_echo_once(listener: TcpListener, expected: &'static [u8]) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+        echo_once(&mut stream, expected);
+    })
+}
+
+fn spawn_unix_echo(listener: UnixListener, expected: &'static [u8]) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+        echo_once(&mut stream, expected);
+    })
+}
+
+fn echo_once(stream: &mut (impl Read + Write), expected: &[u8]) {
+    let mut payload = vec![0u8; expected.len()];
+    stream.read_exact(&mut payload).unwrap();
+    assert_eq!(payload, expected);
+    stream.write_all(&payload).unwrap();
+}
+
 fn assert_tcp_round_trip(port: u16, payload: &[u8]) {
     // Poll until the tunnel source is bound and the multiplex path is live.
     let deadline = std::time::Instant::now() + TIMEOUT;
@@ -302,7 +393,7 @@ fn assert_tcp_round_trip(port: u16, payload: &[u8]) {
     );
 }
 
-fn try_stream_round_trip(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
+fn try_stream_round_trip(stream: &mut (impl Read + Write), payload: &[u8]) -> std::io::Result<()> {
     stream.write_all(payload)?;
     let mut echoed = vec![0u8; payload.len()];
     stream.read_exact(&mut echoed)?;
@@ -313,6 +404,18 @@ fn try_stream_round_trip(stream: &mut TcpStream, payload: &[u8]) -> std::io::Res
         ));
     }
     Ok(())
+}
+
+fn assert_ready_tcp_round_trip(port: u16, payload: &[u8]) {
+    let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    try_stream_round_trip(&mut stream, payload).unwrap();
+}
+
+fn assert_unix_round_trip(path: &std::path::Path, payload: &[u8]) {
+    let mut stream = UnixStream::connect(path).unwrap();
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    try_stream_round_trip(&mut stream, payload).unwrap();
 }
 
 fn wait_connect(port: u16) -> TcpStream {

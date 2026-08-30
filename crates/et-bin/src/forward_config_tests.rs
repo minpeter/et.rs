@@ -61,7 +61,17 @@ fn ssh_config_reverse_forwards_preserve_agent_forwarding() {
         hostname: "host".to_owned(),
         user: None,
         local_forwards: Vec::new(),
-        remote_forwards: vec!["localhost:1492:[127.0.0.1]:1492".to_owned()],
+        remote_forwards: vec![PortForwardSourceRequest {
+            source: Some(SocketEndpoint {
+                name: Some("localhost".to_owned()),
+                port: Some(1492),
+            }),
+            destination: Some(SocketEndpoint {
+                name: Some("127.0.0.1".to_owned()),
+                port: Some(1492),
+            }),
+            environmentvariable: None,
+        }],
     };
 
     config.apply_ssh_config(&args, &resolved).unwrap();

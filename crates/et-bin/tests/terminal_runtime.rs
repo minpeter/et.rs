@@ -156,6 +156,31 @@ fn malformed_credentials_fail_before_router_connection() {
 }
 
 #[test]
+fn bootstrap_parent_reports_terminal_child_startup_failure() {
+    let missing_router =
+        std::env::temp_dir().join(format!("et-rs-missing-router-{}", std::process::id()));
+    let output = Command::new(env!("CARGO_BIN_EXE_et"))
+        .args(["terminal", "--serverfifo"])
+        .arg(&missing_router)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            writeln!(child.stdin.take().unwrap(), "{ID}/{KEY}_xterm-256color")?;
+            child.wait_with_output()
+        })
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("could not connect terminal router"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn router_disconnect_terminates_the_shell() {
     let fixture = Fixture::new("disconnect");
     let mut child = fixture.spawn();

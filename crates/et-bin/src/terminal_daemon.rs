@@ -21,7 +21,11 @@ use std::time::Duration;
 
 use crate::terminal_credentials::CredentialInput;
 
-const READY_TIMEOUT: Duration = Duration::from_secs(10);
+// Process creation and router registration can take longer than ten seconds
+// when the destination is under severe CPU, memory, or I/O pressure. Actual
+// child failures are reported through stderr, so this deadline only bounds a
+// genuinely stuck startup.
+const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub fn spawn(router: &Path, input: &CredentialInput, verbose: u8) -> Result<(), String> {
     spawn_with_args(router, input, verbose, &[])
@@ -56,7 +60,7 @@ pub fn spawn_with_args(
         .args(extra)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     crate::detach::configure(&mut child);
     let mut child = crate::detach::spawn(&mut child)
         .map_err(|error| format!("could not start terminal session process: {error}"))?;
@@ -75,20 +79,41 @@ pub fn spawn_with_args(
         readiness.cleanup();
         return Err(error);
     }
-    let (sender, receiver) = mpsc::sync_channel(1);
+    let child_stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "terminal child stderr was not created".to_owned())?;
+    let (sender, receiver) = mpsc::sync_channel(2);
     let acceptor = readiness.acceptor();
+    let ready_sender = sender.clone();
     let worker = std::thread::Builder::new()
         .name("et-terminal-ready".to_owned())
         .spawn(move || {
-            let _ = sender.send(acceptor.accept_ready());
+            let _ = ready_sender.send(StartupEvent::Ready(acceptor.accept_ready()));
         })
         .map_err(|error| format!("could not start terminal readiness worker: {error}"))?;
+    std::thread::Builder::new()
+        .name("et-terminal-stderr".to_owned())
+        .spawn(move || {
+            let mut stderr = String::new();
+            let result = std::io::BufReader::new(child_stderr).read_to_string(&mut stderr);
+            let message = match result {
+                Ok(_) if stderr.trim().is_empty() => {
+                    "terminal session process exited before becoming ready".to_owned()
+                }
+                Ok(_) => stderr.trim().to_owned(),
+                Err(error) => format!("could not read terminal session process error: {error}"),
+            };
+            let _ = sender.send(StartupEvent::Exited(message));
+        })
+        .map_err(|error| format!("could not start terminal stderr worker: {error}"))?;
     let result = receiver
         .recv_timeout(READY_TIMEOUT)
         .map_err(|_| "timed out waiting for terminal session process".to_owned())
-        .and_then(|result| {
-            result
-                .map_err(|error| format!("terminal session process did not become ready: {error}"))
+        .and_then(|event| match event {
+            StartupEvent::Ready(result) => result
+                .map_err(|error| format!("terminal session process did not become ready: {error}")),
+            StartupEvent::Exited(message) => Err(message),
         });
     if result.is_err() {
         stop(&mut child);
@@ -97,6 +122,11 @@ pub fn spawn_with_args(
     let _ = worker.join();
     readiness.cleanup();
     result
+}
+
+enum StartupEvent {
+    Ready(std::io::Result<()>),
+    Exited(String),
 }
 
 /// Tell the parent this session is live. `target` is the value that was passed

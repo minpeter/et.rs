@@ -221,7 +221,12 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
     assert_eq!(invocations.len(), 3);
     assert_eq!(
         invocations[0],
-        ["-G", "-oStrictHostKeyChecking=no", "test-user@server-alias"]
+        [
+            "-G",
+            "-T",
+            "-oStrictHostKeyChecking=no",
+            "test-user@server-alias"
+        ]
     );
     assert!(invocations[1].last().unwrap().contains("__ET_COMSPEC__"));
     let argv = &invocations[2];
@@ -539,7 +544,7 @@ fn explicit_posix_shell_skips_probe_and_uses_exact_posix_bootstrap() {
 
     let invocations = fake.invocations();
     assert_eq!(invocations.len(), 2, "{invocations:?}");
-    assert_eq!(invocations[0], ["-G", "127.0.0.1"]);
+    assert_eq!(invocations[0], ["-G", "-T", "127.0.0.1"]);
     let bootstrap = &invocations[1];
     assert_eq!(bootstrap[0], "config-user@127.0.0.1");
     let input = bootstrap[1]
@@ -926,7 +931,7 @@ fn jumphost_starts_a_jump_terminal_and_connects_to_the_jumphost() {
     // -G dst, login-shell probe, dst bootstrap through -J, -G jumphost,
     // jump bootstrap.
     assert_eq!(invocations.len(), 5, "{invocations:?}");
-    assert_eq!(invocations[0], ["-G", "test-user@server-alias"]);
+    assert_eq!(invocations[0], ["-G", "-T", "test-user@server-alias"]);
     assert!(invocations[1].last().unwrap().contains("__ET_COMSPEC__"));
     let destination = &invocations[2];
     assert_eq!(destination[0], "-J");
@@ -948,7 +953,7 @@ fn jumphost_starts_a_jump_terminal_and_connects_to_the_jumphost() {
         "{:?}",
         destination[3]
     );
-    assert_eq!(invocations[3], ["-G", "jump.example"]);
+    assert_eq!(invocations[3], ["-G", "-T", "jump.example"]);
     let jump = &invocations[4];
     assert_eq!(jump[0], "jump.example");
     // The jumphost remains POSIX even when the destination probe selects Cmd.

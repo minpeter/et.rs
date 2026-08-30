@@ -17,7 +17,10 @@ pub fn resolve_ssh_config(
     deadline: Deadline,
 ) -> Result<ResolvedSshConfig, ClientError> {
     validate_ssh_destination(host_alias, requested_user)?;
-    let mut args = vec!["-G".to_string()];
+    // Config expansion never opens a remote session. Disable PTY allocation
+    // so Windows OpenSSH completes reliably when stdout is a pipe, preserving
+    // the bounded SystemSsh capture path.
+    let mut args = vec!["-G".to_string(), "-T".to_string()];
     args.extend(ssh_options.iter().map(|option| format!("-o{option}")));
     let destination = match requested_user {
         Some(user) => format!("{user}@{host_alias}"),
@@ -75,7 +78,7 @@ mod tests {
         fn run(&self, invocation: &SshInvocation, _: Deadline) -> Result<SshOutput, ClientError> {
             assert_eq!(
                 invocation.args,
-                ["-G", "-oPort=2222", "requested@server-alias"]
+                ["-G", "-T", "-oPort=2222", "requested@server-alias"]
             );
             Ok(SshOutput {
                 status: Some(success_status()),

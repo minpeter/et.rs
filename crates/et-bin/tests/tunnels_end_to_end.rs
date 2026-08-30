@@ -18,6 +18,51 @@ use tunnel_support::SingleCutProxy;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 #[test]
+fn ssh_config_local_and_remote_tunnels_relay_real_tcp_payloads() {
+    let mut stack = Stack::start();
+    let local_destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let local_destination_port = local_destination.local_addr().unwrap().port();
+    let local_echo = spawn_tcp_echo(local_destination);
+    let local_source_port = reserve_port();
+    let reverse_destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let reverse_destination_port = reverse_destination.local_addr().unwrap().port();
+    let reverse_echo = spawn_tcp_echo(reverse_destination);
+    let reverse_source_port = reserve_port();
+    let gate = stack.directory.join("ssh-config-ready");
+    mkfifo(&gate);
+    let config = format!(
+        "hostname 127.0.0.1\nuser tester\n\
+         localforward {local_source_port} [127.0.0.1]:{local_destination_port}\n\
+         remoteforward {reverse_source_port} [127.0.0.1]:{reverse_destination_port}\n"
+    );
+    let mut client = Command::new(env!("CARGO_BIN_EXE_et"));
+    client
+        .env("PATH", &stack.directory)
+        .env("ET_SSH_COUNT", &stack.ssh_count)
+        .env("ET_SSH_CONFIG", config)
+        .env("ET_SSH_READY", &gate)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .args(["--terminal-path"])
+        .arg(&stack.terminal)
+        .args(["--serverfifo"])
+        .arg(&stack.router)
+        .arg("-N")
+        .arg(format!("tester@127.0.0.1:{}", stack.port));
+    let mut client = client.spawn().unwrap();
+
+    await_fifo(&gate);
+    assert_tcp_round_trip(local_source_port, b"config-local");
+    assert_tcp_round_trip(reverse_source_port, b"config-reverse");
+
+    stop(&mut client);
+    local_echo.join().unwrap();
+    reverse_echo.join().unwrap();
+    stack.shutdown();
+}
+
+#[test]
 fn cli_local_and_reverse_tunnels_relay_real_tcp_payloads() {
     let mut stack = Stack::start();
     let local_destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();

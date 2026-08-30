@@ -61,6 +61,7 @@ impl Stack {
         fs::write(
             &ssh,
             "#!/bin/sh\nif [ \"$1\" = \"-G\" ]; then\n\
+             if [ -n \"$ET_SSH_CONFIG\" ]; then printf '%s' \"$ET_SSH_CONFIG\"; exit 0; fi\n\
              printf 'hostname 127.0.0.1\\nuser tester\\n'; exit 0; fi\n\
              printf x >> \"$ET_SSH_COUNT\"\nfor last do :; done\n\
              exec /bin/sh -c \"$last\"\n",

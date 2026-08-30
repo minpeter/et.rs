@@ -87,14 +87,8 @@ fn run_client(
 ) -> Result<(), ClientError> {
     let destination = parse_positional_host(&args.host, args.port)?;
     validate_bootstrap_mode(args)?;
-    let forward_config =
+    let mut forward_config =
         crate::forward_config::build(args, std::env::var("SSH_AUTH_SOCK").ok().as_deref())?;
-    let has_forwarding = !forward_config.local_sources.is_empty()
-        || !forward_config.initial_payload.reversetunnels.is_empty();
-    // Bind local sources only after the encrypted session exists so accepted
-    // tunnels can be multiplexed immediately (avoids pre-handshake accept races).
-    let local_sources = forward_config.local_sources;
-    let mut initial_payload = forward_config.initial_payload;
     let local_term = std::env::var("TERM").ok();
     let local_colorterm = std::env::var("COLORTERM").ok();
     let term = normalize_terminal_type(local_term.as_deref());
@@ -105,12 +99,14 @@ fn run_client(
         .then(|| ghostty_colorterm(local_term.as_deref(), local_colorterm.as_deref()))
         .flatten();
     let reserved_environment = reserved_environment_value_lengths(
-        initial_payload
+        forward_config
+            .initial_payload
             .environmentvariables
             .iter()
             .map(|(name, value)| (name.as_str(), value.len())),
         colorterm,
-        initial_payload
+        forward_config
+            .initial_payload
             .reversetunnels
             .iter()
             .filter_map(|request| request.environmentvariable.as_deref()),
@@ -127,8 +123,12 @@ fn run_client(
         bounded_locale_environment(ssh_locale_environment(), &reserved_environment)
             .map_err(crate::forward_config::ForwardConfigError::EnvironmentPacketTooLarge)?;
     if args.jumphost.is_some() {
-        bound_jumphost_locale_environment(&initial_payload, &mut locale_environment, colorterm)
-            .map_err(crate::forward_config::ForwardConfigError::JumphostPacketTooLarge)?;
+        bound_jumphost_locale_environment(
+            &forward_config.initial_payload,
+            &mut locale_environment,
+            colorterm,
+        )
+        .map_err(crate::forward_config::ForwardConfigError::JumphostPacketTooLarge)?;
     }
 
     let requested_user = command_user(destination.user, args.username.clone());
@@ -140,6 +140,21 @@ fn run_client(
         &args.ssh_option,
         deadline,
     )?;
+    forward_config.apply_ssh_config(args, &resolved)?;
+    if args.jumphost.is_some() {
+        bound_jumphost_locale_environment(
+            &forward_config.initial_payload,
+            &mut locale_environment,
+            colorterm,
+        )
+        .map_err(crate::forward_config::ForwardConfigError::JumphostPacketTooLarge)?;
+    }
+    let has_forwarding = !forward_config.local_sources.is_empty()
+        || !forward_config.initial_payload.reversetunnels.is_empty();
+    // Bind local sources only after the encrypted session exists so accepted
+    // tunnels can be multiplexed immediately (avoids pre-handshake accept races).
+    let local_sources = forward_config.local_sources;
+    let mut initial_payload = forward_config.initial_payload;
     let user = requested_user.or(resolved.user);
     validate_ssh_destination(&destination.host, user.as_deref())?;
     let probe_request = BootstrapRequest {

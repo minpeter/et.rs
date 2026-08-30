@@ -4,6 +4,7 @@ use et_cli::client::ClientArgs;
 use et_cli::tunnel::parse_tunnels;
 use et_core::proto::{InitialPayload, PortForwardSourceRequest, SocketEndpoint};
 
+use crate::ssh_config::ResolvedSshConfig;
 use crate::terminal_protocol::{valid_environment_name, MAX_ENVIRONMENT};
 
 #[derive(Debug)]
@@ -70,6 +71,24 @@ impl From<et_cli::tunnel::TunnelError> for ForwardConfigError {
 pub struct ForwardConfig {
     pub local_sources: Vec<PortForwardSourceRequest>,
     pub initial_payload: InitialPayload,
+}
+
+impl ForwardConfig {
+    pub fn apply_ssh_config(
+        &mut self,
+        args: &ClientArgs,
+        resolved: &ResolvedSshConfig,
+    ) -> Result<(), ForwardConfigError> {
+        if args.tunnel.is_empty() {
+            self.local_sources = parse_tunnels(&resolved.local_forwards)?;
+        }
+        if args.reverse_tunnel.is_empty() {
+            let mut configured = parse_tunnels(&resolved.remote_forwards)?;
+            configured.append(&mut self.initial_payload.reversetunnels);
+            self.initial_payload.reversetunnels = configured;
+        }
+        validate_environment_names(&self.initial_payload.reversetunnels)
+    }
 }
 
 pub fn build(

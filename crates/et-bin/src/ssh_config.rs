@@ -7,6 +7,8 @@ use crate::ssh_process::{run_checked, SshRunner};
 pub struct ResolvedSshConfig {
     pub hostname: String,
     pub user: Option<String>,
+    pub local_forwards: Vec<String>,
+    pub remote_forwards: Vec<String>,
 }
 
 pub fn resolve_ssh_config(
@@ -41,6 +43,8 @@ fn parse_ssh_config(stdout: &[u8]) -> Result<ResolvedSshConfig, ClientError> {
         std::str::from_utf8(stdout).map_err(|_| ClientError::SshConfigMalformed("UTF-8 output"))?;
     let mut hostname = None;
     let mut user = None;
+    let mut local_forwards = Vec::new();
+    let mut remote_forwards = Vec::new();
     for line in text.lines() {
         let mut fields = line.split_whitespace();
         match fields.next() {
@@ -50,6 +54,12 @@ fn parse_ssh_config(stdout: &[u8]) -> Result<ResolvedSshConfig, ClientError> {
             Some(key) if key.eq_ignore_ascii_case("user") => {
                 user = fields.next().map(str::to_string);
             }
+            Some(key) if key.eq_ignore_ascii_case("localforward") => {
+                local_forwards.push(parse_forward(fields));
+            }
+            Some(key) if key.eq_ignore_ascii_case("remoteforward") => {
+                remote_forwards.push(parse_forward(fields));
+            }
             _ => {}
         }
     }
@@ -58,7 +68,24 @@ fn parse_ssh_config(stdout: &[u8]) -> Result<ResolvedSshConfig, ClientError> {
         .ok_or(ClientError::SshConfigMalformed("hostname"))?;
     let user = user.filter(|user| !user.is_empty());
     validate_ssh_destination(&hostname, user.as_deref())?;
-    Ok(ResolvedSshConfig { hostname, user })
+    Ok(ResolvedSshConfig {
+        hostname,
+        user,
+        local_forwards,
+        remote_forwards,
+    })
+}
+
+fn parse_forward<'a>(fields: impl Iterator<Item = &'a str>) -> String {
+    let fields: Vec<&str> = fields.collect();
+    let [source, destination] = fields.as_slice() else {
+        return fields.join(" ");
+    };
+    if source.starts_with('/') || destination.starts_with('/') || source.contains(':') {
+        format!("{source}:{destination}")
+    } else {
+        format!("localhost:{source}:{destination}")
+    }
 }
 
 #[cfg(test)]
@@ -109,6 +136,8 @@ mod tests {
             ResolvedSshConfig {
                 hostname: "127.0.0.1".to_string(),
                 user: Some("config-user".to_string()),
+                local_forwards: Vec::new(),
+                remote_forwards: Vec::new(),
             }
         );
     }
@@ -123,5 +152,30 @@ mod tests {
             parse_ssh_config(b"hostname host\nuser -oProxyCommand=bad\n"),
             Err(ClientError::InvalidSshComponent("user"))
         ));
+    }
+
+    #[test]
+    fn parses_ordered_tcp_ipv6_and_unix_forwards() {
+        let resolved = parse_ssh_config(
+            b"hostname host\n\
+              localforward 10022 [127.0.0.1]:22\n\
+              localforward [::1]:18080 [::1]:80\n\
+              localforward /tmp/local.sock /tmp/remote.sock\n\
+              remoteforward 1492 [127.0.0.1]:1492\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.local_forwards,
+            [
+                "localhost:10022:[127.0.0.1]:22",
+                "[::1]:18080:[::1]:80",
+                "/tmp/local.sock:/tmp/remote.sock",
+            ]
+        );
+        assert_eq!(
+            resolved.remote_forwards,
+            ["localhost:1492:[127.0.0.1]:1492"]
+        );
     }
 }

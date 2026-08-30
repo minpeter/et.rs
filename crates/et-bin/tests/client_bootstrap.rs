@@ -166,6 +166,132 @@ fn initial_payload_server_with_error(
 }
 
 #[test]
+fn ssh_config_local_and_remote_forwards_become_et_tunnels() {
+    let (port, server) = initial_payload_server_with_error(Some("stop after payload"));
+    let fake = FakeSsh::new();
+    let config = concat!(
+        "host server-alias\n",
+        "user config-user\n",
+        "hostname 127.0.0.1\n",
+        "port 22\n",
+        "localforward 10022 [127.0.0.1]:22\n",
+        "remoteforward 1492 [127.0.0.1]:1492\n",
+    );
+
+    let _output = fake
+        .command(config, VALID_MARKER, 0, "")
+        .args(["-N", &format!("server-alias:{port}")])
+        .output()
+        .unwrap();
+    let payload = server.join().unwrap();
+
+    assert_eq!(payload.reversetunnels.len(), 1);
+    let reverse = &payload.reversetunnels[0];
+    assert_eq!(
+        reverse.source.as_ref().and_then(|source| source.port),
+        Some(1492)
+    );
+    assert_eq!(
+        reverse
+            .destination
+            .as_ref()
+            .and_then(|destination| destination.port),
+        Some(1492)
+    );
+    assert_eq!(fake.invocations()[0], ["-G", "-T", "server-alias"]);
+}
+
+#[test]
+fn ssh_config_forwards_apply_on_the_unspecified_axis() {
+    let (port, server) = initial_payload_server_with_error(Some("stop after payload"));
+    let fake = FakeSsh::new();
+    let config = concat!(
+        "host server-alias\n",
+        "user config-user\n",
+        "hostname 127.0.0.1\n",
+        "port 22\n",
+        "localforward 10022 [127.0.0.1]:22\n",
+        "remoteforward 1492 [127.0.0.1]:1492\n",
+    );
+
+    let _output = fake
+        .command(config, VALID_MARKER, 0, "")
+        .args(["-N", "-t", "5555:22", &format!("server-alias:{port}")])
+        .output()
+        .unwrap();
+    let payload = server.join().unwrap();
+
+    assert_eq!(payload.reversetunnels.len(), 1);
+    assert_eq!(
+        payload.reversetunnels[0]
+            .source
+            .as_ref()
+            .and_then(|source| source.port),
+        Some(1492)
+    );
+}
+
+#[test]
+fn ssh_config_malformed_forward_is_rejected() {
+    let fake = FakeSsh::new();
+    let config = concat!(
+        "host server-alias\n",
+        "user config-user\n",
+        "hostname 127.0.0.1\n",
+        "port 22\n",
+        "localforward none\n",
+    );
+
+    let output = fake
+        .command(config, VALID_MARKER, 0, "")
+        .args(["-N", "server-alias:1"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("invalid tunnel"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn ssh_config_cli_same_axis_replaces_config() {
+    let (port, server) = initial_payload_server_with_error(Some("stop after payload"));
+    let fake = FakeSsh::new();
+    let config = concat!(
+        "host server-alias\n",
+        "user config-user\n",
+        "hostname 127.0.0.1\n",
+        "port 22\n",
+        "localforward 10022 [127.0.0.1]:22\n",
+        "remoteforward 1492 [127.0.0.1]:1492\n",
+    );
+
+    let _output = fake
+        .command(config, VALID_MARKER, 0, "")
+        .args(["-N", "-r", "3000:4000", &format!("server-alias:{port}")])
+        .output()
+        .unwrap();
+    let payload = server.join().unwrap();
+
+    assert_eq!(payload.reversetunnels.len(), 1);
+    let reverse = &payload.reversetunnels[0];
+    assert_eq!(
+        reverse.source.as_ref().and_then(|source| source.port),
+        Some(3000)
+    );
+    assert_eq!(
+        reverse
+            .destination
+            .as_ref()
+            .and_then(|destination| destination.port),
+        Some(4000)
+    );
+}
+
+#[test]
 fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
     let (port, server) = initial_payload_server();
 

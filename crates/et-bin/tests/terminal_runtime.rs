@@ -23,6 +23,7 @@ const ID: &str = "abcdefghijklmnop";
 const KEY: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
 const TIMEOUT: Duration = Duration::from_secs(5);
 const LOGIN_TERM_COMPLETION: &[u8] = b"__ET_LOGIN_TERM_COMPLETE__\r\n";
+const MOTD_MARKER: &[u8] = b"ET-MOTD-MARKER";
 
 #[test]
 fn bootstrap_parent_reports_marker_and_leaves_registered_session_running() {
@@ -270,6 +271,125 @@ fn real_terminal_login_shell_preserves_term_without_colorterm() {
         "expected complete TERM/COLORTERM record; got {:?}",
         String::from_utf8_lossy(&output),
     );
+}
+
+#[test]
+fn real_terminal_emits_motd_before_login_shell_output() {
+    // Given: a server-side MOTD file the session is told to display.
+    let fixture = Fixture::new("motd-before-shell");
+    let motd = fixture.file("motd", b"ET-MOTD-MARKER\n");
+    let shell = fixture.login_probe_shell();
+    let mut child = fixture.spawn_session(
+        shell.to_str().unwrap(),
+        &[("ET_MOTD_PATH", motd.as_os_str())],
+    );
+    write_credentials(&mut child);
+    let (mut router, _) = fixture.listener.accept().unwrap();
+    router.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let _ = read_local_packet(&mut router).unwrap();
+    fixture.wait_ready();
+
+    // When: the session initializes and the login shell starts producing output.
+    send(
+        &mut router,
+        TerminalPacketType::TerminalInit,
+        &TermInit {
+            environmentnames: Vec::new(),
+            environmentvalues: Vec::new(),
+        },
+    );
+    send(
+        &mut router,
+        TerminalPacketType::TerminalBuffer,
+        &TerminalBuffer {
+            buffer: Some(b"exit\n".to_vec()),
+        },
+    );
+    let output = collect_until(&mut router, |output| contains(output, LOGIN_COLOR_MARKER));
+    let status = child.wait_timeout(TIMEOUT).unwrap().unwrap();
+    assert!(status.success());
+
+    // Then: the MOTD reached the client before any shell output.
+    let motd_at = find(&output, MOTD_MARKER);
+    let shell_at = find(&output, LOGIN_COLOR_MARKER);
+    assert!(
+        motd_at.is_some_and(|motd_at| shell_at.is_some_and(|shell_at| motd_at < shell_at)),
+        "expected MOTD before login shell output; got {:?}",
+        String::from_utf8_lossy(&output),
+    );
+    assert!(
+        contains(&output, b"ET-MOTD-MARKER\r\n"),
+        "expected MOTD lines terminated with CRLF; got {:?}",
+        String::from_utf8_lossy(&output),
+    );
+    assert_eq!(
+        count(&output, MOTD_MARKER),
+        1,
+        "expected MOTD exactly once; got {:?}",
+        String::from_utf8_lossy(&output),
+    );
+}
+
+#[test]
+fn real_terminal_suppresses_motd_when_home_has_hushlogin() {
+    // Given: a MOTD file plus a HOME containing .hushlogin.
+    let fixture = Fixture::new("motd-hushlogin");
+    let motd = fixture.file("motd", b"ET-MOTD-MARKER\n");
+    let home = fixture.file(".hushlogin", b"");
+    let home = home.parent().unwrap().to_owned();
+    let shell = fixture.login_probe_shell();
+    let mut child = fixture.spawn_session(
+        shell.to_str().unwrap(),
+        &[
+            ("ET_MOTD_PATH", motd.as_os_str()),
+            ("HOME", home.as_os_str()),
+        ],
+    );
+    write_credentials(&mut child);
+    let (mut router, _) = fixture.listener.accept().unwrap();
+    router.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let _ = read_local_packet(&mut router).unwrap();
+    fixture.wait_ready();
+
+    // When: the session runs to the point the login shell has produced output.
+    send(
+        &mut router,
+        TerminalPacketType::TerminalInit,
+        &TermInit {
+            environmentnames: Vec::new(),
+            environmentvalues: Vec::new(),
+        },
+    );
+    send(
+        &mut router,
+        TerminalPacketType::TerminalBuffer,
+        &TerminalBuffer {
+            buffer: Some(b"exit\n".to_vec()),
+        },
+    );
+    let output = collect_until(&mut router, |output| contains(output, LOGIN_COLOR_MARKER));
+    let status = child.wait_timeout(TIMEOUT).unwrap().unwrap();
+    assert!(status.success());
+
+    // Then: no MOTD was ever sent.
+    assert!(
+        !contains(&output, MOTD_MARKER),
+        "expected .hushlogin to suppress the MOTD; got {:?}",
+        String::from_utf8_lossy(&output),
+    );
+}
+
+fn find(output: &[u8], marker: &[u8]) -> Option<usize> {
+    output
+        .windows(marker.len())
+        .position(|window| window == marker)
+}
+
+fn count(output: &[u8], marker: &[u8]) -> usize {
+    output
+        .windows(marker.len())
+        .filter(|window| *window == marker)
+        .count()
 }
 
 fn send<M: Message>(router: &mut impl Write, kind: TerminalPacketType, message: &M) {

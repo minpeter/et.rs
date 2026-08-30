@@ -28,6 +28,10 @@ enum WorkerEvent {
 
 pub fn run(mut router: LocalStream, term: &str) -> Result<i32, String> {
     let environment = read_initial_environment(&mut router)?;
+    // Upstream issue #257: show the login banner an interactive ssh would have
+    // printed, before the shell writes anything.
+    #[cfg(unix)]
+    crate::terminal_motd::emit(&mut router)?;
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,

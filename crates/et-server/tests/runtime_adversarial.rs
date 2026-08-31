@@ -315,6 +315,7 @@ fn jumphost_payload_is_relayed_to_the_registered_terminal() {
     };
     let (stream, response) = server.handshake(ID_A);
     assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let (client_received_tx, client_received_rx) = std::sync::mpsc::sync_channel(0);
     let terminal_handshake = std::thread::spawn(move || {
         let packet = et_net::local_packet::read_local_packet(&mut terminal).unwrap();
         assert_eq!(
@@ -330,10 +331,12 @@ fn jumphost_payload_is_relayed_to_the_registered_terminal() {
             ),
         )
         .unwrap();
+        client_received_rx.recv_timeout(TIMEOUT).unwrap();
         relayed
     });
     let (_client, initial) = runtime_support::initialize(stream, &key, payload);
     assert!(initial.error.is_none(), "{:?}", initial.error);
+    client_received_tx.send(()).unwrap();
     let relayed = terminal_handshake.join().unwrap();
     assert_eq!(relayed.jumphost, Some(true));
     assert_eq!(relayed.flowcontrol, Some(FlowControlMode::Discard as i32));

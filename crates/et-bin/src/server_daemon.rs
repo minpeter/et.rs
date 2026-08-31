@@ -9,7 +9,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 #[cfg(unix)]
 pub const DEFAULT_PID_FILE: &str = "/var/run/etserver.pid";
@@ -30,7 +30,7 @@ pub fn spawn_detached(args: &[std::ffi::OsString]) -> Result<(), String> {
         .map_err(|error| format!("could not locate etserver executable: {error}"))?
         .canonicalize()
         .map_err(|error| format!("could not resolve etserver executable: {error}"))?;
-    let mut child = Command::new(executable);
+    let mut child = crate::detach::command(executable.as_os_str());
     child.arg("server");
     for argument in args {
         if argument == std::ffi::OsStr::new("--daemon") {
@@ -57,12 +57,8 @@ pub fn detach_child(pidfile: Option<&Path>) -> Result<(), String> {
     {
         // A fresh child of the original shell is not a process-group leader, so
         // this succeeds and drops the controlling terminal.
-        if let Err(error) = rustix::process::setsid() {
-            // Already a session leader is not an error for our purposes.
-            if error != rustix::io::Errno::PERM {
-                return Err(format!("could not create a new session: {error}"));
-            }
-        }
+        rustix::process::setsid()
+            .map_err(|error| format!("could not create a new session: {error}"))?;
     }
     // The working directory is already `/`: the parent sets it on the child
     // via `Command::current_dir`, matching upstream's `chdir("/")`.

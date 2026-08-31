@@ -12,7 +12,9 @@ use et_core::proto::{
 use et_net::connection::Connection;
 use et_net::framing_io::{read_proto_limited, write_proto};
 use et_net::handshake::client_request;
-use et_net::local_packet::write_local_packet;
+use et_net::local_packet::{
+    parse_status, read_local_packet, write_local_packet, REGISTRATION_STATUS,
+};
 use et_server::path::select_router_path_for;
 use et_server::{Runtime, RuntimeHandle};
 use prost::Message;
@@ -50,6 +52,15 @@ impl TestRuntime {
     }
 
     pub fn register(&self, id: &str, passkey: &str) -> UnixStream {
+        self.register_with_capability(id, passkey, false)
+    }
+
+    pub fn register_with_capability(
+        &self,
+        id: &str,
+        passkey: &str,
+        startup_ack: bool,
+    ) -> UnixStream {
         let mut stream = UnixStream::connect(self.dir.socket()).unwrap();
         let uid = i64::from(rustix::process::getuid().as_raw());
         let gid = i64::from(rustix::process::getgid().as_raw());
@@ -58,13 +69,15 @@ impl TestRuntime {
             passkey: Some(passkey.to_owned()),
             uid: Some(uid),
             gid: Some(gid),
-            fd: None,
+            fd: startup_ack.then_some(-6),
         };
         let packet = Packet::new(
             TerminalPacketType::TerminalUserInfo as u8,
             user.encode_to_vec(),
         );
         write_local_packet(&mut stream, &packet).unwrap();
+        let acknowledgement = read_local_packet(&mut stream).unwrap();
+        parse_status(&acknowledgement, REGISTRATION_STATUS).unwrap();
         self.handle.wait_registered(id, TIMEOUT).unwrap();
         stream
     }

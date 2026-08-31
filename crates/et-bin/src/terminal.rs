@@ -8,7 +8,10 @@ use clap::error::ErrorKind;
 use clap::Parser;
 use et_core::packet::Packet;
 use et_core::proto::{TerminalPacketType, TerminalUserInfo};
-use et_net::local_packet::write_local_packet;
+use et_net::local_packet::{
+    parse_status, read_local_packet, status_packet, write_local_packet, REGISTRATION_STATUS,
+    STARTUP_STATUS,
+};
 use et_server::path::select_router_path;
 use prost::Message;
 
@@ -79,6 +82,11 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
     });
     let router_path = select_router_path(parsed.serverfifo.as_deref())
         .map_err(|error| clap_error(error.to_string()))?;
+    #[cfg(unix)]
+    if parsed.session_child {
+        rustix::process::setsid()
+            .map_err(|error| clap_error(format!("could not create terminal session: {error}")))?;
+    }
     if parsed.jump {
         return run_jump(&parsed, router_path.path(), &input);
     }
@@ -87,15 +95,30 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
             .map_err(clap_error)?;
         return print_marker(&input);
     }
-    let mut router = et_net::local::connect(router_path.path())
-        .map_err(|error| clap_error(format!("could not connect terminal router: {error}")))?;
-    register(&mut router, &input).map_err(clap_error)?;
-    let ready_socket = parsed
-        .ready_socket
-        .as_deref()
-        .ok_or_else(|| clap_error("terminal session child has no readiness socket"))?;
-    crate::terminal_daemon::signal(ready_socket).map_err(clap_error)?;
-    terminal_pty::run(router, &input.term).map_err(clap_error)
+    let result = (|| {
+        let mut router = et_net::local::connect(router_path.path())
+            .map_err(|error| clap_error(format!("could not connect terminal router: {error}")))?;
+        register(&mut router, &input).map_err(clap_error)?;
+        let ready_socket = parsed
+            .ready_socket
+            .as_deref()
+            .ok_or_else(|| clap_error("terminal session child has no readiness socket"))?;
+        crate::terminal_daemon::signal(ready_socket).map_err(clap_error)?;
+        let mut startup = router
+            .try_clone()
+            .map_err(|error| clap_error(format!("could not clone startup channel: {error}")))?;
+        let result = terminal_pty::run_with_startup(router, &input.term, |router| {
+            report_startup(router, Ok(()))
+        });
+        if let Err(error) = &result {
+            let _ = report_startup(&mut startup, Err(error));
+        }
+        result.map_err(clap_error)
+    })();
+    if let Err(error) = &result {
+        crate::terminal_daemon::fail(&error.to_string());
+    }
+    result
 }
 
 /// `etterminal --jump`: print the marker the client scrapes, then relay the
@@ -128,12 +151,31 @@ fn run_jump(
         .map_err(clap_error)?;
         return print_marker(input);
     }
-    let mut router = et_net::local::connect(router_path)
-        .map_err(|error| clap_error(format!("could not connect terminal router: {error}")))?;
-    register(&mut router, input).map_err(clap_error)?;
-    let ready_socket = parsed_ready_socket(args)?;
-    crate::terminal_daemon::signal(ready_socket).map_err(clap_error)?;
-    crate::terminal_jump::run(router, input, &destination_host, args.dstport).map_err(clap_error)
+    let result = (|| {
+        let mut router = et_net::local::connect(router_path)
+            .map_err(|error| clap_error(format!("could not connect terminal router: {error}")))?;
+        register(&mut router, input).map_err(clap_error)?;
+        let ready_socket = parsed_ready_socket(args)?;
+        crate::terminal_daemon::signal(ready_socket).map_err(clap_error)?;
+        let mut startup = router
+            .try_clone()
+            .map_err(|error| clap_error(format!("could not clone startup channel: {error}")))?;
+        let result = crate::terminal_jump::run_with_startup(
+            router,
+            input,
+            &destination_host,
+            args.dstport,
+            |router| report_startup(router, Ok(())),
+        );
+        if let Err(error) = &result {
+            let _ = report_startup(&mut startup, Err(error));
+        }
+        result.map_err(clap_error)
+    })();
+    if let Err(error) = &result {
+        crate::terminal_daemon::fail(&error.to_string());
+    }
+    result
 }
 
 fn parsed_ready_socket(args: &TerminalArgs) -> Result<&std::path::Path, clap::Error> {
@@ -191,14 +233,33 @@ fn register(router: &mut LocalStream, input: &CredentialInput) -> Result<(), Str
         passkey: Some(input.passkey.clone()),
         uid: Some(uid),
         gid: Some(gid),
-        fd: None,
+        // Local protocol-v6 capability sentinel: this terminal acknowledges
+        // PTY/relay startup before the server answers INITIAL_RESPONSE.
+        fd: Some(-6),
     };
     let packet = Packet::new(
         TerminalPacketType::TerminalUserInfo as u8,
         user.encode_to_vec(),
     );
     write_local_packet(router, &packet)
-        .map_err(|error| format!("could not register terminal: {error}"))
+        .map_err(|error| format!("could not register terminal: {error}"))?;
+    router
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|error| format!("could not set registration acknowledgement deadline: {error}"))?;
+    let acknowledgement = read_local_packet(router)
+        .map_err(|error| format!("could not read registration acknowledgement: {error}"))
+        .and_then(|packet| {
+            parse_status(&packet, REGISTRATION_STATUS)
+                .map_err(|error| format!("terminal registration rejected: {error}"))
+        });
+    let _ = router.set_read_timeout(None);
+    acknowledgement
+}
+
+fn report_startup(router: &mut LocalStream, result: Result<(), &String>) -> Result<(), String> {
+    let packet = status_packet(STARTUP_STATUS, result.map_err(String::as_str));
+    write_local_packet(router, &packet)
+        .map_err(|error| format!("could not report terminal startup: {error}"))
 }
 
 #[cfg(unix)]

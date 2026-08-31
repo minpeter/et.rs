@@ -233,7 +233,6 @@ mod tests {
 
     use super::Runtime;
     use crate::path::select_router_path_for;
-    use crate::session_table::SessionState;
 
     const ID: &str = "aaaaaaaaaaaaaaaa";
     const KEY: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
@@ -278,23 +277,15 @@ mod tests {
 
         let (mut client_a, response) = handshake(address);
         assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
-        handle
-            .wait_for_state(ID, SessionState::Starting, TIMEOUT)
-            .unwrap();
+        assert_eq!(handle.session_state(ID).unwrap(), None);
 
-        let mut client_b = connect_request(address);
-        runtime
-            .core
-            .sessions
-            .wait_for_claim_waiters(ID, 1, TIMEOUT)
-            .unwrap();
+        // A newer unauthenticated connection displaces the old one without
+        // creating a Starting slot or a waiter.
+        let (mut client_b, response) = handshake(address);
+        assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+        assert_closed(&mut client_a);
 
         drop(terminal);
-        runtime
-            .core
-            .sessions
-            .wait_for_claim_waiters(ID, 0, TIMEOUT)
-            .unwrap();
         handle.wait_disconnected(ID, TIMEOUT).unwrap();
         assert_closed(&mut client_a);
         assert_closed(&mut client_b);

@@ -18,6 +18,7 @@ pub struct Registration {
     pub key: [u8; KEY_LEN],
     pub uid: u32,
     pub gid: u32,
+    pub(crate) startup_ack: bool,
     pub(crate) identity: Arc<()>,
 }
 
@@ -27,6 +28,7 @@ impl PartialEq for Registration {
             && self.key == other.key
             && self.uid == other.uid
             && self.gid == other.gid
+            && self.startup_ack == other.startup_ack
     }
 }
 

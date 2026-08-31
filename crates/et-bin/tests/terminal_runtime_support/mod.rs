@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::process::{Command, Stdio};
@@ -145,16 +145,6 @@ impl Drop for Fixture {
 pub fn write_credentials(child: &mut std::process::Child) {
     let mut stdin = child.stdin.take().unwrap();
     writeln!(stdin, "{ID}/{KEY}_xterm-256color").unwrap();
-}
-
-pub fn read_line_timeout(stdout: impl std::io::Read + Send + 'static) -> String {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
-        let _ = sender.send(result);
-    });
-    receiver.recv_timeout(TIMEOUT).unwrap().unwrap()
 }
 
 pub fn contains(output: &[u8], marker: &[u8]) -> bool {

@@ -10,7 +10,10 @@ use std::time::Duration;
 
 use et_core::packet::Packet;
 use et_core::proto::{TermInit, TerminalBuffer, TerminalPacketType};
-use et_net::local_packet::{read_local_packet, write_local_packet};
+use et_net::local_packet::{
+    parse_status, read_local_packet, status_packet, write_local_packet, REGISTRATION_STATUS,
+    STARTUP_STATUS,
+};
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
 use prost::Message;
@@ -27,6 +30,7 @@ fn malformed_initialization_and_shell_spawn_failure_are_typed() {
     write_credentials(&mut malformed_child);
     let (mut malformed_router, _) = malformed.listener.accept().unwrap();
     let _ = read_local_packet(&mut malformed_router).unwrap();
+    acknowledge_registration(&mut malformed_router);
     malformed.wait_ready();
     send(
         &mut malformed_router,
@@ -46,6 +50,7 @@ fn malformed_initialization_and_shell_spawn_failure_are_typed() {
     write_credentials(&mut failed_child);
     let (mut failed_router, _) = spawn_failure.listener.accept().unwrap();
     let _ = read_local_packet(&mut failed_router).unwrap();
+    acknowledge_registration(&mut failed_router);
     spawn_failure.wait_ready();
     send(
         &mut failed_router,
@@ -72,6 +77,7 @@ fn shell_exit_reaps_background_process_group() {
     write_credentials(&mut child);
     let (mut router, _) = fixture.listener.accept().unwrap();
     let _ = read_local_packet(&mut router).unwrap();
+    acknowledge_registration(&mut router);
     fixture.wait_ready();
     let mut output_reader = router.try_clone().unwrap();
     let (output_tx, output_rx) = mpsc::sync_channel(64);
@@ -93,6 +99,10 @@ fn shell_exit_reaps_background_process_group() {
     let mut output = String::new();
     let pid = loop {
         let packet = output_rx.recv_timeout(TIMEOUT).unwrap();
+        if packet.header() == STARTUP_STATUS {
+            parse_status(&packet, STARTUP_STATUS).unwrap();
+            continue;
+        }
         let bytes = TerminalBuffer::decode(packet.payload())
             .unwrap()
             .buffer
@@ -116,6 +126,10 @@ fn background_pid(output: &str) -> Option<i32> {
             .then(|| digits.parse::<i32>().ok())
             .flatten()
     })
+}
+
+fn acknowledge_registration(router: &mut impl Write) {
+    write_local_packet(router, &status_packet(REGISTRATION_STATUS, Ok(()))).unwrap();
 }
 
 fn send<M: Message>(router: &mut impl Write, kind: TerminalPacketType, message: &M) {

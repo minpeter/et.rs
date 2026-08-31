@@ -55,6 +55,7 @@ impl Drop for PreAuthGuard {
 struct TrackedSocket {
     stream: TcpStream,
     registration: Option<RegistrationIdentity>,
+    authenticated: bool,
 }
 
 pub(crate) struct RawSockets {
@@ -93,6 +94,7 @@ impl RawSockets {
             TrackedSocket {
                 stream: clone,
                 registration: None,
+                authenticated: false,
             },
         );
         Ok(RawSocketGuard {
@@ -143,10 +145,38 @@ impl RawSocketGuard {
             .streams
             .lock()
             .map_err(|_| RuntimeError::WorkerUnavailable)?;
+        // A known-id peer must not allocate an unbounded set of stalled
+        // authentication workers. Newest wins: close the previous raw socket
+        // for this registration generation before assigning this one. A
+        // legitimate client can therefore displace a passkey-less staller.
+        for (id, tracked) in streams.iter() {
+            if *id != self.id
+                && !tracked.authenticated
+                && tracked
+                    .registration
+                    .as_ref()
+                    .is_some_and(|current| current.same_generation(&registration))
+            {
+                let _ = tracked.stream.shutdown(Shutdown::Both);
+            }
+        }
         let tracked = streams
             .get_mut(&self.id)
             .ok_or(RuntimeError::WorkerUnavailable)?;
         tracked.registration = Some(registration);
+        Ok(())
+    }
+
+    pub(crate) fn authenticate(&mut self) -> Result<(), RuntimeError> {
+        let mut streams = self
+            .sockets
+            .streams
+            .lock()
+            .map_err(|_| RuntimeError::WorkerUnavailable)?;
+        let tracked = streams
+            .get_mut(&self.id)
+            .ok_or(RuntimeError::WorkerUnavailable)?;
+        tracked.authenticated = true;
         Ok(())
     }
 }

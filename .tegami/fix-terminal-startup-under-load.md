@@ -6,6 +6,7 @@ packages:
 
 ## Keep terminal startup reliable under heavy load
 
-Terminal startup now allows heavily loaded servers more time to create and
-register a session process, while still reporting child startup failures
-immediately instead of hiding them behind a generic timeout.
+Terminal startup now uses authenticated, bounded registration and structured
+startup acknowledgements before reporting readiness. Initialization remains
+responsive under load while forged identities, stalled peers, premature
+success, leaked children, and unbounded admission are rejected or cleaned up.

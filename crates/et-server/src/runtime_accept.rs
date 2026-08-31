@@ -96,12 +96,26 @@ fn accept_ready(listener: &TcpListener, core: &Arc<RuntimeCore>) -> Result<(), R
                     .name("et-session-handler".to_owned())
                     .spawn(move || {
                         runtime_handler::handle(stream, worker_core, guard, pre_auth_guard)
-                    })
-                    .map_err(RuntimeError::Spawn)?;
-                core.handlers.push(worker)?;
+                    });
+                match worker {
+                    Ok(worker) => core.handlers.push(worker)?,
+                    Err(error) => {
+                        // The closure is dropped here, releasing its socket and
+                        // admission permit. Keep the listener supervised and
+                        // observable rather than silently killing acceptance.
+                        crate::diag::info(format!("could not start session handler: {error}"));
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        return Ok(());
+                    }
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(source) if matches!(source.raw_os_error(), Some(23 | 24)) => {
+                crate::diag::info(format!("TCP accept resource exhaustion: {source}"));
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                return Ok(());
+            }
             Err(source) => {
                 return Err(RuntimeError::Io {
                     operation: "accept TCP connection",

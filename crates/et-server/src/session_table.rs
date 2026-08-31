@@ -21,6 +21,7 @@ pub enum SessionTableError {
     ObsoleteRegistration,
     Timeout,
     InvalidTransition,
+    StartingBusy,
     Io(io::Error),
 }
 
@@ -32,6 +33,7 @@ impl std::fmt::Display for SessionTableError {
             Self::ObsoleteRegistration => write!(f, "terminal registration is obsolete"),
             Self::Timeout => write!(f, "timed out waiting for session state"),
             Self::InvalidTransition => write!(f, "invalid session state transition"),
+            Self::StartingBusy => write!(f, "session initialization is already in progress"),
             Self::Io(error) => write!(f, "session socket: {error}"),
         }
     }
@@ -49,8 +51,6 @@ impl std::error::Error for SessionTableError {
 #[derive(Default)]
 pub(crate) struct TableState {
     pub(crate) slots: HashMap<String, Slot>,
-    #[cfg(test)]
-    pub(crate) claim_waiters: HashMap<String, usize>,
     pub(crate) shutdown: bool,
 }
 
@@ -145,27 +145,10 @@ impl SessionTable {
                     });
                 }
                 Some(Slot::Starting { .. }) => {
-                    #[cfg(test)]
-                    {
-                        *state.claim_waiters.entry(id.clone()).or_default() += 1;
-                        self.inner.changed.notify_all();
-                    }
-                    state = self
-                        .inner
-                        .changed
-                        .wait(state)
-                        .map_err(|_| SessionTableError::Unavailable)?;
-                    #[cfg(test)]
-                    {
-                        let remove = state.claim_waiters.get_mut(&id).is_some_and(|waiters| {
-                            *waiters -= 1;
-                            *waiters == 0
-                        });
-                        if remove {
-                            state.claim_waiters.remove(&id);
-                        }
-                        self.inner.changed.notify_all();
-                    }
+                    // Never allocate one blocking thread per known-id attacker.
+                    // The owner has an absolute initialization deadline and all
+                    // followers are rejected until it commits or rolls back.
+                    return Err(SessionTableError::StartingBusy);
                 }
                 Some(Slot::Active { session, .. }) => {
                     return Ok(SessionClaim::Returning(session.clone()));

@@ -35,35 +35,6 @@ impl SessionTable {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn wait_for_claim_waiters(
-        &self,
-        id: &str,
-        expected: usize,
-        timeout: Duration,
-    ) -> Result<(), SessionTableError> {
-        let deadline = deadline(timeout)?;
-        let mut state = self.lock()?;
-        loop {
-            let waiters = state.claim_waiters.get(id).copied().unwrap_or(0);
-            if waiters == expected {
-                return Ok(());
-            }
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or(SessionTableError::Timeout)?;
-            let (next, wait) = self
-                .inner
-                .changed
-                .wait_timeout(state, remaining)
-                .map_err(|_| SessionTableError::Unavailable)?;
-            state = next;
-            if wait.timed_out() && state.claim_waiters.get(id).copied().unwrap_or(0) != expected {
-                return Err(SessionTableError::Timeout);
-            }
-        }
-    }
-
     fn wait_for(
         &self,
         id: &str,

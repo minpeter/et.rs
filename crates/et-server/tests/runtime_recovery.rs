@@ -3,7 +3,7 @@
 mod runtime_support;
 mod support;
 
-use std::sync::{mpsc, Arc, Barrier};
+use std::sync::mpsc;
 use std::thread;
 
 use et_core::keys::passkey_to_key;
@@ -16,46 +16,31 @@ use et_server::SessionState;
 use runtime_support::{default_payload, initialize, TestRuntime, ID_A, KEY_A, TIMEOUT};
 
 #[test]
-fn simultaneous_same_id_is_new_then_serialized_returning() {
+fn same_id_startup_is_newest_wins_then_returning() {
     let mut server = TestRuntime::start();
     let _terminal = server.register(ID_A, KEY_A);
-    let barrier = Arc::new(Barrier::new(3));
-    let (sender, receiver) = mpsc::channel();
+    let (mut stale, stale_response) = server.handshake(ID_A);
+    assert_eq!(stale_response.status, Some(ConnectStatus::NewClient as i32));
 
-    let mut workers = Vec::new();
-    for _ in 0..2 {
-        let barrier = barrier.clone();
-        let sender = sender.clone();
-        let address = server.address;
-        workers.push(thread::spawn(move || {
-            let mut stream = std::net::TcpStream::connect(address).unwrap();
-            runtime_support::bound(&stream);
-            barrier.wait();
-            write_proto(&mut stream, &client_request(ID_A)).unwrap();
-            let response: ConnectResponse = read_proto_limited(&mut stream, 64 * 1024).unwrap();
-            sender.send((stream, response)).unwrap();
-        }));
-    }
-    barrier.wait();
-    let (first_stream, first_response) = receiver.recv_timeout(TIMEOUT).unwrap();
-    assert_eq!(first_response.status, Some(ConnectStatus::NewClient as i32));
+    let (new_stream, new_response) = server.handshake(ID_A);
+    assert_eq!(new_response.status, Some(ConnectStatus::NewClient as i32));
+    let mut probe = [0u8; 1];
+    assert_eq!(std::io::Read::read(&mut stale, &mut probe).unwrap_or(0), 0);
+
     let key = passkey_to_key(KEY_A).unwrap();
-    let (mut client, initial) = initialize(first_stream, &key, default_payload());
+    let (mut client, initial) = initialize(new_stream, &key, default_payload());
     assert_eq!(initial.error, None);
     server
         .handle
         .wait_for_state(ID_A, SessionState::Active, TIMEOUT)
         .unwrap();
 
-    let (returning_stream, response) = receiver.recv_timeout(TIMEOUT).unwrap();
+    let (returning_stream, response) = server.handshake(ID_A);
     assert_eq!(response.status, Some(ConnectStatus::ReturningClient as i32));
     client.recover(returning_stream).unwrap();
     client
         .write_packet(TerminalPacketType::KeepAlive as u8, &[])
         .unwrap();
-    for worker in workers {
-        worker.join().unwrap();
-    }
     server.runtime.shutdown().unwrap();
 }
 

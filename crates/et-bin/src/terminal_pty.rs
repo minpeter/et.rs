@@ -26,7 +26,10 @@ enum WorkerEvent {
     Child(Result<u32, String>),
 }
 
-pub fn run(mut router: LocalStream, term: &str) -> Result<i32, String> {
+pub fn run_with_startup<F>(mut router: LocalStream, term: &str, started: F) -> Result<i32, String>
+where
+    F: FnOnce(&mut LocalStream) -> Result<(), String>,
+{
     let environment = read_initial_environment(&mut router)?;
     // Upstream issue #257: show the login banner an interactive ssh would have
     // printed, before the shell writes anything.
@@ -47,13 +50,8 @@ pub fn run(mut router: LocalStream, term: &str) -> Result<i32, String> {
     for (name, value) in environment {
         command.env(name, value);
     }
-    let mut child = pair
-        .slave
-        .spawn_command(command)
-        .map_err(|error| format!("could not spawn terminal shell: {error}"))?;
-    let child_pid = child.process_id();
-    drop(pair.slave);
-    let mut killer = child.clone_killer();
+    // Complete every fallible descriptor allocation before creating the shell.
+    // Once the process exists, all returns below pass through one cleanup path.
     let mut pty_reader = pair
         .master
         .try_clone_reader()
@@ -70,17 +68,32 @@ pub fn run(mut router: LocalStream, term: &str) -> Result<i32, String> {
     let output_wake = wake_writer
         .try_clone()
         .map_err(|error| format!("could not clone PTY wakeup: {error}"))?;
+
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|error| format!("could not spawn terminal shell: {error}"))?;
+    let child_pid = child.process_id();
+    drop(pair.slave);
+    let mut killer = child.clone_killer();
     let (events_tx, events_rx) = mpsc::channel();
     let output_tx = events_tx.clone();
-    let output_worker = thread::Builder::new()
+    let output_worker = match thread::Builder::new()
         .name("et-pty-output".to_owned())
         .spawn(move || {
             let result = forward_output(&mut pty_reader, &mut router_writer);
             let _ = output_tx.send(WorkerEvent::Output(result));
             signal(output_wake);
-        })
-        .map_err(|error| format!("could not start PTY output worker: {error}"))?;
-    let child_worker = thread::Builder::new()
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            kill_process_group(child_pid);
+            let _ = killer.kill();
+            let _ = child.wait();
+            return Err(format!("could not start PTY output worker: {error}"));
+        }
+    };
+    let child_worker = match thread::Builder::new()
         .name("et-pty-child".to_owned())
         .spawn(move || {
             let result = child
@@ -89,22 +102,35 @@ pub fn run(mut router: LocalStream, term: &str) -> Result<i32, String> {
                 .map_err(|error| format!("could not wait for terminal shell: {error}"));
             let _ = events_tx.send(WorkerEvent::Child(result));
             signal(wake_writer);
-        })
-        .map_err(|error| format!("could not start PTY child worker: {error}"))?;
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            kill_process_group(child_pid);
+            let _ = killer.kill();
+            drop(pty_writer);
+            let _ = output_worker.join();
+            return Err(format!("could not start PTY child worker: {error}"));
+        }
+    };
 
-    router
+    let setup = router
         .set_nonblocking(true)
-        .map_err(|error| format!("could not configure terminal router: {error}"))?;
-    wake_reader
-        .set_nonblocking(true)
-        .map_err(|error| format!("could not configure PTY wakeup: {error}"))?;
-    let result = pump(
-        &mut router,
-        wake_reader,
-        pair.master.as_ref(),
-        &mut pty_writer,
-        &events_rx,
-    );
+        .map_err(|error| format!("could not configure terminal router: {error}"))
+        .and_then(|()| {
+            wake_reader
+                .set_nonblocking(true)
+                .map_err(|error| format!("could not configure PTY wakeup: {error}"))
+        })
+        .and_then(|()| started(&mut router));
+    let result = setup.and_then(|()| {
+        pump(
+            &mut router,
+            wake_reader,
+            pair.master.as_ref(),
+            &mut pty_writer,
+            &events_rx,
+        )
+    });
     kill_process_group(child_pid);
     if result.is_err() {
         let _ = killer.kill();

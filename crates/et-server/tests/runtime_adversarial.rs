@@ -32,10 +32,7 @@ fn bad_encrypted_initial_messages_reset_the_slot() {
         .write_packet(253, &default_payload().encode_to_vec())
         .unwrap();
     assert!(wrong.read_packet().is_err());
-    server
-        .handle
-        .wait_for_state(ID_A, SessionState::Registered, TIMEOUT)
-        .unwrap();
+    assert_eq!(server.handle.session_state(ID_A).unwrap(), None);
 
     for (header, bytes) in [(1, default_payload().encode_to_vec()), (253, vec![0xff])] {
         let (stream, response) = server.handshake(ID_A);
@@ -45,10 +42,7 @@ fn bad_encrypted_initial_messages_reset_the_slot() {
         let packet = client.read_packet().unwrap();
         let response = InitialResponse::decode(packet.payload()).unwrap();
         assert!(response.error.is_some());
-        server
-            .handle
-            .wait_for_state(ID_A, SessionState::Registered, TIMEOUT)
-            .unwrap();
+        assert_eq!(server.handle.session_state(ID_A).unwrap(), None);
     }
     server.runtime.shutdown().unwrap();
 }

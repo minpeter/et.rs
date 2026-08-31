@@ -14,7 +14,10 @@ use crate::deadline::Deadline;
 use crate::error::ClientError;
 
 pub const MAX_SSH_STDOUT: usize = 1024 * 1024;
-pub const DEFAULT_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(60);
+// The remote registration phase is bounded at 45 seconds. Leave explicit
+// budget for SSH configuration, authentication, propagation of a structured
+// remote timeout, and cancellation cleanup.
+pub const DEFAULT_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
 pub struct SshOutput {

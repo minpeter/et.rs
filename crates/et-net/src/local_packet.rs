@@ -6,6 +6,11 @@ use std::time::Duration;
 use et_core::packet::{Packet, PacketError};
 
 pub const MAX_LOCAL_PACKET_LEN: usize = 64 * 1024;
+/// Local-only control packets. These values are deliberately outside the
+/// protocol-v6 terminal enum and never cross the encrypted network transport.
+pub const REGISTRATION_STATUS: u8 = 254;
+pub const STARTUP_STATUS: u8 = 255;
+pub const MAX_STATUS_MESSAGE: usize = 8 * 1024;
 const PREFIX_LEN: usize = std::mem::size_of::<i64>();
 /// How long a writer naps before retrying a `WouldBlock` write. Matches the
 /// 10ms cadence the Windows pump loops already use.
@@ -57,6 +62,37 @@ pub fn read_local_packet<R: Read>(reader: &mut R) -> Result<Packet, LocalPacketE
     let mut serialized = vec![0u8; length];
     read_exact_classified(reader, &mut serialized, LocalPacketError::TruncatedPayload)?;
     Packet::from_serialized(&serialized).map_err(LocalPacketError::MalformedPacket)
+}
+
+pub fn status_packet(header: u8, result: Result<(), &str>) -> Packet {
+    let mut payload = Vec::new();
+    match result {
+        Ok(()) => payload.push(0),
+        Err(message) => {
+            payload.push(1);
+            payload.extend_from_slice(&message.as_bytes()[..message.len().min(MAX_STATUS_MESSAGE)]);
+        }
+    }
+    Packet::new(header, payload)
+}
+
+pub fn parse_status(packet: &Packet, expected_header: u8) -> io::Result<()> {
+    if packet.is_encrypted() || packet.header() != expected_header {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected local status packet",
+        ));
+    }
+    match packet.payload().split_first() {
+        Some((&0, [])) => Ok(()),
+        Some((&1, message)) if message.len() <= MAX_STATUS_MESSAGE => Err(io::Error::other(
+            String::from_utf8_lossy(message).into_owned(),
+        )),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "malformed local status packet",
+        )),
+    }
 }
 
 pub fn write_local_packet<W: Write>(writer: &mut W, packet: &Packet) -> io::Result<()> {

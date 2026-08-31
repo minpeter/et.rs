@@ -10,16 +10,41 @@
 //! `et` server and terminal usable on Windows without WSL. Some jobs forbid
 //! breakaway, so the flag is dropped on retry.
 
+use std::ffi::OsStr;
 use std::io;
 use std::process::{Child, Command};
 
-/// Configure `command` to survive the current shell/session.
-pub fn configure(command: &mut Command) {
+/// Construct a re-exec command that closes every descriptor above stderr
+/// before entering the long-lived child. The shell is only a descriptor-hygiene
+/// trampoline; all executable paths and arguments remain positional values.
+pub fn command(executable: &OsStr) -> Command {
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
+        const CLOSE_AND_EXEC: &str = r#"
+for path in /proc/self/fd/[3-9] /proc/self/fd/[1-9][0-9]* /dev/fd/[3-9] /dev/fd/[1-9][0-9]*; do
+    [ -e "$path" ] || continue
+    fd=${path##*/}
+    eval "exec ${fd}>&-" 2>/dev/null || :
+done
+exec "$@"
+"#;
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", CLOSE_AND_EXEC, "et-detached-child"]);
+        command.arg(executable);
+        command
     }
+    #[cfg(windows)]
+    {
+        Command::new(executable)
+    }
+}
+
+/// Configure `command` to survive the current shell/session. On Unix the
+/// re-executed child calls `setsid()` itself; making it a process-group leader
+/// here would make that operation fail with `EPERM`.
+pub fn configure(command: &mut Command) {
+    #[cfg(unix)]
+    let _ = command;
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -27,20 +52,11 @@ pub fn configure(command: &mut Command) {
     }
 }
 
-/// Spawn `command` detached, retrying without job breakaway if the job object
-/// does not allow it.
+/// Spawn `command` detached. Windows must fail closed when the enclosing job
+/// forbids breakaway: retrying without breakaway would report readiness for a
+/// child that OpenSSH kills as soon as bootstrap exits.
 pub fn spawn(command: &mut Command) -> io::Result<Child> {
-    match command.spawn() {
-        Ok(child) => Ok(child),
-        #[cfg(windows)]
-        Err(error) => {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(windows_flags(false));
-            command.spawn().map_err(|_| error)
-        }
-        #[cfg(unix)]
-        Err(error) => Err(error),
-    }
+    command.spawn()
 }
 
 #[cfg(windows)]
@@ -83,9 +99,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn breakaway_is_requested_first_and_optional() {
-        assert_ne!(windows_flags(true), windows_flags(false));
+    fn breakaway_is_mandatory() {
         assert_eq!(windows_flags(true) & 0x0100_0000, 0x0100_0000);
-        assert_eq!(windows_flags(false) & 0x0100_0000, 0);
     }
 }

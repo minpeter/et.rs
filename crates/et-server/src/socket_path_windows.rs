@@ -63,9 +63,10 @@ impl OwnedRouterListener {
         &self.listener
     }
 
-    /// Accept a terminal, enforcing loopback origin and token authentication.
+    /// Accept a terminal without blocking the sole router worker. Token bytes
+    /// are authenticated incrementally by the bounded pending state machine.
     pub(crate) fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
-        let (mut stream, peer) = self.listener.accept()?;
+        let (stream, peer) = self.listener.accept()?;
         if !peer.ip().is_loopback() {
             let _ = stream.shutdown(std::net::Shutdown::Both);
             return Err(io::Error::new(
@@ -73,21 +74,12 @@ impl OwnedRouterListener {
                 "router peer is not loopback",
             ));
         }
-        // Accepted sockets inherit the listener's non-blocking mode on Windows;
-        // the token exchange below is blocking with a timeout.
-        stream.set_nonblocking(false)?;
         stream.set_nodelay(true)?;
-        // The token line is short and sent immediately after connect.
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-        let authenticated = et_net::local::accept_token(&mut stream, &self.token);
-        stream.set_read_timeout(None)?;
-        match authenticated {
-            Ok(()) => Ok((stream, peer)),
-            Err(error) => {
-                let _ = stream.shutdown(std::net::Shutdown::Both);
-                Err(error)
-            }
-        }
+        Ok((stream, peer))
+    }
+
+    pub(crate) fn token(&self) -> &str {
+        &self.token
     }
 }
 

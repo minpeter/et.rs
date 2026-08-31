@@ -1,5 +1,7 @@
 use std::net::TcpStream;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use et_core::proto::{
     ConnectResponse, ConnectStatus, EtPacketType, InitialPayload, InitialResponse, TermInit,
@@ -9,14 +11,18 @@ use et_net::connection::Connection;
 use et_net::handshake::{
     protocol_matches, read_request_deadline, write_response, HANDSHAKE_TIMEOUT,
 };
-use et_net::local_packet::write_local_packet;
+use et_net::local_packet::{write_local_packet, write_local_packet_cancelled};
 use prost::Message;
 
 use crate::runtime_state::{PreAuthGuard, RawSocketGuard, RuntimeCore};
 use crate::session::ActiveSession;
 use crate::session_table::SessionClaim;
 
-const JUMPHOST_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const LEGACY_UNTRUSTED_ORIGIN_MARKER: &str = "ET_RS_SSH_CONFIG_REMOTE_FORWARD";
+// The client caps an individual initialization read at ten seconds. The server
+// owns one shorter absolute budget so authenticated failures arrive first.
+const INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(8);
+const INITIALIZATION_RESPONSE_MARGIN: Duration = Duration::from_millis(500);
 
 pub(crate) fn handle(
     stream: TcpStream,
@@ -30,22 +36,22 @@ pub(crate) fn handle(
         .unwrap_or_else(|_| "unknown".to_owned());
     crate::diag::verbose(1, format!("accepted TCP connection from {peer}"));
     let mut stream = stream;
-    let request =
-        match read_request_deadline(&mut stream, std::time::Instant::now() + HANDSHAKE_TIMEOUT) {
-            Ok(request) => request,
-            Err(error) => {
-                crate::diag::verbose(1, format!("malformed ConnectRequest from {peer}: {error}"));
-                reject(
-                    &mut stream,
-                    ConnectStatus::InvalidKey,
-                    "malformed ConnectRequest",
-                    &peer,
-                    None,
-                );
-                return;
-            }
-        };
-    drop(pre_auth_guard);
+    let initialization_deadline = Instant::now() + INITIALIZATION_TIMEOUT;
+    let handshake_deadline = (Instant::now() + HANDSHAKE_TIMEOUT).min(initialization_deadline);
+    let request = match read_request_deadline(&mut stream, handshake_deadline) {
+        Ok(request) => request,
+        Err(error) => {
+            crate::diag::verbose(1, format!("malformed ConnectRequest from {peer}: {error}"));
+            reject(
+                &mut stream,
+                ConnectStatus::InvalidKey,
+                "malformed ConnectRequest",
+                &peer,
+                None,
+            );
+            return;
+        }
+    };
     if !protocol_matches(&request) {
         let client_id = request
             .client_id
@@ -59,6 +65,18 @@ pub(crate) fn handle(
             &peer,
             client_id.as_deref(),
         );
+        return;
+    }
+    let remaining = initialization_deadline
+        .checked_duration_since(Instant::now())
+        .unwrap_or(Duration::ZERO);
+    if remaining.is_zero()
+        || stream
+            .set_read_timeout(Some(remaining))
+            .and_then(|()| stream.set_write_timeout(Some(remaining)))
+            .is_err()
+    {
+        crate::diag::info(format!("drop {peer}: initialization deadline expired"));
         return;
     }
     let Some(id) = request.client_id.filter(|id| valid_id(id)) else {
@@ -84,10 +102,35 @@ pub(crate) fn handle(
             return;
         }
     };
-    if guard.assign(registration.identity()).is_err() {
+    #[cfg(test)]
+    run_before_raw_assignment_hook(&id);
+    let registration_identity = registration.identity();
+    if guard.assign(registration_identity.clone()).is_err() {
         crate::diag::info(format!(
             "drop {peer} id={id}: could not track raw socket for registration"
         ));
+        return;
+    }
+    if !matches!(core.registry.contains(&registration_identity), Ok(true)) {
+        crate::diag::info(format!(
+            "drop {peer} id={id}: registration disconnected during raw socket assignment"
+        ));
+        return;
+    }
+    if !matches!(
+        core.sessions.state(&id),
+        Ok(Some(crate::session_table::SessionState::Active))
+    ) {
+        crate::diag::info(format!("id={id}: new client session from {peer}"));
+        handle_new(
+            stream,
+            registration,
+            &core,
+            &peer,
+            pre_auth_guard,
+            initialization_deadline,
+            &mut guard,
+        );
         return;
     }
     let claim = match core.sessions.claim(registration, &stream, &core.registry) {
@@ -110,20 +153,11 @@ pub(crate) fn handle(
         }
     };
     match claim {
-        SessionClaim::New { start, replaced } => {
-            if replaced.is_some() {
-                crate::diag::info(format!(
-                    "id={id}: replacing existing session for new client from {peer}"
-                ));
-            }
-            if replaced.is_some_and(|connection| connection.shutdown().is_err()) {
-                crate::diag::info(format!(
-                    "id={id}: failed to shut down replaced session; aborting new client"
-                ));
-                return;
-            }
-            crate::diag::info(format!("id={id}: new client session from {peer}"));
-            handle_new(stream, start, &core, &id, &peer);
+        SessionClaim::New { .. } => {
+            // The active session changed while this connection was being
+            // classified. Roll back and let the client retry from a fresh
+            // plaintext handshake rather than assigning the wrong status.
+            crate::diag::info(format!("id={id}: session changed while classifying {peer}"));
         }
         SessionClaim::Returning(session) => {
             crate::diag::info(format!("id={id}: returning client reconnect from {peer}"));
@@ -167,20 +201,45 @@ pub(crate) fn handle(
 
 fn handle_new(
     mut stream: TcpStream,
-    start: crate::session_slot::SessionStart,
+    registration: crate::registry::Registration,
     core: &RuntimeCore,
-    id: &str,
     peer: &str,
+    pre_auth_guard: PreAuthGuard,
+    initialization_deadline: Instant,
+    raw_guard: &mut RawSocketGuard,
 ) {
-    let initialization_deadline = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    let id = registration.id.clone();
     if send_status(&mut stream, ConnectStatus::NewClient).is_err() {
         crate::diag::info(format!(
             "id={id}: failed to send NewClient status to {peer}"
         ));
         return;
     }
-    let mut connection = Connection::new_server(stream, &start.registration().key);
-    let packet = match connection.read_packet_until(initialization_deadline) {
+    let remaining = initialization_deadline
+        .checked_duration_since(Instant::now())
+        .unwrap_or(Duration::ZERO);
+    if remaining.is_zero()
+        || stream
+            .set_read_timeout(Some(remaining))
+            .and_then(|()| stream.set_write_timeout(Some(remaining)))
+            .is_err()
+    {
+        crate::diag::info(format!(
+            "id={id}: initialization deadline expired for {peer}"
+        ));
+        return;
+    }
+    let claim_stream = match stream.try_clone() {
+        Ok(stream) => stream,
+        Err(error) => {
+            crate::diag::info(format!(
+                "id={id}: could not clone initialization socket: {error}"
+            ));
+            return;
+        }
+    };
+    let mut connection = Connection::new_server(stream, &registration.key);
+    let packet = match connection.read_packet_deadline(initialization_deadline) {
         Ok(packet) => packet,
         Err(error) => {
             crate::diag::info(format!(
@@ -189,6 +248,13 @@ fn handle_new(
             return;
         }
     };
+    // Successfully decrypting this packet is the first cryptographic proof of
+    // possession of the registration key. Keep admission occupied until now.
+    if raw_guard.authenticate().is_err() {
+        crate::diag::info(format!("id={id}: could not mark authenticated socket"));
+        return;
+    }
+    drop(pre_auth_guard);
     let payload = if packet.header() == EtPacketType::InitialPayload as u8 {
         InitialPayload::decode(packet.payload()).map_err(|_| "malformed InitialPayload")
     } else {
@@ -204,44 +270,121 @@ fn handle_new(
             return;
         }
     };
-    if payload.jumphost.unwrap_or(false) {
-        crate::diag::info(format!("id={id}: jumphost session from {peer}"));
-        run_jumphost(connection, start, core, payload, id, peer);
+    let start = match core
+        .sessions
+        .claim(registration, &claim_stream, &core.registry)
+    {
+        Ok(SessionClaim::New {
+            start,
+            replaced: None,
+        }) => start,
+        Ok(SessionClaim::New {
+            replaced: Some(replaced),
+            ..
+        }) => {
+            let _ = replaced.shutdown();
+            send_initial_error(&mut connection, "session changed during authentication");
+            return;
+        }
+        Ok(SessionClaim::Returning(_)) => {
+            send_initial_error(
+                &mut connection,
+                "session became active during authentication",
+            );
+            return;
+        }
+        Err(error) => {
+            send_initial_error(&mut connection, &format!("session claim failed: {error}"));
+            return;
+        }
+    };
+    // This raw connection now owns the Starting/Active session slot. Lifecycle
+    // teardown closes Starting through the slot while preserving an Active
+    // transport long enough to drain terminal bytes buffered before HUP.
+    if raw_guard.own_session().is_err() {
+        send_initial_error(&mut connection, "could not track session owner");
         return;
     }
-    if payload.reversetunnels.len() > et_net::forward::MAX_SESSION_LISTENERS {
-        send_initial_error(&mut connection, "reverse listener limit exceeded");
+    if payload.jumphost.unwrap_or(false) {
+        crate::diag::info(format!("id={id}: jumphost session from {peer}"));
+        run_jumphost(
+            connection,
+            start,
+            core,
+            payload,
+            &id,
+            peer,
+            initialization_deadline,
+        );
+        return;
+    }
+    if payload.reversetunnels.len() > et_net::reverse_report::MAX_REVERSE_ROWS {
+        send_initial_error(&mut connection, "too many reverse forwarding rows");
         return;
     }
     let owner = {
         let registration = start.registration();
         (registration.uid, registration.gid)
     };
-    let (forwarder, forward_environment) = match et_net::forward::Forwarder::start_with_user_until(
-        payload.reversetunnels.clone(),
-        owner,
-        initialization_deadline,
-    ) {
-        Ok(started) => started,
-        Err(error) => {
-            crate::diag::info(format!(
-                "id={id}: reverse-tunnel setup failed for {peer}: {error}"
-            ));
-            send_initial_error(&mut connection, &error.to_string());
-            return;
+    let mut reverse_tunnels = payload.reversetunnels.clone();
+    for request in &mut reverse_tunnels {
+        if request.environmentvariable.as_deref() == Some(LEGACY_UNTRUSTED_ORIGIN_MARKER) {
+            request.environmentvariable = None;
+        }
+    }
+    let (forwarder, forward_environment, skipped) =
+        match et_net::forward::Forwarder::start_with_user_report_deadline(
+            reverse_tunnels,
+            Some(owner),
+            initialization_deadline - INITIALIZATION_RESPONSE_MARGIN,
+            core.forward_resolver.clone(),
+        ) {
+            Ok(started) => started,
+            Err(error) => {
+                crate::diag::info(format!(
+                    "id={id}: reverse-tunnel setup failed for {peer}: {error}"
+                ));
+                let message = error.to_string();
+                if error.is_timeout() {
+                    send_initial_error(
+                        &mut connection,
+                        &et_net::forward::encode_forward_timeout(&message),
+                    );
+                } else {
+                    send_initial_error(&mut connection, &message);
+                }
+                return;
+            }
+        };
+    let response_error = if skipped.is_empty() {
+        None
+    } else {
+        let mut rows: Vec<_> = skipped
+            .iter()
+            .filter_map(|skipped| {
+                skipped
+                    .report_index
+                    .map(|index| et_net::reverse_report::SkippedRow {
+                        index,
+                        reason: skipped.reason,
+                    })
+            })
+            .collect();
+        rows.sort_unstable_by_key(|row| row.index);
+        match et_net::reverse_report::encode_skipped_rows(&rows) {
+            Ok(report) => Some(report),
+            Err(_) => {
+                drop(forwarder);
+                send_initial_error(&mut connection, "too many skipped reverse forwarding rows");
+                return;
+            }
         }
     };
-    if connection
-        .write_packet_live_until(
-            EtPacketType::InitialResponse as u8,
-            &InitialResponse { error: None }.encode_to_vec(),
-            initialization_deadline,
-        )
-        .is_err()
-    {
-        crate::diag::info(format!(
-            "id={id}: failed writing INITIAL_RESPONSE to {peer}"
-        ));
+    if Instant::now() >= initialization_deadline {
+        send_initial_error(
+            &mut connection,
+            "initialization deadline elapsed during forwarding",
+        );
         return;
     }
     let mut terminal = match core.registry.clone_stream(start.registration()) {
@@ -267,8 +410,58 @@ fn handle_new(
         TerminalPacketType::TerminalInit as u8,
         term_init.encode_to_vec(),
     );
-    if write_local_packet(&mut terminal, &init_packet).is_err() {
+    if write_initial_local_packet(&mut terminal, &init_packet, initialization_deadline).is_err() {
+        send_initial_error(
+            &mut connection,
+            "terminal disconnected during initialization",
+        );
         return;
+    }
+    if start.registration().startup_ack {
+        if let Err(error) = wait_for_terminal_startup(
+            &core.registry,
+            start.registration(),
+            initialization_deadline,
+        ) {
+            crate::diag::info(format!("id={id}: terminal startup failed: {error}"));
+            send_initial_error(&mut connection, &error);
+            let _ = terminal.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+    }
+    if Instant::now() >= initialization_deadline {
+        send_initial_error(
+            &mut connection,
+            "initialization deadline elapsed before response",
+        );
+        return;
+    }
+    let requires_ack = response_error.is_some();
+    if connection
+        .write_packet_strict(
+            EtPacketType::InitialResponse as u8,
+            &InitialResponse {
+                error: response_error,
+            }
+            .encode_to_vec(),
+        )
+        .is_err()
+    {
+        crate::diag::info(format!(
+            "id={id}: failed writing INITIAL_RESPONSE to {peer}"
+        ));
+        return;
+    }
+    if requires_ack {
+        if connection.set_io_timeout(Some(HANDSHAKE_TIMEOUT)).is_err() {
+            return;
+        }
+        let acknowledged = connection.read_packet().is_ok_and(|packet| {
+            packet.header() == EtPacketType::Heartbeat as u8 && packet.payload().is_empty()
+        });
+        if !acknowledged || connection.set_io_timeout(None).is_err() {
+            return;
+        }
     }
     let active = match ActiveSession::new(connection, &terminal) {
         Ok(active) => active,
@@ -300,7 +493,12 @@ fn run_jumphost(
     payload: InitialPayload,
     id: &str,
     peer: &str,
+    initialization_deadline: Instant,
 ) {
+    if Instant::now() >= initialization_deadline {
+        send_initial_error(&mut connection, "jumphost initialization deadline elapsed");
+        return;
+    }
     let mut terminal = match core.registry.clone_stream(start.registration()) {
         Ok(terminal) => terminal,
         Err(error) => {
@@ -314,14 +512,42 @@ fn run_jumphost(
         TerminalPacketType::JumphostInit as u8,
         payload.encode_to_vec(),
     );
-    if terminal
-        .set_nonblocking(false)
-        .and_then(|()| terminal.set_read_timeout(Some(JUMPHOST_RESPONSE_TIMEOUT)))
-        .and_then(|()| terminal.set_write_timeout(Some(JUMPHOST_RESPONSE_TIMEOUT)))
-        .is_err()
-        || write_local_packet(&mut terminal, &init_packet).is_err()
+    if terminal.set_nonblocking(true).is_err()
+        || write_initial_local_packet(&mut terminal, &init_packet, initialization_deadline).is_err()
     {
         crate::diag::info(format!("id={id}: jumphost failed sending JUMPHOST_INIT"));
+        send_initial_error(
+            &mut connection,
+            "jumphost disconnected during initialization",
+        );
+        return;
+    }
+    if start.registration().startup_ack {
+        if let Err(error) = wait_for_terminal_startup(
+            &core.registry,
+            start.registration(),
+            initialization_deadline,
+        ) {
+            crate::diag::info(format!("id={id}: jumphost startup failed: {error}"));
+            send_initial_error(&mut connection, &error);
+            let _ = terminal.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+    }
+    let remaining = match initialization_deadline.checked_duration_since(Instant::now()) {
+        Some(remaining) => remaining,
+        None => {
+            send_initial_error(&mut connection, "jumphost initialization deadline elapsed");
+            return;
+        }
+    };
+    if terminal
+        .set_nonblocking(false)
+        .and_then(|()| terminal.set_read_timeout(Some(remaining)))
+        .and_then(|()| terminal.set_write_timeout(Some(remaining)))
+        .is_err()
+    {
+        send_initial_error(&mut connection, "jumphost initialization deadline elapsed");
         return;
     }
     let response_packet = match et_net::local_packet::read_local_packet(&mut terminal) {
@@ -339,8 +565,15 @@ fn run_jumphost(
         }
     };
     let response = InitialResponse::decode(response_packet.payload()).ok();
+    if Instant::now() >= initialization_deadline {
+        send_initial_error(
+            &mut connection,
+            "initialization deadline elapsed before response",
+        );
+        return;
+    }
     if connection
-        .write_packet_live(
+        .write_packet_strict(
             EtPacketType::InitialResponse as u8,
             response_packet.payload(),
         )
@@ -411,6 +644,31 @@ fn run_jumphost(
     let _ = active.finish_terminal();
 }
 
+fn wait_for_terminal_startup(
+    registry: &crate::registry::Registry,
+    registration: &crate::registry::Registration,
+    deadline: Instant,
+) -> Result<(), String> {
+    registry
+        .wait_for_startup(registration, deadline)
+        .map_err(|error| format!("terminal startup acknowledgement failed: {error}"))
+}
+
+fn write_initial_local_packet(
+    stream: &mut et_net::local::LocalStream,
+    packet: &et_core::packet::Packet,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let result = write_local_packet_cancelled(stream, packet, &AtomicBool::new(false), deadline);
+    if result.is_err() {
+        // A cancelled framed write may have emitted only a prefix. Poison this
+        // registration generation so the router retires it instead of letting
+        // a later initialization append to and reuse the partial frame.
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+    result
+}
+
 fn send_initial_error(connection: &mut Connection, message: &str) {
     let _ = connection.write_packet(
         EtPacketType::InitialResponse as u8,
@@ -453,4 +711,179 @@ fn reject(
 
 fn valid_id(id: &str) -> bool {
     id.len() == 16 && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+#[cfg(test)]
+struct RawAssignmentHook {
+    id: String,
+    reached: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+fn raw_assignment_hook() -> &'static std::sync::Mutex<Option<RawAssignmentHook>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<RawAssignmentHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn install_raw_assignment_hook(
+    id: &str,
+    reached: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+) {
+    *raw_assignment_hook().lock().unwrap() = Some(RawAssignmentHook {
+        id: id.to_owned(),
+        reached,
+        release,
+    });
+}
+
+#[cfg(test)]
+fn run_before_raw_assignment_hook(id: &str) {
+    let hook = {
+        let mut installed = raw_assignment_hook().lock().unwrap();
+        if installed.as_ref().is_some_and(|hook| hook.id == id) {
+            installed.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        hook.reached.send(()).unwrap();
+        hook.release.recv().unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::router::{Router, RouterEvent};
+    use et_core::proto::TerminalUserInfo;
+    use prost::Message;
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
+    use std::path::Path;
+
+    const TEST_ID: &str = "initialframe0001";
+    const TEST_KEY: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
+
+    fn register(path: &Path) -> UnixStream {
+        let mut terminal = UnixStream::connect(path).unwrap();
+        let packet = et_core::packet::Packet::new(
+            TerminalPacketType::TerminalUserInfo as u8,
+            TerminalUserInfo {
+                id: Some(TEST_ID.to_owned()),
+                passkey: Some(TEST_KEY.to_owned()),
+                uid: Some(i64::from(rustix::process::getuid().as_raw())),
+                gid: Some(i64::from(rustix::process::getgid().as_raw())),
+                fd: None,
+            }
+            .encode_to_vec(),
+        );
+        et_net::local_packet::write_local_packet(&mut terminal, &packet).unwrap();
+        terminal
+    }
+
+    fn interrupted_initial_write_retires_registration(header: TerminalPacketType) {
+        let directory = std::env::temp_dir().join(format!(
+            "et-interrupted-init-{}-{}",
+            std::process::id(),
+            header as i32
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("router.sock");
+        let selected = crate::path::select_router_path_for(
+            rustix::process::getuid().as_raw(),
+            Some(&path),
+            None,
+            None,
+        )
+        .unwrap();
+        let registry = crate::registry::Registry::new();
+        let mut router = Router::start(selected, registry.clone()).unwrap();
+        let mut terminal = register(&path);
+        assert_eq!(
+            router.recv_event_timeout(Duration::from_secs(1)).unwrap(),
+            RouterEvent::Registered {
+                id: TEST_ID.to_owned()
+            }
+        );
+
+        let registration = registry.get(TEST_ID).unwrap().unwrap();
+        let mut writer = registry.clone_stream(&registration).unwrap();
+        writer.set_nonblocking(true).unwrap();
+        let fill = [0u8; 8192];
+        loop {
+            match writer.write(&fill) {
+                Ok(0) => panic!("local stream closed while being saturated"),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("could not saturate local stream: {error}"),
+            }
+        }
+        let packet = et_core::packet::Packet::new(header as u8, vec![1; 1024]);
+        let error = write_initial_local_packet(
+            &mut writer,
+            &packet,
+            Instant::now() + Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+
+        assert_eq!(
+            router.recv_event_timeout(Duration::from_secs(1)).unwrap(),
+            RouterEvent::Disconnected {
+                id: TEST_ID.to_owned()
+            }
+        );
+        assert!(registry.get(TEST_ID).unwrap().is_none());
+
+        terminal
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut bytes = [0u8; 8192];
+        loop {
+            match terminal.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                    panic!("poisoned local stream remained open: {error}")
+                }
+                Err(error) => panic!("unexpected local stream error: {error}"),
+            }
+        }
+
+        let _fresh_terminal = register(&path);
+        assert_eq!(
+            router.recv_event_timeout(Duration::from_secs(1)).unwrap(),
+            RouterEvent::Registered {
+                id: TEST_ID.to_owned()
+            }
+        );
+        assert!(registry.get(TEST_ID).unwrap().is_some());
+        router.shutdown().unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn interrupted_terminal_init_retires_registration_generation() {
+        interrupted_initial_write_retires_registration(TerminalPacketType::TerminalInit);
+    }
+
+    #[test]
+    fn interrupted_jumphost_init_retires_registration_generation() {
+        interrupted_initial_write_retires_registration(TerminalPacketType::JumphostInit);
+    }
 }

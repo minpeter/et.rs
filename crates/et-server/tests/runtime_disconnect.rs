@@ -66,15 +66,12 @@ fn terminal_eof_interrupts_blocked_returning_recovery() {
 }
 
 #[test]
-fn terminal_eof_interrupts_a_starting_session() {
+fn terminal_eof_interrupts_an_unauthenticated_initialization() {
     let mut server = TestRuntime::start();
     let terminal = server.register(ID_A, KEY_A);
     let (mut starting_client, response) = server.handshake(ID_A);
     assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
-    server
-        .handle
-        .wait_for_state(ID_A, SessionState::Starting, TIMEOUT)
-        .unwrap();
+    assert_eq!(server.handle.session_state(ID_A).unwrap(), None);
 
     drop(terminal);
     server.handle.wait_disconnected(ID_A, TIMEOUT).unwrap();

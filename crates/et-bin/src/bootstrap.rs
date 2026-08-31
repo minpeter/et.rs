@@ -5,6 +5,7 @@ use crate::error::ClientError;
 const MARKER: &[u8] = b"IDPASSKEY:";
 const CREDENTIAL_LEN: usize = 16 + 1 + 32;
 pub const WINDOWS_SHELL_PROBE_SENTINEL: &str = "__ET_COMSPEC__";
+const CLEAR_ALL_FORWARDINGS: &str = "ClearAllForwardings=yes";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Credentials {
@@ -70,9 +71,7 @@ pub fn build_jump_invocation(
         args.push("-p".to_string());
         args.push(port.to_string());
     }
-    for option in &request.ssh_options {
-        args.push(format!("-o{option}"));
-    }
+    append_operational_options(&mut args, &request.ssh_options);
     let host = parsed.host.trim_matches(|c| c == '[' || c == ']');
     args.push(if parsed.user.is_empty() {
         host.to_string()
@@ -162,12 +161,7 @@ pub fn build_invocation(request: &BootstrapRequest, credentials: &Credentials) -
         None => request.host_alias.clone(),
     };
     args.push(destination);
-    args.extend(
-        request
-            .ssh_options
-            .iter()
-            .map(|option| format!("-o{option}")),
-    );
+    append_operational_options(&mut args, &request.ssh_options);
     args.push(remote_command(request, credentials));
 
     SshInvocation {
@@ -189,12 +183,7 @@ pub fn build_shell_probe(request: &BootstrapRequest) -> SshInvocation {
         None => request.host_alias.clone(),
     };
     args.push(destination);
-    args.extend(
-        request
-            .ssh_options
-            .iter()
-            .map(|option| format!("-o{option}")),
-    );
+    append_operational_options(&mut args, &request.ssh_options);
     args.push("-oLogLevel=ERROR".to_owned());
     args.push(format!("echo {WINDOWS_SHELL_PROBE_SENTINEL}%ComSpec%"));
     SshInvocation {
@@ -203,6 +192,16 @@ pub fn build_shell_probe(request: &BootstrapRequest) -> SshInvocation {
         operation: "detecting the remote login shell",
         completion: InvocationCompletion::ShellProbe,
     }
+}
+
+fn append_operational_options(args: &mut Vec<String>, options: &[String]) {
+    args.extend(
+        options
+            .iter()
+            .filter(|option| !option.eq_ignore_ascii_case(CLEAR_ALL_FORWARDINGS))
+            .map(|option| format!("-o{option}")),
+    );
+    args.push(format!("-o{CLEAR_ALL_FORWARDINGS}"));
 }
 
 pub fn parse_shell_probe(stdout: &[u8]) -> Result<RemoteShell, ClientError> {
@@ -407,6 +406,55 @@ mod tests {
         }
     }
 
+    fn assert_clear_all_forwardings_once(invocation: &SshInvocation) {
+        assert_eq!(
+            invocation
+                .args
+                .iter()
+                .filter(|argument| argument.as_str() == "-oClearAllForwardings=yes")
+                .count(),
+            1,
+            "operational SSH argv must suppress configured forwarding exactly once: {:?}",
+            invocation.args
+        );
+    }
+
+    #[test]
+    fn ssh_config_hardening_destination_bootstrap_suppresses_forwardings() {
+        let mut request = request();
+        request
+            .ssh_options
+            .push("ClearAllForwardings=yes".to_owned());
+        let invocation = build_invocation(&request, &provisional_credentials().unwrap());
+
+        assert_clear_all_forwardings_once(&invocation);
+    }
+
+    #[test]
+    fn ssh_config_hardening_shell_probe_suppresses_forwardings() {
+        let invocation = build_shell_probe(&request());
+
+        assert_clear_all_forwardings_once(&invocation);
+    }
+
+    #[test]
+    fn ssh_config_hardening_direct_jumphost_suppresses_forwardings() {
+        let request = JumpBootstrapRequest {
+            jumphost: "jump.example".to_owned(),
+            destination_host: "destination.example".to_owned(),
+            destination_port: 2022,
+            jump_server_fifo: None,
+            terminal_path: None,
+            kill_other_sessions: false,
+            verbose: 0,
+            ssh_options: Vec::new(),
+            term: "xterm-256color".to_owned(),
+        };
+        let invocation = build_jump_invocation(&request, &provisional_credentials().unwrap());
+
+        assert_clear_all_forwardings_once(&invocation);
+    }
+
     #[test]
     fn builds_upstream_ssh_shape() {
         let credentials = Credentials {
@@ -415,9 +463,12 @@ mod tests {
         };
         let invocation = build_invocation(&request(), &credentials);
         assert_eq!(invocation.program, "ssh");
-        assert_eq!(invocation.args[0..2], ["alice@server", "-oPort=2222"]);
         assert_eq!(
-            invocation.args[2],
+            invocation.args[0..3],
+            ["alice@server", "-oPort=2222", "-oClearAllForwardings=yes"]
+        );
+        assert_eq!(
+            invocation.args[3],
             "printf '%s\\n' 'XXXdefghijklmnop/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef_xterm-256color' | 'etterminal' '--verbose=2'"
         );
     }
@@ -589,15 +640,16 @@ mod tests {
         };
         let invocation = build_jump_invocation(&request, &credentials);
         assert_eq!(
-            invocation.args[0..4],
+            invocation.args[0..5],
             [
                 "-p",
                 "2200",
                 "-oStrictHostKeyChecking=no",
+                "-oClearAllForwardings=yes",
                 "user@jump.example"
             ]
         );
-        let command = &invocation.args[4];
+        let command = &invocation.args[5];
         assert!(command.contains("'--serverfifo=/tmp/jump.fifo'"));
         assert!(command.contains("'--jump'"));
         assert!(command.contains("'--dsthost=dst.internal'"));

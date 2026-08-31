@@ -414,18 +414,22 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
     assert!(invocations[1].last().unwrap().contains("__ET_COMSPEC__"));
     let argv = &invocations[2];
     assert_eq!(
-        &argv[..2],
-        ["test-user@server-alias", "-oStrictHostKeyChecking=no"]
+        &argv[..3],
+        [
+            "test-user@server-alias",
+            "-oStrictHostKeyChecking=no",
+            "-oClearAllForwardings=yes",
+        ]
     );
     let prefix = "printf '%s\\n' '";
-    let value = argv[2].strip_prefix(prefix).unwrap();
+    let value = argv[3].strip_prefix(prefix).unwrap();
     let provisional = value.split_once("_xterm-256color'").unwrap().0;
     let (id, key) = parse_id_passkey(provisional).unwrap();
     assert!(id.starts_with("XXX"));
     assert_eq!(id.len(), 16);
     assert_eq!(key.len(), 32);
     assert_eq!(
-        argv[2],
+        argv[3],
         format!(
             "printf '%s\\n' '{provisional}_xterm-256color' | '/opt/et terminal' '--verbose=2' '--serverfifo=/tmp/server fifo'"
         )
@@ -730,7 +734,8 @@ fn explicit_posix_shell_skips_probe_and_uses_exact_posix_bootstrap() {
     assert_eq!(invocations[0], ["-G", "-T", "127.0.0.1"]);
     let bootstrap = &invocations[1];
     assert_eq!(bootstrap[0], "config-user@127.0.0.1");
-    let input = bootstrap[1]
+    assert_eq!(bootstrap[1], "-oClearAllForwardings=yes");
+    let input = bootstrap[2]
         .strip_prefix("printf '%s\\n' '")
         .unwrap()
         .strip_suffix("_xterm-256color' | 'etterminal' '--verbose=0'")
@@ -1120,37 +1125,49 @@ fn jumphost_starts_a_jump_terminal_and_connects_to_the_jumphost() {
     assert_eq!(destination[0], "-J");
     assert_eq!(destination[1], "jump.example");
     assert_eq!(destination[2], "test-user@server-alias");
-    assert!(destination[3].starts_with("echo "), "{:?}", destination[3]);
+    assert_eq!(destination[3], "-oClearAllForwardings=yes");
+    let destination_command = &destination[4];
     assert!(
-        destination[3].contains("\"et.exe\""),
-        "{:?}",
-        destination[3]
+        destination_command.starts_with("echo "),
+        "{destination_command:?}"
     );
     assert!(
-        destination[3].contains("_xterm-256color|"),
-        "{:?}",
-        destination[3]
+        destination_command.contains("\"et.exe\""),
+        "{destination_command:?}"
     );
     assert!(
-        !destination[3].contains("_xterm-ghostty"),
-        "{:?}",
-        destination[3]
+        destination_command.contains("_xterm-256color|"),
+        "{destination_command:?}"
+    );
+    assert!(
+        !destination_command.contains("_xterm-ghostty"),
+        "{destination_command:?}"
     );
     assert_eq!(invocations[3], ["-G", "-T", "jump.example"]);
     let jump = &invocations[4];
-    assert_eq!(jump[0], "jump.example");
+    assert_eq!(jump[0], "-oClearAllForwardings=yes");
+    assert_eq!(jump[1], "jump.example");
+    let jump_command = &jump[2];
     // The jumphost remains POSIX even when the destination probe selects Cmd.
-    assert!(jump[1].contains("'etterminal'"), "{:?}", jump[1]);
-    assert!(!jump[1].contains("et.exe"), "{:?}", jump[1]);
-    assert!(jump[1].contains("_xterm-256color'"), "{:?}", jump[1]);
-    assert!(!jump[1].contains("_xterm-ghostty"), "{:?}", jump[1]);
-    assert!(jump[1].contains("'--jump'"), "{:?}", jump[1]);
-    assert!(jump[1].contains("'--dsthost=127.0.0.1'"), "{:?}", jump[1]);
-    assert!(jump[1].contains("'--dstport=2022'"), "{:?}", jump[1]);
+    assert!(jump_command.contains("'etterminal'"), "{jump_command:?}");
+    assert!(!jump_command.contains("et.exe"), "{jump_command:?}");
     assert!(
-        jump[1].contains("'--serverfifo=/tmp/jump.fifo'"),
-        "{:?}",
-        jump[1]
+        jump_command.contains("_xterm-256color'"),
+        "{jump_command:?}"
+    );
+    assert!(!jump_command.contains("_xterm-ghostty"), "{jump_command:?}");
+    assert!(jump_command.contains("'--jump'"), "{jump_command:?}");
+    assert!(
+        jump_command.contains("'--dsthost=127.0.0.1'"),
+        "{jump_command:?}"
+    );
+    assert!(
+        jump_command.contains("'--dstport=2022'"),
+        "{jump_command:?}"
+    );
+    assert!(
+        jump_command.contains("'--serverfifo=/tmp/jump.fifo'"),
+        "{jump_command:?}"
     );
 }
 

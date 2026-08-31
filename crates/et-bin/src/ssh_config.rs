@@ -197,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn query_preserves_alias_and_parses_effective_values() {
+    fn ssh_config_hardening_query_does_not_suppress_forwardings() {
         let runner = FakeRunner {
             stdout: b"host server-alias\nuser config-user\nhostname 127.0.0.1\nport 22\n".to_vec(),
         };

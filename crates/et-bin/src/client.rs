@@ -266,6 +266,7 @@ fn run_client(
             command: args.command.as_deref(),
             no_exit: args.no_exit,
             keepalive: args.keepalive,
+            flow_control: args.flow_control,
             terminal_enabled: !args.no_terminal,
             lines: crate::client_terminal::RemoteLines::from(remote_mode.terminal_shell),
             connection_name: &request.host_alias,

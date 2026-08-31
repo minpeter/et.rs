@@ -19,7 +19,7 @@ use wait_timeout::ChildExt;
 const TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_PROMPT_LATENCY: Duration = Duration::from_secs(5);
 pub const THROTTLE_BYTES_PER_SECOND: usize = 100 * 1024;
-pub const SATURATION_BYTES: usize = 576 * 1024;
+pub const SATURATION_BYTES: usize = 128 * 1024;
 const PROXY_RECEIVE_BUFFER_BYTES: usize = 64 * 1024;
 static STACK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -58,14 +58,16 @@ pub fn receive_bytes(
 
 pub struct ThrottleProxy {
     pub port: u16,
+    saturated: mpsc::Receiver<()>,
     stop: mpsc::Receiver<TcpStream>,
     worker: thread::JoinHandle<io::Result<()>>,
 }
 
 impl ThrottleProxy {
-    pub fn start(server_port: u16, bytes_per_second: usize) -> Self {
+    pub fn start(server_port: u16, bytes_per_second: usize, saturation_bytes: usize) -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
+        let (saturated_tx, saturated) = mpsc::sync_channel(1);
         let (stop_tx, stop) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || {
             let (mut client, _) = listener.accept()?;
@@ -86,6 +88,7 @@ impl ThrottleProxy {
             let downstream = (|| {
                 let started = Instant::now();
                 let mut transferred = 0usize;
+                let mut saturation_signalled = false;
                 let mut chunk = [0u8; 8192];
                 loop {
                     let count = server.read(&mut chunk)?;
@@ -94,6 +97,12 @@ impl ThrottleProxy {
                     }
                     client.write_all(&chunk[..count])?;
                     transferred += count;
+                    if !saturation_signalled && transferred >= saturation_bytes {
+                        saturated_tx
+                            .send(())
+                            .map_err(|_| io::Error::other("saturation receiver closed"))?;
+                        saturation_signalled = true;
+                    }
                     let expected =
                         Duration::from_secs_f64(transferred as f64 / bytes_per_second as f64);
                     if let Some(remaining) = expected.checked_sub(started.elapsed()) {
@@ -109,7 +118,16 @@ impl ThrottleProxy {
             normalize_proxy_close(downstream)?;
             normalize_proxy_close(upstream.map(|_| ()))
         });
-        Self { port, stop, worker }
+        Self {
+            port,
+            saturated,
+            stop,
+            worker,
+        }
+    }
+
+    pub fn wait_saturated(&self, timeout: Duration) -> Result<(), mpsc::RecvTimeoutError> {
+        self.saturated.recv_timeout(timeout)
     }
 
     pub fn finish(self) -> io::Result<()> {

@@ -77,8 +77,9 @@ impl Connection {
 
     pub fn write_packet(&mut self, header: u8, payload: &[u8]) -> Result<(), ConnError> {
         let prepared = self.prepare_write_packet(header, payload)?;
-        if prepared.send().is_err() {
+        if let Err(error) = prepared.send() {
             self.disconnect();
+            return Err(error);
         }
         Ok(())
     }
@@ -88,19 +89,35 @@ impl Connection {
         header: u8,
         payload: &[u8],
     ) -> Result<PreparedWrite, ConnError> {
+        self.prepare_write_packet_with(header, payload, TcpStream::try_clone)
+    }
+
+    fn prepare_write_packet_with<F>(
+        &mut self,
+        header: u8,
+        payload: &[u8],
+        clone_stream: F,
+    ) -> Result<PreparedWrite, ConnError>
+    where
+        F: FnOnce(&TcpStream) -> io::Result<TcpStream>,
+    {
         // Probe first so a half-closed peer (laptop sleep, Wi-Fi drop) moves
         // the writer into the disconnected catch-up buffer before we try to
         // push bytes onto a dead socket.
-        if let Err(_error) = self.refresh_connectivity() {
+        if self.refresh_connectivity().is_err() {
             self.disconnect();
         }
+        // Cloning is the only fallible transport preparation. Do it before
+        // encryption advances the nonce/sequence and inserts replay history.
+        let live_stream = self
+            .writer
+            .connected()
+            .then(|| clone_stream(&self.stream).map_err(ConnError::Io))
+            .transpose()?;
         match self.writer.write_packet(header, payload)? {
-            WriterOutcome::Send(frame) => {
-                let stream = self.stream.try_clone().map_err(ConnError::Io)?;
-                Ok(PreparedWrite {
-                    live: Some((stream, frame, self.live_write_timeout)),
-                })
-            }
+            WriterOutcome::Send(frame) => Ok(PreparedWrite {
+                live: live_stream.map(|stream| (stream, frame, self.live_write_timeout)),
+            }),
             WriterOutcome::BufferedOnly => Ok(PreparedWrite { live: None }),
             WriterOutcome::Skipped => Err(ConnError::Backpressure),
         }
@@ -303,4 +320,38 @@ fn write_all_until(stream: &mut TcpStream, mut buffer: &[u8], deadline: Instant)
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::thread;
+
+    #[test]
+    fn clone_failure_does_not_advance_writer_nonce_or_sequence() {
+        // Given: an authenticated connection whose transport clone fails.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let connector = thread::spawn(move || TcpStream::connect(address).unwrap());
+        let (server_stream, _) = listener.accept().unwrap();
+        let client_stream = connector.join().unwrap();
+        let key = [19u8; KEY_LEN];
+        let mut sender = Connection::new_client(client_stream, &key);
+        let mut receiver = Connection::new_server(server_stream, &key);
+
+        // When: preparation fails, then the same logical packet is retried.
+        let failure = sender.prepare_write_packet_with(7, b"once", |_| {
+            Err(io::Error::other("injected clone failure"))
+        });
+        assert!(matches!(failure, Err(ConnError::Io(_))));
+        assert_eq!(sender.writer_sequence(), 0);
+        sender.write_packet(7, b"once").unwrap();
+
+        // Then: the peer decrypts sequence zero exactly once.
+        let packet = receiver.read_packet().unwrap();
+        assert_eq!((packet.header(), packet.payload()), (7, b"once".as_slice()));
+        assert_eq!(sender.writer_sequence(), 1);
+        assert_eq!(receiver.reader_sequence(), 1);
+    }
 }

@@ -14,7 +14,7 @@ use std::time::Duration;
 use et_core::keys::passkey_to_key;
 use et_core::packet::Packet;
 use et_core::proto::{
-    ConnectResponse, ConnectStatus, EtPacketType, InitialPayload, InitialResponse,
+    ConnectResponse, ConnectStatus, EtPacketType, FlowControlMode, InitialPayload, InitialResponse,
     TerminalPacketType,
 };
 use et_net::connection::Connection;
@@ -41,6 +41,20 @@ pub fn run(
     let payload = read_jumphost_init(&mut router)?;
     if !payload.jumphost.unwrap_or(false) {
         return Err("Jumphost should be set by the initial client".to_owned());
+    }
+    let flow_control = payload
+        .flowcontrol
+        .and_then(|value| FlowControlMode::try_from(value).ok())
+        .unwrap_or(FlowControlMode::None);
+    let bounded_output = match flow_control {
+        FlowControlMode::None => false,
+        FlowControlMode::Backpressure | FlowControlMode::Discard => true,
+    };
+    if bounded_output {
+        // Destination output enters the jumphost router through this terminal-
+        // side sender. Keep pressure in the server's bounded application lanes.
+        et_net::local::minimize_terminal_output_buffering(&router)
+            .map_err(|error| format!("could not bound jumphost output buffering: {error}"))?;
     }
     // The destination runs a real terminal, so the relayed payload must not
     // ask it to start another jumphost.
@@ -91,6 +105,20 @@ fn try_connect_once(
     port: u16,
     payload: &InitialPayload,
 ) -> Result<Connection, String> {
+    try_connect_once_observed(id, key, host, port, payload, |_| Ok(()))
+}
+
+fn try_connect_once_observed<F>(
+    id: &str,
+    key: &[u8; 32],
+    host: &str,
+    port: u16,
+    payload: &InitialPayload,
+    observe_before_payload: F,
+) -> Result<Connection, String>
+where
+    F: FnOnce(&Connection) -> Result<(), String>,
+{
     let addresses = (host, port)
         .to_socket_addrs()
         .map_err(|error| format!("could not resolve {host}: {error}"))?;
@@ -136,6 +164,17 @@ fn try_connect_once(
         None => return Err("destination sent an unknown connect status".to_owned()),
     }
     let mut connection = Connection::new_client(stream, key);
+    match payload
+        .flowcontrol
+        .and_then(|value| FlowControlMode::try_from(value).ok())
+        .unwrap_or(FlowControlMode::None)
+    {
+        FlowControlMode::None => {}
+        FlowControlMode::Backpressure | FlowControlMode::Discard => connection
+            .minimize_output_buffering()
+            .map_err(|error| format!("could not bound destination output buffering: {error}"))?,
+    }
+    observe_before_payload(&connection)?;
     connection
         .write_packet(EtPacketType::InitialPayload as u8, &payload.encode_to_vec())
         .map_err(|error| format!("could not send INITIAL_PAYLOAD: {error}"))?;
@@ -308,3 +347,7 @@ fn read_router_packet(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "terminal_jump_tests.rs"]
+mod tests;

@@ -80,6 +80,7 @@ fn role(name: &str, args: &[OsString]) -> Result<i32, clap::Error> {
 mod bootstrap;
 mod client;
 mod client_environment;
+mod client_output;
 mod client_terminal;
 mod client_terminal_loop;
 #[cfg(windows)]

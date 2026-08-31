@@ -5,7 +5,9 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use et_net::connection::{Connection, DEFAULT_LIVE_WRITE_TIMEOUT, MAX_RECOVERY_PROTO_LEN};
+use et_net::connection::{
+    ConnError, Connection, DEFAULT_LIVE_WRITE_TIMEOUT, MAX_RECOVERY_PROTO_LEN,
+};
 
 #[test]
 fn eof_invalidates_connection_so_future_output_is_buffered() {
@@ -67,10 +69,26 @@ fn blackholed_peer_write_soft_disconnects_within_live_timeout() {
     let mut disconnected = false;
     // Fill the socket send buffer until the bounded write times out.
     for _ in 0..4_096 {
-        connection.write_packet(7, &payload).unwrap();
-        if !connection.connected() {
-            disconnected = true;
-            break;
+        match connection.write_packet(7, &payload) {
+            Ok(()) if connection.connected() => {}
+            Ok(()) => {
+                disconnected = true;
+                break;
+            }
+            Err(ConnError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                assert!(
+                    !connection.connected(),
+                    "timed-out live write did not soft-disconnect"
+                );
+                disconnected = true;
+                break;
+            }
+            Err(error) => panic!("blackhole write failed unexpectedly: {error}"),
         }
         assert!(
             started.elapsed() < DEFAULT_LIVE_WRITE_TIMEOUT + Duration::from_secs(3),

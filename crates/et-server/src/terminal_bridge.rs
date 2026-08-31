@@ -73,6 +73,9 @@ fn run_mode_poll(
     // An outbound forwarding packet that could not fit in the disconnected
     // replay buffer. Keep ownership until recovery restores write capacity.
     let mut pending_outbound: Option<Packet> = None;
+    // A complete terminal packet already read from the local stream. Retain
+    // ownership across backpressure instead of dropping it or reading ahead.
+    let mut pending_terminal: Option<Packet> = None;
     loop {
         let mut resume_outbound_drain = false;
         if session.is_shutting_down() {
@@ -88,6 +91,10 @@ fn run_mode_poll(
             pending_outbound =
                 send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
             resume_outbound_drain = pending_outbound.is_none();
+        }
+        if let Some(packet) = pending_terminal.take() {
+            pending_terminal =
+                send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
         }
         let (client, polled_generation) = if connected {
             match session.try_clone_stream() {
@@ -107,7 +114,8 @@ fn run_mode_poll(
         } else {
             (None, None)
         };
-        let accept_terminal = session.can_buffer_write((READ_BUFFER * 2) as i64)?;
+        let accept_terminal =
+            pending_terminal.is_none() && session.can_buffer_write((READ_BUFFER * 2) as i64)?;
         // When the client is down, poll with a short timeout so recovery wakes
         // (via the wake pipe) are still processed promptly and we re-check
         // `session.connected()` after recover installs a new stream.
@@ -117,7 +125,10 @@ fn run_mode_poll(
             forwarder.wake().map_err(forward_error)?,
             client.as_ref(),
             accept_terminal,
-            pending_forward.is_some() || pending_outbound.is_some() || !connected,
+            pending_forward.is_some()
+                || pending_outbound.is_some()
+                || pending_terminal.is_some()
+                || !connected,
         )?;
         let client_events_are_stale = wake_events.intersects(PollFlags::IN | PollFlags::HUP);
         if client_events_are_stale {
@@ -139,16 +150,12 @@ fn run_mode_poll(
                             jumphost_terminal_packet(&session, packet)?
                         };
                         decoder = LocalPacketDecoder::new();
-                        if let Err(error) = session.send_packet(packet.header(), packet.payload()) {
-                            if !client_transport_error(
-                                &error,
-                                &session,
-                                &mut connected,
-                                &mut connection_generation,
-                            )? {
-                                return Err(error);
-                            }
-                        }
+                        pending_terminal = send_or_hold(
+                            &session,
+                            packet,
+                            &mut connected,
+                            &mut connection_generation,
+                        )?;
                     }
                     Ok(None) if terminal_closed => continue,
                     Ok(None) => break,
@@ -247,6 +254,7 @@ fn run_mode_windows(
     // further client packets are read so forwarding data stays ordered.
     let mut pending_forward: Option<Packet> = None;
     let mut pending_outbound: Option<Packet> = None;
+    let mut pending_terminal: Option<Packet> = None;
     loop {
         if session.is_shutting_down() {
             return Ok(());
@@ -267,6 +275,11 @@ fn run_mode_windows(
                 send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
             progress |= pending_outbound.is_none();
         }
+        if let Some(packet) = pending_terminal.take() {
+            pending_terminal =
+                send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
+            progress |= pending_terminal.is_none();
+        }
 
         // Connection state changes are announced through the wake channel.
         if drain_available(&mut wake)? {
@@ -278,7 +291,7 @@ fn run_mode_windows(
         }
 
         // Terminal -> client, honouring the same write-buffer backpressure.
-        if session.can_buffer_write((READ_BUFFER * 2) as i64)? {
+        if pending_terminal.is_none() && session.can_buffer_write((READ_BUFFER * 2) as i64)? {
             match read_terminal_packet(&mut terminal, &mut decoder) {
                 Ok(Some(packet)) => {
                     progress = true;
@@ -289,16 +302,8 @@ fn run_mode_windows(
                         jumphost_terminal_packet(&session, packet)?
                     };
                     decoder = LocalPacketDecoder::new();
-                    if let Err(error) = session.send_packet(packet.header(), packet.payload()) {
-                        if !client_transport_error(
-                            &error,
-                            &session,
-                            &mut connected,
-                            &mut connection_generation,
-                        )? {
-                            return Err(error);
-                        }
-                    }
+                    pending_terminal =
+                        send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
                 }
                 Ok(None) => {}
                 Err(error) => return Err(error),

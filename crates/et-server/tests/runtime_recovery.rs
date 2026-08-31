@@ -313,18 +313,33 @@ fn recover_succeeds_while_old_peer_blackholes_writes() {
     let _live = client.try_clone_stream().unwrap();
 
     let payload = vec![b'x'; 32 * 1024];
+    let mut timed_out_round = None;
     for round in 0..1_024u32 {
         let send_started = Instant::now();
-        server
-            .handle
-            .send_packet(ID_A, 40, &payload)
-            .unwrap_or_else(|error| panic!("flood round {round}: {error}"));
+        let result = server.handle.send_packet(ID_A, 40, &payload);
         assert!(
             send_started.elapsed() < std::time::Duration::from_secs(8),
             "send_packet round {round} blocked for {:?} — live write timeout not applied",
             send_started.elapsed()
         );
+        match result {
+            Ok(()) => {}
+            Err(error) => {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("io: live write deadline elapsed"),
+                    "flood round {round} failed unexpectedly: {error}"
+                );
+                timed_out_round = Some(round);
+                break;
+            }
+        }
     }
+    assert!(
+        timed_out_round.is_some(),
+        "blackholed live path never reached its bounded write timeout"
+    );
 
     let recover_started = Instant::now();
     let (returning, response) = server.handshake(ID_A);

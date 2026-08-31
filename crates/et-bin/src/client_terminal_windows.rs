@@ -19,8 +19,8 @@ use et_net::connection::Connection;
 use et_net::forward::{is_forward_packet, Forwarder};
 
 use crate::client_terminal::{
-    connection_ended, display_packet, recover_transport, send_buffer, send_size, terminal_error,
-    terminal_text, TerminalModeState,
+    connection_ended, recover_transport, send_buffer, send_size, terminal_error, terminal_io,
+    terminal_text, DisplayOutcome, TerminalModeState,
 };
 use crate::error::ClientError;
 use crate::initial_connect::ReconnectOutcome;
@@ -41,10 +41,13 @@ where
     let crate::client_terminal_loop::PumpOptions {
         read_stdin,
         keepalive_seconds,
+        flow_control,
         terminal_enabled,
         auto_cursor_report,
         terminal_modes,
     } = options;
+    let console_output = crate::client_output::ConsoleOutput::stdout(flow_control)
+        .map_err(|error| terminal_io("starting console output worker", error))?;
     let interval = Duration::from_secs(u64::from(keepalive_seconds.max(1)));
     let silence = interval.saturating_mul(MISSED_KEEPALIVES);
     let mut last_received = Instant::now();
@@ -55,6 +58,7 @@ where
     // A forwarding packet the worker had no room for. While it is held, no
     // further session packets are read so forwarding data stays ordered.
     let mut pending_forward: Option<et_core::packet::Packet> = None;
+    let mut pending_output: Option<et_core::packet::Packet> = None;
     loop {
         let mut reconnect_needed = false;
         // Retry the held packet first: draining the forwarder's outbound
@@ -64,6 +68,17 @@ where
             pending_forward = forwarder
                 .try_receive(packet)
                 .map_err(|error| terminal_text(error.to_string()))?;
+        }
+        if let Some(packet) = pending_output.take() {
+            match route_server_packet(packet, terminal_enabled, terminal_modes, &console_output)? {
+                DisplayOutcome::Displayed { cursor_report }
+                    if cursor_report && auto_cursor_report =>
+                {
+                    let _ = send_buffer(connection, crate::client_terminal::CURSOR_REPORT_REPLY);
+                }
+                DisplayOutcome::Displayed { .. } => {}
+                DisplayOutcome::Pending(packet) => pending_output = Some(packet),
+            }
         }
 
         // 1. Console input and resize notifications.
@@ -100,7 +115,7 @@ where
         }
 
         // 2. Server packets.
-        while pending_forward.is_none() {
+        while pending_forward.is_none() && pending_output.is_none() {
             match connection.try_read_packet() {
                 Ok(Some(packet)) => {
                     last_received = Instant::now();
@@ -113,11 +128,24 @@ where
                         pending_forward = forwarder
                             .try_receive(packet)
                             .map_err(|error| terminal_text(error.to_string()))?;
-                    } else if route_server_packet(packet, terminal_enabled, terminal_modes)?
-                        && auto_cursor_report
-                    {
-                        let _ =
-                            send_buffer(connection, crate::client_terminal::CURSOR_REPORT_REPLY);
+                    } else {
+                        match route_server_packet(
+                            packet,
+                            terminal_enabled,
+                            terminal_modes,
+                            &console_output,
+                        )? {
+                            DisplayOutcome::Displayed { cursor_report }
+                                if cursor_report && auto_cursor_report =>
+                            {
+                                let _ = send_buffer(
+                                    connection,
+                                    crate::client_terminal::CURSOR_REPORT_REPLY,
+                                );
+                            }
+                            DisplayOutcome::Displayed { .. } => {}
+                            DisplayOutcome::Pending(packet) => pending_output = Some(packet),
+                        }
                     }
                 }
                 Ok(None) => break,
@@ -145,7 +173,7 @@ where
         }
 
         let now = Instant::now();
-        if now.saturating_duration_since(last_received) >= silence {
+        if pending_output.is_none() && now.saturating_duration_since(last_received) >= silence {
             reconnect_needed = true;
         }
         if reconnect_needed {
@@ -185,12 +213,19 @@ fn route_server_packet(
     packet: et_core::packet::Packet,
     terminal_enabled: bool,
     terminal_modes: &mut TerminalModeState,
-) -> Result<bool, ClientError> {
+    output: &crate::client_output::ConsoleOutput,
+) -> Result<DisplayOutcome, ClientError> {
     if terminal_enabled || packet.header() == TerminalPacketType::KeepAlive as u8 {
-        return display_packet(packet, terminal_modes);
+        return crate::client_terminal::display_packet_with(packet, terminal_modes, |bytes| {
+            output
+                .try_write(bytes)
+                .map_err(|error| terminal_io("writing terminal output", error))
+        });
     }
     if packet.header() == TerminalPacketType::TerminalBuffer as u8 {
-        return Ok(false);
+        return Ok(DisplayOutcome::Displayed {
+            cursor_report: false,
+        });
     }
     Err(terminal_text(
         "server sent an unsupported no-terminal packet",

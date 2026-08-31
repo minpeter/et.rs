@@ -44,6 +44,7 @@ pub struct TerminalOptions<'a> {
     pub command: Option<&'a str>,
     pub no_exit: bool,
     pub keepalive: u32,
+    pub flow_control: et_cli::client::FlowControlMode,
     pub terminal_enabled: bool,
     pub lines: RemoteLines,
     pub connection_name: &'a str,
@@ -62,6 +63,7 @@ where
         command,
         no_exit,
         keepalive,
+        flow_control,
         terminal_enabled,
         lines,
         connection_name,
@@ -146,6 +148,7 @@ where
             crate::client_terminal_loop::PumpOptions {
                 read_stdin,
                 keepalive_seconds: keepalive,
+                flow_control,
                 terminal_enabled,
                 auto_cursor_report,
                 terminal_modes: &mut terminal_modes,
@@ -163,6 +166,7 @@ where
         crate::client_terminal_loop::PumpOptions {
             read_stdin,
             keepalive_seconds: keepalive,
+            flow_control,
             terminal_enabled,
             auto_cursor_report,
             terminal_modes: &mut terminal_modes,
@@ -184,10 +188,19 @@ pub(crate) const CURSOR_REPORT_REPLY: &[u8] = b"\x1b[1;1R";
 /// emits that request on startup and waits for the answer, which an interactive
 /// terminal emulator provides. Non-interactive sessions have no emulator to
 /// answer, so the caller replies on their behalf (see `auto_cursor_report`).
-pub(crate) fn display_packet(
+pub(crate) enum DisplayOutcome {
+    Displayed { cursor_report: bool },
+    Pending(et_core::packet::Packet),
+}
+
+pub(crate) fn display_packet_with<F>(
     packet: et_core::packet::Packet,
     terminal_modes: &mut TerminalModeState,
-) -> Result<bool, ClientError> {
+    mut output: F,
+) -> Result<DisplayOutcome, ClientError>
+where
+    F: FnMut(&[u8]) -> Result<bool, ClientError>,
+{
     match packet.header() {
         value if value == TerminalPacketType::TerminalBuffer as u8 => {
             let message = TerminalBuffer::decode(packet.payload())
@@ -195,15 +208,17 @@ pub(crate) fn display_packet(
             let bytes = message
                 .buffer
                 .ok_or_else(|| terminal_text("terminal output is missing bytes"))?;
+            if !output(&bytes)? {
+                return Ok(DisplayOutcome::Pending(packet));
+            }
             terminal_modes.observe(&bytes);
-            io::stdout()
-                .lock()
-                .write_all(&bytes)
-                .and_then(|()| io::stdout().lock().flush())
-                .map_err(|error| terminal_io("writing terminal output", error))?;
-            Ok(contains_cursor_report_request(&bytes))
+            Ok(DisplayOutcome::Displayed {
+                cursor_report: contains_cursor_report_request(&bytes),
+            })
         }
-        value if value == TerminalPacketType::KeepAlive as u8 => Ok(false),
+        value if value == TerminalPacketType::KeepAlive as u8 => Ok(DisplayOutcome::Displayed {
+            cursor_report: false,
+        }),
         _ => Err(terminal_text("server sent an unsupported terminal packet")),
     }
 }

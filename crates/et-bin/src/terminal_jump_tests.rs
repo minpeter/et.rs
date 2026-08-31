@@ -107,8 +107,9 @@ fn slow_jumphost_output_does_not_block_ctrl_c_toward_destination() {
     let mut destination_client = Connection::new_client(client_stream, &key);
     let mut destination_server = Connection::new_server(server_stream, &key);
     let (relay_router, mut router_peer) = et_net::local::wake_pair().unwrap();
-    et_net::local::minimize_terminal_output_buffering(&relay_router).unwrap();
+    saturate_router_output(&relay_router, &router_peer);
     let (output_sent_tx, output_sent_rx) = mpsc::sync_channel(0);
+    let (pending_tx, pending_rx) = mpsc::sync_channel(0);
     let (input_tx, input_rx) = mpsc::sync_channel(0);
     let destination = thread::spawn(move || {
         destination_server
@@ -121,8 +122,13 @@ fn slow_jumphost_output_does_not_block_ctrl_c_toward_destination() {
             .unwrap();
         destination_server.shutdown().unwrap();
     });
-    let relay = thread::spawn(move || relay(relay_router, &mut destination_client));
+    let relay = thread::spawn(move || {
+        relay_with_output_observer(relay_router, &mut destination_client, || {
+            pending_tx.send(()).unwrap();
+        })
+    });
     output_sent_rx.recv_timeout(PTY_CONTRACT).unwrap();
+    pending_rx.recv_timeout(PTY_CONTRACT).unwrap();
 
     // When: Ctrl-C arrives while ownership of the blocked prompt/output frame
     // remains in the destination-to-router direction.
@@ -180,6 +186,58 @@ fn jumphost_drains_coalesced_destination_packets_without_new_socket_readiness() 
     assert_eq!(
         relayed,
         (91..96)
+            .map(|header| (header, vec![header]))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn jumphost_resumes_coalesced_destination_packets_after_router_backpressure() {
+    // Given: five destination packets coalesce in userspace while the router
+    // output queue is already full.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let connector = thread::spawn(move || std::net::TcpStream::connect(address).unwrap());
+    let (server_stream, _) = listener.accept().unwrap();
+    let client_stream = connector.join().unwrap();
+    let key = [37u8; 32];
+    let mut destination_client = Connection::new_client(client_stream, &key);
+    let mut destination_server = Connection::new_server(server_stream, &key);
+    for header in 101..106 {
+        destination_server.write_packet(header, &[header]).unwrap();
+    }
+    let (relay_router, mut router_peer) = et_net::local::wake_pair().unwrap();
+    let filler_bytes = saturate_router_output(&relay_router, &router_peer);
+    router_peer.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let (pending_tx, pending_rx) = mpsc::sync_channel(0);
+    let relay = thread::spawn(move || {
+        relay_with_output_observer(relay_router, &mut destination_client, || {
+            pending_tx.send(()).unwrap();
+        })
+    });
+    pending_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+
+    // When: the router resumes reading after the first destination frame was
+    // interrupted by real socket backpressure.
+    router_peer
+        .read_exact(&mut vec![0u8; filler_bytes])
+        .unwrap();
+    let mut relayed = Vec::new();
+    for _ in 0..5 {
+        match et_net::local_packet::read_local_packet(&mut router_peer) {
+            Ok(packet) => relayed.push((packet.header(), packet.payload().to_vec())),
+            Err(_) => break,
+        }
+    }
+    drop(router_peer);
+    assert_eq!(relay.join().unwrap().unwrap(), 0);
+
+    // Then: clearing pending output resumes the userspace drain without a new
+    // destination POLLIN event.
+    assert_eq!(
+        relayed,
+        (101..106)
             .map(|header| (header, vec![header]))
             .collect::<Vec<_>>()
     );
@@ -263,4 +321,30 @@ fn jumphost_run_bounds_router_sender_before_destination_output() {
     );
     drop(router_peer);
     assert_eq!(relay.join().unwrap().unwrap(), 0);
+}
+
+fn saturate_router_output(
+    router: &et_net::local::LocalStream,
+    peer: &et_net::local::LocalStream,
+) -> usize {
+    et_net::local::minimize_terminal_output_buffering(router).unwrap();
+    SockRef::from(router)
+        .set_send_buffer_size(2 * 1024)
+        .unwrap();
+    SockRef::from(peer).set_recv_buffer_size(2 * 1024).unwrap();
+    let mut saturator = router.try_clone().unwrap();
+    saturator.set_nonblocking(true).unwrap();
+    let filler = [0u8; 16 * 1024];
+    let mut saturated_bytes = 0usize;
+    loop {
+        match saturator.write(&filler) {
+            Ok(0) => panic!("router output closed before reaching backpressure"),
+            Ok(written) => saturated_bytes += written,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("could not saturate router output: {error}"),
+        }
+    }
+    assert!(saturated_bytes > 0);
+    saturated_bytes
 }

@@ -231,7 +231,15 @@ fn is_acknowledgement(packet: &Packet) -> bool {
 }
 
 /// Relay packets verbatim between the local router and the destination.
-fn relay(mut router: LocalStream, destination: &mut Connection) -> Result<i32, String> {
+fn relay(router: LocalStream, destination: &mut Connection) -> Result<i32, String> {
+    relay_with_output_observer(router, destination, || {})
+}
+
+fn relay_with_output_observer(
+    mut router: LocalStream,
+    destination: &mut Connection,
+    mut output_pending: impl FnMut(),
+) -> Result<i32, String> {
     router
         .set_nonblocking(true)
         .map_err(|error| format!("could not configure the router socket: {error}"))?;
@@ -269,6 +277,9 @@ fn relay(mut router: LocalStream, destination: &mut Connection) -> Result<i32, S
                         0,
                     ));
                     let _ = write_pending_local(&mut router, &mut pending_output)?;
+                    if pending_output.is_some() {
+                        output_pending();
+                    }
                 }
                 Ok(None) => break,
                 Err(_) => return Ok(0),
@@ -280,6 +291,8 @@ fn relay(mut router: LocalStream, destination: &mut Connection) -> Result<i32, S
     }
     #[cfg(unix)]
     let mut pending_output: Option<(Vec<u8>, usize)> = None;
+    #[cfg(unix)]
+    let mut resume_destination_drain = false;
     #[cfg(unix)]
     loop {
         let client = destination
@@ -335,10 +348,13 @@ fn relay(mut router: LocalStream, destination: &mut Connection) -> Result<i32, S
                 }
             }
         }
-        if client_events.contains(PollFlags::IN) && pending_output.is_none() {
+        if pending_output.is_none()
+            && (client_events.contains(PollFlags::IN) || resume_destination_drain)
+        {
             while pending_output.is_none() {
                 match destination.try_read_packet() {
                     Ok(Some(packet)) => {
+                        resume_destination_drain = true;
                         let packet = router_packet(destination, packet);
                         pending_output = Some((
                             encode_local_packet(&packet).map_err(|error| {
@@ -349,8 +365,14 @@ fn relay(mut router: LocalStream, destination: &mut Connection) -> Result<i32, S
                         if write_pending_local(&mut router, &mut pending_output).is_err() {
                             return Ok(0);
                         }
+                        if pending_output.is_some() {
+                            output_pending();
+                        }
                     }
-                    Ok(None) => break,
+                    Ok(None) => {
+                        resume_destination_drain = false;
+                        break;
+                    }
                     Err(_) => return Ok(0),
                 }
             }

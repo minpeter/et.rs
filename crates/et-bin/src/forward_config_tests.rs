@@ -1,6 +1,8 @@
 use clap::Parser;
 use et_cli::client::ClientArgs;
 
+use crate::ssh_config::ResolvedSshConfig;
+
 use super::*;
 
 #[test]
@@ -49,4 +51,43 @@ fn agent_forwarding_falls_back_to_environment_and_requires_a_socket() {
         build(&args, None),
         Err(ForwardConfigError::MissingAgentSocket)
     ));
+}
+
+#[test]
+fn ssh_config_reverse_forwards_preserve_agent_forwarding() {
+    let args = ClientArgs::try_parse_from(["et", "host", "--forward-ssh-agent"]).unwrap();
+    let mut config = build(&args, Some("/run/agent.sock")).unwrap();
+    let resolved = ResolvedSshConfig {
+        hostname: "host".to_owned(),
+        user: None,
+        local_forwards: Vec::new(),
+        remote_forwards: vec![PortForwardSourceRequest {
+            source: Some(SocketEndpoint {
+                name: Some("localhost".to_owned()),
+                port: Some(1492),
+            }),
+            destination: Some(SocketEndpoint {
+                name: Some("127.0.0.1".to_owned()),
+                port: Some(1492),
+            }),
+            environmentvariable: None,
+        }],
+    };
+
+    config.apply_ssh_config(&args, &resolved).unwrap();
+
+    assert_eq!(config.initial_payload.reversetunnels.len(), 2);
+    assert_eq!(
+        config.initial_payload.reversetunnels[0]
+            .source
+            .as_ref()
+            .and_then(|source| source.port),
+        Some(1492)
+    );
+    assert_eq!(
+        config.initial_payload.reversetunnels[1]
+            .environmentvariable
+            .as_deref(),
+        Some("SSH_AUTH_SOCK")
+    );
 }

@@ -242,7 +242,7 @@ fn is_representable_tcp_destination(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost")
         || host
             .parse::<Ipv4Addr>()
-            .is_ok_and(|address| address.is_loopback())
+            .is_ok_and(|address| address == Ipv4Addr::LOCALHOST)
         || host
             .parse::<Ipv6Addr>()
             .is_ok_and(|address| address == Ipv6Addr::LOCALHOST)
@@ -579,10 +579,7 @@ mod tests {
 
         assert_eq!(
             resolved.local_forwards,
-            [
-                request("localhost", Some(15433), "127.0.0.2", Some(5432)),
-                request("localhost", Some(15434), "LocalHost", Some(5432)),
-            ]
+            [request("localhost", Some(15434), "LocalHost", Some(5432))]
         );
         assert_eq!(
             resolved.remote_forwards,

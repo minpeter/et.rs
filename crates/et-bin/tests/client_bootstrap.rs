@@ -274,7 +274,7 @@ fn ssh_config_hardening_nonlocal_destinations_warn_and_other_rows_continue() {
             .lines()
             .filter(|line| line.contains("WARNING"))
             .count(),
-        2
+        3
     );
 }
 

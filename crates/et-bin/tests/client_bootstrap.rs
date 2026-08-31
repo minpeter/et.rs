@@ -232,7 +232,7 @@ fn ssh_config_forwards_apply_on_the_unspecified_axis() {
 }
 
 #[test]
-fn ssh_config_hardening_nonlocal_destinations_warn_and_other_rows_continue() {
+fn ssh_config_preserves_explicit_destinations_and_warns_only_policy_denied_rows() {
     let (port, server) = initial_payload_server_with_error(Some("stop after payload"));
     let fake = FakeSsh::new();
     let config = concat!(
@@ -262,21 +262,40 @@ fn ssh_config_hardening_nonlocal_destinations_warn_and_other_rows_continue() {
     let payload = server.join().unwrap();
 
     assert_ne!(output.status.code(), Some(2), "{}", stderr(&output));
-    assert_eq!(payload.reversetunnels.len(), 1);
+    assert_eq!(payload.reversetunnels.len(), 2);
+    let endpoints: Vec<_> = payload
+        .reversetunnels
+        .iter()
+        .map(|request| {
+            let source = request.source.as_ref().unwrap();
+            let destination = request.destination.as_ref().unwrap();
+            (
+                source.name.as_deref(),
+                source.port,
+                destination.name.as_deref(),
+                destination.port,
+            )
+        })
+        .collect();
     assert_eq!(
-        payload.reversetunnels[0]
-            .source
-            .as_ref()
-            .and_then(|source| source.port),
-        Some(25433)
+        endpoints,
+        [
+            (
+                Some("localhost"),
+                Some(25432),
+                Some("db.internal"),
+                Some(5432)
+            ),
+            (Some("localhost"), Some(25433), Some("::1"), Some(5432)),
+        ]
     );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter(|line| line.contains("WARNING"))
-            .count(),
-        4
-    );
+    let warnings: Vec<_> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.contains("WARNING"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("wildcard bind is prohibited"));
 }
 
 #[test]

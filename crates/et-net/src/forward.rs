@@ -14,7 +14,7 @@ use et_core::proto::{PortForwardSourceRequest, TerminalPacketType};
 
 use crate::forward_endpoint::{Endpoint, ResolvedEndpoint};
 use crate::forward_io::BoundSource;
-use crate::forward_worker::{run, Command};
+use crate::forward_worker::{command_channel, run, Command, CommandSender, TryCommandError};
 
 const CHANNEL_CAPACITY: usize = 256;
 /// Maximum reverse listeners owned by one terminal session, after DNS fanout
@@ -283,7 +283,7 @@ pub struct SkippedForward {
 }
 
 pub struct Forwarder {
-    commands: mpsc::SyncSender<Command>,
+    commands: CommandSender,
     outbound: mpsc::Receiver<Outbound>,
     /// Readiness channel for outbound packets. Unix callers poll it exactly
     /// like upstream's `select()`; Windows callers drain [`Forwarder::try_outbound`]
@@ -360,7 +360,7 @@ impl Forwarder {
         before_publish: impl FnOnce(),
     ) -> Result<(Self, ForwardEnvironment), ForwardError> {
         let sources = sources.into_iter().map(ForwardSource::explicit).collect();
-        start_forwarder_hook(sources, owner, deadline, resolver, before_publish)
+        start_forwarder_hook(sources, owner, deadline, resolver, before_publish, || {})
             .map(|(forwarder, environment, _)| (forwarder, environment))
     }
 }
@@ -371,7 +371,7 @@ fn start_forwarder(
     deadline: Instant,
     resolver: Arc<dyn ForwardResolver>,
 ) -> Result<(Forwarder, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
-    start_forwarder_hook(sources, owner, deadline, resolver, || {})
+    start_forwarder_hook(sources, owner, deadline, resolver, || {}, || {})
 }
 
 fn start_forwarder_hook(
@@ -380,11 +380,12 @@ fn start_forwarder_hook(
     deadline: Instant,
     resolver: Arc<dyn ForwardResolver>,
     before_publish: impl FnOnce(),
+    worker_start: impl FnOnce() + Send + 'static,
 ) -> Result<(Forwarder, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
     let (sources, environment, skipped) = bind_sources(sources, owner, deadline, resolver)?;
     ensure_setup_deadline(deadline)?;
     let session_user = owner;
-    let (commands_tx, commands_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+    let (commands_tx, commands_rx) = command_channel(CHANNEL_CAPACITY);
     let (outbound_tx, outbound_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
     #[cfg(unix)]
     let (wake, wake_writer) = {
@@ -404,6 +405,7 @@ fn start_forwarder_hook(
     let worker = std::thread::Builder::new()
         .name("et-forwarding".to_owned())
         .spawn(move || {
+            worker_start();
             run(
                 sources,
                 commands_rx,
@@ -463,8 +465,8 @@ impl Forwarder {
     pub fn try_receive(&self, packet: Packet) -> Result<Option<Packet>, ForwardError> {
         match self.commands.try_send(Command::Packet(packet)) {
             Ok(()) => Ok(None),
-            Err(mpsc::TrySendError::Full(Command::Packet(packet))) => Ok(Some(packet)),
-            Err(mpsc::TrySendError::Full(_)) | Err(mpsc::TrySendError::Disconnected(_)) => {
+            Err(TryCommandError::Full(Command::Packet(packet))) => Ok(Some(packet)),
+            Err(TryCommandError::Full(_)) | Err(TryCommandError::Closed) => {
                 Err(ForwardError::Unavailable)
             }
         }
@@ -493,7 +495,7 @@ impl Forwarder {
     fn stop(&mut self) -> Result<(), ForwardError> {
         if let Some(worker) = self.worker.take() {
             self.shutdown.store(true, Ordering::Release);
-            let _ = self.commands.try_send(Command::Stop);
+            self.commands.shutdown();
             worker.join().map_err(|_| ForwardError::Unavailable)?;
         }
         Ok(())
@@ -765,7 +767,7 @@ pub fn is_forward_packet(header: u8) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use et_core::proto::{PortForwardDestinationRequest, SocketEndpoint};
+    use et_core::proto::{PortForwardData, PortForwardDestinationRequest, SocketEndpoint};
     use prost::Message;
     use std::cell::RefCell;
     use std::net::{Ipv4Addr, TcpListener};
@@ -963,8 +965,8 @@ mod tests {
             );
             match forwarder.commands.try_send(Command::Packet(packet)) {
                 Ok(()) => fd += 1,
-                Err(mpsc::TrySendError::Full(_)) => break,
-                Err(mpsc::TrySendError::Disconnected(_)) => {
+                Err(TryCommandError::Full(_)) => break,
+                Err(TryCommandError::Closed) => {
                     panic!("forwarding worker stopped before saturation")
                 }
             }
@@ -980,6 +982,108 @@ mod tests {
             .unwrap();
         assert!(!path.exists(), "owned Unix listener was not retired");
         std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn shutdown_and_drop_ignore_a_full_non_emitting_command_queue() {
+        for drop_only in [false, true] {
+            let directory = std::env::temp_dir().join(format!(
+                "et-forward-stale-close-shutdown-{}-{drop_only}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&directory).unwrap();
+            let path = directory.join("listener.sock");
+            let request = PortForwardSourceRequest {
+                source: Some(SocketEndpoint {
+                    name: Some(path.to_string_lossy().into_owned()),
+                    port: None,
+                }),
+                destination: Some(SocketEndpoint {
+                    name: Some("localhost".to_owned()),
+                    port: Some(1),
+                }),
+                environmentvariable: None,
+            };
+            let (worker_entered_tx, worker_entered_rx) = mpsc::sync_channel(1);
+            let (worker_release_tx, worker_release_rx) = mpsc::sync_channel(1);
+            let (forwarder, _, _) = start_forwarder_hook(
+                vec![ForwardSource::explicit(request)],
+                None,
+                Instant::now() + Duration::from_secs(3),
+                Arc::new(SystemForwardResolver),
+                || {},
+                move || {
+                    worker_entered_tx.send(()).unwrap();
+                    worker_release_rx.recv().unwrap();
+                },
+            )
+            .unwrap();
+            worker_entered_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("forwarding worker did not reach its deterministic gate");
+
+            for socket_id in 1..=CHANNEL_CAPACITY {
+                let packet = Packet::new(
+                    TerminalPacketType::PortForwardData as u8,
+                    PortForwardData {
+                        sourcetodestination: Some(false),
+                        socketid: Some(i32::try_from(socket_id).unwrap()),
+                        buffer: None,
+                        error: None,
+                        closed: Some(true),
+                    }
+                    .encode_to_vec(),
+                );
+                forwarder
+                    .commands
+                    .try_send(Command::Packet(packet))
+                    .unwrap_or_else(|_| panic!("command queue filled before capacity"));
+            }
+            let overflow = Packet::new(
+                TerminalPacketType::PortForwardData as u8,
+                PortForwardData {
+                    sourcetodestination: Some(false),
+                    socketid: Some(i32::MAX),
+                    buffer: None,
+                    error: None,
+                    closed: Some(true),
+                }
+                .encode_to_vec(),
+            );
+            assert!(matches!(
+                forwarder.commands.try_send(Command::Packet(overflow)),
+                Err(TryCommandError::Full(_))
+            ));
+
+            let shutdown_observer = forwarder.commands.clone();
+            let (done_tx, done_rx) = mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let result = if drop_only {
+                    drop(forwarder);
+                    Ok(())
+                } else {
+                    forwarder.shutdown()
+                };
+                let _ = done_tx.send(result);
+            });
+            let shutdown_observed = shutdown_observer.wait_shutdown_timeout(Duration::from_secs(2));
+            if !shutdown_observed {
+                // Failure-only cleanup: release the worker through the queue's
+                // independent cancellation path before reporting the defect.
+                shutdown_observer.shutdown();
+            }
+            worker_release_tx.send(()).unwrap();
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("queue-independent shutdown did not join the worker")
+                .unwrap();
+            assert!(
+                shutdown_observed,
+                "Forwarder shutdown did not signal queue-independent cancellation"
+            );
+            assert!(!path.exists(), "shutdown retained the owned Unix listener");
+            std::fs::remove_dir(directory).unwrap();
+        }
     }
 
     #[test]

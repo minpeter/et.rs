@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(unix)]
 use std::io::Write;
 use std::io::{self};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use crate::forward::{ForwardError, Outbound};
@@ -52,13 +52,181 @@ pub(crate) enum Command {
         socket_id: i32,
         error: io::Error,
     },
-    Stop,
+}
+
+struct CommandQueueState {
+    commands: VecDeque<Command>,
+    senders: usize,
+    receiver_alive: bool,
+    shutdown: bool,
+}
+
+struct CommandQueue {
+    capacity: usize,
+    state: Mutex<CommandQueueState>,
+    changed: Condvar,
+}
+
+pub(crate) struct CommandSender {
+    queue: Arc<CommandQueue>,
+}
+
+pub(crate) struct CommandReceiver {
+    queue: Arc<CommandQueue>,
+}
+
+pub(crate) enum TryCommandError {
+    Full(Command),
+    Closed,
+}
+
+pub(crate) fn command_channel(capacity: usize) -> (CommandSender, CommandReceiver) {
+    let queue = Arc::new(CommandQueue {
+        capacity,
+        state: Mutex::new(CommandQueueState {
+            commands: VecDeque::with_capacity(capacity),
+            senders: 1,
+            receiver_alive: true,
+            shutdown: false,
+        }),
+        changed: Condvar::new(),
+    });
+    (
+        CommandSender {
+            queue: queue.clone(),
+        },
+        CommandReceiver { queue },
+    )
+}
+
+impl Clone for CommandSender {
+    fn clone(&self) -> Self {
+        let mut state = self.queue.state.lock().unwrap();
+        state.senders += 1;
+        drop(state);
+        Self {
+            queue: self.queue.clone(),
+        }
+    }
+}
+
+impl Drop for CommandSender {
+    fn drop(&mut self) {
+        let mut state = self.queue.state.lock().unwrap();
+        state.senders -= 1;
+        self.queue.changed.notify_all();
+    }
+}
+
+impl CommandSender {
+    pub(crate) fn send(&self, command: Command) -> Result<(), Command> {
+        let mut state = self.queue.state.lock().unwrap();
+        while state.commands.len() >= self.queue.capacity && !state.shutdown && state.receiver_alive
+        {
+            state = self.queue.changed.wait(state).unwrap();
+        }
+        if state.shutdown || !state.receiver_alive {
+            return Err(command);
+        }
+        state.commands.push_back(command);
+        self.queue.changed.notify_all();
+        Ok(())
+    }
+
+    pub(crate) fn try_send(&self, command: Command) -> Result<(), TryCommandError> {
+        let mut state = self.queue.state.lock().unwrap();
+        if state.shutdown || !state.receiver_alive {
+            return Err(TryCommandError::Closed);
+        }
+        if state.commands.len() >= self.queue.capacity {
+            return Err(TryCommandError::Full(command));
+        }
+        state.commands.push_back(command);
+        self.queue.changed.notify_all();
+        Ok(())
+    }
+
+    pub(crate) fn shutdown(&self) {
+        let mut state = self.queue.state.lock().unwrap();
+        state.shutdown = true;
+        self.queue.changed.notify_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_shutdown_timeout(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = self.queue.state.lock().unwrap();
+        while !state.shutdown {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return false;
+            };
+            let (next, wait) = self.queue.changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if wait.timed_out() && !state.shutdown {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl CommandReceiver {
+    fn recv(&self) -> Option<Command> {
+        let mut state = self.queue.state.lock().unwrap();
+        loop {
+            if state.shutdown {
+                return None;
+            }
+            if let Some(command) = state.commands.pop_front() {
+                self.queue.changed.notify_all();
+                return Some(command);
+            }
+            if state.senders == 0 {
+                return None;
+            }
+            state = self.queue.changed.wait(state).unwrap();
+        }
+    }
+
+    #[cfg(test)]
+    fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<Command, mpsc::RecvTimeoutError> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = self.queue.state.lock().unwrap();
+        loop {
+            if state.shutdown || state.senders == 0 {
+                return Err(mpsc::RecvTimeoutError::Disconnected);
+            }
+            if let Some(command) = state.commands.pop_front() {
+                self.queue.changed.notify_all();
+                return Ok(command);
+            }
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return Err(mpsc::RecvTimeoutError::Timeout);
+            };
+            let (next, wait) = self.queue.changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if wait.timed_out() && state.commands.is_empty() {
+                return Err(mpsc::RecvTimeoutError::Timeout);
+            }
+        }
+    }
+}
+
+impl Drop for CommandReceiver {
+    fn drop(&mut self) {
+        let mut state = self.queue.state.lock().unwrap();
+        state.receiver_alive = false;
+        self.queue.changed.notify_all();
+    }
 }
 
 pub(crate) fn run(
     sources: Vec<BoundSource>,
-    commands: mpsc::Receiver<Command>,
-    command_sender: mpsc::SyncSender<Command>,
+    commands: CommandReceiver,
+    command_sender: CommandSender,
     outbound: mpsc::SyncSender<Outbound>,
     #[cfg(unix)] mut outbound_wake: UnixStream,
     control: (ListenerStop, Option<(u32, u32)>, Arc<AtomicBool>),
@@ -85,7 +253,7 @@ pub(crate) fn run(
 }
 
 struct Worker {
-    commands: mpsc::SyncSender<Command>,
+    commands: CommandSender,
     outbound: mpsc::SyncSender<Outbound>,
     #[cfg(unix)]
     outbound_wake: UnixStream,
@@ -101,7 +269,7 @@ struct Worker {
 
 impl Worker {
     fn new(
-        commands: mpsc::SyncSender<Command>,
+        commands: CommandSender,
         outbound: mpsc::SyncSender<Outbound>,
         #[cfg(unix)] outbound_wake: Option<UnixStream>,
         shutdown: Arc<AtomicBool>,
@@ -131,7 +299,7 @@ impl Worker {
     fn run(
         &mut self,
         sources: Vec<BoundSource>,
-        commands: mpsc::Receiver<Command>,
+        commands: CommandReceiver,
         listener_stop: ListenerStop,
         session_user: Option<(u32, u32)>,
     ) -> Result<(), ForwardError> {
@@ -151,8 +319,8 @@ impl Worker {
         }
         let result = loop {
             let command = match commands.recv() {
-                Ok(command) => command,
-                Err(_) => break Ok(()),
+                Some(command) => command,
+                None => break Ok(()),
             };
             let step = match command {
                 Command::Packet(packet) => self.handle_packet(packet),
@@ -183,7 +351,6 @@ impl Worker {
                     self.remove(role, socket_id);
                     self.send_data(role, socket_id, Vec::new(), true, Some(error.to_string()))
                 }
-                Command::Stop => break Ok(()),
             };
             if let Err(error) = step {
                 break Err(error);
@@ -223,16 +390,16 @@ mod tests {
     };
     use prost::Message;
 
-    use super::{Command, Worker, MAX_ACTIVE_SOCKETS};
+    use super::{command_channel, Command, CommandReceiver, Worker, MAX_ACTIVE_SOCKETS};
 
     const EVENT_TIMEOUT: Duration = Duration::from_secs(3);
 
     fn worker() -> (
         Worker,
-        mpsc::Receiver<Command>,
+        CommandReceiver,
         mpsc::Receiver<crate::forward::Outbound>,
     ) {
-        let (commands, command_receiver) = mpsc::sync_channel(MAX_ACTIVE_SOCKETS + 1);
+        let (commands, command_receiver) = command_channel(MAX_ACTIVE_SOCKETS + 1);
         let (outbound, outbound_receiver) = mpsc::sync_channel(MAX_ACTIVE_SOCKETS + 1);
         let (_wake_reader, wake_writer) = UnixStream::pair().unwrap();
         (

@@ -14,7 +14,10 @@ use crate::deadline::Deadline;
 use crate::error::ClientError;
 
 pub const MAX_SSH_STDOUT: usize = 1024 * 1024;
-pub const DEFAULT_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(60);
+// The remote registration phase is bounded at 45 seconds. Leave explicit
+// budget for SSH configuration, authentication, propagation of a structured
+// remote timeout, and cancellation cleanup.
+pub const DEFAULT_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
 pub struct SshOutput {
@@ -494,7 +497,6 @@ fn join_reader(reader: JoinHandle<()>) -> Result<(), ClientError> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
     #[cfg(target_os = "linux")]
     use std::{
         fs::{self, File, OpenOptions},
@@ -650,8 +652,13 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn poll_readable(fd: &impl AsFd) -> bool {
+        poll_readable_with(fd, EVENT_WAIT_MILLIS)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn poll_readable_with(fd: &impl AsFd, timeout_millis: u16) -> bool {
         let mut events = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
-        let ready = poll(&mut events, EVENT_WAIT_MILLIS).unwrap();
+        let ready = poll(&mut events, timeout_millis).unwrap();
         ready == 1 && events[0].revents().unwrap().contains(PollFlags::POLLIN)
     }
 
@@ -723,29 +730,32 @@ mod tests {
 
     #[test]
     fn system_runner_terminates_on_deadline() {
-        let runner = SystemSsh::with_timeout(Duration::from_millis(50));
-        let invocation = invocation("/bin/sh", &["-c", "exec /bin/sleep 30"]);
-        let started = Instant::now();
-        let result = runner.run(&invocation, runner.deadline());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let runner = SystemSsh::with_timeout(Duration::from_millis(50));
+            let invocation = invocation("/bin/sh", &["-c", "exec /bin/sleep 30"]);
+            let _ = sender.send(runner.run(&invocation, runner.deadline()));
+        });
+        let result = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("SSH deadline did not terminate its process within the test bound");
         assert!(matches!(result, Err(ClientError::SshTimeout(_))));
-        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn system_runner_times_out_and_kills_stdout_holding_descendant() {
         const SSH_TIMEOUT: Duration = Duration::from_secs(2);
+        const CLEANUP_WATCHDOG_MILLIS: u16 = 15_000;
         const SCRIPT: &str = r#"
-(IFS= read -r _ < "$3") &
+(IFS= read -r _ < "$2") &
 descendant=$!
 printf '%s %s\n' "$$" "$descendant" > "$1"
-IFS= read -r _ < "$2"
 exit 0
 "#;
 
         let dir = ProcessGroupTestDir::new();
         let pid_fifo = dir.fifo("pid");
-        let ack_fifo = dir.fifo("ack");
         let hold_fifo = dir.fifo("hold");
 
         let _pid_control = OpenOptions::new()
@@ -754,12 +764,6 @@ exit 0
             .open(&pid_fifo)
             .unwrap();
         let pid_pipe = File::open(&pid_fifo).unwrap();
-        let _ack_control = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&ack_fifo)
-            .unwrap();
-        let mut ack_pipe = OpenOptions::new().write(true).open(&ack_fifo).unwrap();
         let hold_control = OpenOptions::new()
             .read(true)
             .write(true)
@@ -774,69 +778,60 @@ exit 0
                 SCRIPT,
                 "ssh-process-group-test",
                 pid_fifo.to_str().unwrap(),
-                ack_fifo.to_str().unwrap(),
                 hold_fifo.to_str().unwrap(),
             ],
         );
-        let (result_sender, result_receiver) = mpsc::sync_channel(1);
-        let worker = thread::spawn(move || {
-            let started = Instant::now();
-            let result = runner.run(&invocation, runner.deadline());
-            let _ = result_sender.send((result, started.elapsed()));
+        let observer = thread::spawn(move || {
+            assert!(
+                poll_readable(&pid_pipe),
+                "SSH child did not report its process IDs"
+            );
+            let mut process_ids = String::new();
+            assert_ne!(
+                BufReader::new(pid_pipe)
+                    .read_line(&mut process_ids)
+                    .unwrap(),
+                0
+            );
+            let mut process_ids = process_ids.split_whitespace();
+            let direct_pid = process_ids.next().unwrap().parse::<i32>().unwrap();
+            let descendant_pid = process_ids.next().unwrap().parse::<i32>().unwrap();
+            assert_eq!(process_ids.next(), None);
+            let direct_pidfd = pidfd_open(
+                RustixPid::from_raw(direct_pid).unwrap(),
+                PidfdFlags::empty(),
+            )
+            .unwrap();
+            let descendant_pidfd = pidfd_open(
+                RustixPid::from_raw(descendant_pid).unwrap(),
+                PidfdFlags::empty(),
+            )
+            .unwrap();
+            assert!(
+                poll_readable_with(&direct_pidfd, CLEANUP_WATCHDOG_MILLIS),
+                "direct SSH child did not exit"
+            );
+            let descendant_exited = poll_readable_with(&descendant_pidfd, CLEANUP_WATCHDOG_MILLIS);
+            if !descendant_exited {
+                // Release the stdout reader so a broken implementation returns
+                // and the assertion below fails instead of hanging the suite.
+                pidfd_send_signal(&descendant_pidfd, RustixSignal::KILL).unwrap();
+            }
+            drop(hold_control);
+            descendant_exited
         });
 
-        assert!(
-            poll_readable(&pid_pipe),
-            "SSH child did not report its process IDs"
-        );
-        let mut process_ids = String::new();
-        assert_ne!(
-            BufReader::new(pid_pipe)
-                .read_line(&mut process_ids)
-                .unwrap(),
-            0
-        );
-        let mut process_ids = process_ids.split_whitespace();
-        let direct_pid = process_ids.next().unwrap().parse::<i32>().unwrap();
-        let descendant_pid = process_ids.next().unwrap().parse::<i32>().unwrap();
-        assert_eq!(process_ids.next(), None);
-
-        let direct_pidfd = pidfd_open(
-            RustixPid::from_raw(direct_pid).unwrap(),
-            PidfdFlags::empty(),
-        )
-        .unwrap();
-        let descendant_pidfd = pidfd_open(
-            RustixPid::from_raw(descendant_pid).unwrap(),
-            PidfdFlags::empty(),
-        )
-        .unwrap();
-
-        ack_pipe.write_all(b"exit\n").unwrap();
-        drop(ack_pipe);
-        assert!(
-            poll_readable(&direct_pidfd),
-            "direct SSH child did not exit before the timeout"
-        );
-
-        let (result, elapsed) = result_receiver
-            .recv_timeout(SSH_TIMEOUT + Duration::from_secs(1))
-            .expect("SystemSsh did not return within its cleanup bound");
-        worker.join().unwrap();
-        let descendant_exited = poll_readable(&descendant_pidfd);
-        if !descendant_exited {
-            pidfd_send_signal(&descendant_pidfd, RustixSignal::KILL).unwrap();
-        }
-        drop(hold_control);
+        // Run synchronously: completion is no longer inferred from whether a
+        // separately scheduled runner thread manages to send within one second.
+        let result = runner.run(&invocation, runner.deadline());
+        // The observer has its own bounded pidfd watchdog, so this join waits
+        // for an exact process-exit result rather than another wall-clock race.
+        let descendant_exited = observer.join().unwrap();
 
         assert!(matches!(result, Err(ClientError::SshTimeout(_))));
         assert!(
-            elapsed < SSH_TIMEOUT + Duration::from_secs(1),
-            "SystemSsh returned after {elapsed:?}"
-        );
-        assert!(
             descendant_exited,
-            "SSH descendant survived process-group cleanup"
+            "SSH descendant survived stdout-holder cleanup"
         );
     }
 

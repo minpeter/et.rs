@@ -14,7 +14,7 @@ use std::io::{self, IoSlice, IoSliceMut};
 use std::mem::MaybeUninit;
 use std::net::{SocketAddr, TcpListener};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -34,8 +34,11 @@ const UID_ENV: &str = "ET_RS_USER_SOCKET_UID";
 const GID_ENV: &str = "ET_RS_USER_SOCKET_GID";
 const HELPER_ENV: &str = "ET_RS_USER_SOCKET_HELPER";
 const HELPER_NAME: &str = "et-user-socket-helper";
-/// `sockaddr_un.sun_path` on Linux, including the trailing NUL.
+/// `sockaddr_un.sun_path`, including the trailing NUL.
+#[cfg(not(target_os = "macos"))]
 const UNIX_PATH_MAX: usize = 108;
+#[cfg(target_os = "macos")]
+const UNIX_PATH_MAX: usize = 104;
 const HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 const ATOMIC_SCM_RIGHTS_CLOEXEC: bool = cfg!(any(target_os = "linux", target_os = "android"));
 static HELPER_SPAWN_LOCK: HelperSpawnLock = HelperSpawnLock {
@@ -139,7 +142,12 @@ impl PendingUnixListener {
             ));
         }
         let listener = UnixListener::bind(path)?;
-        let cleanup = PendingSocketPath(Some(path.to_path_buf()));
+        let metadata = fs::symlink_metadata(path)?;
+        let cleanup = PendingSocketPath {
+            path: Some(path.to_path_buf()),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         Ok(Self {
             listener: Some(listener),
@@ -148,7 +156,7 @@ impl PendingUnixListener {
     }
 
     fn into_listener(mut self) -> UnixListener {
-        self.cleanup.0.take();
+        self.cleanup.path.take();
         self.listener.take().expect("bound Unix listener")
     }
 
@@ -196,11 +204,20 @@ impl PendingUnixListener {
     }
 }
 
-struct PendingSocketPath(Option<PathBuf>);
+struct PendingSocketPath {
+    path: Option<PathBuf>,
+    device: u64,
+    inode: u64,
+}
 
 impl Drop for PendingSocketPath {
     fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        if fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode)
+        {
             let _ = fs::remove_file(path);
         }
     }
@@ -232,11 +249,10 @@ pub(crate) fn listen_unix_as_user_until(
     deadline: Instant,
 ) -> io::Result<UserUnixListener> {
     let path = path.as_ref();
-    if already_session_user(uid, gid) {
-        return listen_at_path(path).map(|listener| UserUnixListener {
-            listener,
-            cleanup: None,
-        });
+    if path_too_long(path) {
+        return Err(io::Error::from_raw_os_error(
+            rustix::io::Errno::NAMETOOLONG.raw_os_error(),
+        ));
     }
     run_listener_as_user(path, uid, gid, deadline)
 }
@@ -324,6 +340,38 @@ pub(crate) fn connect_tcp_as_user(
         Instant::now() + HELPER_TIMEOUT,
         Some(port),
     )?))
+}
+
+pub fn listen_tcp_as_user_deadline(
+    address: SocketAddr,
+    uid: u32,
+    gid: u32,
+    deadline: Instant,
+) -> io::Result<TcpListener> {
+    listen_tcp_as_user_until(address, uid, gid, deadline)
+}
+
+#[doc(hidden)]
+pub fn listen_tcp_as_user_deadline_with_helper(
+    address: SocketAddr,
+    uid: u32,
+    gid: u32,
+    deadline: Instant,
+    helper: &Path,
+) -> io::Result<TcpListener> {
+    let argument = address.to_string();
+    let mut spawned = spawn_helper_with_executable(
+        Op::ListenTcp,
+        OsStr::new(&argument),
+        uid,
+        gid,
+        None,
+        deadline,
+        helper,
+    )?;
+    let result = recv_result_until(spawned.channel(), deadline);
+    spawned.release_spawn_guard();
+    finish_helper(&mut spawned, result, deadline).map(TcpListener::from)
 }
 
 pub(crate) fn listen_tcp_as_user_until(
@@ -479,6 +527,18 @@ fn spawn_helper(
     deadline: Instant,
 ) -> io::Result<SpawnedHelper> {
     let helper = helper_exe()?;
+    spawn_helper_with_executable(op, argument, uid, gid, port, deadline, &helper)
+}
+
+fn spawn_helper_with_executable(
+    op: Op,
+    argument: &OsStr,
+    uid: u32,
+    gid: u32,
+    port: Option<u16>,
+    deadline: Instant,
+    helper: &Path,
+) -> io::Result<SpawnedHelper> {
     let (parent, child) = UnixStream::pair()?;
     let mut command = Command::new(helper);
     command
@@ -799,6 +859,9 @@ fn retry_on_intr_until<T>(
         before_attempt(remaining)?;
         match operation() {
             Err(rustix::io::Errno::INTR) => {}
+            Err(rustix::io::Errno::AGAIN) if now() >= deadline => {
+                return Err(io::Error::from(io::ErrorKind::TimedOut));
+            }
             Err(error) => return Err(error.into()),
             Ok(value) => return Ok(value),
         }
@@ -1033,6 +1096,8 @@ mod tests {
         let uid = rustix::process::getuid().as_raw();
         let gid = rustix::process::getgid().as_raw();
         let error = listen_unix_as_user(long_unix_path(), uid, gid).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidFilename);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         assert_eq!(
             error.raw_os_error(),
             Some(rustix::io::Errno::NAMETOOLONG.raw_os_error())
@@ -1128,6 +1193,31 @@ mod tests {
         fs::remove_dir(&target).unwrap();
         fs::remove_dir(&parked).unwrap();
         fs::remove_dir(&base).unwrap();
+    }
+
+    #[test]
+    fn older_helper_cleanup_preserves_replacement_generation() {
+        if helper_exe().is_err() {
+            eprintln!("skipping helper-dependent test: et-user-socket-helper is unavailable");
+            return;
+        }
+        let dir = temp_dir();
+        let path = dir.join("generation.sock");
+        let uid = rustix::process::geteuid().as_raw();
+        let gid = rustix::process::getegid().as_raw();
+        let old = run_listener_as_user(&path, uid, gid, Instant::now() + HELPER_TIMEOUT).unwrap();
+
+        fs::remove_file(&path).unwrap();
+        let replacement = UnixListener::bind(&path).unwrap();
+        drop(old);
+
+        let client = UnixStream::connect(&path)
+            .expect("older helper cleanup unlinked the replacement generation");
+        replacement.accept().unwrap();
+        drop(client);
+        drop(replacement);
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(dir).unwrap();
     }
 
     #[cfg(target_os = "linux")]

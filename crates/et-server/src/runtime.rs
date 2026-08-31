@@ -38,6 +38,21 @@ impl Runtime {
         port: u16,
         router_path: RouterPath,
     ) -> Result<Self, RuntimeError> {
+        Self::start_with_forward_resolver(
+            bind_ip,
+            port,
+            router_path,
+            Arc::new(et_net::forward::SystemForwardResolver),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn start_with_forward_resolver(
+        bind_ip: IpAddr,
+        port: u16,
+        router_path: RouterPath,
+        forward_resolver: Arc<dyn et_net::forward::ForwardResolver>,
+    ) -> Result<Self, RuntimeError> {
         let bound = bind_tcp(bind_ip, port)?;
         let mut tcp_addresses = Vec::new();
         for listener in bound.iter() {
@@ -54,6 +69,7 @@ impl Runtime {
             handlers: HandlerThreads::new(),
             pre_auth_slots: Arc::new(PreAuthSlots::new(MAX_PRE_AUTH_CONNECTIONS)),
             shutdown: AtomicBool::new(false),
+            forward_resolver,
         });
         let router_name = router_path.path().to_path_buf();
         let (lifecycle_sender, lifecycle_events) = mpsc::channel();
@@ -217,11 +233,12 @@ fn remember(first: &mut Option<RuntimeError>, error: RuntimeError) {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::Read;
+    use std::io::{self, Read};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
     use std::time::Duration;
 
     use et_core::packet::Packet;
@@ -233,7 +250,6 @@ mod tests {
 
     use super::Runtime;
     use crate::path::select_router_path_for;
-    use crate::session_table::SessionState;
 
     const ID: &str = "aaaaaaaaaaaaaaaa";
     const KEY: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
@@ -267,6 +283,43 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore = "Miri does not support networking")]
+    fn disconnect_between_registration_lookup_and_raw_assignment_closes_handler() {
+        let directory = TestDirectory::new();
+        let router_path =
+            select_router_path_for(1000, Some(&directory.socket()), None, None).unwrap();
+        let mut runtime = Runtime::start(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, router_path).unwrap();
+        let handle = runtime.handle();
+        let address = runtime.tcp_addresses()[0];
+        let terminal = register(&directory.socket(), &handle);
+        let (assignment_tx, assignment_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (scan_tx, scan_rx) = mpsc::sync_channel(1);
+        crate::runtime_handler::install_raw_assignment_hook(ID, assignment_tx, release_rx);
+        crate::runtime_lifecycle::install_raw_scan_hook(ID, scan_tx);
+
+        let mut client = connect_request(address);
+        assignment_rx
+            .recv_timeout(TIMEOUT)
+            .expect("handler did not reach the post-lookup assignment barrier");
+        drop(terminal);
+        scan_rx
+            .recv_timeout(TIMEOUT)
+            .expect("terminal lifecycle did not complete its raw-socket scan");
+        release_tx.send(()).unwrap();
+        assert_prompt_closed(&mut client);
+
+        let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = shutdown_tx.send(runtime.shutdown());
+        });
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("raced handler and pre-auth permit were not released promptly")
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support networking")]
     fn terminal_eof_does_not_resurrect_a_starting_session_from_a_stale_waiter() {
         let directory = TestDirectory::new();
         let router_path =
@@ -278,23 +331,15 @@ mod tests {
 
         let (mut client_a, response) = handshake(address);
         assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
-        handle
-            .wait_for_state(ID, SessionState::Starting, TIMEOUT)
-            .unwrap();
+        assert_eq!(handle.session_state(ID).unwrap(), None);
 
-        let mut client_b = connect_request(address);
-        runtime
-            .core
-            .sessions
-            .wait_for_claim_waiters(ID, 1, TIMEOUT)
-            .unwrap();
+        // A newer unauthenticated connection displaces the old one without
+        // creating a Starting slot or a waiter.
+        let (mut client_b, response) = handshake(address);
+        assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+        assert_closed(&mut client_a);
 
         drop(terminal);
-        runtime
-            .core
-            .sessions
-            .wait_for_claim_waiters(ID, 0, TIMEOUT)
-            .unwrap();
         handle.wait_disconnected(ID, TIMEOUT).unwrap();
         assert_closed(&mut client_a);
         assert_closed(&mut client_b);
@@ -349,5 +394,30 @@ mod tests {
     fn assert_closed(stream: &mut TcpStream) {
         let mut byte = [0; 1];
         assert_eq!(stream.read(&mut byte).unwrap_or(0), 0);
+    }
+
+    fn assert_prompt_closed(stream: &mut TcpStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut byte = [0; 1];
+        match stream.read(&mut byte) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                ) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                panic!("raced initialization socket remained open: {error}")
+            }
+            Ok(read) => panic!("raced initialization socket produced {read} bytes before close"),
+            Err(error) => panic!("raced initialization socket close failed: {error}"),
+        }
     }
 }

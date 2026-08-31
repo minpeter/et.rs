@@ -84,11 +84,13 @@ pub(crate) fn validate(
         #[cfg(windows)]
         PeerIdentity::AuthenticatedWindowsToken => {}
     }
+    let startup_ack = user_info.fd == Some(-6);
     Ok(Registration {
         id,
         key,
         uid,
         gid,
+        startup_ack,
         identity: Arc::new(()),
     })
 }

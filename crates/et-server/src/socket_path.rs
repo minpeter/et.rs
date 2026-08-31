@@ -53,6 +53,25 @@ impl OwnedRouterListener {
             path: selected.path().to_path_buf(),
             source,
         })?;
+        let capability = et_net::local::capability_path(selected.path());
+        match fs::remove_file(&capability) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(PathError::Io {
+                    operation: "remove stale router capability",
+                    path: capability,
+                    source,
+                });
+            }
+        }
+        et_net::local::write_registration_ack_capability(selected.path()).map_err(|source| {
+            PathError::Io {
+                operation: "write router capability",
+                path: et_net::local::capability_path(selected.path()),
+                source,
+            }
+        })?;
         owned
             .listener
             .set_nonblocking(true)
@@ -82,6 +101,14 @@ impl Drop for OwnedRouterListener {
             && self.identity.matches(&metadata)
             && metadata.uid() == rustix::process::geteuid().as_raw()
         {
+            // Retire this generation's marker before making the socket path
+            // available for replacement. A replacement can then publish its
+            // marker without an older listener deleting it afterward.
+            let _ = et_net::local::retire_registration_ack_capability(
+                &self.path,
+                self.identity.device,
+                self.identity.inode,
+            );
             let _ = fs::remove_file(&self.path);
         }
     }

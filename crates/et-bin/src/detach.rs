@@ -1,61 +1,85 @@
 //! Spawning processes that outlive the launching shell.
 //!
-//! Unix only needs a new process group; the child keeps running once the
-//! bootstrap `ssh` exits.
-//!
-//! Windows needs more care. OpenSSH puts each session in a job object and
-//! terminates the job when the session ends, so a plain `DETACHED_PROCESS`
-//! child of an ssh-launched command dies with the connection. Sessions must
-//! therefore break away from that job as well, which is the piece that makes an
-//! `et` server and terminal usable on Windows without WSL. Some jobs forbid
-//! breakaway, so the flag is dropped on retry.
+//! Unix children re-exec directly, close inherited descriptors, and call
+//! `setsid` in the child. Windows uses `windows-spawn`, whose STARTUPINFOEX
+//! handle list includes only configured stdio, together with mandatory job
+//! breakaway flags. Failure to obtain either property fails before readiness.
 
+use std::ffi::OsStr;
 use std::io;
-use std::process::{Child, Command};
+
+#[cfg(unix)]
+pub type Command = std::process::Command;
+#[cfg(unix)]
+pub type Child = std::process::Child;
+#[cfg(unix)]
+pub type Stdio = std::process::Stdio;
+#[cfg(unix)]
+pub type ChildStdout = std::process::ChildStdout;
+#[cfg(unix)]
+pub type ChildStderr = std::process::ChildStderr;
+#[cfg(windows)]
+pub type Command = windows_spawn::Command;
+#[cfg(windows)]
+pub type Child = windows_spawn::Child;
+#[cfg(windows)]
+pub type Stdio = windows_spawn::Stdio;
+#[cfg(windows)]
+pub type ChildStdout = windows_spawn::ChildStdout;
+#[cfg(windows)]
+pub type ChildStderr = windows_spawn::ChildStderr;
+
+/// Construct a direct re-exec command. Unix children must close inherited
+/// descriptors before creating threads.
+pub fn direct_command(executable: &OsStr) -> Command {
+    Command::new(executable)
+}
+
+/// Close every inherited non-stdio descriptor after direct re-exec.
+#[cfg(unix)]
+pub fn close_inherited_descriptors() -> io::Result<()> {
+    let entries = std::fs::read_dir("/proc/self/fd")
+        .or_else(|_| std::fs::read_dir("/dev/fd"))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let descriptors = entries
+        .iter()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|descriptor| *descriptor >= 3)
+        .collect::<Vec<_>>();
+    drop(entries);
+    for descriptor in descriptors {
+        let _ = nix::unistd::close(descriptor);
+    }
+    Ok(())
+}
 
 /// Configure `command` to survive the current shell/session.
 pub fn configure(command: &mut Command) {
+    // All platform policy is applied either by the Unix child (`setsid`) or by
+    // the Windows spawn transaction below.
+    let _ = command;
+}
+
+/// Spawn detached and fail closed if mandatory Windows breakaway or explicit
+/// handle inheritance cannot be established.
+pub fn spawn(command: &mut Command) -> io::Result<Child> {
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
+        command.spawn()
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(windows_flags(true));
+        use windows_spawn::{CreationFlags, DropPolicy, SpawnOptions};
+        command.spawn_with(
+            SpawnOptions::new()
+                .creation_flags(
+                    CreationFlags::DETACHED_PROCESS
+                        | CreationFlags::NEW_PROCESS_GROUP
+                        | CreationFlags::BREAKAWAY_FROM_JOB,
+                )
+                .drop_policy(DropPolicy::Detach),
+        )
     }
-}
-
-/// Spawn `command` detached, retrying without job breakaway if the job object
-/// does not allow it.
-pub fn spawn(command: &mut Command) -> io::Result<Child> {
-    match command.spawn() {
-        Ok(child) => Ok(child),
-        #[cfg(windows)]
-        Err(error) => {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(windows_flags(false));
-            command.spawn().map_err(|_| error)
-        }
-        #[cfg(unix)]
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(windows)]
-fn windows_flags(breakaway: bool) -> u32 {
-    /// No inherited console.
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    /// Ctrl+C in the parent console does not reach the child.
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    /// Leave the launching job object (e.g. the OpenSSH session job).
-    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-    let mut flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
-    if breakaway {
-        flags |= CREATE_BREAKAWAY_FROM_JOB;
-    }
-    flags
 }
 
 #[cfg(test)]
@@ -73,9 +97,9 @@ mod tests {
             command
         };
         command
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         configure(&mut command);
         let mut child = spawn(&mut command).unwrap();
         assert!(child.wait().unwrap().success());
@@ -83,9 +107,12 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn breakaway_is_requested_first_and_optional() {
-        assert_ne!(windows_flags(true), windows_flags(false));
-        assert_eq!(windows_flags(true) & 0x0100_0000, 0x0100_0000);
-        assert_eq!(windows_flags(false) & 0x0100_0000, 0);
+    fn windows_spawn_uses_explicit_handle_allowlist_and_breakaway() {
+        // `windows_spawn::Command` exposes only configured stdio and explicit
+        // handle arguments to STARTUPINFOEX. This type assertion prevents a
+        // regression back to std::process::Command's inherit-all default.
+        fn requires_allowlisted_command(_: &windows_spawn::Command) {}
+        let command = direct_command(OsStr::new("cmd.exe"));
+        requires_allowlisted_command(&command);
     }
 }

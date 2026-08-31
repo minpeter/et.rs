@@ -4,13 +4,18 @@ mod runtime_support;
 mod support;
 
 use std::collections::HashMap;
-use std::io::Write;
-use std::net::TcpStream;
-use std::time::Duration;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use et_core::keys::passkey_to_key;
 use et_core::proto::{
     ConnectRequest, ConnectResponse, ConnectStatus, InitialPayload, InitialResponse,
+    PortForwardSourceRequest, SocketEndpoint,
 };
 use et_net::connection::Connection;
 use et_net::framing_io::{read_proto_limited, write_proto};
@@ -32,10 +37,7 @@ fn bad_encrypted_initial_messages_reset_the_slot() {
         .write_packet(253, &default_payload().encode_to_vec())
         .unwrap();
     assert!(wrong.read_packet().is_err());
-    server
-        .handle
-        .wait_for_state(ID_A, SessionState::Registered, TIMEOUT)
-        .unwrap();
+    assert_eq!(server.handle.session_state(ID_A).unwrap(), None);
 
     for (header, bytes) in [(1, default_payload().encode_to_vec()), (253, vec![0xff])] {
         let (stream, response) = server.handshake(ID_A);
@@ -45,10 +47,7 @@ fn bad_encrypted_initial_messages_reset_the_slot() {
         let packet = client.read_packet().unwrap();
         let response = InitialResponse::decode(packet.payload()).unwrap();
         assert!(response.error.is_some());
-        server
-            .handle
-            .wait_for_state(ID_A, SessionState::Registered, TIMEOUT)
-            .unwrap();
+        assert_eq!(server.handle.session_state(ID_A).unwrap(), None);
     }
     server.runtime.shutdown().unwrap();
 }
@@ -60,11 +59,222 @@ fn incomplete_initial_payload_expires_and_resets_the_slot() {
     let (mut stream, response) = server.handshake(ID_A);
     assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
     stream.write_all(&[0_u8; 1]).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(9)))
+        .unwrap();
+    let mut byte = [0_u8; 1];
+    assert_eq!(std::io::Read::read(&mut stream, &mut byte).unwrap_or(0), 0);
+    assert_eq!(server.handle.session_state(ID_A).unwrap(), None);
+    server.runtime.shutdown().unwrap();
+}
 
+struct DelayedResolver {
+    address: SocketAddr,
+    entered: mpsc::SyncSender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+    finished: mpsc::SyncSender<()>,
+}
+
+impl et_net::forward::ForwardResolver for DelayedResolver {
+    fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
+        let _ = self.entered.send(());
+        let _ = self.release.lock().unwrap().recv();
+        let _ = self.finished.send(());
+        Ok(vec![self.address])
+    }
+}
+
+#[test]
+fn delayed_valid_reverse_forward_times_out_rolls_back_and_resets_slot() {
+    let probe = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+    let mut server = TestRuntime::start_with_forward_resolver(Arc::new(DelayedResolver {
+        address,
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+        finished: finished_tx,
+    }));
+    let _terminal = server.register(ID_A, KEY_A);
+    let key = passkey_to_key(KEY_A).unwrap();
+    let payload = InitialPayload {
+        jumphost: Some(false),
+        reversetunnels: vec![PortForwardSourceRequest {
+            source: Some(SocketEndpoint {
+                name: Some("delayed.valid.test".to_owned()),
+                port: Some(i32::from(address.port())),
+            }),
+            destination: Some(SocketEndpoint {
+                name: Some("localhost".to_owned()),
+                port: Some(1),
+            }),
+            environmentvariable: None,
+        }],
+        environmentvariables: HashMap::new(),
+    };
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .unwrap();
+    let started = Instant::now();
+    let (initial_tx, initial_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let (_, initial) = runtime_support::initialize(stream, &key, payload);
+        let _ = initial_tx.send(initial);
+    });
+    entered_rx.recv_timeout(TIMEOUT).unwrap();
+    let initial = initial_rx.recv_timeout(Duration::from_secs(8)).unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "forwarding timeout missed the server initialization deadline"
+    );
+    let encoded = initial.error.as_deref().expect("typed forwarding timeout");
+    assert!(et_net::forward::decode_forward_timeout(encoded).is_some());
     server
         .handle
-        .wait_for_state(ID_A, SessionState::Registered, Duration::from_secs(7))
+        .wait_for_state(ID_A, SessionState::Registered, TIMEOUT)
         .unwrap();
+    // Runtime shutdown must not own or join a resolver currently blocked in
+    // the process-wide bounded executor.
+    server.runtime.shutdown().unwrap();
+    release_tx.send(()).unwrap();
+    finished_rx.recv_timeout(TIMEOUT).unwrap();
+    TcpListener::bind(address).expect("cancelled forwarding setup left a listener behind");
+}
+
+struct StalledTcpHelperResolver {
+    address: SocketAddr,
+    helper: PathBuf,
+}
+
+impl et_net::forward::ForwardResolver for StalledTcpHelperResolver {
+    fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
+        Ok(vec![self.address])
+    }
+
+    fn listen_tcp_as_user(
+        &self,
+        address: SocketAddr,
+        uid: u32,
+        gid: u32,
+        deadline: Instant,
+    ) -> std::io::Result<TcpListener> {
+        et_net::user_socket_ops::listen_tcp_as_user_deadline_with_helper(
+            address,
+            uid,
+            gid,
+            deadline,
+            &self.helper,
+        )
+    }
+}
+
+#[test]
+fn stalled_privileged_tcp_helper_honors_initialization_deadline_and_resets_slot() {
+    let probe = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+    let helper_dir = support::TestDir::new();
+    let event = helper_dir.path().join("tcp-helper.event");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&event)
+        .status()
+        .unwrap()
+        .success());
+    let event_control = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&event)
+        .unwrap();
+    let pid_path = helper_dir.path().join("tcp-helper.pid");
+    let helper = helper_dir.path().join("tcp-helper.py");
+    fs::write(
+        &helper,
+        format!(
+            "#!/usr/bin/python3\nimport os, socket\nhost, port = os.environ['ET_RS_USER_SOCKET_PATH'].rsplit(':', 1)\ns = socket.socket(socket.AF_INET)\ns.bind((host, int(port)))\ns.listen(1)\nopen(r'{}', 'w').write(str(os.getpid()))\nopen(r'{}', 'wb').write(b'x')\nos.read(0, 1)\n",
+            pid_path.display(),
+            event.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut server = TestRuntime::start_with_forward_resolver(Arc::new(StalledTcpHelperResolver {
+        address,
+        helper: helper.clone(),
+    }));
+    let _terminal = server.register(ID_A, KEY_A);
+    let key = passkey_to_key(KEY_A).unwrap();
+    let payload = InitialPayload {
+        jumphost: Some(false),
+        reversetunnels: vec![PortForwardSourceRequest {
+            source: Some(SocketEndpoint {
+                name: Some("stalled.helper.test".to_owned()),
+                port: Some(i32::from(address.port())),
+            }),
+            destination: Some(SocketEndpoint {
+                name: Some("localhost".to_owned()),
+                port: Some(1),
+            }),
+            environmentvariable: None,
+        }],
+        environmentvariables: HashMap::new(),
+    };
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .unwrap();
+    let started = Instant::now();
+    let (initial_tx, initial_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let (_, initial) = runtime_support::initialize(stream, &key, payload);
+        let _ = initial_tx.send(initial);
+    });
+    let (event_tx, event_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut event_control = event_control;
+        let mut byte = [0];
+        let result = event_control.read_exact(&mut byte);
+        let _ = event_tx.send(result);
+    });
+    event_rx
+        .recv_timeout(TIMEOUT)
+        .expect("privileged TCP helper did not bind and enter no-reply")
+        .unwrap();
+    let initial = initial_rx
+        .recv_timeout(Duration::from_secs(8))
+        .expect("privileged TCP helper exceeded initialization deadline");
+    assert!(started.elapsed() < Duration::from_secs(8));
+    assert!(
+        initial
+            .error
+            .as_deref()
+            .and_then(et_net::forward::decode_forward_timeout)
+            .is_some(),
+        "unexpected stalled-helper response: {:?}",
+        initial.error
+    );
+    server
+        .handle
+        .wait_for_state(ID_A, SessionState::Registered, TIMEOUT)
+        .unwrap();
+    let pid = fs::read_to_string(pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .unwrap();
+    assert_eq!(
+        rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG).unwrap_err(),
+        rustix::io::Errno::CHILD,
+        "timed-out privileged helper was not killed and reaped"
+    );
+    TcpListener::bind(address).expect("timed-out privileged helper left a listener behind");
     server.runtime.shutdown().unwrap();
 }
 
@@ -138,10 +348,7 @@ fn client_close_before_initial_payload_rolls_back_the_session_claim() {
     assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
     drop(stream);
 
-    server
-        .handle
-        .wait_for_state(ID_A, SessionState::Registered, TIMEOUT)
-        .unwrap();
+    assert_eq!(server.handle.session_state(ID_A).unwrap(), None);
 
     let (stream, response) = server.handshake(ID_A);
     assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));

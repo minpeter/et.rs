@@ -99,9 +99,15 @@ fn cleanup_does_not_remove_a_replacement_inode() {
     let mut router = Router::start(selected, Registry::new()).unwrap();
 
     fs::remove_file(&path).unwrap();
+    fs::remove_file(et_net::local::capability_path(&path)).unwrap();
     File::create(&path).unwrap();
+    et_net::local::write_registration_ack_capability(&path).unwrap();
     router.shutdown().unwrap();
     assert!(path.is_file());
+    assert!(
+        et_net::local::supports_registration_ack(&path),
+        "old listener removed the replacement generation's marker"
+    );
 }
 
 #[test]
@@ -113,6 +119,12 @@ fn root_compatible_socket_is_read_write_without_execute_bits() {
 
     let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o666);
+    let capability = et_net::local::capability_path(&path);
+    assert_eq!(
+        fs::metadata(capability).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    assert!(et_net::local::supports_registration_ack(&path));
     router.shutdown().unwrap();
 }
 

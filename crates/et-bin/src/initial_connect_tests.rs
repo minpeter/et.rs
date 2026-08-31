@@ -1,6 +1,26 @@
-use super::{accept_initial_response, accept_reconnect_response, accept_response, ReconnectStatus};
-use crate::error::ClientError;
+use std::time::Duration;
+
 use et_core::proto::{ConnectResponse, ConnectStatus, InitialResponse};
+
+use super::{
+    accept_initial_response, accept_reconnect_response, accept_response,
+    initialization_admission_deadline, ReconnectStatus,
+};
+use crate::deadline::Deadline;
+use crate::error::ClientError;
+
+#[test]
+fn short_outer_budget_is_rejected_before_connection_admission() {
+    assert!(matches!(
+        initialization_admission_deadline(Deadline::after(Duration::from_secs(3))),
+        Err(ClientError::BootstrapTimeout(
+            "reserving the ET initialization budget"
+        ))
+    ));
+    let outer = Deadline::after(Duration::from_secs(10));
+    let admission = initialization_admission_deadline(outer).unwrap();
+    assert!(admission.expires_at() < outer.expires_at());
+}
 
 #[test]
 fn initial_response_without_error_is_accepted() {
@@ -8,7 +28,7 @@ fn initial_response_without_error_is_accepted() {
 }
 
 #[test]
-fn every_initial_response_error_is_fatal() {
+fn every_non_timeout_initial_response_error_is_fatal() {
     for message in [
         "reverse forwarding failed",
         "ETRS-RF-SKIP/1 0 13",
@@ -21,6 +41,17 @@ fn every_initial_response_error_is_fatal() {
             Err(ClientError::InitialResponseRejected(error)) if error == message
         ));
     }
+}
+
+#[test]
+fn forwarding_timeout_uses_bootstrap_timeout_classification() {
+    let message = et_net::forward::encode_forward_timeout("deadline elapsed");
+    assert!(matches!(
+        accept_initial_response(InitialResponse {
+            error: Some(message),
+        }),
+        Err(ClientError::BootstrapTimeout("setting up forwarding"))
+    ));
 }
 
 #[test]

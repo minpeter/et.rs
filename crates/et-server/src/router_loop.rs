@@ -1,12 +1,15 @@
 use et_net::local::LocalStream;
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Sender, SyncSender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use et_core::packet::Packet;
-use et_net::local_packet::LocalPacketDecoder;
+use et_net::local_packet::{
+    parse_status, status_packet, write_local_packet, LocalPacketDecoder, REGISTRATION_STATUS,
+    STARTUP_STATUS,
+};
 #[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags};
 #[cfg(unix)]
@@ -14,7 +17,9 @@ use rustix::net::{recv, RecvFlags};
 
 use crate::registry::{RegistrationIdentity, Registry};
 use crate::registry_validation::PeerIdentity;
-use crate::router::{RouterError, RouterEvent, RouterReject};
+use crate::router::{
+    RouterError, RouterEvent, RouterReject, MAX_PENDING_REGISTRATIONS, REGISTRATION_TIMEOUT,
+};
 use crate::router_registration;
 use crate::runtime_lifecycle::LifecycleEvent;
 #[cfg(unix)]
@@ -25,13 +30,18 @@ use crate::socket_path_windows::OwnedRouterListener;
 struct PendingConnection {
     stream: LocalStream,
     decoder: LocalPacketDecoder,
+    accepted: Instant,
     peer: PeerIdentity,
-    deadline: Instant,
+    #[cfg(windows)]
+    token: Vec<u8>,
+    #[cfg(windows)]
+    expected_token: String,
 }
 
 struct WatchedRegistration {
     stream: LocalStream,
     identity: RegistrationIdentity,
+    startup: Option<LocalPacketDecoder>,
 }
 
 enum ReadOutcome {
@@ -40,15 +50,11 @@ enum ReadOutcome {
     Reject,
 }
 
-const MAX_PENDING_REGISTRATIONS: usize = 64;
-const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
-const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
-
 pub(crate) fn run(
     listener: OwnedRouterListener,
     wake_reader: LocalStream,
     registry: Registry,
-    events: Sender<RouterEvent>,
+    events: SyncSender<RouterEvent>,
     lifecycle: Option<Sender<LifecycleEvent>>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), RouterError> {
@@ -63,31 +69,22 @@ fn run_poll(
     listener: OwnedRouterListener,
     mut wake_reader: LocalStream,
     registry: Registry,
-    events: Sender<RouterEvent>,
+    events: SyncSender<RouterEvent>,
     lifecycle: Option<Sender<LifecycleEvent>>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), RouterError> {
     let mut pending = Vec::<PendingConnection>::new();
     let mut watched = Vec::<WatchedRegistration>::new();
-    let mut accept_retry_at = None;
     let idle = rustix::time::Timespec::try_from(std::time::Duration::from_millis(100))
         .expect("100ms fits in timespec");
     loop {
-        let now = Instant::now();
-        pending.retain(|connection| connection.deadline > now);
-        let can_accept = pending.len() < MAX_PENDING_REGISTRATIONS
-            && accept_retry_at.is_none_or(|retry_at| now >= retry_at);
+        // Expire before constructing poll descriptors so readiness indices and
+        // the pending vector always describe the same generation.
+        expire_pending(&mut pending, &events);
         let pending_start = 2;
         let watched_start = pending_start + pending.len();
         let mut poll_fds = Vec::with_capacity(watched_start + watched.len());
-        poll_fds.push(PollFd::new(
-            listener.listener(),
-            if can_accept {
-                PollFlags::IN
-            } else {
-                PollFlags::empty()
-            },
-        ));
+        poll_fds.push(PollFd::new(listener.listener(), PollFlags::IN));
         poll_fds.push(PollFd::new(&wake_reader, PollFlags::IN));
         for connection in &pending {
             poll_fds.push(PollFd::new(
@@ -96,10 +93,11 @@ fn run_poll(
             ));
         }
         for registration in &watched {
-            poll_fds.push(PollFd::new(
-                &registration.stream,
-                PollFlags::HUP | PollFlags::ERR,
-            ));
+            let mut flags = PollFlags::HUP | PollFlags::ERR;
+            if registration.startup.is_some() {
+                flags |= PollFlags::IN;
+            }
+            poll_fds.push(PollFd::new(&registration.stream, flags));
         }
         match poll(&mut poll_fds, Some(&idle)) {
             Ok(_) => {}
@@ -132,7 +130,7 @@ fn run_poll(
                 Err(_) => *flags |= PollFlags::ERR,
             }
         }
-        disconnect_ready(
+        service_watched(
             &watched_readiness,
             &mut watched,
             &registry,
@@ -143,8 +141,7 @@ fn run_poll(
             .first()
             .is_some_and(|flags| flags.contains(PollFlags::IN))
         {
-            accept_retry_at = accept_ready(&listener, &mut pending, MAX_PENDING_REGISTRATIONS)?
-                .then(|| Instant::now() + ACCEPT_RETRY_DELAY);
+            accept_ready(&listener, &mut pending, &events)?;
         }
         let ready_pending: Vec<usize> = readiness[pending_start..watched_start]
             .iter()
@@ -161,6 +158,7 @@ fn run_poll(
                 ReadOutcome::Pending => {}
                 ReadOutcome::Packet(packet) => {
                     let connection = pending.swap_remove(index);
+                    let mut status = connection.stream.try_clone().map_err(RouterError::Io)?;
                     match router_registration::process(
                         packet,
                         connection.stream,
@@ -168,6 +166,16 @@ fn run_poll(
                         connection.peer,
                     ) {
                         Ok(terminal) => {
+                            if terminal.startup_ack
+                                && write_local_packet(
+                                    &mut status,
+                                    &status_packet(REGISTRATION_STATUS, Ok(())),
+                                )
+                                .is_err()
+                            {
+                                rollback_registration(&registry, &terminal.identity, &events)?;
+                                continue;
+                            }
                             let id = terminal.identity.id().to_owned();
                             terminal
                                 .watcher
@@ -176,17 +184,23 @@ fn run_poll(
                             watched.push(WatchedRegistration {
                                 stream: terminal.watcher,
                                 identity: terminal.identity,
+                                startup: terminal.startup_ack.then(LocalPacketDecoder::new),
                             });
-                            let _ = events.send(RouterEvent::Registered { id });
+                            emit(&events, RouterEvent::Registered { id });
                         }
                         Err(error) => {
-                            let _ = events.send(RouterEvent::Rejected(error));
+                            let message = format!("registration rejected: {error:?}");
+                            let _ = write_local_packet(
+                                &mut status,
+                                &status_packet(REGISTRATION_STATUS, Err(&message)),
+                            );
+                            emit(&events, RouterEvent::Rejected(error));
                         }
                     }
                 }
                 ReadOutcome::Reject => {
                     pending.swap_remove(index);
-                    let _ = events.send(RouterEvent::Rejected(RouterReject::MalformedFrame));
+                    emit(&events, RouterEvent::Rejected(RouterReject::MalformedFrame));
                 }
             }
         }
@@ -204,64 +218,72 @@ fn run_windows(
     listener: OwnedRouterListener,
     mut wake_reader: LocalStream,
     registry: Registry,
-    events: Sender<RouterEvent>,
+    events: SyncSender<RouterEvent>,
     lifecycle: Option<Sender<LifecycleEvent>>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), RouterError> {
     const IDLE: std::time::Duration = std::time::Duration::from_millis(10);
     let mut pending = Vec::<PendingConnection>::new();
     let mut watched = Vec::<WatchedRegistration>::new();
-    let mut accept_retry_at = None;
     loop {
         if shutdown.load(Ordering::Acquire) {
             drain_waker(&mut wake_reader)?;
             return Ok(());
         }
         let mut progress = false;
-        let now = Instant::now();
-        let before_expiry = pending.len();
-        pending.retain(|connection| connection.deadline > now);
-        progress |= pending.len() != before_expiry;
 
         // Terminals that closed their connection release their registration.
         // The watcher shares the session socket, so this must never consume
         // bytes: `peek` reports EOF without stealing session data.
-        let mut disconnected = Vec::new();
-        for (index, registration) in watched.iter().enumerate() {
-            let mut probe = [0u8; 1];
-            match registration.stream.peek(&mut probe) {
-                Ok(0) => disconnected.push(index),
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => disconnected.push(index),
-            }
-        }
-        for index in disconnected.into_iter().rev() {
-            progress = true;
-            let registration = watched.swap_remove(index);
-            if registry
-                .remove_if_current(&registration.identity)
-                .map_err(|error| RouterError::Io(io::Error::other(error)))?
-            {
-                let id = registration.identity.id().to_owned();
-                let _ = events.send(RouterEvent::Disconnected { id });
-                if let Some(sender) = lifecycle.as_ref() {
-                    let _ =
-                        sender.send(LifecycleEvent::TerminalDisconnected(registration.identity));
+        for index in (0..watched.len()).rev() {
+            if watched[index].startup.is_some() {
+                let outcome = {
+                    let registration = &mut watched[index];
+                    read_decoder(
+                        &mut registration.stream,
+                        registration.startup.as_mut().expect("startup checked"),
+                    )?
+                };
+                match outcome {
+                    ReadOutcome::Packet(packet) => {
+                        progress = true;
+                        let result = parse_status(&packet, STARTUP_STATUS)
+                            .map_err(|error| error.to_string());
+                        registry
+                            .report_startup(&watched[index].identity, result)
+                            .map_err(|error| RouterError::Io(io::Error::other(error)))?;
+                        watched[index].startup = None;
+                    }
+                    ReadOutcome::Reject => {
+                        progress = true;
+                        let _ = registry.report_startup(
+                            &watched[index].identity,
+                            Err("malformed terminal startup status".to_owned()),
+                        );
+                        watched[index].startup = None;
+                    }
+                    ReadOutcome::Pending => {}
                 }
+            }
+            let mut probe = [0u8; 1];
+            let disconnected = match watched[index].stream.peek(&mut probe) {
+                Ok(0) => true,
+                Ok(_) => false,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => false,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => false,
+                Err(_) => true,
+            };
+            if disconnected {
+                progress = true;
+                disconnect_watched(index, &mut watched, &registry, &events, lifecycle.as_ref())?;
             }
         }
 
-        if pending.len() < MAX_PENDING_REGISTRATIONS
-            && accept_retry_at.is_none_or(|retry_at| now >= retry_at)
-        {
-            let before = pending.len();
-            accept_retry_at = accept_ready(&listener, &mut pending, MAX_PENDING_REGISTRATIONS)?
-                .then(|| Instant::now() + ACCEPT_RETRY_DELAY);
-            if pending.len() != before {
-                progress = true;
-            }
+        expire_pending(&mut pending, &events);
+        let before = pending.len();
+        accept_ready(&listener, &mut pending, &events)?;
+        if pending.len() != before {
+            progress = true;
         }
 
         for index in (0..pending.len()).rev() {
@@ -270,6 +292,7 @@ fn run_windows(
                 ReadOutcome::Packet(packet) => {
                     progress = true;
                     let connection = pending.swap_remove(index);
+                    let mut status = connection.stream.try_clone().map_err(RouterError::Io)?;
                     match router_registration::process(
                         packet,
                         connection.stream,
@@ -277,22 +300,38 @@ fn run_windows(
                         connection.peer,
                     ) {
                         Ok(terminal) => {
+                            if terminal.startup_ack
+                                && write_local_packet(
+                                    &mut status,
+                                    &status_packet(REGISTRATION_STATUS, Ok(())),
+                                )
+                                .is_err()
+                            {
+                                rollback_registration(&registry, &terminal.identity, &events)?;
+                                continue;
+                            }
                             let id = terminal.identity.id().to_owned();
                             watched.push(WatchedRegistration {
                                 stream: terminal.watcher,
                                 identity: terminal.identity,
+                                startup: terminal.startup_ack.then(LocalPacketDecoder::new),
                             });
-                            let _ = events.send(RouterEvent::Registered { id });
+                            emit(&events, RouterEvent::Registered { id });
                         }
                         Err(error) => {
-                            let _ = events.send(RouterEvent::Rejected(error));
+                            let message = format!("registration rejected: {error:?}");
+                            let _ = write_local_packet(
+                                &mut status,
+                                &status_packet(REGISTRATION_STATUS, Err(&message)),
+                            );
+                            emit(&events, RouterEvent::Rejected(error));
                         }
                     }
                 }
                 ReadOutcome::Reject => {
                     progress = true;
                     pending.swap_remove(index);
-                    let _ = events.send(RouterEvent::Rejected(RouterReject::MalformedFrame));
+                    emit(&events, RouterEvent::Rejected(RouterReject::MalformedFrame));
                 }
             }
         }
@@ -304,34 +343,67 @@ fn run_windows(
 }
 
 #[cfg(unix)]
-fn disconnect_ready(
+fn service_watched(
     readiness: &[PollFlags],
     watched: &mut Vec<WatchedRegistration>,
     registry: &Registry,
-    events: &Sender<RouterEvent>,
+    events: &SyncSender<RouterEvent>,
     lifecycle: Option<&Sender<LifecycleEvent>>,
 ) -> Result<(), RouterError> {
-    let ready: Vec<usize> = readiness
-        .iter()
-        .enumerate()
-        .filter_map(|(index, flags)| {
-            flags
-                .intersects(PollFlags::HUP | PollFlags::ERR)
-                .then_some(index)
-        })
-        .rev()
-        .collect();
-    for index in ready {
-        let registration = watched.swap_remove(index);
-        if registry
-            .remove_if_current(&registration.identity)
-            .map_err(|error| RouterError::Io(io::Error::other(error)))?
-        {
-            let id = registration.identity.id().to_owned();
-            let _ = events.send(RouterEvent::Disconnected { id });
-            if let Some(sender) = lifecycle {
-                let _ = sender.send(LifecycleEvent::TerminalDisconnected(registration.identity));
+    for index in (0..watched.len()).rev() {
+        let flags = readiness.get(index).copied().unwrap_or(PollFlags::empty());
+        if flags.contains(PollFlags::IN) && watched[index].startup.is_some() {
+            match read_startup(&mut watched[index])? {
+                ReadOutcome::Packet(packet) => {
+                    let result =
+                        parse_status(&packet, STARTUP_STATUS).map_err(|error| error.to_string());
+                    registry
+                        .report_startup(&watched[index].identity, result)
+                        .map_err(|error| RouterError::Io(io::Error::other(error)))?;
+                    watched[index].startup = None;
+                }
+                ReadOutcome::Reject => {
+                    let _ = registry.report_startup(
+                        &watched[index].identity,
+                        Err("malformed terminal startup status".to_owned()),
+                    );
+                    watched[index].startup = None;
+                }
+                ReadOutcome::Pending => {}
             }
+        }
+        if flags.intersects(PollFlags::HUP | PollFlags::ERR) {
+            disconnect_watched(index, watched, registry, events, lifecycle)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_startup(registration: &mut WatchedRegistration) -> Result<ReadOutcome, RouterError> {
+    let decoder = registration
+        .startup
+        .as_mut()
+        .expect("startup decoder checked by caller");
+    read_decoder(&mut registration.stream, decoder)
+}
+
+fn disconnect_watched(
+    index: usize,
+    watched: &mut Vec<WatchedRegistration>,
+    registry: &Registry,
+    events: &SyncSender<RouterEvent>,
+    lifecycle: Option<&Sender<LifecycleEvent>>,
+) -> Result<(), RouterError> {
+    let registration = watched.swap_remove(index);
+    if registry
+        .remove_if_current(&registration.identity)
+        .map_err(|error| RouterError::Io(io::Error::other(error)))?
+    {
+        let id = registration.identity.id().to_owned();
+        emit(events, RouterEvent::Disconnected { id });
+        if let Some(sender) = lifecycle {
+            let _ = sender.send(LifecycleEvent::TerminalDisconnected(registration.identity));
         }
     }
     Ok(())
@@ -340,9 +412,9 @@ fn disconnect_ready(
 fn accept_ready(
     listener: &OwnedRouterListener,
     pending: &mut Vec<PendingConnection>,
-    max_pending: usize,
-) -> Result<bool, RouterError> {
-    while pending.len() < max_pending {
+    _events: &SyncSender<RouterEvent>,
+) -> Result<(), RouterError> {
+    while pending.len() < MAX_PENDING_REGISTRATIONS {
         match listener.accept() {
             Ok((stream, _)) => {
                 let peer = PeerIdentity::from_stream(&stream).map_err(RouterError::Io)?;
@@ -350,50 +422,76 @@ fn accept_ready(
                 pending.push(PendingConnection {
                     stream,
                     decoder: LocalPacketDecoder::new(),
+                    accepted: Instant::now(),
                     peer,
-                    deadline: Instant::now() + REGISTRATION_TIMEOUT,
+                    #[cfg(windows)]
+                    token: Vec::with_capacity(et_net::local::TOKEN_LEN + 1),
+                    #[cfg(windows)]
+                    expected_token: listener.token().to_owned(),
                 });
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) if accept_resource_exhausted(&error) => return Ok(true),
+            Err(error) if matches!(error.raw_os_error(), Some(23 | 24)) => {
+                emit_resource_error(&error);
+                return Ok(());
+            }
             Err(error) => return Err(RouterError::Io(error)),
         }
     }
-    Ok(false)
-}
-
-#[cfg(unix)]
-fn accept_resource_exhausted(error: &io::Error) -> bool {
-    matches!(
-        error.raw_os_error(),
-        Some(code)
-            if code == rustix::io::Errno::MFILE.raw_os_error()
-                || code == rustix::io::Errno::NFILE.raw_os_error()
-    )
-}
-
-#[cfg(windows)]
-fn accept_resource_exhausted(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::OutOfMemory
+    Ok(())
 }
 
 fn read_ready(connection: &mut PendingConnection) -> Result<ReadOutcome, RouterError> {
+    #[cfg(windows)]
+    if connection.token.last() != Some(&b'\n') {
+        loop {
+            let mut byte = [0u8; 1];
+            match connection.stream.read(&mut byte) {
+                Ok(0) => return Ok(ReadOutcome::Reject),
+                Ok(_) => {
+                    connection.token.push(byte[0]);
+                    if connection.token.len() > et_net::local::TOKEN_LEN + 1 {
+                        return Ok(ReadOutcome::Reject);
+                    }
+                    if byte[0] == b'\n' {
+                        let supplied = &connection.token[..connection.token.len() - 1];
+                        if supplied != connection.expected_token.as_bytes() {
+                            return Ok(ReadOutcome::Reject);
+                        }
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok(ReadOutcome::Pending)
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return Ok(ReadOutcome::Reject),
+            }
+        }
+    }
+    read_decoder(&mut connection.stream, &mut connection.decoder)
+}
+
+fn read_decoder(
+    stream: &mut LocalStream,
+    decoder: &mut LocalPacketDecoder,
+) -> Result<ReadOutcome, RouterError> {
     loop {
-        let needed = connection.decoder.required_bytes().min(8192);
+        let needed = decoder.required_bytes().min(8192);
         if needed == 0 {
             return Ok(ReadOutcome::Reject);
         }
         let mut buffer = [0u8; 8192];
-        match connection.stream.read(&mut buffer[..needed]) {
+        match stream.read(&mut buffer[..needed]) {
             Ok(0) => {
-                let decoder = std::mem::take(&mut connection.decoder);
+                let decoder = std::mem::take(decoder);
                 return Ok(match decoder.finish() {
                     Ok(()) => ReadOutcome::Pending,
                     Err(_) => ReadOutcome::Reject,
                 });
             }
-            Ok(count) => match connection.decoder.feed(&buffer[..count]) {
+            Ok(count) => match decoder.feed(&buffer[..count]) {
                 Ok(Some(packet)) => return Ok(ReadOutcome::Packet(packet)),
                 Ok(None) => {}
                 Err(_) => return Ok(ReadOutcome::Reject),
@@ -403,6 +501,49 @@ fn read_ready(connection: &mut PendingConnection) -> Result<ReadOutcome, RouterE
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => return Ok(ReadOutcome::Reject),
+        }
+    }
+}
+
+fn rollback_registration(
+    registry: &Registry,
+    identity: &RegistrationIdentity,
+    events: &SyncSender<RouterEvent>,
+) -> Result<(), RouterError> {
+    registry
+        .remove_if_current(identity)
+        .map_err(|error| RouterError::Io(io::Error::other(error)))?;
+    emit(
+        events,
+        RouterEvent::Rejected(RouterReject::RegistryUnavailable),
+    );
+    Ok(())
+}
+
+fn expire_pending(pending: &mut Vec<PendingConnection>, events: &SyncSender<RouterEvent>) {
+    let now = Instant::now();
+    let mut expired = 0;
+    pending.retain(|connection| {
+        let keep = now.duration_since(connection.accepted) < REGISTRATION_TIMEOUT;
+        expired += usize::from(!keep);
+        keep
+    });
+    for _ in 0..expired {
+        emit(events, RouterEvent::Rejected(RouterReject::Timeout));
+    }
+}
+
+fn emit(events: &SyncSender<RouterEvent>, event: RouterEvent) {
+    let _ = events.try_send(event);
+}
+
+fn emit_resource_error(error: &io::Error) {
+    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    if let Ok(mut last) = LAST.lock() {
+        let now = Instant::now();
+        if last.is_none_or(|previous| now.duration_since(previous) >= Duration::from_secs(1)) {
+            crate::diag::info(format!("router accept resource exhaustion: {error}"));
+            *last = Some(now);
         }
     }
 }
@@ -420,17 +561,66 @@ fn drain_waker(wake_reader: &mut LocalStream) -> Result<(), RouterError> {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
-    use super::accept_resource_exhausted;
+    use super::*;
 
+    #[cfg(unix)]
     #[test]
-    fn descriptor_exhaustion_is_transient() {
-        for errno in [rustix::io::Errno::MFILE, rustix::io::Errno::NFILE] {
-            assert!(accept_resource_exhausted(&std::io::Error::from(errno)));
+    fn expired_hung_up_pending_is_removed_before_readiness_is_indexed() {
+        let (stream, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        drop(peer);
+        let mut pending = vec![PendingConnection {
+            stream,
+            decoder: LocalPacketDecoder::new(),
+            accepted: Instant::now() - REGISTRATION_TIMEOUT,
+            peer: PeerIdentity::Unix {
+                uid: rustix::process::getuid().as_raw(),
+                gid: rustix::process::getgid().as_raw(),
+            },
+        }];
+        let (events, receiver) = std::sync::mpsc::sync_channel(1);
+        expire_pending(&mut pending, &events);
+        assert!(pending.is_empty());
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RouterEvent::Rejected(RouterReject::Timeout)
+        );
+        // Poll descriptors are constructed only after this point, so no stale
+        // readiness index can address the removed connection.
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stalled_startup_socket_remains_nonblocking_while_other_work_progresses() {
+        use std::net::{Ipv4Addr, TcpListener, TcpStream};
+
+        fn pair() -> (TcpStream, TcpStream) {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            let connector = std::thread::spawn(move || TcpStream::connect(address).unwrap());
+            let (server, _) = listener.accept().unwrap();
+            (server, connector.join().unwrap())
         }
-        assert!(!accept_resource_exhausted(&std::io::Error::from(
-            rustix::io::Errno::INVAL,
-        )));
+
+        let (mut stalled, _stalled_peer) = pair();
+        stalled.set_nonblocking(true).unwrap();
+        let mut stalled_decoder = LocalPacketDecoder::new();
+        assert!(matches!(
+            read_decoder(&mut stalled, &mut stalled_decoder).unwrap(),
+            ReadOutcome::Pending
+        ));
+
+        let (mut ready, mut ready_peer) = pair();
+        ready.set_nonblocking(true).unwrap();
+        let packet = et_core::packet::Packet::new(STARTUP_STATUS, vec![0]);
+        write_local_packet(&mut ready_peer, &packet).unwrap();
+        let mut ready_decoder = LocalPacketDecoder::new();
+        assert!(matches!(
+            read_decoder(&mut ready, &mut ready_decoder).unwrap(),
+            ReadOutcome::Packet(_)
+        ));
     }
 }

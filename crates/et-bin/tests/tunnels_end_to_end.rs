@@ -16,7 +16,9 @@ use reconnect_stack::{mkfifo, shell_quote, Stack};
 use tunnel_support::SingleCutProxy;
 use wait_timeout::ChildExt;
 
-const TIMEOUT: Duration = Duration::from_secs(10);
+// Process creation can legitimately exceed ten seconds under the load this
+// suite exercises; every wait remains bounded by the exact FIFO/process event.
+const TIMEOUT: Duration = Duration::from_secs(30);
 
 #[test]
 fn ssh_config_local_tunnel_relays_while_remote_forward_is_omitted() {
@@ -64,9 +66,8 @@ fn ssh_config_local_tunnel_relays_while_remote_forward_is_omitted() {
 #[test]
 fn ssh_config_destination_host_reaches_target_not_localhost_decoy() {
     let mut stack = Stack::start();
-    let target = TcpListener::bind((std::net::Ipv4Addr::new(127, 0, 0, 2), 0)).unwrap();
+    let (target, decoy) = reserve_destination_and_decoy().unwrap();
     let target_port = target.local_addr().unwrap().port();
-    let decoy = TcpListener::bind((Ipv4Addr::LOCALHOST, target_port)).unwrap();
     decoy.set_nonblocking(true).unwrap();
     let target_echo = spawn_tcp_echo_once(target, b"configured-destination");
     let source = stack.directory.join("configured-destination.sock");
@@ -894,6 +895,24 @@ fn reserve_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+fn reserve_destination_and_decoy() -> std::io::Result<(TcpListener, TcpListener)> {
+    const MAX_ATTEMPTS: usize = 128;
+    let target_address = Ipv4Addr::new(127, 0, 0, 2);
+    for _ in 0..MAX_ATTEMPTS {
+        let target = TcpListener::bind((target_address, 0))?;
+        let port = target.local_addr()?.port();
+        match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+            Ok(decoy) => return Ok((target, decoy)),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        format!("could not reserve paired loopback listeners after {MAX_ATTEMPTS} attempts"),
+    ))
 }
 
 fn await_fifo(path: &std::path::Path, child: &mut Child) -> String {

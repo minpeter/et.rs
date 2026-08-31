@@ -252,9 +252,22 @@ impl Worker {
     }
 
     fn emit<M: Message>(&mut self, header: u8, message: M) -> Result<(), ForwardError> {
-        self.outbound
-            .send(Ok(Packet::new(header, message.encode_to_vec())))
-            .map_err(|_| ForwardError::Unavailable)?;
+        let mut outbound = Ok(Packet::new(header, message.encode_to_vec()));
+        loop {
+            if self.shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(ForwardError::Unavailable);
+            }
+            match self.outbound.try_send(outbound) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Full(value)) => {
+                    outbound = value;
+                    std::thread::yield_now();
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    return Err(ForwardError::Unavailable);
+                }
+            }
+        }
         // Unix consumers poll the wake socket; Windows consumers drain
         // `try_outbound` on the client loop's 10ms cadence.
         #[cfg(unix)]

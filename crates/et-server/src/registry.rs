@@ -18,6 +18,7 @@ pub struct Registration {
     pub key: [u8; KEY_LEN],
     pub uid: u32,
     pub gid: u32,
+    pub(crate) startup_ack: bool,
     pub(crate) identity: Arc<()>,
 }
 
@@ -27,6 +28,7 @@ impl PartialEq for Registration {
             && self.key == other.key
             && self.uid == other.uid
             && self.gid == other.gid
+            && self.startup_ack == other.startup_ack
     }
 }
 
@@ -41,11 +43,20 @@ pub(crate) struct RegistrationIdentity {
 pub(crate) struct RegisteredTerminal {
     pub(crate) identity: RegistrationIdentity,
     pub(crate) watcher: LocalStream,
+    pub(crate) startup_ack: bool,
 }
 
 struct StoredRegistration {
     info: Registration,
     stream: LocalStream,
+    startup: StartupState,
+}
+
+#[derive(Clone)]
+enum StartupState {
+    Legacy,
+    Pending,
+    Complete(Result<(), String>),
 }
 
 #[derive(Default)]
@@ -117,14 +128,78 @@ impl Registry {
         let mut state = self.lock()?;
         match state.registrations.entry(registration.id.clone()) {
             Entry::Vacant(entry) => {
+                let startup_ack = registration.startup_ack;
+                let startup = if startup_ack {
+                    StartupState::Pending
+                } else {
+                    StartupState::Legacy
+                };
                 entry.insert(StoredRegistration {
                     info: registration,
                     stream,
+                    startup,
                 });
                 self.inner.changed.notify_all();
-                Ok(RegisteredTerminal { identity, watcher })
+                Ok(RegisteredTerminal {
+                    identity,
+                    watcher,
+                    startup_ack,
+                })
             }
             Entry::Occupied(_) => Err(RegistrationError::Duplicate),
+        }
+    }
+
+    pub(crate) fn report_startup(
+        &self,
+        identity: &RegistrationIdentity,
+        result: Result<(), String>,
+    ) -> Result<(), RegistrationError> {
+        let mut state = self.lock()?;
+        let stored = state
+            .registrations
+            .get_mut(identity.id())
+            .filter(|stored| identity.matches(&stored.info))
+            .ok_or(RegistrationError::Unavailable)?;
+        if !matches!(stored.startup, StartupState::Pending) {
+            return Err(RegistrationError::Invalid);
+        }
+        stored.startup = StartupState::Complete(result);
+        self.inner.changed.notify_all();
+        Ok(())
+    }
+
+    pub(crate) fn wait_for_startup(
+        &self,
+        registration: &Registration,
+        deadline: Instant,
+    ) -> Result<(), RegistrationError> {
+        let mut state = self.lock()?;
+        loop {
+            let stored = state
+                .registrations
+                .get(&registration.id)
+                .filter(|stored| stored.info.same_generation(registration))
+                .ok_or(RegistrationError::Unavailable)?;
+            match &stored.startup {
+                StartupState::Legacy | StartupState::Complete(Ok(())) => return Ok(()),
+                StartupState::Complete(Err(message)) => {
+                    return Err(RegistrationError::Io(io::Error::other(message.clone())))
+                }
+                StartupState::Pending => {}
+            }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(RegistrationError::Timeout)?;
+            let (next, wait) = self
+                .inner
+                .changed
+                .wait_timeout(state, remaining)
+                .map_err(|_| RegistrationError::Unavailable)?;
+            state = next;
+            if wait.timed_out() {
+                return Err(RegistrationError::Timeout);
+            }
         }
     }
 

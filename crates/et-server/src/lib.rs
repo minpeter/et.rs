@@ -26,7 +26,9 @@ mod socket_path_windows;
 mod terminal_bridge;
 
 pub use registry::{Registration, RegistrationError, Registry};
-pub use router::{Router, RouterError, RouterEvent, RouterReject};
+pub use router::{
+    Router, RouterError, RouterEvent, RouterReject, MAX_PENDING_REGISTRATIONS, REGISTRATION_TIMEOUT,
+};
 pub use runtime::Runtime;
 pub use runtime_error::RuntimeError;
 pub use runtime_handle::{HandleError, RuntimeHandle};

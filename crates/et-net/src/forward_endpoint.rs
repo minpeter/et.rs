@@ -9,15 +9,14 @@ use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use et_core::proto::SocketEndpoint;
 
+use crate::forward::{ForwardResolver, ResolverExecutor};
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const RESOLVER_WORKERS: usize = 4;
-const RESOLVER_QUEUE: usize = 32;
 
 #[derive(Clone, Debug)]
 pub(crate) enum Endpoint {
@@ -144,6 +143,7 @@ impl Endpoint {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve_for_bind(&self) -> io::Result<ResolvedEndpoint> {
         match self {
             Self::Tcp { host, port } => {
@@ -170,19 +170,29 @@ impl Endpoint {
         }
     }
 
-    pub(crate) fn resolve_for_bind_until(
+    pub(crate) fn resolve_for_bind_deadline(
         &self,
         deadline: Instant,
-        max_addresses: usize,
+        resolver: Arc<dyn ForwardResolver>,
     ) -> io::Result<ResolvedEndpoint> {
+        ensure_deadline(deadline)?;
         match self {
-            Self::Tcp { host, port } if host.is_empty() => Ok(ResolvedEndpoint::Tcp(vec![
-                (std::net::Ipv6Addr::UNSPECIFIED, *port).into(),
-                (std::net::Ipv4Addr::UNSPECIFIED, *port).into(),
-            ])),
             Self::Tcp { host, port } => {
-                resolve_tcp_bounded(host.clone(), *port, deadline, max_addresses)
-                    .map(ResolvedEndpoint::Tcp)
+                let addresses = if host.is_empty() {
+                    vec![
+                        (std::net::Ipv6Addr::UNSPECIFIED, *port).into(),
+                        (std::net::Ipv4Addr::UNSPECIFIED, *port).into(),
+                    ]
+                } else if host == "localhost" {
+                    vec![
+                        (std::net::Ipv6Addr::LOCALHOST, *port).into(),
+                        (std::net::Ipv4Addr::LOCALHOST, *port).into(),
+                    ]
+                } else {
+                    ResolverExecutor::global().resolve(resolver, host.clone(), *port, deadline)?
+                };
+                ensure_deadline(deadline)?;
+                Ok(ResolvedEndpoint::Tcp(distinct_tcp_addresses(addresses)))
             }
             #[cfg(unix)]
             Self::Unix(path) => Ok(ResolvedEndpoint::Unix(path.clone())),
@@ -220,95 +230,7 @@ pub(crate) fn connect_tcp(host: &str, port: u16) -> io::Result<TcpStream> {
     }))
 }
 
-struct ResolveJob {
-    host: String,
-    port: u16,
-    deadline: Instant,
-    max_addresses: usize,
-    reply: SyncSender<io::Result<Vec<std::net::SocketAddr>>>,
-}
-
-fn resolve_tcp_bounded(
-    host: String,
-    port: u16,
-    deadline: Instant,
-    max_addresses: usize,
-) -> io::Result<Vec<std::net::SocketAddr>> {
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .filter(|remaining| !remaining.is_zero())
-        .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
-    let (reply, result) = sync_channel(1);
-    let job = ResolveJob {
-        host,
-        port,
-        deadline,
-        max_addresses,
-        reply,
-    };
-    match resolver_pool().try_send(job) {
-        Ok(()) => {}
-        Err(TrySendError::Full(_)) => {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "forward resolver queue is full",
-            ));
-        }
-        Err(TrySendError::Disconnected(_)) => {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "forward resolver pool stopped",
-            ));
-        }
-    }
-    result
-        .recv_timeout(remaining)
-        .map_err(|error| match error {
-            std::sync::mpsc::RecvTimeoutError::Timeout => io::Error::from(io::ErrorKind::TimedOut),
-            std::sync::mpsc::RecvTimeoutError::Disconnected => {
-                io::Error::new(io::ErrorKind::BrokenPipe, "forward resolver worker stopped")
-            }
-        })?
-}
-
-fn resolver_pool() -> &'static SyncSender<ResolveJob> {
-    static POOL: OnceLock<SyncSender<ResolveJob>> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let (sender, receiver) = sync_channel::<ResolveJob>(RESOLVER_QUEUE);
-        let receiver = Arc::new(Mutex::new(receiver));
-        for index in 0..RESOLVER_WORKERS {
-            let receiver = receiver.clone();
-            let _ = std::thread::Builder::new()
-                .name(format!("et-forward-resolver-{index}"))
-                .spawn(move || resolver_worker(&receiver));
-        }
-        sender
-    })
-}
-
-fn resolver_worker(receiver: &Mutex<std::sync::mpsc::Receiver<ResolveJob>>) {
-    loop {
-        let job = {
-            let Ok(receiver) = receiver.lock() else {
-                return;
-            };
-            let Ok(job) = receiver.recv() else {
-                return;
-            };
-            job
-        };
-        let result = if Instant::now() >= job.deadline {
-            Err(io::Error::from(io::ErrorKind::TimedOut))
-        } else {
-            collect_distinct_addresses(
-                (job.host.as_str(), job.port).to_socket_addrs(),
-                job.max_addresses,
-            )
-        };
-        let _ = job.reply.send(result);
-    }
-}
-
+#[cfg(test)]
 fn collect_distinct_addresses(
     addresses: io::Result<impl Iterator<Item = std::net::SocketAddr>>,
     max_addresses: usize,
@@ -351,6 +273,7 @@ impl ResolvedEndpoint {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn bind_with_user(
         &self,
         user: Option<(u32, u32)>,
@@ -385,17 +308,29 @@ impl ResolvedEndpoint {
         }
     }
 
-    pub(crate) fn bind_with_user_until(
+    pub(crate) fn bind_with_user_deadline_resolver(
         &self,
         user: Option<(u32, u32)>,
-        #[cfg_attr(windows, allow(unused_variables))] deadline: Instant,
+        deadline: Instant,
+        _resolver: Arc<dyn ForwardResolver>,
     ) -> io::Result<Vec<ForwardListener>> {
-        match (self, user) {
+        ensure_deadline(deadline)?;
+        let listeners = match (self, user) {
             #[cfg(unix)]
             (Self::Tcp(addresses), Some((uid, gid))) => {
                 bind_tcp_addresses_with(addresses.iter().copied(), |address| {
-                    crate::user_socket_ops::listen_tcp_as_user_until(address, uid, gid, deadline)
+                    ensure_deadline(deadline)?;
+                    _resolver
+                        .listen_tcp_as_user(address, uid, gid, deadline)
                         .map(Some)
+                })
+            }
+            (Self::Tcp(addresses), _) => {
+                bind_tcp_addresses_with(addresses.iter().copied(), |address| {
+                    ensure_deadline(deadline)?;
+                    let listener = bind_tcp_single_family(address)?;
+                    ensure_deadline(deadline)?;
+                    Ok(listener)
                 })
             }
             #[cfg(unix)]
@@ -412,8 +347,30 @@ impl ResolvedEndpoint {
                     cleanup_dirs: Vec::new(),
                 }])
             }
-            _ => self.bind_with_user(user),
-        }
+            #[cfg(unix)]
+            (Self::Unix(path), None) => {
+                ensure_deadline(deadline)?;
+                let listener = bind_unix_locally_with(path, |listener| {
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+                    listener.set_nonblocking(true)
+                })?;
+                ensure_deadline(deadline)?;
+                Ok(vec![listener])
+            }
+        }?;
+        ensure_deadline(deadline)?;
+        Ok(listeners)
+    }
+}
+
+fn ensure_deadline(deadline: Instant) -> io::Result<()> {
+    if Instant::now() >= deadline {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "forwarding setup deadline elapsed",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -539,6 +496,7 @@ impl Drop for PendingDirectories {
     }
 }
 
+#[cfg(test)]
 fn bind_tcp_addresses(
     addresses: impl IntoIterator<Item = std::net::SocketAddr>,
 ) -> io::Result<Vec<ForwardListener>> {

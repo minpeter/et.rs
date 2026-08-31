@@ -11,7 +11,7 @@ use rustix::event::{poll, PollFd, PollFlags};
 use crate::forward_endpoint::{Endpoint, ForwardListener, ForwardStream};
 use et_core::proto::SocketEndpoint;
 
-use super::forward_worker::{Command, Role};
+use super::forward_worker::{Command, CommandSender, Role};
 
 const READ_CHUNK: usize = 16 * 1024;
 
@@ -49,7 +49,7 @@ const ACCEPT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10
 
 pub(crate) fn spawn_listener(
     source: BoundSource,
-    commands: mpsc::SyncSender<Command>,
+    commands: CommandSender,
     stop: ListenerStop,
     next_client_fd: Arc<AtomicI32>,
 ) -> JoinHandle<()> {
@@ -125,7 +125,7 @@ pub(crate) fn spawn_connector(
     client_fd: i32,
     socket_id: i32,
     destination: Endpoint,
-    commands: mpsc::SyncSender<Command>,
+    commands: CommandSender,
     session_user: Option<(u32, u32)>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -142,7 +142,7 @@ pub(crate) fn spawn_io(
     role: Role,
     socket_id: i32,
     stream: ForwardStream,
-    commands: mpsc::SyncSender<Command>,
+    commands: CommandSender,
 ) -> io::Result<(ActiveIo, [JoinHandle<()>; 2])> {
     let mut reader = stream.try_clone()?;
     let control = stream.try_clone()?;

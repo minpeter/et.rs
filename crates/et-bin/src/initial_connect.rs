@@ -73,7 +73,7 @@ pub fn connect_initial(
     ensure_deadline(deadline, "sending INITIAL_PAYLOAD")?;
     let mut connection = Connection::new_client(stream, &key);
     connection
-        .write_packet(
+        .write_packet_strict(
             EtPacketType::InitialPayload as u8,
             &initial_payload.encode_to_vec(),
         )
@@ -89,7 +89,7 @@ pub fn connect_initial(
         InitialResponse::decode(packet.payload()).map_err(ClientError::MalformedInitialResponse)?;
     if accept_initial_response(response, remote_origins)? {
         connection
-            .write_packet(EtPacketType::Heartbeat as u8, &[])
+            .write_packet_strict(EtPacketType::Heartbeat as u8, &[])
             .map_err(|error| {
                 transport_error(deadline, "acknowledging reverse forwarding skips", error)
             })?;

@@ -64,7 +64,7 @@ pub fn run(
         }
         destination
             .connection
-            .write_packet(EtPacketType::Heartbeat as u8, &[])
+            .write_packet_strict(EtPacketType::Heartbeat as u8, &[])
             .map_err(|error| format!("could not acknowledge destination response: {error}"))?;
     }
     destination
@@ -165,7 +165,7 @@ fn try_connect_once(
     }
     let mut connection = Connection::new_client(stream, key);
     connection
-        .write_packet(EtPacketType::InitialPayload as u8, &payload.encode_to_vec())
+        .write_packet_strict(EtPacketType::InitialPayload as u8, &payload.encode_to_vec())
         .map_err(|error| format!("could not send INITIAL_PAYLOAD: {error}"))?;
     let packet = connection
         .read_packet()

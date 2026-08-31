@@ -186,10 +186,10 @@ fn register(router: &mut LocalStream, input: &CredentialInput) -> Result<(), Str
     // Upstream uses these to chown forwarded named pipes; Windows has no
     // POSIX ids, so the session reports zero there.
     #[cfg(unix)]
-    let (uid, gid) = (
-        i64::from(rustix::process::getuid().as_raw()),
-        i64::from(rustix::process::getgid().as_raw()),
-    );
+    let (uid, gid) = {
+        let (uid, gid) = effective_terminal_identity();
+        (i64::from(uid), i64::from(gid))
+    };
     #[cfg(windows)]
     let (uid, gid) = (0i64, 0i64);
     let user = TerminalUserInfo {
@@ -205,6 +205,35 @@ fn register(router: &mut LocalStream, input: &CredentialInput) -> Result<(), Str
     );
     write_local_packet(router, &packet)
         .map_err(|error| format!("could not register terminal: {error}"))
+}
+
+#[cfg(unix)]
+fn effective_terminal_identity() -> (u32, u32) {
+    (
+        rustix::process::geteuid().as_raw(),
+        rustix::process::getegid().as_raw(),
+    )
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_registration_identity_matches_effective_peer_credentials() {
+        // Given: this host cannot create differing real/effective IDs without
+        // privilege, so assert the exact credential API used by registration.
+        let expected = (
+            rustix::process::geteuid().as_raw(),
+            rustix::process::getegid().as_raw(),
+        );
+
+        // When
+        let identity = effective_terminal_identity();
+
+        // Then
+        assert_eq!(identity, expected);
+    }
 }
 
 fn clap_error(message: impl Into<String>) -> clap::Error {

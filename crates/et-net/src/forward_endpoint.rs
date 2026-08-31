@@ -218,43 +218,86 @@ impl ResolvedEndpoint {
             }
             (Self::Tcp(addresses), _) => bind_tcp_addresses(addresses.iter().copied()),
             #[cfg(unix)]
-            (Self::Unix(path), Some((uid, gid))) => {
-                let listener = crate::user_socket_ops::listen_unix_as_user(path, uid, gid)?;
-                listener.set_nonblocking(true)?;
-                Ok(vec![ForwardListener {
-                    inner: ListenerKind::Unix(listener),
-                    cleanup: Some(path.clone()),
-                    cleanup_dir: None,
-                }])
-            }
-            #[cfg(unix)]
-            (Self::Unix(path), None) => {
-                if path.exists() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AddrInUse,
-                        "Unix source socket already exists",
-                    ));
-                }
-                let cleanup_dir = if let Some(parent) = path.parent() {
-                    if !parent.exists() {
-                        fs::create_dir_all(parent)?;
-                        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-                        Some(parent.to_path_buf())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                let listener = UnixListener::bind(path)?;
-                fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-                listener.set_nonblocking(true)?;
-                Ok(vec![ForwardListener {
-                    inner: ListenerKind::Unix(listener),
-                    cleanup: Some(path.clone()),
-                    cleanup_dir,
-                }])
-            }
+            (Self::Unix(path), user) => bind_unix_source(path, user, || Ok(()), || Ok(())),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn bind_unix_source(
+    path: &std::path::Path,
+    user: Option<(u32, u32)>,
+    after_directory: impl FnOnce() -> io::Result<()>,
+    after_bind: impl FnOnce() -> io::Result<()>,
+) -> io::Result<Vec<ForwardListener>> {
+    if path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "Unix source socket already exists",
+        ));
+    }
+    let mut directory_guard = None;
+    if user.is_none() {
+        if let Some(parent) = path.parent().filter(|parent| !parent.exists()) {
+            fs::create_dir_all(parent)?;
+            directory_guard = Some(PathCleanup::directory(parent.to_path_buf()));
+            after_directory()?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    let listener = match user {
+        Some((uid, gid)) => crate::user_socket_ops::listen_unix_as_user(path, uid, gid)?,
+        None => UnixListener::bind(path)?,
+    };
+    let socket_guard = PathCleanup::socket(path.to_path_buf());
+    after_bind()?;
+    if user.is_none() {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    listener.set_nonblocking(true)?;
+    Ok(vec![ForwardListener {
+        inner: ListenerKind::Unix(listener),
+        cleanup: socket_guard.disarm(),
+        cleanup_dir: directory_guard.and_then(PathCleanup::disarm),
+    }])
+}
+
+#[cfg(unix)]
+struct PathCleanup {
+    path: Option<PathBuf>,
+    socket: bool,
+}
+
+#[cfg(unix)]
+impl PathCleanup {
+    fn socket(path: PathBuf) -> Self {
+        Self {
+            path: Some(path),
+            socket: true,
+        }
+    }
+
+    fn directory(path: PathBuf) -> Self {
+        Self {
+            path: Some(path),
+            socket: false,
+        }
+    }
+
+    fn disarm(mut self) -> Option<PathBuf> {
+        self.path.take()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PathCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.as_ref() {
+            let _ = if self.socket {
+                fs::remove_file(path)
+            } else {
+                fs::remove_dir(path)
+            };
         }
     }
 }
@@ -508,6 +551,67 @@ mod tests {
             #[cfg(unix)]
             Endpoint::Unix(_) => panic!("TCP destination parsed as Unix"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_source_failure_after_directory_creation_cleans_and_retries() {
+        // Given
+        let root = std::env::temp_dir().join(format!("et-fwd-dir-{}", std::process::id()));
+        let path = root.join("created").join("source.sock");
+        let created = path.parent().unwrap().to_path_buf();
+
+        // When
+        let error = match bind_unix_source(
+            &path,
+            None,
+            || Err(io::Error::other("injected after directory creation")),
+            || Ok(()),
+        ) {
+            Ok(_) => panic!("injected directory failure succeeded"),
+            Err(error) => error,
+        };
+
+        // Then
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(!created.exists());
+        let listeners = bind_unix_source(&path, None, || Ok(()), || Ok(())).unwrap();
+        assert!(path.exists());
+        drop(listeners);
+        assert!(!path.exists());
+        assert!(!created.exists());
+        let _ = fs::remove_dir(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_source_failure_after_bind_cleans_socket_and_directory_then_retries() {
+        // Given
+        let root = std::env::temp_dir().join(format!("et-fwd-bind-{}", std::process::id()));
+        let path = root.join("created").join("source.sock");
+        let created = path.parent().unwrap().to_path_buf();
+
+        // When
+        let error = match bind_unix_source(
+            &path,
+            None,
+            || Ok(()),
+            || Err(io::Error::other("injected before final configuration")),
+        ) {
+            Ok(_) => panic!("injected post-bind failure succeeded"),
+            Err(error) => error,
+        };
+
+        // Then
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(!path.exists());
+        assert!(!created.exists());
+        let listeners = bind_unix_source(&path, None, || Ok(()), || Ok(())).unwrap();
+        assert!(path.exists());
+        drop(listeners);
+        assert!(!path.exists());
+        assert!(!created.exists());
+        let _ = fs::remove_dir(root);
     }
 
     #[cfg(unix)]

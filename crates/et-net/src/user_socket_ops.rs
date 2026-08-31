@@ -100,14 +100,34 @@ pub fn run_helper() -> i32 {
 
 /// Bind/listen a new owner-only UNIX socket path with the current credentials.
 pub fn listen_at_path(path: &Path) -> io::Result<UnixListener> {
+    listen_at_path_with(path, || Ok(()))
+}
+
+fn listen_at_path_with(
+    path: &Path,
+    after_bind: impl FnOnce() -> io::Result<()>,
+) -> io::Result<UnixListener> {
     if path_too_long(path) {
         return Err(io::Error::from_raw_os_error(
             rustix::io::Errno::NAMETOOLONG.raw_os_error(),
         ));
     }
     let listener = UnixListener::bind(path)?;
+    let mut cleanup = SocketPathCleanup(Some(path.to_path_buf()));
+    after_bind()?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    cleanup.0 = None;
     Ok(listener)
+}
+
+struct SocketPathCleanup(Option<PathBuf>);
+
+impl Drop for SocketPathCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.as_ref() {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 /// connect() to a UNIX socket path with the current credentials.
@@ -400,6 +420,26 @@ mod tests {
         // When / Then
         assert!(!helper_identity_matches(target, &[65_534], &inherited));
         assert!(helper_identity_matches(target, &[65_534], &dropped));
+    }
+
+    #[test]
+    fn listen_failure_after_bind_cleans_socket_and_immediate_retry_succeeds() {
+        // Given
+        let dir = temp_dir();
+        let path = dir.join("post-bind-failure.sock");
+
+        // When
+        let error = listen_at_path_with(&path, || Err(io::Error::other("injected before chmod")))
+            .unwrap_err();
+
+        // Then
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(!path.exists());
+        let listener = listen_at_path(&path).unwrap();
+        assert!(path.exists());
+        drop(listener);
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&dir).unwrap();
     }
 
     #[test]

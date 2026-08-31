@@ -207,9 +207,15 @@ impl Connection {
     /// allowing the kernel send queue to autotune to multiple megabytes.
     pub fn minimize_output_buffering(&mut self) -> Result<(), ConnError> {
         self.live_write_timeout = FLOW_CONTROL_LIVE_WRITE_TIMEOUT;
-        SockRef::from(&self.stream)
+        let socket = SockRef::from(&self.stream);
+        socket
             .set_send_buffer_size(FLOW_CONTROL_SOCKET_BUFFER_BYTES)
-            .map_err(ConnError::Io)
+            .map_err(ConnError::Io)?;
+        #[cfg(target_os = "linux")]
+        socket
+            .set_tcp_notsent_lowat(FLOW_CONTROL_SOCKET_BUFFER_BYTES as u32)
+            .map_err(ConnError::Io)?;
+        Ok(())
     }
 
     pub fn writer_sequence(&self) -> i64 {

@@ -25,15 +25,22 @@ use std::path::Path;
 
 use socket2::SockRef;
 
+/// Terminal-side kernel queue bound for opted-in flow-control sessions.
+pub const FLOW_CONTROL_SEND_BUFFER_BYTES: usize = 64 * 1024;
+
 /// Stream type used for local server/terminal IPC.
 #[cfg(unix)]
 pub type LocalStream = std::os::unix::net::UnixStream;
 #[cfg(windows)]
 pub type LocalStream = std::net::TcpStream;
 
-/// Bound terminal-to-server buffering for opted-in flow-control sessions.
-pub fn set_receive_buffer_size(stream: &LocalStream, bytes: usize) -> io::Result<()> {
-    SockRef::from(stream).set_recv_buffer_size(bytes)
+/// Bound terminal-to-server buffering on the sending endpoint.
+///
+/// On Unix this configures the `etterminal` Unix socket, matching upstream
+/// PR #730. On Windows `LocalStream` is loopback TCP, where `SO_SNDBUF` is the
+/// corresponding bound on the same terminal-side hop.
+pub fn minimize_terminal_output_buffering(stream: &LocalStream) -> io::Result<()> {
+    SockRef::from(stream).set_send_buffer_size(FLOW_CONTROL_SEND_BUFFER_BYTES)
 }
 
 /// Length of the hex-encoded Windows registration token.

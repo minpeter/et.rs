@@ -3,7 +3,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use et_core::packet::Packet;
-use et_core::proto::{TerminalBuffer, TerminalPacketType};
+use et_core::proto::{FlowControlMode, TerminalBuffer, TerminalPacketType};
 use et_net::local::LocalStream;
 use et_net::local_packet::{write_local_packet, LocalPacketDecoder};
 #[cfg(unix)]
@@ -19,7 +19,7 @@ use sysinfo::{Pid as SystemPid, ProcessesToUpdate, Signal as SystemSignal, Syste
 
 const MAX_OUTPUT_CHUNK: usize = 16 * 1024;
 
-use crate::terminal_protocol::{handle_packet, read_initial_environment, read_ready_packet};
+use crate::terminal_protocol::{handle_packet, read_initialization, read_ready_packet};
 
 enum WorkerEvent {
     Output(Result<(), String>),
@@ -27,7 +27,13 @@ enum WorkerEvent {
 }
 
 pub fn run(mut router: LocalStream, term: &str) -> Result<i32, String> {
-    let environment = read_initial_environment(&mut router)?;
+    let initialization = read_initialization(&mut router)?;
+    if initialization.flow_control != FlowControlMode::None {
+        // Keep terminal output in the server's bounded application queue,
+        // rather than a large opaque local-socket queue (upstream PR #730).
+        et_net::local::minimize_terminal_output_buffering(&router)
+            .map_err(|error| format!("could not bound terminal output buffering: {error}"))?;
+    }
     // Upstream issue #257: show the login banner an interactive ssh would have
     // printed, before the shell writes anything.
     #[cfg(unix)]
@@ -44,7 +50,7 @@ pub fn run(mut router: LocalStream, term: &str) -> Result<i32, String> {
     #[cfg(unix)]
     command.arg("-l");
     command.env("TERM", term);
-    for (name, value) in environment {
+    for (name, value) in initialization.environment {
         command.env(name, value);
     }
     let mut child = pair

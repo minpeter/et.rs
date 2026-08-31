@@ -19,7 +19,6 @@ use et_net::connection::{ConnError, Connection};
 /// *without* the connection mutex (see [`ActiveSession::recover_body`]).
 const RECOVERY_LOCK_TIMEOUT: Duration = et_net::connection::DEFAULT_RECOVERY_TIMEOUT;
 const FLOW_CONTROL_BUFFER_BYTES: usize = 64 * 1024;
-const FLOW_CONTROL_LOCAL_BUFFER_BYTES: usize = 64 * 1024;
 
 #[path = "session_flow.rs"]
 mod session_flow;
@@ -101,8 +100,6 @@ impl ActiveSession {
             connection
                 .minimize_output_buffering()
                 .map_err(SessionError::Connection)?;
-            et_net::local::set_receive_buffer_size(terminal, FLOW_CONTROL_LOCAL_BUFFER_BYTES)
-                .map_err(SessionError::Io)?;
         }
         let control = connection
             .try_clone_stream()

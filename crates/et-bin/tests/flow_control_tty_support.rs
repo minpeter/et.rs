@@ -7,6 +7,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,8 +19,9 @@ use wait_timeout::ChildExt;
 const TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_PROMPT_LATENCY: Duration = Duration::from_secs(5);
 pub const THROTTLE_BYTES_PER_SECOND: usize = 100 * 1024;
-pub const BASELINE_BYTES_PER_SECOND: usize = 16 * 1024;
-pub const SATURATION_BYTES: usize = 64 * 1024;
+pub const SATURATION_BYTES: usize = 576 * 1024;
+const PROXY_RECEIVE_BUFFER_BYTES: usize = 64 * 1024;
+static STACK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub fn receive_until(
     receiver: &mpsc::Receiver<Vec<u8>>,
@@ -68,7 +70,7 @@ impl ThrottleProxy {
         let worker = thread::spawn(move || {
             let (mut client, _) = listener.accept()?;
             let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
-            socket.set_recv_buffer_size(64 * 1024)?;
+            socket.set_recv_buffer_size(PROXY_RECEIVE_BUFFER_BYTES)?;
             socket.connect(&SockAddr::from(SocketAddrV4::new(
                 Ipv4Addr::LOCALHOST,
                 server_port,
@@ -150,8 +152,11 @@ pub struct Stack {
 
 impl Stack {
     pub fn start() -> Self {
-        let directory =
-            std::env::temp_dir().join(format!("et-rs-flow-control-qa-{}", std::process::id()));
+        let sequence = STACK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "et-rs-flow-control-qa-{}-{sequence}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();

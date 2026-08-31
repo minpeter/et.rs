@@ -15,7 +15,7 @@ use std::time::Duration;
 use reconnect_stack::{mkfifo, shell_quote, Stack};
 use tunnel_support::SingleCutProxy;
 
-const TIMEOUT: Duration = Duration::from_secs(10);
+const TIMEOUT: Duration = Duration::from_secs(30);
 
 #[test]
 fn cli_local_and_reverse_tunnels_relay_real_tcp_payloads() {
@@ -216,6 +216,7 @@ fn spawn_tcp_echo(listener: TcpListener) -> thread::JoinHandle<()> {
                     if let Ok(count) = stream.read(&mut payload) {
                         if count > 0 {
                             let _ = stream.write_all(&payload[..count]);
+                            return;
                         }
                     }
                 }

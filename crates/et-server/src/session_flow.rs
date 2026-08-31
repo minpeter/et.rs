@@ -108,8 +108,11 @@ impl FlowControl {
 
     pub(super) fn stop_gracefully(&self) {
         if let Ok(mut state) = self.state.lock() {
+            // A recovery pause owns the connection snapshot until its permit
+            // installs the candidate (or safely abandons it). Terminal EOF
+            // must not bypass that pause and drain queued output onto the old
+            // stream; RecoverPermit::drop resumes the writer atomically.
             state.stop = StopMode::Graceful;
-            state.paused = false;
             self.wake.notify_all();
         }
     }
@@ -154,7 +157,7 @@ impl FlowControl {
             .wake
             .wait_while(state, |state| match state.stop {
                 StopMode::Hard => false,
-                StopMode::Graceful => state.queue.bytes() == 0 && state.in_flight,
+                StopMode::Graceful => state.paused || (state.queue.bytes() == 0 && state.in_flight),
                 StopMode::Running => state.paused || !state.connected || state.queue.bytes() == 0,
             })
             .ok()?;
@@ -199,25 +202,46 @@ pub(super) fn run_writer(session: Weak<ActiveSession>, flow: Arc<FlowControl>) {
         let Some(session) = session.upgrade() else {
             return;
         };
-        let prepared = match session.connection.lock() {
-            Ok(mut connection) => connection
-                .prepare_write_packet(packet.header(), packet.payload())
-                .map_err(SessionError::Connection),
-            Err(_) => Err(SessionError::Unavailable),
-        };
-        let result =
-            prepared.and_then(|prepared| prepared.send().map_err(SessionError::Connection));
-        let connected = match session.connection.lock() {
-            Ok(mut connection) => {
-                if result.is_err() {
-                    connection.disconnect();
-                }
-                connection.connected()
-            }
-            Err(_) => false,
-        };
+        // Popping this packet may have reopened bounded queue capacity.
+        // Wake the bridge so it polls terminal output again instead of
+        // sleeping indefinitely with terminal readability disabled.
+        let _ = session.signal();
+        let (result, connected) = write_packet(&session, &packet);
         if !flow.complete(packet, &result, connected) {
             return;
         }
+    }
+}
+
+#[cfg(unix)]
+fn write_packet(session: &ActiveSession, packet: &Packet) -> (Result<(), SessionError>, bool) {
+    let prepared = match session.connection.lock() {
+        Ok(mut connection) => connection
+            .prepare_write_packet(packet.header(), packet.payload())
+            .map_err(SessionError::Connection),
+        Err(_) => Err(SessionError::Unavailable),
+    };
+    let result = prepared.and_then(|prepared| prepared.send().map_err(SessionError::Connection));
+    match session.connection.lock() {
+        Ok(mut connection) => {
+            if result.is_err() {
+                connection.disconnect();
+            }
+            (result, connection.connected())
+        }
+        Err(_) => (Err(SessionError::Unavailable), false),
+    }
+}
+
+#[cfg(windows)]
+fn write_packet(session: &ActiveSession, packet: &Packet) -> (Result<(), SessionError>, bool) {
+    match session.connection.lock() {
+        Ok(mut connection) => {
+            let result = connection
+                .write_packet(packet.header(), packet.payload())
+                .map_err(SessionError::Connection);
+            (result, connection.connected())
+        }
+        Err(_) => (Err(SessionError::Unavailable), false),
     }
 }

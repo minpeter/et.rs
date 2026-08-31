@@ -349,6 +349,67 @@ fn before_replay_waits_for_explicit_resume_while_session_is_recoverable() {
 }
 
 #[test]
+fn disconnected_recovery_pause_transfers_graceful_output_to_candidate() {
+    // Given: the old transport is disconnected before recovery pauses the writer.
+    let flow = FlowControl::new(et_core::flow_control::FlowControlMode::Backpressure);
+    flow.disconnected();
+    flow.pause().unwrap();
+    flow.enqueue(et_core::packet::Packet::new(55, b"candidate".as_slice()))
+        .unwrap();
+
+    // When: terminal EOF requests graceful completion and recovery installs a candidate.
+    flow.stop_gracefully();
+    flow.resume(true);
+
+    // Then: the candidate owns and drains the final packet exactly once.
+    let packet = flow.next_packet().unwrap();
+    assert_eq!(
+        (packet.header(), packet.payload()),
+        (55, b"candidate".as_slice())
+    );
+    assert!(flow.complete(packet, &FlowWriteResult::Delivered, true));
+    assert!(flow.next_packet().is_none());
+    assert!(!flow.unrecoverable());
+}
+
+#[test]
+fn buffered_only_admission_cannot_complete_graceful_session() {
+    // Given: graceful completion owns one final packet.
+    let flow = FlowControl::new(et_core::flow_control::FlowControlMode::Backpressure);
+    flow.enqueue(et_core::packet::Packet::new(
+        57,
+        b"buffered-only".as_slice(),
+    ))
+    .unwrap();
+    flow.stop_gracefully();
+    let packet = flow.next_packet().unwrap();
+
+    // When: replay admits it but no live transport receives it.
+    assert!(!flow.complete(packet, &FlowWriteResult::Delivered, false));
+
+    // Then: removing the session is a typed failure, not false delivery.
+    assert!(flow.unrecoverable());
+}
+
+#[test]
+fn disconnected_recovery_pause_fails_gracefully_when_candidate_fails() {
+    // Given: graceful EOF is waiting on a candidate for a disconnected transport.
+    let flow = FlowControl::new(et_core::flow_control::FlowControlMode::Backpressure);
+    flow.disconnected();
+    flow.pause().unwrap();
+    flow.enqueue(et_core::packet::Packet::new(56, b"undelivered".as_slice()))
+        .unwrap();
+    flow.stop_gracefully();
+
+    // When: candidate recovery fails and resumes without a live transport.
+    flow.resume(false);
+
+    // Then: completion is bounded and reported as unrecoverable.
+    assert!(flow.next_packet().is_none());
+    assert!(flow.unrecoverable());
+}
+
+#[test]
 fn live_send_reset_disconnects_without_requeueing_replay_owned_packet() {
     // Given: one in-flight packet followed by queued output.
     let flow = FlowControl::new(et_core::flow_control::FlowControlMode::Backpressure);

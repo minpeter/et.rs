@@ -88,7 +88,7 @@ pub struct SkippedForward {
 pub struct Forwarder {
     commands: channel::Sender<Command>,
     outbound: channel::Receiver<Outbound>,
-    cancel: channel::Sender<()>,
+    cancel: Option<channel::Sender<()>>,
     /// Readiness channel for outbound packets. Unix callers poll it exactly
     /// like upstream's `select()`; Windows callers drain [`Forwarder::try_outbound`]
     /// on the client loop's 10ms cadence instead, because a socket pair created
@@ -187,7 +187,7 @@ fn start_forwarder(
         Forwarder {
             commands: commands_tx,
             outbound: outbound_rx,
-            cancel: cancel_tx,
+            cancel: Some(cancel_tx),
             #[cfg(unix)]
             wake,
             worker: Some(worker),
@@ -259,7 +259,7 @@ impl Forwarder {
     /// worker. Returns true when queued commands or outbound packets could not
     /// be completed and were explicitly abandoned.
     pub fn shutdown_hard(&mut self) -> Result<bool, ForwardError> {
-        let _ = self.cancel.try_send(());
+        self.cancel.take();
         let mut abandoned = !self.commands.is_empty() || !self.outbound.is_empty();
         if let Some(worker) = self.worker.take() {
             worker.join().map_err(|_| ForwardError::Unavailable)?;
@@ -276,7 +276,7 @@ impl Forwarder {
     fn stop(&mut self) -> Result<(), ForwardError> {
         if let Some(worker) = self.worker.take() {
             if self.commands.send(Command::Stop).is_err() {
-                let _ = self.cancel.try_send(());
+                self.cancel.take();
             }
             worker.join().map_err(|_| ForwardError::Unavailable)?;
         }

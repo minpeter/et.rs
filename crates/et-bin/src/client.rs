@@ -119,9 +119,12 @@ fn run_client(
             .into(),
         );
     }
-    let mut locale_environment =
-        bounded_locale_environment(ssh_locale_environment(), &reserved_environment)
-            .map_err(crate::forward_config::ForwardConfigError::EnvironmentPacketTooLarge)?;
+    let mut locale_environment = bounded_locale_environment(
+        ssh_locale_environment(),
+        &reserved_environment,
+        forward_config.initial_payload.flowcontrol,
+    )
+    .map_err(crate::forward_config::ForwardConfigError::EnvironmentPacketTooLarge)?;
     if args.jumphost.is_some() {
         bound_jumphost_locale_environment(
             &forward_config.initial_payload,

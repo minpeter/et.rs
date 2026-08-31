@@ -13,8 +13,8 @@ use crossbeam_channel as channel;
 use crate::forward::{ForwardError, Outbound};
 use crate::forward_endpoint::ForwardStream;
 use crate::forward_io::{
-    spawn_connector, spawn_io, spawn_listener, stop_io, ActiveIo, BoundSource, ListenerStop,
-    WriteCommand,
+    abort_io, spawn_connector, spawn_io, spawn_listener, stop_io, ActiveIo, BoundSource,
+    ListenerStop, WriteCommand,
 };
 use et_core::packet::Packet;
 use et_core::proto::SocketEndpoint;
@@ -157,13 +157,18 @@ impl Worker {
             self.threads.push(spawn_listener(
                 source,
                 self.commands.clone(),
+                self.cancel.clone(),
                 stop,
                 next_client_fd.clone(),
             ));
         }
+        let mut hard_cancelled = false;
         let result = loop {
             let command = channel::select! {
-                recv(self.cancel) -> _ => break Ok(()),
+                recv(self.cancel) -> _ => {
+                    hard_cancelled = true;
+                    break Ok(())
+                },
                 recv(commands) -> command => match command {
                     Ok(command) => command,
                     Err(_) => break Ok(()),
@@ -212,8 +217,13 @@ impl Worker {
         for (_, stream) in self.pending.drain() {
             stream.shutdown();
         }
+        hard_cancelled |= !matches!(self.cancel.try_recv(), Err(channel::TryRecvError::Empty));
         for (_, io) in self.sources.drain().chain(self.destinations.drain()) {
-            stop_io(io);
+            if hard_cancelled {
+                abort_io(io);
+            } else {
+                stop_io(io);
+            }
         }
         for thread in self.threads.drain(..) {
             let _ = thread.join();

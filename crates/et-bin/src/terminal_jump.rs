@@ -7,7 +7,7 @@
 //! the same id/passkey, and then relays packets verbatim in both directions.
 
 use et_net::local::LocalStream;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::net::ToSocketAddrs;
 use std::time::Duration;
 
@@ -20,7 +20,7 @@ use et_core::proto::{
 use et_net::connection::Connection;
 use et_net::framing_io::{read_proto_limited, write_proto};
 use et_net::handshake::{client_request, MAX_HANDSHAKE_PROTO_LEN};
-use et_net::local_packet::{write_local_packet, LocalPacketDecoder};
+use et_net::local_packet::{encode_local_packet, write_local_packet, LocalPacketDecoder};
 use prost::Message;
 #[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags};
@@ -239,8 +239,10 @@ fn relay(mut router: LocalStream, destination: &mut Connection) -> Result<i32, S
     // Windows cannot poll the router channel and the destination socket
     // together, so it walks both without blocking on upstream's 10ms cadence.
     #[cfg(windows)]
+    let mut pending_output: Option<(Vec<u8>, usize)> = None;
+    #[cfg(windows)]
     loop {
-        let mut progress = false;
+        let mut progress = write_pending_local(&mut router, &mut pending_output)?;
         match read_router_packet(&mut router, &mut decoder)? {
             Some(packet) => {
                 progress = true;
@@ -255,14 +257,18 @@ fn relay(mut router: LocalStream, destination: &mut Connection) -> Result<i32, S
             }
             None => {}
         }
-        loop {
+        while pending_output.is_none() {
             match destination.try_read_packet() {
                 Ok(Some(packet)) => {
                     progress = true;
                     let packet = router_packet(destination, packet);
-                    if write_local_packet(&mut router, &packet).is_err() {
-                        return Ok(0);
-                    }
+                    pending_output = Some((
+                        encode_local_packet(&packet).map_err(|error| {
+                            format!("could not frame destination output: {error}")
+                        })?,
+                        0,
+                    ));
+                    let _ = write_pending_local(&mut router, &mut pending_output)?;
                 }
                 Ok(None) => break,
                 Err(_) => return Ok(0),
@@ -273,13 +279,28 @@ fn relay(mut router: LocalStream, destination: &mut Connection) -> Result<i32, S
         }
     }
     #[cfg(unix)]
+    let mut pending_output: Option<(Vec<u8>, usize)> = None;
+    #[cfg(unix)]
     loop {
         let client = destination
             .try_clone_stream()
             .map_err(|error| format!("could not poll the destination: {error}"))?;
+        let router_flags = PollFlags::IN
+            | PollFlags::HUP
+            | PollFlags::ERR
+            | if pending_output.is_some() {
+                PollFlags::OUT
+            } else {
+                PollFlags::empty()
+            };
+        let client_flags = if pending_output.is_none() {
+            PollFlags::IN | PollFlags::HUP | PollFlags::ERR
+        } else {
+            PollFlags::HUP | PollFlags::ERR
+        };
         let mut descriptors = [
-            PollFd::new(&router, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
-            PollFd::new(&client, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
+            PollFd::new(&router, router_flags),
+            PollFd::new(&client, client_flags),
         ];
         // poll() is never restarted by SA_RESTART; retry on EINTR so a stray
         // signal cannot kill the jump-host bridge.
@@ -297,6 +318,11 @@ fn relay(mut router: LocalStream, destination: &mut Connection) -> Result<i32, S
         if router_events.intersects(PollFlags::HUP | PollFlags::ERR) {
             return Ok(0);
         }
+        if router_events.contains(PollFlags::OUT)
+            && write_pending_local(&mut router, &mut pending_output).is_err()
+        {
+            return Ok(0);
+        }
         if router_events.contains(PollFlags::IN) {
             if let Some(packet) = read_router_packet(&mut router, &mut decoder)? {
                 decoder = LocalPacketDecoder::new();
@@ -309,22 +335,50 @@ fn relay(mut router: LocalStream, destination: &mut Connection) -> Result<i32, S
                 }
             }
         }
-        if client_events.contains(PollFlags::IN) {
-            loop {
-                match destination.try_read_packet() {
-                    Ok(Some(packet)) => {
-                        let packet = router_packet(destination, packet);
-                        if write_local_packet(&mut router, &packet).is_err() {
-                            return Ok(0);
-                        }
+        if client_events.contains(PollFlags::IN) && pending_output.is_none() {
+            match destination.try_read_packet() {
+                Ok(Some(packet)) => {
+                    let packet = router_packet(destination, packet);
+                    pending_output = Some((
+                        encode_local_packet(&packet).map_err(|error| {
+                            format!("could not frame destination output: {error}")
+                        })?,
+                        0,
+                    ));
+                    if write_pending_local(&mut router, &mut pending_output).is_err() {
+                        return Ok(0);
                     }
-                    Ok(None) => break,
-                    Err(_) => return Ok(0),
                 }
+                Ok(None) => {}
+                Err(_) => return Ok(0),
             }
         }
         if client_events.intersects(PollFlags::HUP | PollFlags::ERR) {
             return Ok(0);
+        }
+    }
+}
+
+fn write_pending_local(
+    router: &mut LocalStream,
+    pending: &mut Option<(Vec<u8>, usize)>,
+) -> Result<bool, String> {
+    let Some((frame, offset)) = pending.as_mut() else {
+        return Ok(false);
+    };
+    loop {
+        match router.write(&frame[*offset..]) {
+            Ok(0) => return Err("jumphost router stopped accepting output".to_owned()),
+            Ok(count) => {
+                *offset += count;
+                if *offset == frame.len() {
+                    *pending = None;
+                    return Ok(true);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) => return Err(format!("could not write destination output: {error}")),
         }
     }
 }

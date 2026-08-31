@@ -110,6 +110,7 @@ impl Worker {
             socket_id,
             destination,
             self.commands.clone(),
+            self.cancel.clone(),
             self.session_user,
         ));
         Ok(())
@@ -167,10 +168,12 @@ impl Worker {
         let Some(active) = self.map_ref(role).get(&socket_id) else {
             return Ok(());
         };
-        active
-            .writer
-            .send(WriteCommand::Data(buffer))
-            .map_err(|_| ForwardError::Unavailable)
+        channel::select! {
+            send(active.writer, WriteCommand::Data(buffer)) -> result => {
+                result.map_err(|_| ForwardError::Unavailable)
+            }
+            recv(self.cancel) -> _ => Err(ForwardError::Unavailable),
+        }
     }
 
     pub(super) fn send_data(
@@ -210,8 +213,14 @@ impl Worker {
         socket_id: i32,
         stream: ForwardStream,
     ) -> Result<(), ForwardError> {
-        let (active, handles) =
-            spawn_io(role, socket_id, stream, self.commands.clone()).map_err(ForwardError::Io)?;
+        let (active, handles) = spawn_io(
+            role,
+            socket_id,
+            stream,
+            self.commands.clone(),
+            self.cancel.clone(),
+        )
+        .map_err(ForwardError::Io)?;
         self.map(role).insert(socket_id, active);
         self.threads.extend(handles);
         Ok(())

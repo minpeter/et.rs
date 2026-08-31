@@ -89,6 +89,10 @@ impl FlowControl {
         if let Ok(mut state) = self.state.lock() {
             state.connected = connected;
             state.paused = false;
+            if !connected && state.stop == StopMode::Graceful {
+                state.unrecoverable = true;
+                state.stop = StopMode::Hard;
+            }
             self.wake.notify_all();
         }
     }
@@ -126,11 +130,11 @@ impl FlowControl {
             // must not bypass that pause and drain queued output onto the old
             // stream; RecoverPermit::drop resumes the writer atomically.
             if state.stop == StopMode::Running {
-                if !state.connected {
+                if state.connected || state.paused {
+                    state.stop = StopMode::Graceful;
+                } else {
                     state.unrecoverable = true;
                     state.stop = StopMode::Hard;
-                } else {
-                    state.stop = StopMode::Graceful;
                 }
                 self.wake.notify_all();
             }
@@ -219,7 +223,13 @@ impl FlowControl {
         state.in_flight = false;
         state.connected = connected;
         match result {
-            writer::FlowWriteResult::Delivered => state.queue.complete(&packet),
+            writer::FlowWriteResult::Delivered => {
+                state.queue.complete(&packet);
+                if !connected && state.stop == StopMode::Graceful {
+                    state.unrecoverable = true;
+                    state.stop = StopMode::Hard;
+                }
+            }
             writer::FlowWriteResult::BeforeReplay(_error) => {
                 state.queue.restore_front(packet);
                 state.connected = false;

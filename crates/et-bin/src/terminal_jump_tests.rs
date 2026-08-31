@@ -6,6 +6,7 @@ use std::thread;
 use socket2::SockRef;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
+const PTY_CONTRACT: Duration = Duration::from_secs(5);
 const ID: &str = "abcdefghijklmnop";
 const KEY_TEXT: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
 
@@ -91,6 +92,56 @@ fn jumphost_clamps_destination_before_typed_initial_payload() {
     // Then: initialization completed after bounded pressure and mode retention.
     drop(connection);
     destination.join().unwrap();
+}
+
+#[test]
+fn slow_jumphost_output_does_not_block_ctrl_c_toward_destination() {
+    // Given: a real encrypted destination hop and a bounded local router link
+    // whose client side deliberately does not consume destination output.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let connector = thread::spawn(move || std::net::TcpStream::connect(address).unwrap());
+    let (server_stream, _) = listener.accept().unwrap();
+    let client_stream = connector.join().unwrap();
+    let key = [29u8; 32];
+    let mut destination_client = Connection::new_client(client_stream, &key);
+    let mut destination_server = Connection::new_server(server_stream, &key);
+    let (relay_router, mut router_peer) = et_net::local::wake_pair().unwrap();
+    et_net::local::minimize_terminal_output_buffering(&relay_router).unwrap();
+    let (output_sent_tx, output_sent_rx) = mpsc::sync_channel(0);
+    let (input_tx, input_rx) = mpsc::sync_channel(0);
+    let destination = thread::spawn(move || {
+        for header in 71..87 {
+            destination_server
+                .write_packet(header, &vec![b'p'; 60 * 1024])
+                .unwrap();
+        }
+        output_sent_tx.send(()).unwrap();
+        let input = destination_server.read_packet().unwrap();
+        input_tx
+            .send((input.header(), input.payload().to_vec()))
+            .unwrap();
+        destination_server.shutdown().unwrap();
+    });
+    let relay = thread::spawn(move || relay(relay_router, &mut destination_client));
+    output_sent_rx.recv_timeout(PTY_CONTRACT).unwrap();
+
+    // When: Ctrl-C arrives while ownership of the blocked prompt/output frame
+    // remains in the destination-to-router direction.
+    write_local_packet(
+        &mut router_peer,
+        &Packet::new(TerminalPacketType::TerminalBuffer as u8, vec![3]),
+    )
+    .unwrap();
+
+    // Then: input reaches the destination within the unchanged five-second PTY contract.
+    assert_eq!(
+        input_rx.recv_timeout(PTY_CONTRACT).unwrap(),
+        (TerminalPacketType::TerminalBuffer as u8, vec![3])
+    );
+    destination.join().unwrap();
+    drop(router_peer);
+    assert_eq!(relay.join().unwrap().unwrap(), 0);
 }
 
 #[test]

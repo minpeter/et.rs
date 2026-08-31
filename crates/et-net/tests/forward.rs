@@ -11,7 +11,11 @@ use et_core::packet::Packet;
 use et_core::proto::{
     PortForwardDestinationRequest, PortForwardSourceRequest, SocketEndpoint, TerminalPacketType,
 };
-use et_net::forward::{ForwardError, ForwardOrigin, ForwardSource, Forwarder};
+#[cfg(unix)]
+use et_net::forward::ForwardError;
+use et_net::forward::Forwarder;
+#[cfg(target_os = "linux")]
+use et_net::forward::{ForwardOrigin, ForwardSource};
 use prost::Message;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
@@ -121,6 +125,61 @@ fn hard_shutdown_cancels_worker_blocked_on_full_command_and_outbound_queues() {
         .unwrap()
         .unwrap());
     worker.join().unwrap();
+}
+
+#[test]
+fn hard_shutdown_cancels_active_destination_write_after_socket_backpressure() {
+    // Given: a real forwarding destination accepts but never drains its socket.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let destination_port = listener.local_addr().unwrap().port();
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+    let peer = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        socket2::SockRef::from(&stream)
+            .set_recv_buffer_size(4096)
+            .unwrap();
+        accepted_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    let source_port = reserve_port();
+    let mut source = Forwarder::start(vec![request(source_port, destination_port)]).unwrap();
+    let mut destination = Forwarder::start(Vec::new()).unwrap();
+    let mut application = TcpStream::connect((Ipv4Addr::LOCALHOST, source_port)).unwrap();
+    destination
+        .receive(source.wait_outbound(TIMEOUT).unwrap())
+        .unwrap();
+    source
+        .receive(destination.wait_outbound(TIMEOUT).unwrap())
+        .unwrap();
+    accepted_rx.recv_timeout(TIMEOUT).unwrap();
+    let application_writer = thread::spawn(move || {
+        let payload = vec![7u8; 64 * 1024 * 1024];
+        let _ = application.write_all(&payload);
+    });
+
+    // When: destination writer ownership is proven blocked by its full bounded
+    // write-command queue, hard cancellation must close the socket before join.
+    let held = loop {
+        let packet = source.wait_outbound(TIMEOUT).unwrap();
+        if let Some(held) = destination.try_receive(packet).unwrap() {
+            break held;
+        }
+    };
+    drop(held);
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
+    let shutdown = thread::spawn(move || done_tx.send(destination.shutdown_hard()).unwrap());
+
+    // Then: completion is the exact shutdown result, not elapsed-time inference.
+    assert!(done_rx
+        .recv_timeout(HARD_SHUTDOWN_TIMEOUT)
+        .unwrap()
+        .unwrap());
+    shutdown.join().unwrap();
+    source.shutdown_hard().unwrap();
+    application_writer.join().unwrap();
+    release_tx.send(()).unwrap();
+    peer.join().unwrap();
 }
 
 #[test]

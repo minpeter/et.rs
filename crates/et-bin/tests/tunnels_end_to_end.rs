@@ -727,31 +727,36 @@ fn spawn_client(
 }
 
 fn spawn_tcp_echo_once(listener: TcpListener, expected: &'static [u8]) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        // Accept multiple times so readiness retries do not exhaust a one-shot echo.
-        let deadline = std::time::Instant::now() + TIMEOUT + TIMEOUT;
-        listener
-            .set_nonblocking(true)
-            .expect("echo listener nonblocking");
-        while std::time::Instant::now() < deadline {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    stream.set_nonblocking(false).ok();
-                    stream.set_read_timeout(Some(TIMEOUT)).ok();
-                    let mut payload = vec![0u8; expected.len()];
-                    if stream.read_exact(&mut payload).is_ok() {
-                        assert_eq!(payload, expected);
-                        stream.write_all(&payload).unwrap();
-                        return;
-                    }
+    let address = listener.local_addr().unwrap();
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_cancelled = std::sync::Arc::clone(&cancelled);
+    let (completed_tx, completed_rx) = mpsc::sync_channel(0);
+    let worker = thread::spawn(move || {
+        // Accept multiple times so readiness probes do not exhaust a one-shot echo.
+        loop {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            let mut payload = vec![0u8; expected.len()];
+            if stream.read_exact(&mut payload).is_err() {
+                if worker_cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Brief park while waiting for the next tunnel probe.
-                    thread::park_timeout(Duration::from_millis(10));
-                }
-                Err(_) => break,
+                continue;
             }
+            assert_eq!(payload, expected);
+            stream.write_all(&payload).unwrap();
+            completed_tx.send(()).unwrap();
+            return;
         }
+    });
+    thread::spawn(move || {
+        if completed_rx.recv_timeout(TIMEOUT + TIMEOUT).is_err() {
+            cancelled.store(true, std::sync::atomic::Ordering::Release);
+            drop(TcpStream::connect(address));
+            worker.join().unwrap();
+            panic!("TCP echo did not receive its payload before the deadline");
+        }
+        worker.join().unwrap();
     })
 }
 

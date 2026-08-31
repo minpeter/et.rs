@@ -59,7 +59,7 @@ pub fn read_local_packet<R: Read>(reader: &mut R) -> Result<Packet, LocalPacketE
     Packet::from_serialized(&serialized).map_err(LocalPacketError::MalformedPacket)
 }
 
-pub fn write_local_packet<W: Write>(writer: &mut W, packet: &Packet) -> io::Result<()> {
+pub fn encode_local_packet(packet: &Packet) -> io::Result<Vec<u8>> {
     let serialized = packet.serialize();
     if serialized.len() > MAX_LOCAL_PACKET_LEN {
         return Err(io::Error::new(
@@ -69,8 +69,15 @@ pub fn write_local_packet<W: Write>(writer: &mut W, packet: &Packet) -> io::Resu
     }
     let length = i64::try_from(serialized.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "local packet too large"))?;
-    write_all_blocking(writer, &length.to_ne_bytes())?;
-    write_all_blocking(writer, &serialized)?;
+    let mut frame = Vec::with_capacity(PREFIX_LEN + serialized.len());
+    frame.extend_from_slice(&length.to_ne_bytes());
+    frame.extend_from_slice(&serialized);
+    Ok(frame)
+}
+
+pub fn write_local_packet<W: Write>(writer: &mut W, packet: &Packet) -> io::Result<()> {
+    let frame = encode_local_packet(packet)?;
+    write_all_blocking(writer, &frame)?;
     flush_blocking(writer)
 }
 

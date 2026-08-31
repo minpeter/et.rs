@@ -7,6 +7,7 @@ use et_core::proto::{
     ConnectResponse, ConnectStatus, EtPacketType, InitialPayload, InitialResponse,
 };
 use et_net::connection::Connection;
+use et_net::forward::ForwardOrigin;
 use et_net::framing_io::{read_proto_limited, write_proto};
 use et_net::handshake::{client_request, MAX_HANDSHAKE_PROTO_LEN};
 use prost::Message;
@@ -53,6 +54,7 @@ pub fn connect_initial(
     endpoint: &Endpoint,
     credentials: &Credentials,
     initial_payload: &InitialPayload,
+    remote_origins: &[ForwardOrigin],
     resolver: &dyn EndpointResolver,
     deadline: Deadline,
 ) -> Result<Connection, ClientError> {
@@ -85,8 +87,12 @@ pub fn connect_initial(
     }
     let response =
         InitialResponse::decode(packet.payload()).map_err(ClientError::MalformedInitialResponse)?;
-    if let Some(message) = response.error {
-        return Err(ClientError::InitialResponseRejected(message));
+    if accept_initial_response(response, remote_origins)? {
+        connection
+            .write_packet(EtPacketType::Heartbeat as u8, &[])
+            .map_err(|error| {
+                transport_error(deadline, "acknowledging reverse forwarding skips", error)
+            })?;
     }
     connection
         .set_io_timeout(None)
@@ -164,6 +170,41 @@ fn transport_error(
         Some(_) => ClientError::Transport(error),
         None => ClientError::BootstrapTimeout(operation),
     }
+}
+
+fn accept_initial_response(
+    response: InitialResponse,
+    remote_origins: &[ForwardOrigin],
+) -> Result<bool, ClientError> {
+    let Some(message) = response.error else {
+        return Ok(false);
+    };
+    let rows = match et_net::reverse_report::decode_skipped_rows(&message, remote_origins.len()) {
+        Ok(Some(rows)) => rows,
+        Ok(None) => return Err(ClientError::InitialResponseRejected(message)),
+        Err(_) => {
+            return Err(ClientError::InitialResponseRejected(
+                "malformed reverse forwarding skip report".to_owned(),
+            ));
+        }
+    };
+    for row in &rows {
+        match remote_origins[row.index] {
+            ForwardOrigin::SshConfig => {}
+            ForwardOrigin::Explicit | ForwardOrigin::Reported(_) => {
+                return Err(ClientError::InitialResponseRejected(
+                    "explicit reverse forwarding row could not bind".to_owned(),
+                ));
+            }
+        }
+    }
+    for row in rows {
+        et_cli::logging::warn(format!(
+            "SSH remoteforward row {} could not bind; skipping forwarding row",
+            row.index
+        ));
+    }
+    Ok(true)
 }
 
 fn accept_response(response: ConnectResponse) -> Result<(), ClientError> {

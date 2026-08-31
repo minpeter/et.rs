@@ -134,6 +134,109 @@ gatewayports no
 }
 
 #[test]
+fn imported_remote_bind_report_warns_and_keeps_usable_row_live() {
+    let mut stack = Stack::start();
+    let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let occupied_port = occupied.local_addr().unwrap().port();
+    let destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let destination_port = destination.local_addr().unwrap().port();
+    let echo = spawn_tcp_echo_once(destination, b"usable-remote-import");
+    let usable_port = reserve_port();
+    let gate = stack.directory.join("imported-remote-bind-ready");
+    mkfifo(&gate);
+    let config = format!(
+        "hostname 127.0.0.1\nuser tester\n\
+         remoteforward {occupied_port} [127.0.0.1]:{destination_port}\n\
+         remoteforward {usable_port} [127.0.0.1]:{destination_port}\n"
+    );
+    let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env("PATH", &stack.directory)
+        .env("ET_SSH_COUNT", &stack.ssh_count)
+        .env("ET_SSH_CONFIG", config)
+        .env("ET_SSH_READY", &gate)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(["--logtostdout", "--terminal-path"])
+        .arg(&stack.terminal)
+        .args(["--serverfifo"])
+        .arg(&stack.router)
+        .arg("-N")
+        .arg(format!("tester@127.0.0.1:{}", stack.port))
+        .spawn()
+        .unwrap();
+
+    assert_eq!(await_fifo(&gate, &mut client), "ready");
+    assert_ready_tcp_round_trip(usable_port, b"usable-remote-import");
+
+    stop(&mut client);
+    let mut output = String::new();
+    client
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert_eq!(
+        output
+            .lines()
+            .filter(|line| line.contains("WARNING"))
+            .count(),
+        1
+    );
+    drop(occupied);
+    echo.join().unwrap();
+    stack.shutdown();
+}
+
+#[test]
+fn explicit_remote_bind_report_aborts_and_releases_sibling_listener() {
+    let mut stack = Stack::start();
+    let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let occupied_port = occupied.local_addr().unwrap().port();
+    let sibling_port = reserve_port();
+    let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env("PATH", &stack.directory)
+        .env("ET_SSH_COUNT", &stack.ssh_count)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .args(["--terminal-path"])
+        .arg(&stack.terminal)
+        .args(["--serverfifo"])
+        .arg(&stack.router)
+        .args(["-N", "-r"])
+        .arg(format!("{occupied_port}:1"))
+        .arg("-r")
+        .arg(format!("{sibling_port}:1"))
+        .arg(format!("tester@127.0.0.1:{}", stack.port))
+        .spawn()
+        .unwrap();
+
+    let status = client
+        .wait_timeout(TIMEOUT)
+        .unwrap()
+        .expect("explicit reported bind failure did not terminate the client");
+    let mut error = String::new();
+    client
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut error)
+        .unwrap();
+
+    assert!(!status.success());
+    assert!(
+        error.contains("explicit reverse forwarding row could not bind"),
+        "{error}"
+    );
+    stack.shutdown();
+    let rebound = TcpListener::bind((Ipv4Addr::LOCALHOST, sibling_port)).unwrap();
+    drop(rebound);
+    drop(occupied);
+}
+
+#[test]
 fn cumulative_local_forwards_deduplicate_exact_rows_but_preserve_distinct_destinations() {
     // Given
     let mut stack = Stack::start();

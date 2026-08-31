@@ -71,6 +71,7 @@ impl From<et_cli::tunnel::TunnelError> for ForwardConfigError {
 
 pub struct ForwardConfig {
     pub local_sources: Vec<ForwardSource>,
+    pub remote_origins: Vec<et_net::forward::ForwardOrigin>,
     pub initial_payload: InitialPayload,
 }
 
@@ -97,24 +98,29 @@ impl ForwardConfig {
         }
 
         let mut remote_requests = Vec::new();
-        self.initial_payload.reversetunnels.retain(|request| {
+        let mut deduplicated = Vec::new();
+        let mut origins = Vec::new();
+        for (request, origin) in std::mem::take(&mut self.initial_payload.reversetunnels)
+            .into_iter()
+            .zip(std::mem::take(&mut self.remote_origins))
+        {
             let is_agent_forward = request.source.is_none()
                 && request.environmentvariable.as_deref() == Some("SSH_AUTH_SOCK");
-            if is_agent_forward {
-                true
-            } else if remote_requests.contains(request) {
-                false
-            } else {
+            if is_agent_forward || !remote_requests.contains(&request) {
                 remote_requests.push(request.clone());
-                true
+                deduplicated.push(request);
+                origins.push(origin);
             }
-        });
+        }
         for request in &resolved.remote_forwards {
             if !remote_requests.contains(request) {
                 remote_requests.push(request.clone());
-                self.initial_payload.reversetunnels.push(request.clone());
+                deduplicated.push(request.clone());
+                origins.push(et_net::forward::ForwardOrigin::SshConfig);
             }
         }
+        self.initial_payload.reversetunnels = deduplicated;
+        self.remote_origins = origins;
         validate_environment_names(&self.initial_payload.reversetunnels)
     }
 }
@@ -148,8 +154,10 @@ pub fn build(
         });
     }
     validate_environment_names(&reverse_tunnels)?;
+    let remote_origins = vec![et_net::forward::ForwardOrigin::Explicit; reverse_tunnels.len()];
     Ok(ForwardConfig {
         local_sources,
+        remote_origins,
         initial_payload: InitialPayload {
             jumphost: Some(false),
             reversetunnels: reverse_tunnels,

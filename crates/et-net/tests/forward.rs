@@ -179,6 +179,23 @@ fn authenticated_reverse_tcp_wildcard_bind_exposes_session_to_external_network()
         owner,
     );
 
+    let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = reservation.local_addr().unwrap().port();
+    let error = match Forwarder::start_with_user_report(
+        vec![request_on(&Ipv4Addr::UNSPECIFIED.to_string(), port, 1)],
+        Some(owner),
+    ) {
+        Ok((forwarder, _, _)) => {
+            forwarder.shutdown().unwrap();
+            panic!("authority failure was downgraded to a row report")
+        }
+        Err(error) => error,
+    };
+    match error {
+        ForwardError::Io(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
+        other => panic!("unexpected wildcard report result: {other}"),
+    }
+
     if let Ok(ipv6_probe) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) {
         drop(ipv6_probe);
         assert_authenticated_wildcard_rejected(

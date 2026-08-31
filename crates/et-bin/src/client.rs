@@ -156,6 +156,7 @@ fn run_client(
     // Bind local sources only after the encrypted session exists so accepted
     // tunnels can be multiplexed immediately (avoids pre-handshake accept races).
     let local_sources = forward_config.local_sources;
+    let remote_origins = forward_config.remote_origins;
     let mut initial_payload = forward_config.initial_payload;
     let user = requested_user.or(resolved.user);
     validate_ssh_destination(&destination.host, user.as_deref())?;
@@ -275,6 +276,7 @@ fn run_client(
         &endpoint,
         &credentials,
         &initial_payload,
+        &remote_origins,
         resolver,
         deadline,
     )?;

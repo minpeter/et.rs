@@ -180,6 +180,13 @@ fn ssh_config_forwards_are_cumulative_stable_and_exactly_deduplicated() {
     );
     assert_eq!(config.initial_payload.reversetunnels.len(), 2);
     assert_eq!(
+        config.remote_origins,
+        [
+            et_net::forward::ForwardOrigin::Explicit,
+            et_net::forward::ForwardOrigin::SshConfig,
+        ]
+    );
+    assert_eq!(
         config.initial_payload.reversetunnels[0],
         resolved.remote_forwards[0]
     );

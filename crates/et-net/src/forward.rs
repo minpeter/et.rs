@@ -13,6 +13,7 @@ use et_core::proto::{PortForwardSourceRequest, TerminalPacketType};
 use crate::forward_endpoint::{Endpoint, ResolvedEndpoint};
 use crate::forward_io::BoundSource;
 use crate::forward_worker::{run, Command};
+use crate::reverse_report::SkipReason;
 
 const CHANNEL_CAPACITY: usize = 256;
 /// Maximum reverse listeners owned by one terminal session, after DNS fanout
@@ -52,6 +53,7 @@ pub(crate) type Outbound = Result<Packet, ForwardError>;
 pub enum ForwardOrigin {
     Explicit,
     SshConfig,
+    Reported(usize),
 }
 
 pub struct ForwardSource {
@@ -78,6 +80,8 @@ impl ForwardSource {
 pub struct SkippedForward {
     pub request: PortForwardSourceRequest,
     pub error: io::Error,
+    pub reason: SkipReason,
+    pub report_index: Option<usize>,
 }
 
 pub struct Forwarder {
@@ -115,6 +119,21 @@ impl Forwarder {
     ) -> Result<(Self, ForwardEnvironment), ForwardError> {
         let sources = sources.into_iter().map(ForwardSource::explicit).collect();
         start_forwarder(sources, owner).map(|(forwarder, environment, _)| (forwarder, environment))
+    }
+
+    pub fn start_with_user_report(
+        sources: Vec<PortForwardSourceRequest>,
+        owner: Option<(u32, u32)>,
+    ) -> Result<(Self, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
+        let sources = sources
+            .into_iter()
+            .enumerate()
+            .map(|(index, request)| ForwardSource {
+                request,
+                origin: ForwardOrigin::Reported(index),
+            })
+            .collect();
+        start_forwarder(sources, owner)
     }
 }
 
@@ -299,18 +318,29 @@ fn bind_sources(
                 ));
             }
         } else {
-            let resolved =
-                Endpoint::parse(request.source).and_then(|source| source.resolve_for_bind());
-            let source = match resolved {
-                Ok(source) => source,
-                Err(error) if origin == ForwardOrigin::SshConfig => {
+            let endpoint = Endpoint::parse(request.source).map_err(ForwardError::Io)?;
+            let resolved = endpoint.resolve_for_bind();
+            let source = match (resolved, origin) {
+                (Ok(source), _) => source,
+                (Err(error), ForwardOrigin::SshConfig) => {
                     skipped.push(SkippedForward {
                         request: original,
                         error,
+                        reason: SkipReason::Resolve,
+                        report_index: None,
                     });
                     continue;
                 }
-                Err(error) => return Err(ForwardError::Io(error)),
+                (Err(error), ForwardOrigin::Reported(index)) => {
+                    skipped.push(SkippedForward {
+                        request: original,
+                        error,
+                        reason: SkipReason::Resolve,
+                        report_index: Some(index),
+                    });
+                    continue;
+                }
+                (Err(error), ForwardOrigin::Explicit) => return Err(ForwardError::Io(error)),
             };
             if owner.is_some() {
                 match &source {
@@ -359,8 +389,8 @@ fn bind_sources(
                 destination,
                 original,
                 origin,
-            } => match source.bind_with_user(owner) {
-                Ok(listeners) => {
+            } => match (source.bind_with_user(owner), origin) {
+                (Ok(listeners), _) => {
                     for listener in listeners {
                         bound.push(BoundSource {
                             listener,
@@ -368,13 +398,23 @@ fn bind_sources(
                         });
                     }
                 }
-                Err(error) if origin == ForwardOrigin::SshConfig => {
+                (Err(error), ForwardOrigin::SshConfig) => {
                     skipped.push(SkippedForward {
                         request: original,
                         error,
+                        reason: SkipReason::Bind,
+                        report_index: None,
                     });
                 }
-                Err(error) => return Err(ForwardError::Io(error)),
+                (Err(error), ForwardOrigin::Reported(index)) => {
+                    skipped.push(SkippedForward {
+                        request: original,
+                        error,
+                        reason: SkipReason::Bind,
+                        report_index: Some(index),
+                    });
+                }
+                (Err(error), ForwardOrigin::Explicit) => return Err(ForwardError::Io(error)),
             },
             #[cfg(unix)]
             PlannedSource::Environment {

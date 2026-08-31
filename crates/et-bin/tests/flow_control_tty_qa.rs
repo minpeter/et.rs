@@ -110,6 +110,7 @@ fn flow_control_keeps_ctrl_c_and_prompt_responsive_on_a_slow_link() {
         let prompt_timeout = MAX_PROMPT_LATENCY;
         let deadline = interrupted + prompt_timeout;
         writer.write_all(b"\x03").unwrap();
+        writer.flush().unwrap();
         let interrupt = receive_until(
             &receiver,
             output.clone(),
@@ -119,6 +120,9 @@ fn flow_control_keeps_ctrl_c_and_prompt_responsive_on_a_slow_link() {
         let prompt = interrupt.and_then(|output| {
             writer
                 .write_all(b"printf 'FLOW-%s\\n' PROMPT\n")
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)?;
+            writer
+                .flush()
                 .map_err(|_| mpsc::RecvTimeoutError::Disconnected)?;
             let remaining = deadline
                 .checked_duration_since(Instant::now())

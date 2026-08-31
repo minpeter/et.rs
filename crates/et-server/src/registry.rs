@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use et_core::crypto::KEY_LEN;
 use et_core::proto::TerminalUserInfo;
 
-use crate::registry_validation::validate;
+use crate::registry_validation::{validate, PeerIdentity};
 
 #[derive(Clone, Debug)]
 pub struct Registration {
@@ -103,8 +103,9 @@ impl Registry {
         &self,
         user_info: TerminalUserInfo,
         stream: LocalStream,
+        peer: PeerIdentity,
     ) -> Result<RegisteredTerminal, RegistrationError> {
-        let registration = validate(user_info)?;
+        let registration = validate(user_info, peer)?;
         let watcher = stream.try_clone().map_err(RegistrationError::Io)?;
         // The Windows router peeks this handle for EOF, which requires
         // non-blocking mode so a live session never stalls the loop.

@@ -77,6 +77,225 @@ fn unbindable_reverse_tunnel_reports_an_error_and_resets_the_slot() {
 }
 
 #[test]
+fn occupied_reverse_row_is_reported_while_usable_row_stays_live() {
+    let mut server = TestRuntime::start();
+    let _terminal = server.register(ID_A, KEY_A);
+    let key = passkey_to_key(KEY_A).unwrap();
+    let occupied_path = server.dir.path().join("reported-occupied.sock");
+    let usable_path = server.dir.path().join("reported-usable.sock");
+    let _occupied = std::os::unix::net::UnixListener::bind(&occupied_path).unwrap();
+    let request = |path: &std::path::Path| et_core::proto::PortForwardSourceRequest {
+        source: Some(et_core::proto::SocketEndpoint {
+            name: Some(path.to_string_lossy().into_owned()),
+            port: None,
+        }),
+        destination: Some(et_core::proto::SocketEndpoint {
+            name: Some("/tmp/destination.sock".to_owned()),
+            port: None,
+        }),
+        environmentvariable: None,
+    };
+    let payload = InitialPayload {
+        jumphost: Some(false),
+        reversetunnels: vec![request(&occupied_path), request(&usable_path)],
+        environmentvariables: HashMap::new(),
+    };
+
+    let (stream, _) = server.handshake(ID_A);
+    let (mut client, initial) = runtime_support::initialize(stream, &key, payload);
+    let report = et_net::reverse_report::decode_skipped_rows(initial.error.as_deref().unwrap(), 2)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        report,
+        [et_net::reverse_report::SkippedRow {
+            index: 0,
+            reason: et_net::reverse_report::SkipReason::Bind,
+        }]
+    );
+    runtime_support::acknowledge_skip_report(&mut client);
+    let usable = std::os::unix::net::UnixStream::connect(&usable_path).unwrap();
+    drop(usable);
+    drop(client);
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
+fn unacknowledged_report_releases_sibling_before_activation() {
+    let mut server = TestRuntime::start();
+    let _terminal = server.register(ID_A, KEY_A);
+    let key = passkey_to_key(KEY_A).unwrap();
+    let occupied_path = server.dir.path().join("unacked-occupied.sock");
+    let sibling_path = server.dir.path().join("unacked-sibling.sock");
+    let _occupied = std::os::unix::net::UnixListener::bind(&occupied_path).unwrap();
+    let request = |path: &std::path::Path| et_core::proto::PortForwardSourceRequest {
+        source: Some(et_core::proto::SocketEndpoint {
+            name: Some(path.to_string_lossy().into_owned()),
+            port: None,
+        }),
+        destination: Some(et_core::proto::SocketEndpoint {
+            name: Some("/tmp/destination.sock".to_owned()),
+            port: None,
+        }),
+        environmentvariable: None,
+    };
+    let payload = InitialPayload {
+        jumphost: Some(false),
+        reversetunnels: vec![request(&occupied_path), request(&sibling_path)],
+        environmentvariables: HashMap::new(),
+    };
+
+    let (stream, _) = server.handshake(ID_A);
+    let (client, initial) = runtime_support::initialize(stream, &key, payload);
+    assert!(initial.error.is_some());
+    drop(client);
+
+    server
+        .handle
+        .wait_for_state(ID_A, SessionState::Registered, TIMEOUT)
+        .unwrap();
+    assert!(!sibling_path.exists());
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
+fn reverse_row_and_report_bounds_are_global_fatal() {
+    let cases = [
+        vec![Default::default(); et_net::reverse_report::MAX_REVERSE_ROWS + 1],
+        vec![
+            et_core::proto::PortForwardSourceRequest {
+                source: Some(et_core::proto::SocketEndpoint {
+                    name: Some("a".repeat(256)),
+                    port: Some(1),
+                }),
+                destination: Some(et_core::proto::SocketEndpoint {
+                    name: Some("127.0.0.1".to_owned()),
+                    port: Some(1),
+                }),
+                environmentvariable: None,
+            };
+            et_net::reverse_report::MAX_REVERSE_ROWS
+        ],
+    ];
+    for requests in cases {
+        let count = requests.len();
+        let mut server = TestRuntime::start();
+        let _terminal = server.register(ID_A, KEY_A);
+        let key = passkey_to_key(KEY_A).unwrap();
+        let payload = InitialPayload {
+            jumphost: Some(false),
+            reversetunnels: requests,
+            environmentvariables: HashMap::new(),
+        };
+
+        let (stream, _) = server.handshake(ID_A);
+        let (_, initial) = runtime_support::initialize(stream, &key, payload);
+
+        let error = initial.error.unwrap();
+        assert_eq!(
+            et_net::reverse_report::decode_skipped_rows(&error, count).unwrap(),
+            None
+        );
+        server.runtime.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn reverse_listener_cap_is_prebind_transactional_on_server() {
+    let mut server = TestRuntime::start();
+    let _terminal = server.register(ID_A, KEY_A);
+    let key = passkey_to_key(KEY_A).unwrap();
+    let paths: Vec<_> = (0..33)
+        .map(|index| server.dir.path().join(format!("cap-{index}.sock")))
+        .collect();
+    let payload = InitialPayload {
+        jumphost: Some(false),
+        reversetunnels: paths
+            .iter()
+            .map(|path| et_core::proto::PortForwardSourceRequest {
+                source: Some(et_core::proto::SocketEndpoint {
+                    name: Some(path.to_string_lossy().into_owned()),
+                    port: None,
+                }),
+                destination: Some(et_core::proto::SocketEndpoint {
+                    name: Some("/tmp/destination.sock".to_owned()),
+                    port: None,
+                }),
+                environmentvariable: None,
+            })
+            .collect(),
+        environmentvariables: HashMap::new(),
+    };
+
+    let (stream, _) = server.handshake(ID_A);
+    let (_, initial) = runtime_support::initialize(stream, &key, payload);
+
+    assert!(initial
+        .error
+        .is_some_and(|error| error.contains("listener limit")));
+    assert!(paths.iter().all(|path| !path.exists()));
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
+fn hostile_origin_marker_does_not_change_origin_independent_report() {
+    fn run(marker: Option<&str>) -> String {
+        let mut server = TestRuntime::start();
+        let _terminal = server.register(ID_A, KEY_A);
+        let key = passkey_to_key(KEY_A).unwrap();
+        let occupied_path = server.dir.path().join("hostile-origin.sock");
+        let usable_path = server.dir.path().join("hostile-usable.sock");
+        let _occupied = std::os::unix::net::UnixListener::bind(&occupied_path).unwrap();
+        let request = |path: &std::path::Path, environmentvariable: Option<String>| {
+            et_core::proto::PortForwardSourceRequest {
+                source: Some(et_core::proto::SocketEndpoint {
+                    name: Some(path.to_string_lossy().into_owned()),
+                    port: None,
+                }),
+                destination: Some(et_core::proto::SocketEndpoint {
+                    name: Some("/tmp/destination.sock".to_owned()),
+                    port: None,
+                }),
+                environmentvariable,
+            }
+        };
+        let payload = InitialPayload {
+            jumphost: Some(false),
+            reversetunnels: vec![
+                request(&occupied_path, marker.map(str::to_owned)),
+                request(&usable_path, None),
+            ],
+            environmentvariables: HashMap::new(),
+        };
+
+        let (stream, _) = server.handshake(ID_A);
+        let (mut client, initial) = runtime_support::initialize(stream, &key, payload);
+        let report = initial.error.unwrap();
+        runtime_support::acknowledge_skip_report(&mut client);
+        let usable = std::os::unix::net::UnixStream::connect(&usable_path).unwrap();
+        drop(usable);
+        drop(client);
+        server.runtime.shutdown().unwrap();
+        report
+    }
+
+    let ordinary = run(None);
+    let hostile = run(Some("ET_RS_SSH_CONFIG_REMOTE_FORWARD"));
+
+    assert_eq!(hostile, ordinary);
+    assert_eq!(
+        et_net::reverse_report::decode_skipped_rows(&hostile, 2)
+            .unwrap()
+            .unwrap(),
+        [et_net::reverse_report::SkippedRow {
+            index: 0,
+            reason: et_net::reverse_report::SkipReason::Bind,
+        }]
+    );
+}
+
+#[test]
 fn jumphost_payload_is_relayed_to_the_registered_terminal() {
     let mut server = TestRuntime::start();
     let mut terminal = server.register(ID_A, KEY_A);
@@ -88,16 +307,26 @@ fn jumphost_payload_is_relayed_to_the_registered_terminal() {
     };
     let (stream, response) = server.handshake(ID_A);
     assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let terminal_handshake = std::thread::spawn(move || {
+        let packet = et_net::local_packet::read_local_packet(&mut terminal).unwrap();
+        assert_eq!(
+            packet.header(),
+            et_core::proto::TerminalPacketType::JumphostInit as u8
+        );
+        let relayed = InitialPayload::decode(packet.payload()).unwrap();
+        et_net::local_packet::write_local_packet(
+            &mut terminal,
+            &et_core::packet::Packet::new(
+                et_core::proto::TerminalPacketType::JumphostInit as u8,
+                InitialResponse { error: None }.encode_to_vec(),
+            ),
+        )
+        .unwrap();
+        relayed
+    });
     let (_client, initial) = runtime_support::initialize(stream, &key, payload);
-    // Jumphost sessions succeed: upstream `runJumpHost` answers with an empty
-    // InitialResponse and forwards JUMPHOST_INIT to the jump terminal.
     assert!(initial.error.is_none(), "{:?}", initial.error);
-    let packet = et_net::local_packet::read_local_packet(&mut terminal).unwrap();
-    assert_eq!(
-        packet.header(),
-        et_core::proto::TerminalPacketType::JumphostInit as u8
-    );
-    let relayed = InitialPayload::decode(packet.payload()).unwrap();
+    let relayed = terminal_handshake.join().unwrap();
     assert_eq!(relayed.jumphost, Some(true));
     server.runtime.shutdown().unwrap();
 }

@@ -12,6 +12,7 @@ use rustix::event::{poll, PollFd, PollFlags};
 use rustix::net::{recv, RecvFlags};
 
 use crate::registry::{RegistrationIdentity, Registry};
+use crate::registry_validation::PeerIdentity;
 use crate::router::{RouterError, RouterEvent, RouterReject};
 use crate::router_registration;
 use crate::runtime_lifecycle::LifecycleEvent;
@@ -23,6 +24,7 @@ use crate::socket_path_windows::OwnedRouterListener;
 struct PendingConnection {
     stream: LocalStream,
     decoder: LocalPacketDecoder,
+    peer: PeerIdentity,
 }
 
 struct WatchedRegistration {
@@ -140,7 +142,12 @@ fn run_poll(
                 ReadOutcome::Pending => {}
                 ReadOutcome::Packet(packet) => {
                     let connection = pending.swap_remove(index);
-                    match router_registration::process(packet, connection.stream, &registry) {
+                    match router_registration::process(
+                        packet,
+                        connection.stream,
+                        &registry,
+                        connection.peer,
+                    ) {
                         Ok(terminal) => {
                             let id = terminal.identity.id().to_owned();
                             terminal
@@ -234,7 +241,12 @@ fn run_windows(
                 ReadOutcome::Packet(packet) => {
                     progress = true;
                     let connection = pending.swap_remove(index);
-                    match router_registration::process(packet, connection.stream, &registry) {
+                    match router_registration::process(
+                        packet,
+                        connection.stream,
+                        &registry,
+                        connection.peer,
+                    ) {
                         Ok(terminal) => {
                             let id = terminal.identity.id().to_owned();
                             watched.push(WatchedRegistration {
@@ -303,10 +315,12 @@ fn accept_ready(
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                let peer = PeerIdentity::from_stream(&stream).map_err(RouterError::Io)?;
                 stream.set_nonblocking(true).map_err(RouterError::Io)?;
                 pending.push(PendingConnection {
                     stream,
                     decoder: LocalPacketDecoder::new(),
+                    peer,
                 });
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),

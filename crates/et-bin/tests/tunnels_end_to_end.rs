@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use reconnect_stack::{mkfifo, shell_quote, Stack};
 use tunnel_support::SingleCutProxy;
+use wait_timeout::ChildExt;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -22,11 +23,11 @@ fn ssh_config_local_and_remote_tunnels_relay_real_tcp_payloads() {
     let mut stack = Stack::start();
     let local_destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let local_destination_port = local_destination.local_addr().unwrap().port();
-    let local_echo = spawn_tcp_echo(local_destination);
+    let local_echo = spawn_tcp_echo_once(local_destination, b"config-local");
     let local_source_port = reserve_port();
     let reverse_destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let reverse_destination_port = reverse_destination.local_addr().unwrap().port();
-    let reverse_echo = spawn_tcp_echo(reverse_destination);
+    let reverse_echo = spawn_tcp_echo_once(reverse_destination, b"config-reverse");
     let reverse_source_port = reserve_port();
     let gate = stack.directory.join("ssh-config-ready");
     mkfifo(&gate);
@@ -52,13 +53,392 @@ fn ssh_config_local_and_remote_tunnels_relay_real_tcp_payloads() {
         .arg(format!("tester@127.0.0.1:{}", stack.port));
     let mut client = client.spawn().unwrap();
 
-    await_fifo(&gate);
-    assert_tcp_round_trip(local_source_port, b"config-local");
-    assert_tcp_round_trip(reverse_source_port, b"config-reverse");
+    await_fifo(&gate, &mut client);
+    assert_ready_tcp_round_trip(local_source_port, b"config-local");
+    assert_ready_tcp_round_trip(reverse_source_port, b"config-reverse");
 
     stop(&mut client);
     local_echo.join().unwrap();
     reverse_echo.join().unwrap();
+    stack.shutdown();
+}
+
+#[test]
+fn ssh_config_hardening_imported_bind_failure_skips_only_that_row() {
+    let mut stack = Stack::start();
+    let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let occupied_port = occupied.local_addr().unwrap().port();
+    let destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let destination_port = destination.local_addr().unwrap().port();
+    let echo = spawn_tcp_echo_once(destination, b"usable-import");
+    let usable_port = reserve_port();
+    let gate = stack.directory.join("imported-bind-ready");
+    mkfifo(&gate);
+    let config = format!(
+        "hostname 127.0.0.1
+user tester
+gatewayports no
+         localforward {occupied_port} [127.0.0.1]:{destination_port}
+         localforward {usable_port} [127.0.0.1]:{destination_port}
+"
+    );
+    let mut client = Command::new(env!("CARGO_BIN_EXE_et"));
+    client
+        .env("PATH", &stack.directory)
+        .env("ET_SSH_COUNT", &stack.ssh_count)
+        .env("ET_SSH_CONFIG", config)
+        .env("ET_SSH_READY", &gate)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(["--logtostdout", "--terminal-path"])
+        .arg(&stack.terminal)
+        .args(["--serverfifo"])
+        .arg(&stack.router)
+        .arg("-N")
+        .arg(format!("tester@127.0.0.1:{}", stack.port));
+    let mut client = client.spawn().unwrap();
+
+    let ready = {
+        let gate = gate.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = sender.send(fs::read_to_string(gate));
+        });
+        receiver
+            .recv_timeout(TIMEOUT)
+            .expect("imported bind failure prevented client readiness")
+            .unwrap()
+    };
+    assert_eq!(ready, "ready");
+    assert_ready_tcp_round_trip(usable_port, b"usable-import");
+
+    stop(&mut client);
+    let mut output = String::new();
+    client
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert_eq!(
+        output
+            .lines()
+            .filter(|line| line.contains("WARNING"))
+            .count(),
+        1
+    );
+    drop(occupied);
+    echo.join().unwrap();
+    stack.shutdown();
+}
+
+#[test]
+fn imported_remote_bind_report_warns_and_keeps_usable_row_live() {
+    let mut stack = Stack::start();
+    let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let occupied_port = occupied.local_addr().unwrap().port();
+    let destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let destination_port = destination.local_addr().unwrap().port();
+    let echo = spawn_tcp_echo_once(destination, b"usable-remote-import");
+    let usable_port = reserve_port();
+    let gate = stack.directory.join("imported-remote-bind-ready");
+    mkfifo(&gate);
+    let config = format!(
+        "hostname 127.0.0.1\nuser tester\n\
+         remoteforward {occupied_port} [127.0.0.1]:{destination_port}\n\
+         remoteforward {usable_port} [127.0.0.1]:{destination_port}\n"
+    );
+    let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env("PATH", &stack.directory)
+        .env("ET_SSH_COUNT", &stack.ssh_count)
+        .env("ET_SSH_CONFIG", config)
+        .env("ET_SSH_READY", &gate)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(["--logtostdout", "--terminal-path"])
+        .arg(&stack.terminal)
+        .args(["--serverfifo"])
+        .arg(&stack.router)
+        .arg("-N")
+        .arg(format!("tester@127.0.0.1:{}", stack.port))
+        .spawn()
+        .unwrap();
+
+    assert_eq!(await_fifo(&gate, &mut client), "ready");
+    assert_ready_tcp_round_trip(usable_port, b"usable-remote-import");
+
+    stop(&mut client);
+    let mut output = String::new();
+    client
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert_eq!(
+        output
+            .lines()
+            .filter(|line| line.contains("WARNING"))
+            .count(),
+        1
+    );
+    drop(occupied);
+    echo.join().unwrap();
+    stack.shutdown();
+}
+
+#[test]
+fn native_jumphost_relays_imported_remote_skip_report_and_acknowledgement() {
+    let mut destination = Stack::start();
+    let mut jump = Stack::start();
+    let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let occupied_port = occupied.local_addr().unwrap().port();
+    let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let backend_port = backend.local_addr().unwrap().port();
+    let echo = spawn_tcp_echo_once(backend, b"native-jump-report");
+    let usable_port = reserve_port();
+    let gate = destination.directory.join("native-jump-report-ready");
+    mkfifo(&gate);
+    let config = format!(
+        "hostname 127.0.0.1\nuser tester\n\
+         remoteforward {occupied_port} [127.0.0.1]:{backend_port}\n\
+         remoteforward {usable_port} [127.0.0.1]:{backend_port}\n"
+    );
+    let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env("PATH", &destination.directory)
+        .env("ET_SSH_COUNT", &destination.ssh_count)
+        .env("ET_SSH_CONFIG", config)
+        .env("ET_SSH_READY", &gate)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(["--logtostdout", "--terminal-path"])
+        .arg(&destination.terminal)
+        .args(["--serverfifo"])
+        .arg(&destination.router)
+        .args(["--jumphost", "jump.example", "--jport"])
+        .arg(jump.port.to_string())
+        .args(["--jserverfifo"])
+        .arg(&jump.router)
+        .arg("-N")
+        .arg(format!("tester@127.0.0.1:{}", destination.port))
+        .spawn()
+        .unwrap();
+
+    assert_eq!(await_fifo(&gate, &mut client), "ready");
+    assert_ready_tcp_round_trip(usable_port, b"native-jump-report");
+
+    stop(&mut client);
+    let mut output = String::new();
+    client
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert_eq!(
+        output
+            .lines()
+            .filter(|line| line.contains("WARNING"))
+            .count(),
+        1
+    );
+    drop(occupied);
+    echo.join().unwrap();
+    jump.shutdown();
+    destination.shutdown();
+}
+
+#[test]
+fn native_jumphost_explicit_remote_skip_aborts_and_releases_final_sibling() {
+    let mut destination = Stack::start();
+    let mut jump = Stack::start();
+    let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let occupied_port = occupied.local_addr().unwrap().port();
+    let sibling_port = reserve_port();
+    let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env("PATH", &destination.directory)
+        .env("ET_SSH_COUNT", &destination.ssh_count)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .args(["--terminal-path"])
+        .arg(&destination.terminal)
+        .args(["--serverfifo"])
+        .arg(&destination.router)
+        .args(["--jumphost", "jump.example", "--jport"])
+        .arg(jump.port.to_string())
+        .args(["--jserverfifo"])
+        .arg(&jump.router)
+        .args(["-N", "-r"])
+        .arg(format!("{occupied_port}:1"))
+        .arg("-r")
+        .arg(format!("{sibling_port}:1"))
+        .arg(format!("tester@127.0.0.1:{}", destination.port))
+        .spawn()
+        .unwrap();
+
+    let status = client
+        .wait_timeout(TIMEOUT)
+        .unwrap()
+        .expect("native jumphost explicit skip did not terminate the top-level client");
+    let mut error = String::new();
+    client
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut error)
+        .unwrap();
+
+    assert!(!status.success());
+    assert!(
+        error.contains("explicit reverse forwarding row could not bind"),
+        "{error}"
+    );
+    jump.shutdown();
+    destination.shutdown();
+    let rebound = TcpListener::bind((Ipv4Addr::LOCALHOST, sibling_port)).unwrap();
+    drop(rebound);
+    drop(occupied);
+}
+
+#[test]
+fn explicit_remote_bind_report_aborts_and_releases_sibling_listener() {
+    let mut stack = Stack::start();
+    let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let occupied_port = occupied.local_addr().unwrap().port();
+    let sibling_port = reserve_port();
+    let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env("PATH", &stack.directory)
+        .env("ET_SSH_COUNT", &stack.ssh_count)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .args(["--terminal-path"])
+        .arg(&stack.terminal)
+        .args(["--serverfifo"])
+        .arg(&stack.router)
+        .args(["-N", "-r"])
+        .arg(format!("{occupied_port}:1"))
+        .arg("-r")
+        .arg(format!("{sibling_port}:1"))
+        .arg(format!("tester@127.0.0.1:{}", stack.port))
+        .spawn()
+        .unwrap();
+
+    let status = client
+        .wait_timeout(TIMEOUT)
+        .unwrap()
+        .expect("explicit reported bind failure did not terminate the client");
+    let mut error = String::new();
+    client
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut error)
+        .unwrap();
+
+    assert!(!status.success());
+    assert!(
+        error.contains("explicit reverse forwarding row could not bind"),
+        "{error}"
+    );
+    stack.shutdown();
+    let rebound = TcpListener::bind((Ipv4Addr::LOCALHOST, sibling_port)).unwrap();
+    drop(rebound);
+    drop(occupied);
+}
+
+#[test]
+fn cumulative_local_forwards_deduplicate_exact_rows_but_preserve_distinct_destinations() {
+    // Given
+    let mut stack = Stack::start();
+    let destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let destination_port = destination.local_addr().unwrap().port();
+    let echo = spawn_tcp_echo_once(destination, b"cumulative");
+    let distinct_destination_port = reserve_port();
+    let source_port = reserve_port();
+    let gate = stack.directory.join("cumulative-local-ready");
+    mkfifo(&gate);
+    let exact = format!("localhost:{source_port}:127.0.0.1:{destination_port}");
+    let config = format!(
+        "hostname 127.0.0.1\nuser tester\ngatewayports no\n\
+         localforward {source_port} [127.0.0.1]:{destination_port}\n\
+         localforward {source_port} [127.0.0.1]:{destination_port}\n\
+         localforward {source_port} [127.0.0.1]:{distinct_destination_port}\n"
+    );
+    let mut client = Command::new(env!("CARGO_BIN_EXE_et"));
+    client
+        .env("PATH", &stack.directory)
+        .env("ET_SSH_COUNT", &stack.ssh_count)
+        .env("ET_SSH_CONFIG", config)
+        .env("ET_SSH_READY", &gate)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(["--logtostdout", "--terminal-path"])
+        .arg(&stack.terminal)
+        .args(["--serverfifo"])
+        .arg(&stack.router)
+        .args(["-N", "--tunnel", &exact, "--tunnel", &exact])
+        .arg(format!("tester@127.0.0.1:{}", stack.port));
+
+    // When
+    let mut client = client.spawn().unwrap();
+    assert_eq!(await_fifo(&gate, &mut client), "ready");
+    assert_ready_tcp_round_trip(source_port, b"cumulative");
+
+    // Then
+    stop(&mut client);
+    let mut output = String::new();
+    client
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert_eq!(
+        output
+            .lines()
+            .filter(|line| line.contains("WARNING"))
+            .count(),
+        1,
+        "only the distinct same-source row should reach bind-failure policy: {output}"
+    );
+    echo.join().unwrap();
+    stack.shutdown();
+}
+
+#[test]
+fn ssh_config_hardening_explicit_bind_failure_remains_fatal() {
+    let mut stack = Stack::start();
+    let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let occupied_port = occupied.local_addr().unwrap().port();
+    let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env("PATH", &stack.directory)
+        .env("ET_SSH_COUNT", &stack.ssh_count)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .args(["--terminal-path"])
+        .arg(&stack.terminal)
+        .args(["--serverfifo"])
+        .arg(&stack.router)
+        .args(["-N", "--tunnel"])
+        .arg(format!("{occupied_port}:1"))
+        .arg(format!("tester@127.0.0.1:{}", stack.port))
+        .spawn()
+        .unwrap();
+
+    let status = client
+        .wait_timeout(TIMEOUT)
+        .unwrap()
+        .expect("explicit bind failure did not terminate the client");
+
+    assert!(!status.success());
+    drop(occupied);
     stack.shutdown();
 }
 
@@ -116,7 +496,7 @@ fn ssh_config_mixed_unix_tcp_tunnels_relay_on_both_axes() {
         .arg(format!("tester@127.0.0.1:{}", stack.port));
     let mut client = client.spawn().unwrap();
 
-    await_fifo(&gate);
+    await_fifo(&gate, &mut client);
     assert_unix_round_trip(&local_unix_source, b"local-unix-source");
     assert_ready_tcp_round_trip(local_tcp_source_port, b"local-unix-destination");
     assert_unix_round_trip(&remote_unix_source, b"remote-unix-source");
@@ -135,7 +515,7 @@ fn cli_local_and_reverse_tunnels_relay_real_tcp_payloads() {
     let mut stack = Stack::start();
     let local_destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let local_destination_port = local_destination.local_addr().unwrap().port();
-    let local_echo = spawn_tcp_echo(local_destination);
+    let local_echo = spawn_tcp_echo_once(local_destination, b"local");
     let local_source_port = reserve_port();
     let local_gate = stack.directory.join("local-ready");
     mkfifo(&local_gate);
@@ -148,14 +528,16 @@ fn cli_local_and_reverse_tunnels_relay_real_tcp_payloads() {
         true,
         None,
     );
-    await_fifo(&local_gate);
-    assert_tcp_round_trip(local_source_port, b"local");
+    await_fifo(&local_gate, &mut local_client);
+    assert_ready_tcp_round_trip(local_source_port, b"local");
     stop(&mut local_client);
     local_echo.join().unwrap();
+    stack.shutdown();
 
+    let mut stack = Stack::start();
     let reverse_destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let reverse_destination_port = reverse_destination.local_addr().unwrap().port();
-    let reverse_echo = spawn_tcp_echo(reverse_destination);
+    let reverse_echo = spawn_tcp_echo_once(reverse_destination, b"reverse");
     let reverse_source_port = reserve_port();
     let reverse_gate = stack.directory.join("reverse-ready");
     mkfifo(&reverse_gate);
@@ -168,10 +550,40 @@ fn cli_local_and_reverse_tunnels_relay_real_tcp_payloads() {
         false,
         None,
     );
-    await_fifo(&reverse_gate);
-    assert_tcp_round_trip(reverse_source_port, b"reverse");
+    await_fifo(&reverse_gate, &mut reverse_client);
+    assert_ready_tcp_round_trip(reverse_source_port, b"reverse");
     stop(&mut reverse_client);
     reverse_echo.join().unwrap();
+    stack.shutdown();
+}
+
+#[test]
+fn cli_remote_unix_tunnel_relays_on_a_fresh_source_path() {
+    // Given
+    let mut stack = Stack::start();
+    let source = stack.directory.join("cli-remote-source.sock");
+    let destination_path = stack.directory.join("cli-remote-destination.sock");
+    let destination = UnixListener::bind(&destination_path).unwrap();
+    let echo = spawn_unix_echo(destination, b"cli-remote-unix");
+    let gate = stack.directory.join("cli-remote-unix-ready");
+    mkfifo(&gate);
+    let mut client = spawn_client(
+        &stack,
+        &format!("{}:{}", source.display(), destination_path.display()),
+        true,
+        &gate,
+        None,
+        true,
+        None,
+    );
+
+    // When
+    assert_eq!(await_fifo(&gate, &mut client), "ready");
+    assert_unix_round_trip(&source, b"cli-remote-unix");
+
+    // Then
+    stop(&mut client);
+    echo.join().unwrap();
     stack.shutdown();
 }
 
@@ -198,7 +610,7 @@ fn cli_ssh_agent_forwarding_relays_a_real_unix_socket() {
         false,
         None,
     );
-    let remote_agent_path = await_fifo(&gate);
+    let remote_agent_path = await_fifo(&gate, &mut client);
     let mut remote = UnixStream::connect(&remote_agent_path).unwrap();
     remote.set_read_timeout(Some(TIMEOUT)).unwrap();
     remote.write_all(b"agent").unwrap();
@@ -243,7 +655,7 @@ fn active_local_tunnel_survives_et_reconnect() {
         true,
         Some(proxy.port),
     );
-    await_fifo(&gate);
+    await_fifo(&gate, &mut client);
     // Wait until the local source accepts (listener bound after handshake).
     let mut application = wait_connect(source_port);
     application.set_read_timeout(Some(TIMEOUT)).unwrap();
@@ -285,6 +697,7 @@ fn spawn_client(
     process
         .env("PATH", &stack.directory)
         .env("ET_SSH_COUNT", &stack.ssh_count)
+        .env("ET_SHELL", "/bin/sh")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -313,35 +726,6 @@ fn spawn_client(
         .unwrap()
 }
 
-fn spawn_tcp_echo(listener: TcpListener) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        // Accept multiple times so readiness retries do not exhaust a one-shot echo.
-        let deadline = std::time::Instant::now() + TIMEOUT + TIMEOUT;
-        listener
-            .set_nonblocking(true)
-            .expect("echo listener nonblocking");
-        while std::time::Instant::now() < deadline {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    stream.set_nonblocking(false).ok();
-                    stream.set_read_timeout(Some(TIMEOUT)).ok();
-                    let mut payload = [0u8; 16];
-                    if let Ok(count) = stream.read(&mut payload) {
-                        if count > 0 {
-                            let _ = stream.write_all(&payload[..count]);
-                        }
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Brief park while waiting for the next tunnel probe.
-                    thread::park_timeout(Duration::from_millis(10));
-                }
-                Err(_) => break,
-            }
-        }
-    })
-}
-
 fn spawn_tcp_echo_once(listener: TcpListener, expected: &'static [u8]) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -363,34 +747,6 @@ fn echo_once(stream: &mut (impl Read + Write), expected: &[u8]) {
     stream.read_exact(&mut payload).unwrap();
     assert_eq!(payload, expected);
     stream.write_all(&payload).unwrap();
-}
-
-fn assert_tcp_round_trip(port: u16, payload: &[u8]) {
-    // Poll until the tunnel source is bound and the multiplex path is live.
-    let deadline = std::time::Instant::now() + TIMEOUT;
-    let mut last = None;
-    while std::time::Instant::now() < deadline {
-        match TcpStream::connect_timeout(
-            &std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-            Duration::from_millis(50),
-        ) {
-            Ok(mut stream) => {
-                stream
-                    .set_read_timeout(Some(Duration::from_millis(500)))
-                    .unwrap();
-                stream.set_write_timeout(Some(TIMEOUT)).unwrap();
-                match try_stream_round_trip(&mut stream, payload) {
-                    Ok(()) => return,
-                    Err(error) => last = Some(error),
-                }
-            }
-            Err(error) => last = Some(error),
-        }
-    }
-    panic!(
-        "tunnel round-trip on port {port} failed within {TIMEOUT:?}: {:?}",
-        last
-    );
 }
 
 fn try_stream_round_trip(stream: &mut (impl Read + Write), payload: &[u8]) -> std::io::Result<()> {
@@ -448,13 +804,36 @@ fn reserve_port() -> u16 {
         .port()
 }
 
-fn await_fifo(path: &std::path::Path) -> String {
+fn await_fifo(path: &std::path::Path, child: &mut Child) -> String {
     let path = path.to_owned();
+    let reader_path = path.clone();
     let (sender, receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let _ = sender.send(fs::read_to_string(path));
+    let reader = thread::spawn(move || {
+        let _ = sender.send(fs::read_to_string(reader_path));
     });
-    receiver.recv_timeout(TIMEOUT).unwrap().unwrap()
+    match receiver.recv_timeout(TIMEOUT) {
+        Ok(result) => {
+            reader.join().unwrap();
+            result.unwrap()
+        }
+        Err(error) => {
+            let status = child.try_wait().unwrap();
+            if status.is_none() {
+                child.kill().unwrap();
+                let _ = child.wait().unwrap();
+            }
+            let _ = fs::OpenOptions::new().write(true).open(&path);
+            reader.join().unwrap();
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!("client readiness failed: {error}; status={status:?}; stderr={stderr}");
+        }
+    }
 }
 
 fn stop(child: &mut Child) {

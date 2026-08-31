@@ -44,9 +44,8 @@ impl Endpoint {
                 }
                 // Upstream sends TCP endpoints with the name unset for the
                 // common `port:port` tunnel form; treat those as localhost.
-                let host = name.filter(|name| !name.is_empty());
                 Ok(Self::Tcp {
-                    host: host.unwrap_or_else(|| "localhost".to_owned()),
+                    host: name.unwrap_or_else(|| "localhost".to_owned()),
                     port,
                 })
             }
@@ -160,33 +159,13 @@ impl Endpoint {
         }
     }
 
-    pub(crate) fn bind_with_user(
-        &self,
-        user: Option<(u32, u32)>,
-    ) -> io::Result<Vec<ForwardListener>> {
-        match (self, user) {
-            #[cfg(unix)]
-            (Self::Unix(path), Some((uid, gid))) => {
-                let listener = crate::user_socket_ops::listen_unix_as_user(path, uid, gid)?;
-                listener.set_nonblocking(true)?;
-                Ok(vec![ForwardListener {
-                    inner: ListenerKind::Unix(listener),
-                    cleanup: Some(path.clone()),
-                    cleanup_dir: None,
-                }])
-            }
-            _ => self.bind(),
-        }
-    }
-
-    pub(crate) fn bind(&self) -> io::Result<Vec<ForwardListener>> {
+    pub(crate) fn resolve_for_bind(&self) -> io::Result<ResolvedEndpoint> {
         match self {
             Self::Tcp { host, port } => {
                 // Mirror upstream `TcpSocketHandler::listen`: resolve the bind
                 // name with getaddrinfo semantics and bind every distinct
-                // address ("localhost" usually yields both ::1 and 127.0.0.1;
-                // an empty name binds the wildcard addresses).
-                let addresses: Vec<std::net::SocketAddr> = if host.is_empty() {
+                // address ("localhost" usually yields both loopback families).
+                let addresses = if host.is_empty() {
                     vec![
                         (std::net::Ipv6Addr::UNSPECIFIED, *port).into(),
                         (std::net::Ipv4Addr::UNSPECIFIED, *port).into(),
@@ -199,11 +178,58 @@ impl Endpoint {
                 } else {
                     (host.as_str(), *port).to_socket_addrs()?.collect()
                 };
-                let addresses = distinct_tcp_addresses(addresses);
-                bind_tcp_addresses(addresses)
+                Ok(ResolvedEndpoint::Tcp(distinct_tcp_addresses(addresses)))
             }
             #[cfg(unix)]
-            Self::Unix(path) => {
+            Self::Unix(path) => Ok(ResolvedEndpoint::Unix(path.clone())),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind(&self) -> io::Result<Vec<ForwardListener>> {
+        self.resolve_for_bind()?.bind_with_user(None)
+    }
+}
+
+pub(crate) enum ResolvedEndpoint {
+    Tcp(Vec<std::net::SocketAddr>),
+    #[cfg(unix)]
+    Unix(PathBuf),
+}
+
+impl ResolvedEndpoint {
+    pub(crate) fn listener_count(&self) -> usize {
+        match self {
+            Self::Tcp(addresses) => addresses.len(),
+            #[cfg(unix)]
+            Self::Unix(_) => 1,
+        }
+    }
+
+    pub(crate) fn bind_with_user(
+        &self,
+        user: Option<(u32, u32)>,
+    ) -> io::Result<Vec<ForwardListener>> {
+        match (self, user) {
+            #[cfg(unix)]
+            (Self::Tcp(addresses), Some((uid, gid))) => {
+                bind_tcp_addresses_with(addresses.iter().copied(), |address| {
+                    crate::user_socket_ops::listen_tcp_as_user(address, uid, gid).map(Some)
+                })
+            }
+            (Self::Tcp(addresses), _) => bind_tcp_addresses(addresses.iter().copied()),
+            #[cfg(unix)]
+            (Self::Unix(path), Some((uid, gid))) => {
+                let listener = crate::user_socket_ops::listen_unix_as_user(path, uid, gid)?;
+                listener.set_nonblocking(true)?;
+                Ok(vec![ForwardListener {
+                    inner: ListenerKind::Unix(listener),
+                    cleanup: Some(path.clone()),
+                    cleanup_dir: None,
+                }])
+            }
+            #[cfg(unix)]
+            (Self::Unix(path), None) => {
                 if path.exists() {
                     return Err(io::Error::new(
                         io::ErrorKind::AddrInUse,
@@ -222,6 +248,7 @@ impl Endpoint {
                     None
                 };
                 let listener = UnixListener::bind(path)?;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
                 listener.set_nonblocking(true)?;
                 Ok(vec![ForwardListener {
                     inner: ListenerKind::Unix(listener),
@@ -275,7 +302,9 @@ fn distinct_tcp_addresses(
 /// Bind one TCP listener for exactly one address family, mirroring upstream
 /// `TcpSocketHandler::listen` (which sets `IPV6_V6ONLY` and binds each
 /// resolved address separately).
-fn bind_tcp_single_family(address: std::net::SocketAddr) -> io::Result<Option<TcpListener>> {
+pub(crate) fn bind_tcp_single_family(
+    address: std::net::SocketAddr,
+) -> io::Result<Option<TcpListener>> {
     let domain = if address.is_ipv6() {
         socket2::Domain::IPV6
     } else {
@@ -435,6 +464,24 @@ impl Drop for ForwardListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_source_bind_uses_openssh_default_owner_only_mode() {
+        // Given
+        let path = std::env::temp_dir().join(format!("et-forward-mode-{}", std::process::id()));
+        let endpoint = ResolvedEndpoint::Unix(path.clone());
+
+        // When
+        let listeners = endpoint.bind_with_user(None).unwrap();
+
+        // Then
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(listeners);
+    }
 
     #[test]
     fn localhost_bind_rejects_one_occupied_address_family() {

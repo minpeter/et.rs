@@ -138,11 +138,11 @@ fn run_client(
         &destination.host,
         requested_user.as_deref(),
         &args.ssh_option,
-        args.tunnel.is_empty(),
-        args.reverse_tunnel.is_empty(),
+        true,
+        true,
         deadline,
     )?;
-    forward_config.apply_ssh_config(args, &resolved)?;
+    forward_config.apply_ssh_config(&resolved)?;
     if args.jumphost.is_some() {
         bound_jumphost_locale_environment(
             &forward_config.initial_payload,
@@ -156,6 +156,7 @@ fn run_client(
     // Bind local sources only after the encrypted session exists so accepted
     // tunnels can be multiplexed immediately (avoids pre-handshake accept races).
     let local_sources = forward_config.local_sources;
+    let remote_origins = forward_config.remote_origins;
     let mut initial_payload = forward_config.initial_payload;
     let user = requested_user.or(resolved.user);
     validate_ssh_destination(&destination.host, user.as_deref())?;
@@ -275,6 +276,7 @@ fn run_client(
         &endpoint,
         &credentials,
         &initial_payload,
+        &remote_origins,
         resolver,
         deadline,
     )?;
@@ -282,8 +284,21 @@ fn run_client(
     if args.no_terminal && !has_forwarding {
         return Ok(());
     }
-    let forwarder = et_net::forward::Forwarder::start(local_sources)
+    let (forwarder, skipped) = et_net::forward::Forwarder::start_with_origins(local_sources)
         .map_err(|error| ClientError::Terminal(error.to_string()))?;
+    for skipped in skipped {
+        let source = skipped.request.source.unwrap_or_default();
+        let label = match (source.name.as_deref(), source.port) {
+            (Some(name), Some(port)) if !name.is_empty() => format!("{name}:{port}"),
+            (_, Some(port)) => port.to_string(),
+            (Some(name), None) => name.to_owned(),
+            (None, None) => "<missing>".to_owned(),
+        };
+        et_cli::logging::warn(format!(
+            "SSH localforward source '{label}' could not bind: {}; skipping forwarding row",
+            skipped.error
+        ));
+    }
     crate::client_terminal::run(
         connection,
         crate::client_terminal::TerminalOptions {

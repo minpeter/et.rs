@@ -138,6 +138,8 @@ fn run_client(
         &destination.host,
         requested_user.as_deref(),
         &args.ssh_option,
+        args.tunnel.is_empty(),
+        args.reverse_tunnel.is_empty(),
         deadline,
     )?;
     forward_config.apply_ssh_config(args, &resolved)?;
@@ -228,8 +230,15 @@ fn run_client(
             .to_owned();
         let jump_user = Some(parsed_jump.user.as_str()).filter(|user| !user.is_empty());
         validate_ssh_destination(&jump_host, jump_user)?;
-        let jump_resolved =
-            resolve_ssh_config(runner, &jump_host, jump_user, &args.ssh_option, deadline)?;
+        let jump_resolved = resolve_ssh_config(
+            runner,
+            &jump_host,
+            jump_user,
+            &args.ssh_option,
+            false,
+            false,
+            deadline,
+        )?;
         let jump_request = JumpBootstrapRequest {
             jumphost: jumphost.to_owned(),
             destination_host: endpoint.host.clone(),

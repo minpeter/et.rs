@@ -284,6 +284,36 @@ fn ssh_config_extra_forward_field_is_rejected_before_bootstrap() {
 }
 
 #[test]
+fn ssh_config_malformed_replaced_axis_is_ignored() {
+    let config = concat!(
+        "host server-alias\n",
+        "user config-user\n",
+        "hostname 127.0.0.1\n",
+        "port 22\n",
+        "localforward unsupported\n",
+        "remoteforward 1492 [127.0.0.1]:1492 unexpected\n",
+    );
+
+    for (option, value, rejected, ignored) in [
+        ("-t", "5555:22", "remoteforward", "localforward"),
+        ("-r", "3000:4000", "localforward", "remoteforward"),
+    ] {
+        let fake = FakeSsh::new();
+        let output = fake
+            .command(config, VALID_MARKER, 0, "")
+            .args(["-N", option, value, "server-alias:1"])
+            .output()
+            .unwrap();
+        let error = stderr(&output);
+
+        assert_eq!(output.status.code(), Some(2), "{option}: {error}");
+        assert!(error.contains(&format!("malformed {rejected}")), "{error}");
+        assert!(!error.contains(&format!("malformed {ignored}")), "{error}");
+        assert_eq!(fake.invocations(), [["-G", "-T", "server-alias"]]);
+    }
+}
+
+#[test]
 fn ssh_config_cli_same_axis_replaces_config() {
     let (port, server) = initial_payload_server_with_error(Some("stop after payload"));
     let fake = FakeSsh::new();

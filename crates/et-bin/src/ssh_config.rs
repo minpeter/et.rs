@@ -17,6 +17,8 @@ pub fn resolve_ssh_config(
     host_alias: &str,
     requested_user: Option<&str>,
     ssh_options: &[String],
+    parse_local_forwards: bool,
+    parse_remote_forwards: bool,
     deadline: Deadline,
 ) -> Result<ResolvedSshConfig, ClientError> {
     validate_ssh_destination(host_alias, requested_user)?;
@@ -36,10 +38,18 @@ pub fn resolve_ssh_config(
         operation: "resolving SSH configuration",
         completion: InvocationCompletion::Exit,
     };
-    parse_ssh_config(&run_checked(runner, &invocation, deadline)?)
+    parse_ssh_config(
+        &run_checked(runner, &invocation, deadline)?,
+        parse_local_forwards,
+        parse_remote_forwards,
+    )
 }
 
-fn parse_ssh_config(stdout: &[u8]) -> Result<ResolvedSshConfig, ClientError> {
+fn parse_ssh_config(
+    stdout: &[u8],
+    parse_local_forwards: bool,
+    parse_remote_forwards: bool,
+) -> Result<ResolvedSshConfig, ClientError> {
     let text =
         std::str::from_utf8(stdout).map_err(|_| ClientError::SshConfigMalformed("UTF-8 output"))?;
     let mut hostname = None;
@@ -55,10 +65,10 @@ fn parse_ssh_config(stdout: &[u8]) -> Result<ResolvedSshConfig, ClientError> {
             Some(key) if key.eq_ignore_ascii_case("user") => {
                 user = fields.next().map(str::to_string);
             }
-            Some(key) if key.eq_ignore_ascii_case("localforward") => {
+            Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("localforward") => {
                 local_forwards.push(parse_forward(fields, "localforward")?);
             }
-            Some(key) if key.eq_ignore_ascii_case("remoteforward") => {
+            Some(key) if parse_remote_forwards && key.eq_ignore_ascii_case("remoteforward") => {
                 remote_forwards.push(parse_forward(fields, "remoteforward")?);
             }
             _ => {}
@@ -196,6 +206,8 @@ mod tests {
             "server-alias",
             Some("requested"),
             &["Port=2222".to_string()],
+            true,
+            true,
             Deadline::after(Duration::from_secs(1)),
         )
         .unwrap();
@@ -213,11 +225,11 @@ mod tests {
     #[test]
     fn malformed_and_option_like_values_are_rejected() {
         assert!(matches!(
-            parse_ssh_config(b"user somebody\n"),
+            parse_ssh_config(b"user somebody\n", true, true),
             Err(ClientError::SshConfigMalformed("hostname"))
         ));
         assert!(matches!(
-            parse_ssh_config(b"hostname host\nuser -oProxyCommand=bad\n"),
+            parse_ssh_config(b"hostname host\nuser -oProxyCommand=bad\n", true, true),
             Err(ClientError::InvalidSshComponent("user"))
         ));
     }
@@ -232,6 +244,8 @@ mod tests {
               localforward /tmp/mixed.sock [127.0.0.1]:8080\n\
               localforward [127.0.0.1]:9090 /tmp/destination.sock\n\
               remoteforward 1492 [127.0.0.1]:1492\n",
+            true,
+            true,
         )
         .unwrap();
 
@@ -261,7 +275,7 @@ mod tests {
             ),
         ] {
             assert!(matches!(
-                parse_ssh_config(config.as_bytes()),
+                parse_ssh_config(config.as_bytes(), true, true),
                 Err(ClientError::SshConfigMalformedForward {
                     directive: found,
                     reason: "expected exactly two fields",

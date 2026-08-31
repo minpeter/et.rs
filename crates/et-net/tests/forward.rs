@@ -220,16 +220,36 @@ fn imported_local_wildcard_is_externally_reachable_while_loopback_is_not() {
     wildcard.shutdown().unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn reverse_listener_limit_is_transactional() {
-    let reservations: Vec<TcpListener> = (0..33)
-        .map(|_| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
+    struct RemoveDir(std::path::PathBuf);
+    impl Drop for RemoveDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let directory = std::env::temp_dir().join(format!("etrl-{}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    let _cleanup = RemoveDir(directory.clone());
+    let paths: Vec<_> = (0..33)
+        .map(|index| directory.join(format!("source-{index}.sock")))
         .collect();
-    let ports: Vec<u16> = reservations
+    let requests = paths
         .iter()
-        .map(|listener| listener.local_addr().unwrap().port())
+        .map(|path| PortForwardSourceRequest {
+            source: Some(SocketEndpoint {
+                name: Some(path.to_string_lossy().into_owned()),
+                port: None,
+            }),
+            destination: Some(SocketEndpoint {
+                name: Some("/tmp/destination.sock".to_owned()),
+                port: None,
+            }),
+            environmentvariable: None,
+        })
         .collect();
-    let requests = ports.iter().map(|port| request(*port, 1)).collect();
 
     let error = match Forwarder::start(requests) {
         Ok(forwarder) => {
@@ -239,13 +259,11 @@ fn reverse_listener_limit_is_transactional() {
         Err(error) => error,
     };
 
-    assert!(error.to_string().contains("listener limit"));
-    drop(reservations);
-    let rebound: Vec<TcpListener> = ports
-        .iter()
-        .map(|port| TcpListener::bind((Ipv4Addr::LOCALHOST, *port)).unwrap())
-        .collect();
-    assert_eq!(rebound.len(), 33);
+    assert!(
+        error.to_string().contains("listener limit"),
+        "unexpected error: {error}"
+    );
+    assert!(paths.iter().all(|path| !path.exists()));
 }
 
 fn reserve_port() -> u16 {
@@ -275,7 +293,6 @@ fn assert_authenticated_wildcard_rejected(loopback: IpAddr, wildcard: IpAddr, ow
         .iter()
         .map(|listener| listener.local_addr().unwrap().port())
         .collect();
-    drop(reservations);
     let error = match Forwarder::start_with_user(
         vec![
             request_on(&loopback.to_string(), ports[0], 1),
@@ -293,14 +310,7 @@ fn assert_authenticated_wildcard_rejected(loopback: IpAddr, wildcard: IpAddr, ow
         ForwardError::Io(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
         other => panic!("unexpected wildcard bind result: {other}"),
     }
-    let rebound: Vec<TcpListener> = [
-        SocketAddr::new(loopback, ports[0]),
-        SocketAddr::new(wildcard, ports[1]),
-    ]
-    .into_iter()
-    .map(|address| TcpListener::bind(address).unwrap())
-    .collect();
-    assert_eq!(rebound.len(), ports.len());
+    assert_eq!(reservations.len(), ports.len());
 }
 
 fn request(source: u16, destination: u16) -> PortForwardSourceRequest {

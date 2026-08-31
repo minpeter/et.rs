@@ -1,11 +1,14 @@
 use std::io::{self, Read, Write};
-use std::sync::{mpsc, Arc, Mutex};
+use std::net::Shutdown;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use et_core::packet::Packet;
 use et_core::proto::{TerminalBuffer, TerminalPacketType};
 use et_net::local::LocalStream;
-use et_net::local_packet::{write_local_packet, LocalPacketDecoder};
+use et_net::local_packet::{write_local_packet_cancelled, LocalPacketDecoder};
 #[cfg(unix)]
 use nix::sys::signal::{kill, Signal};
 #[cfg(unix)]
@@ -18,6 +21,7 @@ use rustix::event::{poll, PollFd, PollFlags};
 use sysinfo::{Pid as SystemPid, ProcessesToUpdate, Signal as SystemSignal, System};
 
 const MAX_OUTPUT_CHUNK: usize = 16 * 1024;
+const OUTPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 use crate::terminal_protocol::{handle_packet, read_initial_environment, read_ready_packet};
 
@@ -60,9 +64,12 @@ where
         .master
         .take_writer()
         .map_err(|error| format!("could not open PTY writer: {error}"))?;
-    let mut router_writer = router
-        .try_clone()
-        .map_err(|error| format!("could not clone terminal router: {error}"))?;
+    let router_writer =
+        Arc::new(Mutex::new(router.try_clone().map_err(|error| {
+            format!("could not clone terminal router: {error}")
+        })?));
+    let output_gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let cancelled = Arc::new(AtomicBool::new(false));
     let (wake_reader, wake_writer) = et_net::local::wake_pair()
         .map_err(|error| format!("could not create PTY wakeup: {error}"))?;
     let output_wake = wake_writer
@@ -78,10 +85,14 @@ where
     let mut killer = child.clone_killer();
     let (events_tx, events_rx) = mpsc::channel();
     let output_tx = events_tx.clone();
+    let worker_writer = router_writer.clone();
+    let worker_gate = output_gate.clone();
+    let worker_cancelled = cancelled.clone();
     let output_worker = match thread::Builder::new()
         .name("et-pty-output".to_owned())
         .spawn(move || {
-            let result = forward_output(&mut pty_reader, &mut router_writer);
+            let result = wait_for_output_gate(&worker_gate, &worker_cancelled)
+                .and_then(|()| forward_output(&mut pty_reader, &worker_writer, &worker_cancelled));
             let _ = output_tx.send(WorkerEvent::Output(result));
             signal(output_wake);
         }) {
@@ -124,6 +135,12 @@ where
                     let _ = child.wait();
                 }
             }
+            cancelled.store(true, Ordering::Release);
+            let (ready, changed) = &*output_gate;
+            if let Ok(mut ready) = ready.lock() {
+                *ready = true;
+                changed.notify_all();
+            }
             drop(pty_writer);
             let _ = output_worker.join();
             return Err(format!("could not start PTY child worker: {error}"));
@@ -138,7 +155,20 @@ where
                 .set_nonblocking(true)
                 .map_err(|error| format!("could not configure PTY wakeup: {error}"))
         })
-        .and_then(|()| started(&mut router));
+        .and_then(|()| {
+            let mut writer = router_writer
+                .lock()
+                .map_err(|_| "terminal router writer is unavailable".to_owned())?;
+            started(&mut writer)
+        });
+    let output_started = setup.is_ok();
+    if output_started {
+        let (ready, changed) = &*output_gate;
+        if let Ok(mut ready) = ready.lock() {
+            *ready = true;
+            changed.notify_all();
+        }
+    }
     let result = setup.and_then(|()| {
         pump(
             &mut router,
@@ -149,6 +179,18 @@ where
         )
     });
     kill_process_group(child_pid);
+    cancelled.store(true, Ordering::Release);
+    let (ready, changed) = &*output_gate;
+    if let Ok(mut ready) = ready.lock() {
+        *ready = true;
+        changed.notify_all();
+    }
+    if output_started {
+        let _ = router.shutdown(Shutdown::Both);
+        if let Ok(writer) = router_writer.lock() {
+            let _ = writer.shutdown(Shutdown::Both);
+        }
+    }
     if result.is_err() {
         let _ = killer.kill();
     }
@@ -194,7 +236,31 @@ fn default_shell() -> String {
     }
 }
 
-fn forward_output(reader: &mut dyn Read, router: &mut LocalStream) -> Result<(), String> {
+fn wait_for_output_gate(
+    gate: &(Mutex<bool>, Condvar),
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    let (ready, changed) = gate;
+    let mut ready = ready
+        .lock()
+        .map_err(|_| "terminal output gate is unavailable".to_owned())?;
+    while !*ready && !cancelled.load(Ordering::Acquire) {
+        ready = changed
+            .wait(ready)
+            .map_err(|_| "terminal output gate is unavailable".to_owned())?;
+    }
+    if cancelled.load(Ordering::Acquire) {
+        Err("terminal output cancelled before startup".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+fn forward_output(
+    reader: &mut dyn Read,
+    router: &Mutex<LocalStream>,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
     let mut buffer = [0u8; MAX_OUTPUT_CHUNK];
     loop {
         let count = reader
@@ -210,8 +276,16 @@ fn forward_output(reader: &mut dyn Read, router: &mut LocalStream) -> Result<(),
             TerminalPacketType::TerminalBuffer as u8,
             message.encode_to_vec(),
         );
-        write_local_packet(router, &packet)
-            .map_err(|error| format!("could not forward PTY output: {error}"))?;
+        let mut router = router
+            .lock()
+            .map_err(|_| "terminal router writer is unavailable".to_owned())?;
+        write_local_packet_cancelled(
+            &mut *router,
+            &packet,
+            cancelled,
+            Instant::now() + OUTPUT_WRITE_TIMEOUT,
+        )
+        .map_err(|error| format!("could not forward PTY output: {error}"))?;
     }
 }
 
@@ -394,5 +468,91 @@ fn kill_process_group(process_id: Option<u32>) {
         .filter(|process| process.session_id() == Some(session))
     {
         let _ = process.kill_with(SystemSignal::Kill);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use et_core::proto::TermInit;
+    use et_net::local_packet::{
+        read_local_packet, status_packet, write_local_packet, STARTUP_STATUS,
+    };
+    use prost::Message;
+    use std::io::Cursor;
+
+    #[test]
+    fn injected_setup_failure_reaps_shell_while_peer_stays_open_and_unread() {
+        let (router, mut peer) = et_net::local::wake_pair().unwrap();
+        let mut startup = router.try_clone().unwrap();
+        write_local_packet(
+            &mut peer,
+            &Packet::new(
+                TerminalPacketType::TerminalInit as u8,
+                TermInit::default().encode_to_vec(),
+            ),
+        )
+        .unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result =
+                run_with_startup(router, "xterm", |_| Err("injected setup failure".into()));
+            let _ = done_tx.send(result);
+        });
+        let error = done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("PTY cleanup waited for the non-reading peer")
+            .unwrap_err();
+        assert_eq!(error, "injected setup failure");
+        write_local_packet(
+            &mut startup,
+            &status_packet(STARTUP_STATUS, Err("injected setup failure")),
+        )
+        .unwrap();
+        assert_eq!(
+            read_local_packet(&mut peer).unwrap().header(),
+            STARTUP_STATUS
+        );
+        drop(peer);
+    }
+
+    #[test]
+    fn immediate_output_waits_until_startup_status_is_fully_serialized() {
+        let (writer, mut peer) = et_net::local::wake_pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let writer = Arc::new(Mutex::new(writer));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_writer = writer.clone();
+        let worker_gate = gate.clone();
+        let worker_cancelled = cancelled.clone();
+        let worker = thread::spawn(move || {
+            wait_for_output_gate(&worker_gate, &worker_cancelled)?;
+            forward_output(
+                &mut Cursor::new(b"immediate output"),
+                &worker_writer,
+                &worker_cancelled,
+            )
+        });
+
+        // Model delayed main-thread scheduling: output is already readable from
+        // the PTY, but the only socket writer remains owned by startup status.
+        {
+            let mut writer = writer.lock().unwrap();
+            write_local_packet(&mut *writer, &status_packet(STARTUP_STATUS, Ok(()))).unwrap();
+        }
+        let (ready, changed) = &*gate;
+        *ready.lock().unwrap() = true;
+        changed.notify_all();
+
+        assert_eq!(
+            read_local_packet(&mut peer).unwrap().header(),
+            STARTUP_STATUS
+        );
+        assert_eq!(
+            read_local_packet(&mut peer).unwrap().header(),
+            TerminalPacketType::TerminalBuffer as u8
+        );
+        worker.join().unwrap().unwrap();
     }
 }

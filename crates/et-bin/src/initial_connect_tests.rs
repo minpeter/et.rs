@@ -1,6 +1,26 @@
-use super::{accept_initial_response, accept_reconnect_response, accept_response, ReconnectStatus};
-use crate::error::ClientError;
+use std::time::Duration;
+
 use et_core::proto::{ConnectResponse, ConnectStatus, InitialResponse};
+
+use super::{
+    accept_initial_response, accept_reconnect_response, accept_response,
+    initialization_admission_deadline, ReconnectStatus,
+};
+use crate::deadline::Deadline;
+use crate::error::ClientError;
+
+#[test]
+fn short_outer_budget_is_rejected_before_connection_admission() {
+    assert!(matches!(
+        initialization_admission_deadline(Deadline::after(Duration::from_secs(3))),
+        Err(ClientError::BootstrapTimeout(
+            "reserving the ET initialization budget"
+        ))
+    ));
+    let outer = Deadline::after(Duration::from_secs(10));
+    let admission = initialization_admission_deadline(outer).unwrap();
+    assert!(admission.expires_at() < outer.expires_at());
+}
 
 #[test]
 fn initial_response_without_error_is_accepted() {

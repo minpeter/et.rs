@@ -85,13 +85,10 @@ pub fn supports_registration_ack(path: &Path) -> bool {
         let Ok(metadata) = std::fs::symlink_metadata(path) else {
             return false;
         };
-        std::fs::read_to_string(capability_path(path)).is_ok_and(|value| {
-            let mut fields = value.split_whitespace();
-            fields.next() == Some(REGISTRATION_ACK_CAPABILITY)
-                && fields.next().and_then(|value| value.parse::<u64>().ok()) == Some(metadata.dev())
-                && fields.next().and_then(|value| value.parse::<u64>().ok()) == Some(metadata.ino())
-                && fields.next().is_none()
-        })
+        std::fs::read_to_string(capability_path(path))
+            .ok()
+            .and_then(|value| parse_capability(&value))
+            == Some((metadata.dev(), metadata.ino()))
     }
     #[cfg(windows)]
     {
@@ -108,7 +105,9 @@ pub fn write_registration_ack_capability(path: &Path) -> io::Result<()> {
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        // The marker is not a secret. Root-mode routers are intentionally
+        // reachable by unprivileged terminal users through a 0666 socket.
+        .mode(0o644)
         .open(capability_path(path))?
         .write_all(
             format!(
@@ -118,6 +117,43 @@ pub fn write_registration_ack_capability(path: &Path) -> io::Result<()> {
             )
             .as_bytes(),
         )
+}
+
+#[cfg(unix)]
+pub fn retire_registration_ack_capability(path: &Path, device: u64, inode: u64) -> io::Result<()> {
+    let capability = capability_path(path);
+    let mut retired = capability.as_os_str().to_owned();
+    retired.push(format!(".retired-{device}-{inode}"));
+    let retired = PathBuf::from(retired);
+    match std::fs::rename(&capability, &retired) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    let belongs_to_listener = std::fs::read_to_string(&retired)
+        .ok()
+        .and_then(|value| parse_capability(&value))
+        == Some((device, inode));
+    if belongs_to_listener {
+        std::fs::remove_file(retired)
+    } else if !capability.exists() {
+        std::fs::rename(retired, capability)
+    } else {
+        // A current generation already published its marker. Never overwrite
+        // it while retiring an unrelated generation.
+        std::fs::remove_file(retired)
+    }
+}
+
+#[cfg(unix)]
+fn parse_capability(value: &str) -> Option<(u64, u64)> {
+    let mut fields = value.split_whitespace();
+    if fields.next() != Some(REGISTRATION_ACK_CAPABILITY) {
+        return None;
+    }
+    let device = fields.next()?.parse().ok()?;
+    let inode = fields.next()?.parse().ok()?;
+    fields.next().is_none().then_some((device, inode))
 }
 
 /// Connect to a local endpoint described by `path`.
@@ -235,6 +271,15 @@ mod unix_tests {
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         write_registration_ack_capability(&path).unwrap();
         assert!(supports_registration_ack(&path));
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(capability_path(&path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
         drop(listener);
         std::fs::remove_file(&path).unwrap();
         let replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
@@ -244,6 +289,13 @@ mod unix_tests {
         )
         .unwrap();
         assert!(!supports_registration_ack(&path));
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        retire_registration_ack_capability(&path, metadata.dev() + 1, metadata.ino()).unwrap();
+        assert!(
+            capability_path(&path).exists(),
+            "unrelated generation marker was deleted"
+        );
         drop(replacement);
         std::fs::remove_dir_all(directory).unwrap();
     }

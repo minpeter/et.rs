@@ -19,6 +19,9 @@ use crate::resolver::EndpointResolver;
 const MAX_ENDPOINT_ADDRESSES: usize = 16;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Server owns an eight-second absolute initialization budget. Do not admit a
+/// connection unless the outer budget leaves an additional propagation margin.
+const MIN_INITIALIZATION_BUDGET: Duration = Duration::from_secs(9);
 
 #[path = "reconnect.rs"]
 mod reconnect_impl;
@@ -56,8 +59,9 @@ pub fn connect_initial(
     resolver: &dyn EndpointResolver,
     deadline: Deadline,
 ) -> Result<Connection, ClientError> {
+    let admission_deadline = initialization_admission_deadline(deadline)?;
     let key = passkey_to_key(&credentials.passkey).ok_or(ClientError::InvalidPasskey)?;
-    let mut stream = connect_endpoint(endpoint, resolver, deadline)?;
+    let mut stream = connect_endpoint(endpoint, resolver, admission_deadline)?;
     set_stream_timeout(&stream, deadline)?;
 
     ensure_deadline(deadline, "sending ConnectRequest")?;
@@ -137,6 +141,17 @@ fn set_stream_timeout(stream: &TcpStream, deadline: Deadline) -> Result<(), Clie
             operation: "setting the write timeout",
             source,
         })
+}
+
+fn initialization_admission_deadline(deadline: Deadline) -> Result<Deadline, ClientError> {
+    match deadline.remaining() {
+        Some(remaining) if remaining > MIN_INITIALIZATION_BUDGET => {
+            Ok(Deadline::after(remaining - MIN_INITIALIZATION_BUDGET))
+        }
+        _ => Err(ClientError::BootstrapTimeout(
+            "reserving the ET initialization budget",
+        )),
+    }
 }
 
 fn ensure_deadline(deadline: Deadline, operation: &'static str) -> Result<(), ClientError> {

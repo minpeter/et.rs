@@ -1,7 +1,8 @@
 //! Native-`i64` framing for packets exchanged with local terminal processes.
 
 use std::io::{self, Read, Write};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use et_core::packet::{Packet, PacketError};
 
@@ -96,6 +97,28 @@ pub fn parse_status(packet: &Packet, expected_header: u8) -> io::Result<()> {
 }
 
 pub fn write_local_packet<W: Write>(writer: &mut W, packet: &Packet) -> io::Result<()> {
+    write_local_packet_with(writer, packet, || false)
+}
+
+/// Write one frame while allowing an owner to cancel blocked backpressure.
+/// Once cancellation begins the caller must close the channel because a
+/// partially written frame is intentionally abandoned during teardown.
+pub fn write_local_packet_cancelled<W: Write>(
+    writer: &mut W,
+    packet: &Packet,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+) -> io::Result<()> {
+    write_local_packet_with(writer, packet, || {
+        cancelled.load(Ordering::Acquire) || Instant::now() >= deadline
+    })
+}
+
+fn write_local_packet_with<W: Write>(
+    writer: &mut W,
+    packet: &Packet,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<()> {
     let serialized = packet.serialize();
     if serialized.len() > MAX_LOCAL_PACKET_LEN {
         return Err(io::Error::new(
@@ -105,9 +128,9 @@ pub fn write_local_packet<W: Write>(writer: &mut W, packet: &Packet) -> io::Resu
     }
     let length = i64::try_from(serialized.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "local packet too large"))?;
-    write_all_blocking(writer, &length.to_ne_bytes())?;
-    write_all_blocking(writer, &serialized)?;
-    flush_blocking(writer)
+    write_all_blocking(writer, &length.to_ne_bytes(), &cancelled)?;
+    write_all_blocking(writer, &serialized, &cancelled)?;
+    flush_blocking(writer, &cancelled)
 }
 
 /// `write_all` that treats `WouldBlock` as backpressure instead of an error.
@@ -123,8 +146,18 @@ pub fn write_local_packet<W: Write>(writer: &mut W, packet: &Packet) -> io::Resu
 /// drain, exactly like upstream's blocking writes, rather than tearing the
 /// session down — and a bare `write_all` would also abandon a partially
 /// written frame, corrupting the stream for good.
-fn write_all_blocking<W: Write>(writer: &mut W, mut buffer: &[u8]) -> io::Result<()> {
+fn write_all_blocking<W: Write>(
+    writer: &mut W,
+    mut buffer: &[u8],
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<()> {
     while !buffer.is_empty() {
+        if cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "local packet write cancelled",
+            ));
+        }
         match writer.write(buffer) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(count) => buffer = &buffer[count..],
@@ -138,8 +171,14 @@ fn write_all_blocking<W: Write>(writer: &mut W, mut buffer: &[u8]) -> io::Result
     Ok(())
 }
 
-fn flush_blocking<W: Write>(writer: &mut W) -> io::Result<()> {
+fn flush_blocking<W: Write>(writer: &mut W, cancelled: &impl Fn() -> bool) -> io::Result<()> {
     loop {
+        if cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "local packet flush cancelled",
+            ));
+        }
         match writer.flush() {
             Ok(()) => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -259,4 +298,49 @@ fn read_exact_classified<R: Read>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{mpsc, Arc};
+
+    struct StalledWriter(Option<mpsc::Sender<()>>);
+
+    impl Write for StalledWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            if let Some(started) = self.0.take() {
+                let _ = started.send(());
+            }
+            Err(io::ErrorKind::WouldBlock.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cancelled_local_write_finishes_while_peer_remains_stalled() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        std::thread::spawn(move || {
+            let result = write_local_packet_cancelled(
+                &mut StalledWriter(Some(started_tx)),
+                &Packet::new(1, vec![0; 1024]),
+                &worker_cancelled,
+                Instant::now() + Duration::from_secs(30),
+            );
+            let _ = done_tx.send(result);
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        cancelled.store(true, Ordering::Release);
+        let error = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancelled writer did not terminate")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
 }

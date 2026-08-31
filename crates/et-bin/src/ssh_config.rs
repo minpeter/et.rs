@@ -320,15 +320,14 @@ fn normalize_tcp_source(
         (false, _, None) => "localhost".to_owned(),
         (false, _, Some(requested)) if requested == "*" || requested == "[*]" => String::new(),
         (false, _, Some(requested)) => requested,
-        (true, GatewayPorts::No, _) => "localhost".to_owned(),
-        (true, GatewayPorts::Yes, _) => String::new(),
-        (true, GatewayPorts::ClientSpecified, None) => "localhost".to_owned(),
-        (true, GatewayPorts::ClientSpecified, Some(requested))
+        (true, GatewayPorts::No | GatewayPorts::ClientSpecified, None) => "localhost".to_owned(),
+        (true, GatewayPorts::Yes, None) => String::new(),
+        (true, _, Some(requested))
             if requested.is_empty() || requested == "*" || requested == "[*]" =>
         {
             String::new()
         }
-        (true, GatewayPorts::ClientSpecified, Some(requested)) => requested,
+        (true, _, Some(requested)) => requested,
     };
     endpoint.name = Some(normalized);
     endpoint
@@ -460,10 +459,10 @@ mod tests {
             resolved.local_forwards,
             [
                 request("localhost", Some(10022), "127.0.0.1", Some(22)),
-                request("localhost", Some(18080), "::1", Some(80)),
+                request("::1", Some(18080), "::1", Some(80)),
                 request("/tmp/local.sock", None, "/tmp/remote.sock", None),
                 request("/tmp/mixed.sock", None, "127.0.0.1", Some(8080)),
-                request("localhost", Some(9090), "/tmp/destination.sock", None,),
+                request("127.0.0.1", Some(9090), "/tmp/destination.sock", None,),
             ]
         );
         assert_eq!(
@@ -523,7 +522,7 @@ mod tests {
                 .iter()
                 .map(|request| request.source.as_ref().unwrap().name.as_deref().unwrap())
                 .collect::<Vec<_>>(),
-            ["localhost", "localhost", "localhost"]
+            ["", "", "127.0.0.2"]
         );
         assert_eq!(
             no.remote_forwards
@@ -539,7 +538,7 @@ mod tests {
                 .iter()
                 .map(|request| request.source.as_ref().unwrap().name.as_deref().unwrap())
                 .collect::<Vec<_>>(),
-            ["", "", ""]
+            ["", "", "127.0.0.2"]
         );
         assert_eq!(
             yes.remote_forwards
@@ -572,6 +571,86 @@ mod tests {
             assert!(
                 String::from_utf8_lossy(&clientspecified.stderr).contains("unsupported option")
                     && String::from_utf8_lossy(&clientspecified.stderr).contains("clientspecified")
+            );
+        }
+    }
+
+    #[test]
+    fn local_forward_listener_exposure_matches_explicit_bind_precedence() {
+        use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+
+        let route = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        route.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).unwrap();
+        let external_ip = route.local_addr().unwrap().ip();
+        assert!(!external_ip.is_loopback() && !external_ip.is_unspecified());
+
+        for (gateway_ports, source, reachable, unreachable) in [
+            ("yes", "", external_ip, None),
+            (
+                "yes",
+                "localhost:",
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                Some(external_ip),
+            ),
+            ("no", "*:", external_ip, None),
+            (
+                "no",
+                "127.0.0.2:",
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+                Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            ),
+        ] {
+            // Given
+            let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = reservation.local_addr().unwrap().port();
+            drop(reservation);
+            let config = format!(
+                "hostname host\ngatewayports {gateway_ports}\n\
+                 localforward {source}{port} localhost:9\n"
+            );
+            let resolved = parse_ssh_config(config.as_bytes(), true, false).unwrap();
+
+            // When
+            let forwarder =
+                et_net::forward::Forwarder::start(resolved.local_forwards.clone()).unwrap();
+
+            // Then
+            TcpStream::connect_timeout(&SocketAddr::new(reachable, port), Duration::from_secs(1))
+                .unwrap();
+            if let Some(unreachable) = unreachable {
+                assert!(TcpStream::connect_timeout(
+                    &SocketAddr::new(unreachable, port),
+                    Duration::from_millis(100),
+                )
+                .is_err());
+            }
+            forwarder.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn local_forward_preserves_explicit_bind_and_applies_gateway_ports_to_omitted_bind() {
+        for (gateway_ports, omitted) in [("no", "localhost"), ("yes", "")] {
+            // Given
+            let config = format!(
+                "hostname host\ngatewayports {gateway_ports}\n\
+                 localforward 15430 localhost:5432\n\
+                 localforward localhost:15431 localhost:5432\n\
+                 localforward 127.0.0.2:15432 localhost:5432\n\
+                 localforward *:15433 localhost:5432\n"
+            );
+
+            // When
+            let resolved = parse_ssh_config(config.as_bytes(), true, false).unwrap();
+
+            // Then
+            assert_eq!(
+                resolved
+                    .local_forwards
+                    .iter()
+                    .map(|request| request.source.as_ref().unwrap().name.as_deref().unwrap())
+                    .collect::<Vec<_>>(),
+                [omitted, "localhost", "127.0.0.2", ""]
             );
         }
     }

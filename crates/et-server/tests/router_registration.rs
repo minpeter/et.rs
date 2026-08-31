@@ -18,6 +18,13 @@ use support::TestDir;
 const ID: &str = "abcdefghijklmnop";
 const KEY: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
 
+fn peer_identity() -> (i64, i64) {
+    (
+        i64::from(rustix::process::geteuid().as_raw()),
+        i64::from(rustix::process::getegid().as_raw()),
+    )
+}
+
 fn info(
     id: Option<&str>,
     key: Option<&str>,
@@ -58,9 +65,10 @@ fn valid_plaintext_registration_is_retained() {
     let selected = select_router_path_for(1000, Some(&path), None, None).unwrap();
     let mut router = Router::start(selected, registry.clone()).unwrap();
 
+    let (uid, gid) = peer_identity();
     let packet = Packet::new(
         TerminalPacketType::TerminalUserInfo as u8,
-        info(Some(ID), Some(KEY), Some(501), Some(20)).encode_to_vec(),
+        info(Some(ID), Some(KEY), Some(uid), Some(gid)).encode_to_vec(),
     );
     let _terminal = connect_packet(&path, &packet);
     assert_eq!(
@@ -69,9 +77,35 @@ fn valid_plaintext_registration_is_retained() {
     );
 
     let registered = registry.get(ID).unwrap().unwrap();
-    assert_eq!(registered.uid, 501);
-    assert_eq!(registered.gid, 20);
+    assert_eq!(registered.uid, u32::try_from(uid).unwrap());
+    assert_eq!(registered.gid, u32::try_from(gid).unwrap());
     assert_eq!(&registered.key, KEY.as_bytes());
+    router.shutdown().unwrap();
+}
+
+#[test]
+fn router_registration_rejects_forged_identity() {
+    let dir = TestDir::new();
+    let path = dir.socket();
+    let registry = Registry::new();
+    let selected = select_router_path_for(0, Some(&path), None, None).unwrap();
+    let mut router = Router::start(selected, registry.clone()).unwrap();
+    let (forged_uid, forged_gid) = if rustix::process::geteuid().as_raw() == 0 {
+        (1, 1)
+    } else {
+        (0, 0)
+    };
+
+    send_packet(
+        &path,
+        &Packet::new(
+            TerminalPacketType::TerminalUserInfo as u8,
+            info(Some(ID), Some(KEY), Some(forged_uid), Some(forged_gid)).encode_to_vec(),
+        ),
+    );
+
+    expect_rejected(&router, RouterReject::InvalidRegistration);
+    assert!(registry.is_empty().unwrap());
     router.shutdown().unwrap();
 }
 
@@ -153,9 +187,10 @@ fn duplicate_rejection_preserves_the_original_registration() {
     let selected = select_router_path_for(1000, Some(&path), None, None).unwrap();
     let mut router = Router::start(selected, registry.clone()).unwrap();
 
+    let (uid, gid) = peer_identity();
     let first = Packet::new(
         TerminalPacketType::TerminalUserInfo as u8,
-        info(Some(ID), Some(KEY), Some(10), Some(1)).encode_to_vec(),
+        info(Some(ID), Some(KEY), Some(uid), Some(gid)).encode_to_vec(),
     );
     let _terminal = connect_packet(&path, &first);
     assert_eq!(
@@ -165,11 +200,14 @@ fn duplicate_rejection_preserves_the_original_registration() {
 
     let duplicate = Packet::new(
         TerminalPacketType::TerminalUserInfo as u8,
-        info(Some(ID), Some(KEY), Some(20), Some(1)).encode_to_vec(),
+        info(Some(ID), Some(KEY), Some(uid), Some(gid)).encode_to_vec(),
     );
     send_packet(&path, &duplicate);
     expect_rejected(&router, RouterReject::Duplicate);
-    assert_eq!(registry.get(ID).unwrap().unwrap().uid, 10);
+    assert_eq!(
+        registry.get(ID).unwrap().unwrap().uid,
+        u32::try_from(uid).unwrap()
+    );
     assert_eq!(registry.len().unwrap(), 1);
     router.shutdown().unwrap();
 }
@@ -181,9 +219,10 @@ fn terminal_disconnect_is_typed_and_same_id_can_register_again() {
     let registry = Registry::new();
     let selected = select_router_path_for(1000, Some(&path), None, None).unwrap();
     let mut router = Router::start(selected, registry.clone()).unwrap();
+    let (uid, gid) = peer_identity();
     let packet = Packet::new(
         TerminalPacketType::TerminalUserInfo as u8,
-        info(Some(ID), Some(KEY), Some(501), Some(20)).encode_to_vec(),
+        info(Some(ID), Some(KEY), Some(uid), Some(gid)).encode_to_vec(),
     );
 
     let terminal = connect_packet(&path, &packet);

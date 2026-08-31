@@ -62,6 +62,12 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
             .map(|value| OsString::from(*value))
             .chain(args.iter().cloned()),
     )?;
+    #[cfg(unix)]
+    if parsed.session_child {
+        crate::detach::close_inherited_descriptors().map_err(|error| {
+            clap_error(format!("could not close inherited descriptors: {error}"))
+        })?;
+    }
     parsed.verbose = et_cli::logging::effective_verbose(parsed.verbose);
     let log_directory = et_cli::logging::effective_log_directory(parsed.logdir.clone());
     let input = load_credentials(&parsed).map_err(clap_error)?;

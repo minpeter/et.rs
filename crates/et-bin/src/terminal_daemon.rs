@@ -41,7 +41,7 @@ pub fn spawn_with_args(
         .map_err(|error| format!("could not locate et executable: {error}"))?
         .canonicalize()
         .map_err(|error| format!("could not resolve et executable: {error}"))?;
-    let mut command = crate::detach::command(executable.as_os_str());
+    let mut command = crate::detach::direct_command(executable.as_os_str());
     command
         .args([
             "terminal",
@@ -57,7 +57,7 @@ pub fn spawn_with_args(
         .args(extra)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     crate::detach::configure(&mut command);
     let child = crate::detach::spawn(&mut command)
         .map_err(|error| format!("could not start terminal session process: {error}"))?;
@@ -85,10 +85,13 @@ pub fn spawn_with_args(
         .recv_timeout(READY_TIMEOUT)
         .map_err(|_| "timed out waiting for terminal registration".to_owned())?
         .map_err(|error| format!("terminal session process did not become ready: {error}"));
-    if result.is_ok() {
-        startup.commit();
+    match result {
+        Ok(()) => {
+            startup.commit();
+            Ok(())
+        }
+        Err(error) => Err(format!("{error}; {}", startup.stop_and_diagnose())),
     }
-    result
 }
 
 fn spawn_status_worker(
@@ -198,6 +201,36 @@ impl StartupChild {
             let _ = worker.join();
         }
     }
+
+    fn stop_and_diagnose(&mut self) -> String {
+        let status = if let Some(child) = self.child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => format!("child exited with {status}"),
+                Ok(None) => {
+                    let _ = child.kill();
+                    match child.wait() {
+                        Ok(status) => format!("child was still running and was killed: {status}"),
+                        Err(error) => format!("child kill/wait failed: {error}"),
+                    }
+                }
+                Err(error) => format!("could not inspect child exit status: {error}"),
+            }
+        } else {
+            "child was not owned".to_owned()
+        };
+        let stderr = self
+            .child
+            .as_mut()
+            .and_then(|child| child.stderr.take())
+            .map(read_bounded_stderr)
+            .unwrap_or_else(|| "<unavailable>".to_owned());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        self.child.take();
+        self.committed = true;
+        format!("{status}; stderr={stderr}")
+    }
 }
 
 impl Drop for StartupChild {
@@ -216,6 +249,19 @@ impl Drop for StartupChild {
 fn stop(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+fn read_bounded_stderr(mut stderr: impl Read) -> String {
+    let mut bytes = Vec::new();
+    let _ = stderr
+        .by_ref()
+        .take(u64::try_from(MAX_STATUS_MESSAGE).expect("status bound fits u64"))
+        .read_to_end(&mut bytes);
+    if bytes.is_empty() {
+        "<empty>".to_owned()
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
 }
 
 #[cfg(test)]

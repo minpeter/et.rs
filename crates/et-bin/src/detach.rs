@@ -1,6 +1,6 @@
 //! Spawning processes that outlive the launching shell.
 //!
-//! Unix children re-exec through a descriptor-closing trampoline and call
+//! Unix children re-exec directly, close inherited descriptors, and call
 //! `setsid` in the child. Windows uses `windows-spawn`, whose STARTUPINFOEX
 //! handle list includes only configured stdio, together with mandatory job
 //! breakaway flags. Failure to obtain either property fails before readiness.
@@ -28,29 +28,6 @@ pub type Stdio = windows_spawn::Stdio;
 pub type ChildStdout = windows_spawn::ChildStdout;
 #[cfg(windows)]
 pub type ChildStderr = windows_spawn::ChildStderr;
-
-/// Construct a re-exec command with inherited-resource hygiene.
-pub fn command(executable: &OsStr) -> Command {
-    #[cfg(unix)]
-    {
-        const CLOSE_AND_EXEC: &str = r#"
-for path in /proc/self/fd/[3-9] /proc/self/fd/[1-9][0-9]* /dev/fd/[3-9] /dev/fd/[1-9][0-9]*; do
-    [ -e "$path" ] || continue
-    fd=${path##*/}
-    eval "exec ${fd}>&-" 2>/dev/null || :
-done
-exec "$@"
-"#;
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", CLOSE_AND_EXEC, "et-detached-child"]);
-        command.arg(executable);
-        command
-    }
-    #[cfg(windows)]
-    {
-        Command::new(executable)
-    }
-}
 
 /// Construct a direct re-exec command. Unix children must close inherited
 /// descriptors before creating threads.
@@ -135,7 +112,7 @@ mod tests {
         // handle arguments to STARTUPINFOEX. This type assertion prevents a
         // regression back to std::process::Command's inherit-all default.
         fn requires_allowlisted_command(_: &windows_spawn::Command) {}
-        let command = command(OsStr::new("cmd.exe"));
+        let command = direct_command(OsStr::new("cmd.exe"));
         requires_allowlisted_command(&command);
     }
 }

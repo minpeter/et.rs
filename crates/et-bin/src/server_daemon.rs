@@ -69,39 +69,7 @@ pub fn spawn_detached(args: &[std::ffi::OsString]) -> Result<(), String> {
         .stderr
         .take()
         .ok_or_else(|| "background etserver status pipe was not created".to_owned())?;
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let worker = match spawn_status_worker(stderr, sender) {
-        Ok(worker) => worker,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-    };
-    let result = match receiver.recv_timeout(READY_TIMEOUT) {
-        Ok(result) => {
-            result.map_err(|error| format!("background etserver did not detach: {error}"))
-        }
-        Err(_) => Err("timed out waiting for background etserver to detach".to_owned()),
-    };
-    let _ = worker.join();
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let status = match child.try_wait() {
-                Ok(Some(status)) => format!("child exited with {status}"),
-                Ok(None) => {
-                    let _ = child.kill();
-                    match child.wait() {
-                        Ok(status) => format!("child was still running and was killed: {status}"),
-                        Err(wait_error) => format!("child kill/wait failed: {wait_error}"),
-                    }
-                }
-                Err(wait_error) => format!("could not inspect child exit status: {wait_error}"),
-            };
-            Err(format!("{error}; {status}"))
-        }
-    }
+    await_startup(child, stderr, READY_TIMEOUT)
 }
 
 /// Finish detaching inside the re-executed child: become a session leader,
@@ -148,6 +116,51 @@ fn write_startup_status(code: u8, message: &str) -> Result<(), String> {
         .and_then(|()| output.write_all(bytes))
         .and_then(|()| output.flush())
         .map_err(|error| format!("could not write daemon startup status: {error}"))
+}
+
+fn await_startup(
+    mut child: crate::detach::Child,
+    stderr: ChildStderr,
+    timeout: Duration,
+) -> Result<(), String> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker = match spawn_status_worker(stderr, sender) {
+        Ok(worker) => worker,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let result = match receiver.recv_timeout(timeout) {
+        Ok(result) => {
+            result.map_err(|error| format!("background etserver did not detach: {error}"))
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err("timed out waiting for background etserver to detach".to_owned())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("background etserver status reader terminated".to_owned())
+        }
+    };
+    if result.is_ok() {
+        let _ = worker.join();
+        return Ok(());
+    }
+
+    let status = match child.try_wait() {
+        Ok(Some(status)) => format!("child exited with {status}"),
+        Ok(None) => {
+            let _ = child.kill();
+            match child.wait() {
+                Ok(status) => format!("child was still running and was killed: {status}"),
+                Err(wait_error) => format!("child kill/wait failed: {wait_error}"),
+            }
+        }
+        Err(wait_error) => format!("could not inspect child exit status: {wait_error}"),
+    };
+    let _ = worker.join();
+    Err(format!("{}; {status}", result.unwrap_err()))
 }
 
 fn spawn_status_worker(
@@ -309,5 +322,28 @@ mod tests {
     fn pid_file_errors_are_reported_with_the_path() {
         let error = write_pid_file(Path::new("/nonexistent-dir/etserver.pid")).unwrap_err();
         assert!(error.contains("/nonexistent-dir/etserver.pid"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_status_timeout_kills_reaps_then_joins_reader() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "printf ET >&2; printf R >&1; exec sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let mut ready = [0u8; 1];
+        child.stdout.take().unwrap().read_exact(&mut ready).unwrap();
+        assert_eq!(ready, *b"R");
+        let stderr = child.stderr.take().unwrap();
+
+        let error = await_startup(child, stderr, Duration::from_millis(50)).unwrap_err();
+
+        assert!(error.contains("timed out waiting for background etserver"));
+        assert!(error.contains("was killed"));
+        assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err());
     }
 }

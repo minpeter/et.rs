@@ -199,15 +199,18 @@ fn parse_forward<'a>(
             "stream-local forwarding is unsupported on this platform".to_owned(),
         ));
     }
-    let source = parse_source_endpoint(
-        source,
-        policies.gateway_ports,
-        directive.eq_ignore_ascii_case("localforward"),
-    )
-    .ok_or(ClientError::SshConfigMalformedForward {
-        directive,
-        reason: "invalid source endpoint",
-    })?;
+    let is_local_forward = directive.eq_ignore_ascii_case("localforward");
+    let source = parse_source_endpoint(source, policies.gateway_ports, is_local_forward).ok_or(
+        ClientError::SshConfigMalformedForward {
+            directive,
+            reason: "invalid source endpoint",
+        },
+    )?;
+    if !is_local_forward && source.name.as_deref() == Some("") {
+        return Ok(ForwardRecord::Unsupported(
+            "wildcard bind is prohibited by authenticated reverse forwarding policy".to_owned(),
+        ));
+    }
     let destination =
         parse_destination_endpoint(destination).ok_or(ClientError::SshConfigMalformedForward {
             directive,
@@ -296,7 +299,7 @@ fn parse_source_endpoint(
     if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Some(normalize_tcp_source(
             SocketEndpoint {
-                name: Some("localhost".to_owned()),
+                name: None,
                 port: Some(parse_port(value)?),
             },
             gateway_ports,
@@ -312,18 +315,20 @@ fn normalize_tcp_source(
     gateway_ports: GatewayPorts,
     is_local_forward: bool,
 ) -> SocketEndpoint {
-    let requested = endpoint.name.take().unwrap_or_default();
-    let normalized = match (is_local_forward, gateway_ports) {
-        (false, _) if requested == "*" || requested == "[*]" => String::new(),
-        (false, _) if requested.is_empty() => "localhost".to_owned(),
-        (false, _) => requested,
-        (true, GatewayPorts::No) => "localhost".to_owned(),
-        (true, GatewayPorts::Yes) => String::new(),
-        (true, GatewayPorts::ClientSpecified) if requested == "*" || requested == "[*]" => {
+    let requested = endpoint.name.take();
+    let normalized = match (is_local_forward, gateway_ports, requested) {
+        (false, _, None) => "localhost".to_owned(),
+        (false, _, Some(requested)) if requested == "*" || requested == "[*]" => String::new(),
+        (false, _, Some(requested)) => requested,
+        (true, GatewayPorts::No, _) => "localhost".to_owned(),
+        (true, GatewayPorts::Yes, _) => String::new(),
+        (true, GatewayPorts::ClientSpecified, None) => "localhost".to_owned(),
+        (true, GatewayPorts::ClientSpecified, Some(requested))
+            if requested.is_empty() || requested == "*" || requested == "[*]" =>
+        {
             String::new()
         }
-        (true, GatewayPorts::ClientSpecified) if requested.is_empty() => "localhost".to_owned(),
-        (true, GatewayPorts::ClientSpecified) => requested,
+        (true, GatewayPorts::ClientSpecified, Some(requested)) => requested,
     };
     endpoint.name = Some(normalized);
     endpoint
@@ -525,7 +530,7 @@ mod tests {
                 .iter()
                 .map(|request| request.source.as_ref().unwrap().name.as_deref().unwrap())
                 .collect::<Vec<_>>(),
-            ["", "localhost", "127.0.0.2"]
+            ["127.0.0.2"]
         );
 
         let yes = parse_oracle("yes");
@@ -541,7 +546,7 @@ mod tests {
                 .iter()
                 .map(|request| request.source.as_ref().unwrap().name.as_deref().unwrap())
                 .collect::<Vec<_>>(),
-            ["", "localhost", "127.0.0.2"]
+            ["127.0.0.2"]
         );
 
         let clientspecified = query("clientspecified");
@@ -553,7 +558,15 @@ mod tests {
                     .iter()
                     .map(|request| request.source.as_ref().unwrap().name.as_deref().unwrap())
                     .collect::<Vec<_>>(),
-                ["", "localhost", "127.0.0.2"]
+                ["", "", "127.0.0.2"]
+            );
+            assert_eq!(
+                resolved
+                    .remote_forwards
+                    .iter()
+                    .map(|request| request.source.as_ref().unwrap().name.as_deref().unwrap())
+                    .collect::<Vec<_>>(),
+                ["127.0.0.2"]
             );
         } else {
             assert!(
@@ -561,6 +574,37 @@ mod tests {
                     && String::from_utf8_lossy(&clientspecified.stderr).contains("clientspecified")
             );
         }
+    }
+
+    #[test]
+    fn ssh_config_hardening_clientspecified_distinguishes_omitted_and_empty_binds() {
+        let resolved = parse_ssh_config(
+            b"hostname host\ngatewayports clientspecified\n\
+              localforward 15431 localhost:5432\n\
+              localforward []:15432 localhost:5432\n\
+              remoteforward 25431 localhost:5432\n\
+              remoteforward []:25432 localhost:5432\n",
+            true,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved
+                .local_forwards
+                .iter()
+                .map(|request| request.source.as_ref().unwrap().name.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["localhost", ""]
+        );
+        assert_eq!(
+            resolved
+                .remote_forwards
+                .iter()
+                .map(|request| request.source.as_ref().unwrap().name.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["localhost"]
+        );
     }
 
     #[test]

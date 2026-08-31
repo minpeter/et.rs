@@ -243,6 +243,7 @@ fn ssh_config_hardening_nonlocal_destinations_warn_and_other_rows_continue() {
         "localforward 15433 127.0.0.2:5432\n",
         "remoteforward 25432 db.internal:5432\n",
         "remoteforward 25433 [::1]:5432\n",
+        "remoteforward []:25434 localhost:5432\n",
     );
 
     let output = fake
@@ -274,7 +275,7 @@ fn ssh_config_hardening_nonlocal_destinations_warn_and_other_rows_continue() {
             .lines()
             .filter(|line| line.contains("WARNING"))
             .count(),
-        3
+        4
     );
 }
 

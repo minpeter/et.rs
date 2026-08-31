@@ -44,9 +44,8 @@ impl Endpoint {
                 }
                 // Upstream sends TCP endpoints with the name unset for the
                 // common `port:port` tunnel form; treat those as localhost.
-                let host = name.filter(|name| !name.is_empty());
                 Ok(Self::Tcp {
-                    host: host.unwrap_or_else(|| "localhost".to_owned()),
+                    host: name.unwrap_or_else(|| "localhost".to_owned()),
                     port,
                 })
             }

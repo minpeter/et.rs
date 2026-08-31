@@ -11,7 +11,7 @@ use et_core::packet::Packet;
 use et_core::proto::{
     PortForwardDestinationRequest, PortForwardSourceRequest, SocketEndpoint, TerminalPacketType,
 };
-use et_net::forward::{ForwardError, Forwarder};
+use et_net::forward::{ForwardError, ForwardOrigin, ForwardSource, Forwarder};
 use prost::Message;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
@@ -187,6 +187,37 @@ fn authenticated_reverse_tcp_wildcard_bind_exposes_session_to_external_network()
             owner,
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn imported_local_wildcard_is_externally_reachable_while_loopback_is_not() {
+    let probe = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    probe.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).unwrap();
+    let external = match probe.local_addr().unwrap().ip() {
+        std::net::IpAddr::V4(address) if !address.is_loopback() => address,
+        address => panic!("route probe did not select a non-loopback IPv4 address: {address}"),
+    };
+
+    let loopback_port = reserve_port();
+    let loopback = Forwarder::start(vec![request(loopback_port, 1)]).unwrap();
+    assert!(
+        TcpStream::connect_timeout(&SocketAddr::from((external, loopback_port)), TIMEOUT,).is_err()
+    );
+    loopback.shutdown().unwrap();
+
+    let wildcard_port = reserve_port();
+    let request = request_on("", wildcard_port, 1);
+    let (wildcard, skipped) = Forwarder::start_with_origins(vec![ForwardSource {
+        request,
+        origin: ForwardOrigin::SshConfig,
+    }])
+    .unwrap();
+    assert!(skipped.is_empty());
+    let connection =
+        TcpStream::connect_timeout(&SocketAddr::from((external, wildcard_port)), TIMEOUT).unwrap();
+    drop(connection);
+    wildcard.shutdown().unwrap();
 }
 
 #[test]

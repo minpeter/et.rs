@@ -77,6 +77,36 @@ fn unbindable_reverse_tunnel_reports_an_error_and_resets_the_slot() {
 }
 
 #[test]
+fn forged_import_origin_cannot_turn_explicit_conflict_into_skip() {
+    let mut server = TestRuntime::start();
+    let _terminal = server.register(ID_A, KEY_A);
+    let key = passkey_to_key(KEY_A).unwrap();
+    let occupied_path = server.dir.path().join("forged-origin.sock");
+    let _occupied = std::os::unix::net::UnixListener::bind(&occupied_path).unwrap();
+    let payload = InitialPayload {
+        jumphost: Some(false),
+        reversetunnels: vec![et_core::proto::PortForwardSourceRequest {
+            source: Some(et_core::proto::SocketEndpoint {
+                name: Some(occupied_path.to_string_lossy().into_owned()),
+                port: None,
+            }),
+            destination: Some(et_core::proto::SocketEndpoint {
+                name: Some("/tmp/destination.sock".to_owned()),
+                port: None,
+            }),
+            environmentvariable: Some("ET_RS_SSH_CONFIG_REMOTE_FORWARD".to_owned()),
+        }],
+        environmentvariables: HashMap::new(),
+    };
+
+    let (stream, _) = server.handshake(ID_A);
+    let (_, initial) = runtime_support::initialize(stream, &key, payload);
+
+    assert!(initial.error.is_some());
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
 fn jumphost_payload_is_relayed_to_the_registered_terminal() {
     let mut server = TestRuntime::start();
     let mut terminal = server.register(ID_A, KEY_A);

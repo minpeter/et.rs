@@ -57,6 +57,7 @@ struct TrackedSocket {
     stream: TcpStream,
     registration: Option<RegistrationIdentity>,
     authenticated: bool,
+    session_owner: bool,
 }
 
 pub(crate) struct RawSockets {
@@ -96,6 +97,7 @@ impl RawSockets {
                 stream: clone,
                 registration: None,
                 authenticated: false,
+                session_owner: false,
             },
         );
         Ok(RawSocketGuard {
@@ -115,7 +117,7 @@ impl RawSockets {
         Ok(())
     }
 
-    pub(crate) fn shutdown_registration(
+    pub(crate) fn shutdown_inactive_registration(
         &self,
         identity: &RegistrationIdentity,
     ) -> Result<(), RuntimeError> {
@@ -124,10 +126,11 @@ impl RawSockets {
             .lock()
             .map_err(|_| RuntimeError::WorkerUnavailable)?;
         for tracked in streams.values() {
-            if tracked
-                .registration
-                .as_ref()
-                .is_some_and(|current| current.same_generation(identity))
+            if !tracked.session_owner
+                && tracked
+                    .registration
+                    .as_ref()
+                    .is_some_and(|current| current.same_generation(identity))
             {
                 let _ = tracked.stream.shutdown(Shutdown::Both);
             }
@@ -178,6 +181,19 @@ impl RawSocketGuard {
             .get_mut(&self.id)
             .ok_or(RuntimeError::WorkerUnavailable)?;
         tracked.authenticated = true;
+        Ok(())
+    }
+
+    pub(crate) fn own_session(&mut self) -> Result<(), RuntimeError> {
+        let mut streams = self
+            .sockets
+            .streams
+            .lock()
+            .map_err(|_| RuntimeError::WorkerUnavailable)?;
+        let tracked = streams
+            .get_mut(&self.id)
+            .ok_or(RuntimeError::WorkerUnavailable)?;
+        tracked.session_owner = true;
         Ok(())
     }
 }

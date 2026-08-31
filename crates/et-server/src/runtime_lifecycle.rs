@@ -23,19 +23,17 @@ pub(crate) fn run(
                     "terminal disconnected for registration id={}",
                     identity.id()
                 ));
-                let removed = core
-                    .sessions
-                    .remove_registration_with(&identity, |shutdown_raw| {
-                        if shutdown_raw {
-                            if let Err(error) = core.raw_sockets.shutdown_registration(&identity) {
-                                crate::diag::info(format!(
-                                    "id={}: error shutting down raw sockets: {error}",
-                                    identity.id()
-                                ));
-                                first_error.get_or_insert(error);
-                            }
-                        }
-                    });
+                // Keep the active transport open long enough for the bridge to
+                // drain terminal bytes already buffered at HUP, but cancel every
+                // pre-slot, starting, and returning raw socket in this generation.
+                if let Err(error) = core.raw_sockets.shutdown_inactive_registration(&identity) {
+                    crate::diag::info(format!(
+                        "id={}: error shutting down inactive raw sockets: {error}",
+                        identity.id()
+                    ));
+                    first_error.get_or_insert(error);
+                }
+                let removed = core.sessions.remove_registration_with(&identity, |_| {});
                 match removed {
                     Ok(Some(removed)) => {
                         crate::diag::info(format!(

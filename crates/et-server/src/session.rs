@@ -5,6 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
+use et_core::backed_writer::{
+    MAX_BACKUP_PACKETS, MAX_DISCONNECT_PACKETS, MAX_RECOVERY_BACKUP_BYTES,
+};
 use et_core::proto::TerminalPacketType;
 use et_net::connection::DEFAULT_RECOVERY_TIMEOUT;
 use et_net::connection::{ConnError, Connection};
@@ -29,6 +32,7 @@ pub(crate) struct ActiveSession {
     /// new stream after install so the connection mutex is not held for the
     /// recovery network RTT.
     recover_hold: Mutex<Vec<(u8, Vec<u8>)>>,
+    recover_hold_bytes: AtomicU64,
     shutdown: AtomicBool,
     /// Only one recover may run at a time. Concurrent returning clients used
     /// to queue on the connection mutex for minutes after a blackhole write.
@@ -94,6 +98,7 @@ impl ActiveSession {
             wake_writer: Mutex::new(wake_writer),
             wake_reader: Mutex::new(Some(wake_reader)),
             recover_hold: Mutex::new(Vec::new()),
+            recover_hold_bytes: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             recovering: AtomicBool::new(false),
             connection_generation: AtomicU64::new(0),
@@ -144,7 +149,24 @@ impl ActiveSession {
         if !self.recovering.load(Ordering::Acquire) {
             return Ok(false);
         }
+        let held_bytes = self.recover_hold_bytes.load(Ordering::Acquire);
+        let payload_bytes = u64::try_from(payload.len()).map_err(|_| SessionError::Unavailable)?;
+        if hold.len() >= MAX_BACKUP_PACKETS + MAX_DISCONNECT_PACKETS {
+            return Err(SessionError::Unavailable);
+        }
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| SessionError::Unavailable)?;
+        let requested = i64::try_from(held_bytes.saturating_add(payload_bytes))
+            .map_err(|_| SessionError::Unavailable)?;
+        if requested > MAX_RECOVERY_BACKUP_BYTES || !connection.can_buffer_write(requested) {
+            return Err(SessionError::Unavailable);
+        }
+        drop(connection);
         hold.push((header, payload.to_vec()));
+        self.recover_hold_bytes
+            .fetch_add(payload_bytes, Ordering::AcqRel);
         Ok(true)
     }
 
@@ -226,6 +248,9 @@ impl ActiveSession {
                 }
                 std::mem::take(&mut *hold)
             };
+            let batch_bytes = batch.iter().fold(0u64, |total, (_, payload)| {
+                total.saturating_add(payload.len() as u64)
+            });
             let mut connection = lock_timeout(&self.connection, RECOVERY_LOCK_TIMEOUT)?;
             let mut remaining = batch.into_iter();
             while let Some((header, payload)) = remaining.next() {
@@ -246,6 +271,8 @@ impl ActiveSession {
                     return Err(SessionError::Connection(error));
                 }
             }
+            self.recover_hold_bytes
+                .fetch_sub(batch_bytes, Ordering::AcqRel);
         }
     }
 
@@ -410,11 +437,24 @@ impl ActiveSession {
     }
 
     pub(crate) fn can_buffer_write(&self, bytes: i64) -> Result<bool, SessionError> {
+        let hold = self
+            .recover_hold
+            .lock()
+            .map_err(|_| SessionError::Unavailable)?;
+        if hold.len() >= MAX_BACKUP_PACKETS + MAX_DISCONNECT_PACKETS {
+            return Ok(false);
+        }
+        let held =
+            i64::try_from(self.recover_hold_bytes.load(Ordering::Acquire)).unwrap_or(i64::MAX);
+        let requested = held.checked_add(bytes).unwrap_or(i64::MAX);
+        if requested > MAX_RECOVERY_BACKUP_BYTES {
+            return Ok(false);
+        }
         Ok(self
             .connection
             .lock()
             .map_err(|_| SessionError::Unavailable)?
-            .can_buffer_write(bytes))
+            .can_buffer_write(requested))
     }
 
     pub(crate) fn is_shutting_down(&self) -> bool {
@@ -489,5 +529,45 @@ impl SessionConnection {
             },
             Self::Active(session) => session.shutdown(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stalled_recovery_hold_is_capacity_bounded_and_fifo() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || TcpStream::connect(address).unwrap());
+        let (stream, _) = listener.accept().unwrap();
+        let _peer = peer.join().unwrap();
+        let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
+        let session =
+            ActiveSession::new(Connection::new_server(stream, &[7; 32]), &terminal).unwrap();
+        let permit = session.try_begin_recover().unwrap();
+
+        for index in 0..4u8 {
+            assert!(session.queue_if_recovering(index, &[index; 8]).unwrap());
+        }
+        let payload = vec![b'x'; 64 * 1024];
+        let mut accepted = 4usize;
+        while session.queue_if_recovering(9, &payload).is_ok() {
+            accepted += 1;
+            assert!(accepted <= MAX_BACKUP_PACKETS + MAX_DISCONNECT_PACKETS);
+        }
+        assert!(!session.can_buffer_write(payload.len() as i64).unwrap());
+
+        let mut hold = session.recover_hold.lock().unwrap();
+        assert_eq!(hold.len(), accepted);
+        for index in 0..4u8 {
+            assert_eq!(hold[index as usize], (index, vec![index; 8]));
+        }
+        hold.clear();
+        session.recover_hold_bytes.store(0, Ordering::Release);
+        drop(hold);
+        session.recovering.store(false, Ordering::Release);
+        drop(permit);
     }
 }

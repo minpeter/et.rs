@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use et_core::packet::Packet;
 use et_core::proto::{TerminalBuffer, TerminalPacketType};
 use et_net::local::LocalStream;
-use et_net::local_packet::{write_local_packet_cancelled, LocalPacketDecoder};
+use et_net::local_packet::{write_local_packet_until_cancelled, LocalPacketDecoder};
 #[cfg(unix)]
 use nix::sys::signal::{kill, Signal};
 #[cfg(unix)]
@@ -21,7 +21,6 @@ use rustix::event::{poll, PollFd, PollFlags};
 use sysinfo::{Pid as SystemPid, ProcessesToUpdate, Signal as SystemSignal, System};
 
 const MAX_OUTPUT_CHUNK: usize = 16 * 1024;
-const OUTPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const FINAL_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 use crate::terminal_protocol::{handle_packet, read_initial_environment, read_ready_packet};
@@ -56,10 +55,6 @@ where
     F: FnOnce(&mut LocalStream) -> Result<(), String>,
 {
     let environment = read_initial_environment(&mut router)?;
-    // Upstream issue #257: show the login banner an interactive ssh would have
-    // printed, before the shell writes anything.
-    #[cfg(unix)]
-    crate::terminal_motd::emit(&mut router)?;
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -181,7 +176,12 @@ where
             let mut writer = router_writer
                 .lock()
                 .map_err(|_| "terminal router writer is unavailable".to_owned())?;
-            started(&mut writer)
+            started(&mut writer)?;
+            // Keep startup status ahead of every user-visible byte while
+            // preserving current-main's MOTD-before-shell ordering.
+            #[cfg(unix)]
+            crate::terminal_motd::emit(&mut writer)?;
+            Ok(())
         });
     let output_started = setup.is_ok();
     if output_started {
@@ -305,13 +305,8 @@ fn forward_output(
         let mut router = router
             .lock()
             .map_err(|_| "terminal router writer is unavailable".to_owned())?;
-        write_local_packet_cancelled(
-            &mut *router,
-            &packet,
-            cancelled,
-            Instant::now() + OUTPUT_WRITE_TIMEOUT,
-        )
-        .map_err(|error| format!("could not forward PTY output: {error}"))?;
+        write_local_packet_until_cancelled(&mut *router, &packet, cancelled)
+            .map_err(|error| format!("could not forward PTY output: {error}"))?;
     }
 }
 

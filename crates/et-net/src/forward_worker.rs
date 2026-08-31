@@ -4,7 +4,7 @@ use std::io::Write;
 use std::io::{self};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 
@@ -61,21 +61,24 @@ pub(crate) fn run(
     command_sender: mpsc::SyncSender<Command>,
     outbound: mpsc::SyncSender<Outbound>,
     #[cfg(unix)] mut outbound_wake: UnixStream,
-    listener_stop: ListenerStop,
-    session_user: Option<(u32, u32)>,
+    control: (ListenerStop, Option<(u32, u32)>, Arc<AtomicBool>),
 ) {
+    let (listener_stop, session_user, shutdown) = control;
     #[cfg(unix)]
     let result = Worker::new(
         command_sender,
         outbound.clone(),
         outbound_wake.try_clone().ok(),
+        shutdown.clone(),
     )
     .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user));
     #[cfg(windows)]
-    let result = Worker::new(command_sender, outbound.clone())
+    let result = Worker::new(command_sender, outbound.clone(), shutdown.clone())
         .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user));
     if let Err(error) = result {
-        let _ = outbound.send(Err(error));
+        if !shutdown.load(Ordering::Acquire) {
+            let _ = outbound.try_send(Err(error));
+        }
         #[cfg(unix)]
         let _ = outbound_wake.write(&[1]);
     }
@@ -93,6 +96,7 @@ struct Worker {
     threads: Vec<JoinHandle<()>>,
     next_socket_id: i32,
     session_user: Option<(u32, u32)>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -100,6 +104,7 @@ impl Worker {
         commands: mpsc::SyncSender<Command>,
         outbound: mpsc::SyncSender<Outbound>,
         #[cfg(unix)] outbound_wake: Option<UnixStream>,
+        shutdown: Arc<AtomicBool>,
     ) -> Result<Self, ForwardError> {
         #[cfg(unix)]
         let outbound_wake = {
@@ -119,6 +124,7 @@ impl Worker {
             threads: Vec::new(),
             next_socket_id: 1,
             session_user: None,
+            shutdown,
         })
     }
 

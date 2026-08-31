@@ -255,6 +255,60 @@ fn real_terminal_registers_runs_shell_and_resizes_pty() {
 }
 
 #[test]
+fn pty_output_backpressure_longer_than_two_seconds_preserves_session_and_order() {
+    let fixture = Fixture::new("pty-backpressure");
+    let mut child = fixture.spawn();
+    write_credentials(&mut child);
+    let mut router = fixture.accept();
+    router.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let _registration = read_local_packet(&mut router).unwrap();
+    acknowledge_registration(&mut router);
+    fixture.wait_ready();
+    send(
+        &mut router,
+        TerminalPacketType::TerminalInit,
+        &TermInit {
+            environmentnames: Vec::new(),
+            environmentvalues: Vec::new(),
+        },
+    );
+    expect_startup(&mut router);
+    send(
+        &mut router,
+        TerminalPacketType::TerminalBuffer,
+        &TerminalBuffer {
+            buffer: Some(b"stty -echo; printf 'PTY-BACKPRESSURE-%s\\n' READY\n".to_vec()),
+        },
+    );
+    let _ = collect_until(&mut router, |output| {
+        contains(output, b"PTY-BACKPRESSURE-READY")
+    });
+    send(
+        &mut router,
+        TerminalPacketType::TerminalBuffer,
+        &TerminalBuffer {
+            buffer: Some(
+                b"head -c 1048576 /dev/zero | tr '\\000' x; printf 'PTY-BACKPRESSURE-%s\\n' MARKER; exit\n"
+                    .to_vec(),
+            ),
+        },
+    );
+
+    assert!(
+        child
+            .wait_timeout(Duration::from_secs(3))
+            .unwrap()
+            .is_none(),
+        "terminal exited instead of backpressuring PTY output"
+    );
+    let output = collect_until(&mut router, |output| {
+        contains(output, b"PTY-BACKPRESSURE-MARKER")
+    });
+    assert!(contains(&output, b"PTY-BACKPRESSURE-MARKER"));
+    assert!(child.wait_timeout(TIMEOUT).unwrap().unwrap().success());
+}
+
+#[test]
 fn malformed_credentials_fail_before_router_connection() {
     let fixture = Fixture::new("bad-credentials");
     let output = Command::new(env!("CARGO_BIN_EXE_et"))
@@ -444,6 +498,7 @@ fn real_terminal_emits_motd_before_login_shell_output() {
     let (mut router, _) = fixture.listener.accept().unwrap();
     router.set_read_timeout(Some(TIMEOUT)).unwrap();
     let _ = read_local_packet(&mut router).unwrap();
+    acknowledge_registration(&mut router);
     fixture.wait_ready();
 
     // When: the session initializes and the login shell starts producing output.
@@ -455,6 +510,7 @@ fn real_terminal_emits_motd_before_login_shell_output() {
             environmentvalues: Vec::new(),
         },
     );
+    expect_startup(&mut router);
     send(
         &mut router,
         TerminalPacketType::TerminalBuffer,
@@ -506,6 +562,7 @@ fn real_terminal_suppresses_motd_when_home_has_hushlogin() {
     let (mut router, _) = fixture.listener.accept().unwrap();
     router.set_read_timeout(Some(TIMEOUT)).unwrap();
     let _ = read_local_packet(&mut router).unwrap();
+    acknowledge_registration(&mut router);
     fixture.wait_ready();
 
     // When: the session runs to the point the login shell has produced output.
@@ -517,6 +574,7 @@ fn real_terminal_suppresses_motd_when_home_has_hushlogin() {
             environmentvalues: Vec::new(),
         },
     );
+    expect_startup(&mut router);
     send(
         &mut router,
         TerminalPacketType::TerminalBuffer,
@@ -555,7 +613,13 @@ fn acknowledge_registration(router: &mut impl Write) {
 
 fn expect_startup(router: &mut impl std::io::Read) {
     let packet = read_local_packet(router).unwrap();
-    parse_status(&packet, STARTUP_STATUS).unwrap();
+    parse_status(&packet, STARTUP_STATUS).unwrap_or_else(|error| {
+        panic!(
+            "expected startup status, got header={} payload={:?}: {error}",
+            packet.header(),
+            packet.payload()
+        )
+    });
 }
 
 fn send<M: Message>(router: &mut impl Write, kind: TerminalPacketType, message: &M) {

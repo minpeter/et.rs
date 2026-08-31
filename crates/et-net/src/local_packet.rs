@@ -114,6 +114,16 @@ pub fn write_local_packet_cancelled<W: Write>(
     })
 }
 
+/// Write one complete local frame under ordinary backpressure, stopping only
+/// when teardown explicitly requests cancellation.
+pub fn write_local_packet_until_cancelled<W: Write>(
+    writer: &mut W,
+    packet: &Packet,
+    cancelled: &AtomicBool,
+) -> io::Result<()> {
+    write_local_packet_with(writer, packet, || cancelled.load(Ordering::Acquire))
+}
+
 fn write_local_packet_with<W: Write>(
     writer: &mut W,
     packet: &Packet,

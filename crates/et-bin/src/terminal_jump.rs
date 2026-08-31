@@ -336,21 +336,23 @@ fn relay(mut router: LocalStream, destination: &mut Connection) -> Result<i32, S
             }
         }
         if client_events.contains(PollFlags::IN) && pending_output.is_none() {
-            match destination.try_read_packet() {
-                Ok(Some(packet)) => {
-                    let packet = router_packet(destination, packet);
-                    pending_output = Some((
-                        encode_local_packet(&packet).map_err(|error| {
-                            format!("could not frame destination output: {error}")
-                        })?,
-                        0,
-                    ));
-                    if write_pending_local(&mut router, &mut pending_output).is_err() {
-                        return Ok(0);
+            while pending_output.is_none() {
+                match destination.try_read_packet() {
+                    Ok(Some(packet)) => {
+                        let packet = router_packet(destination, packet);
+                        pending_output = Some((
+                            encode_local_packet(&packet).map_err(|error| {
+                                format!("could not frame destination output: {error}")
+                            })?,
+                            0,
+                        ));
+                        if write_pending_local(&mut router, &mut pending_output).is_err() {
+                            return Ok(0);
+                        }
                     }
+                    Ok(None) => break,
+                    Err(_) => return Ok(0),
                 }
-                Ok(None) => {}
-                Err(_) => return Ok(0),
             }
         }
         if client_events.intersects(PollFlags::HUP | PollFlags::ERR) {

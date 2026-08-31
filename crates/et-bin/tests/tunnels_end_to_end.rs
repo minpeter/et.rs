@@ -730,7 +730,7 @@ fn spawn_tcp_echo_once(listener: TcpListener, expected: &'static [u8]) -> thread
     let address = listener.local_addr().unwrap();
     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let worker_cancelled = std::sync::Arc::clone(&cancelled);
-    let (completed_tx, completed_rx) = mpsc::sync_channel(0);
+    let (completed_tx, completed_rx) = mpsc::sync_channel(1);
     let worker = thread::spawn(move || {
         // Accept multiple times so readiness probes do not exhaust a one-shot echo.
         loop {

@@ -111,11 +111,9 @@ fn slow_jumphost_output_does_not_block_ctrl_c_toward_destination() {
     let (output_sent_tx, output_sent_rx) = mpsc::sync_channel(0);
     let (input_tx, input_rx) = mpsc::sync_channel(0);
     let destination = thread::spawn(move || {
-        for header in 71..87 {
-            destination_server
-                .write_packet(header, &vec![b'p'; 60 * 1024])
-                .unwrap();
-        }
+        destination_server
+            .write_packet(71, &vec![b'p'; 60 * 1024])
+            .unwrap();
         output_sent_tx.send(()).unwrap();
         let input = destination_server.read_packet().unwrap();
         input_tx
@@ -142,6 +140,49 @@ fn slow_jumphost_output_does_not_block_ctrl_c_toward_destination() {
     destination.join().unwrap();
     drop(router_peer);
     assert_eq!(relay.join().unwrap().unwrap(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn jumphost_drains_coalesced_destination_packets_without_new_socket_readiness() {
+    // Given: several small encrypted frames are already queued before the
+    // relay reads once, allowing one recv() to move all of them into the
+    // connection's userspace BackedReader.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let connector = thread::spawn(move || std::net::TcpStream::connect(address).unwrap());
+    let (server_stream, _) = listener.accept().unwrap();
+    let client_stream = connector.join().unwrap();
+    let key = [31u8; 32];
+    let mut destination_client = Connection::new_client(client_stream, &key);
+    let mut destination_server = Connection::new_server(server_stream, &key);
+    for header in 91..96 {
+        destination_server.write_packet(header, &[header]).unwrap();
+    }
+    let (relay_router, mut router_peer) = et_net::local::wake_pair().unwrap();
+    router_peer.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let relay = thread::spawn(move || relay(relay_router, &mut destination_client));
+
+    // When: the router consumes every frame without sending input that could
+    // create a fresh poll event.
+    let mut relayed = Vec::new();
+    for _ in 0..5 {
+        match et_net::local_packet::read_local_packet(&mut router_peer) {
+            Ok(packet) => relayed.push((packet.header(), packet.payload().to_vec())),
+            Err(_) => break,
+        }
+    }
+    drop(router_peer);
+    assert_eq!(relay.join().unwrap().unwrap(), 0);
+
+    // Then: userspace-buffered frames were drained even after kernel POLLIN
+    // readiness disappeared.
+    assert_eq!(
+        relayed,
+        (91..96)
+            .map(|header| (header, vec![header]))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]

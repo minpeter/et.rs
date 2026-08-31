@@ -671,26 +671,22 @@ mod tests {
 
     #[test]
     fn local_forward_listener_exposure_matches_explicit_bind_precedence() {
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 
-        let route = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
-        route.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).unwrap();
-        let external_ip = route.local_addr().unwrap().ip();
-        assert!(!external_ip.is_loopback() && !external_ip.is_unspecified());
-
+        let loopback_alias = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
         for (gateway_ports, source, reachable, unreachable) in [
-            ("yes", "", external_ip, None),
+            ("yes", "", loopback_alias, None),
             (
                 "yes",
                 "localhost:",
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
-                Some(external_ip),
+                Some(loopback_alias),
             ),
-            ("no", "*:", external_ip, None),
+            ("no", "*:", loopback_alias, None),
             (
                 "no",
                 "127.0.0.2:",
-                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+                loopback_alias,
                 Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             ),
         ] {

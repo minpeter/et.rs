@@ -44,6 +44,7 @@ impl Worker {
         socket_id: i32,
         result: io::Result<ForwardStream>,
     ) -> Result<(), ForwardError> {
+        self.connecting.remove(&socket_id);
         let error = match result {
             Ok(stream) => {
                 self.activate(Role::Destination, socket_id, stream)?;
@@ -105,6 +106,7 @@ impl Worker {
             );
         }
         let socket_id = self.allocate_socket_id()?;
+        self.connecting.insert(socket_id);
         self.threads.push(spawn_connector(
             client_fd,
             socket_id,
@@ -246,8 +248,8 @@ impl Worker {
         }
     }
 
-    fn total_sockets(&self) -> usize {
-        self.pending.len() + self.sources.len() + self.destinations.len()
+    pub(super) fn total_sockets(&self) -> usize {
+        self.pending.len() + self.connecting.len() + self.sources.len() + self.destinations.len()
     }
 
     fn allocate_socket_id(&mut self) -> Result<i32, ForwardError> {

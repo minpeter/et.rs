@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
+use std::net::SocketAddr;
 #[cfg(unix)]
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,7 +16,7 @@ use et_core::proto::{
 #[cfg(unix)]
 use et_net::forward::ForwardError;
 use et_net::forward::Forwarder;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use et_net::forward::{ForwardOrigin, ForwardSource};
 use prost::Message;
 
@@ -247,6 +249,67 @@ fn try_receive_reports_backpressure_and_outbound_drain_recovers() {
 
 #[cfg(unix)]
 #[test]
+fn imported_local_bind_failure_obeys_strict_policy_transactionally() {
+    // Given
+    struct RemoveDir(std::path::PathBuf);
+    impl Drop for RemoveDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let directory = std::env::temp_dir().join(format!("et-fp-{}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    let _cleanup = RemoveDir(directory.clone());
+    let usable_path = directory.join("usable.sock");
+    let occupied_path = directory.join("occupied.sock");
+    let occupied = std::os::unix::net::UnixListener::bind(&occupied_path).unwrap();
+    let imported = |path: &std::path::Path, strict| ForwardSource {
+        request: PortForwardSourceRequest {
+            source: Some(SocketEndpoint {
+                name: Some(path.to_string_lossy().into_owned()),
+                port: None,
+            }),
+            destination: Some(SocketEndpoint {
+                name: Some("/tmp/destination.sock".to_owned()),
+                port: None,
+            }),
+            environmentvariable: None,
+        },
+        origin: ForwardOrigin::SshConfig { strict },
+    };
+
+    // When: nonfatal import contains one occupied row.
+    let (forwarder, skipped) = Forwarder::start_with_origins(vec![
+        imported(&usable_path, false),
+        imported(&occupied_path, false),
+    ])
+    .unwrap();
+
+    // Then: one warning record remains and the usable sibling stays bound.
+    assert_eq!(skipped.len(), 1);
+    assert!(usable_path.exists());
+    forwarder.shutdown().unwrap();
+
+    // When: strict import contains the same occupied row after a usable sibling.
+    let error = match Forwarder::start_with_origins(vec![
+        imported(&usable_path, true),
+        imported(&occupied_path, true),
+    ]) {
+        Ok((forwarder, _)) => {
+            forwarder.shutdown().unwrap();
+            panic!("strict imported bind failure was downgraded")
+        }
+        Err(error) => error,
+    };
+
+    // Then: strict setup fails and rolls the provisional sibling back.
+    assert!(matches!(error, ForwardError::Io(_)));
+    assert!(!usable_path.exists());
+    drop(occupied);
+}
+
+#[cfg(unix)]
+#[test]
 fn reverse_tcp_bind_uses_session_identity() {
     let root = rustix::process::geteuid().as_raw() == 0;
     let source_port = if root { 1 } else { reserve_port() };
@@ -281,13 +344,13 @@ fn authenticated_reverse_tcp_wildcard_bind_exposes_session_to_external_network()
 
     let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = reservation.local_addr().unwrap().port();
-    let error = match Forwarder::start_with_user_report(
+    let error = match Forwarder::start_with_user(
         vec![request_on(&Ipv4Addr::UNSPECIFIED.to_string(), port, 1)],
         Some(owner),
     ) {
-        Ok((forwarder, _, _)) => {
+        Ok((forwarder, _)) => {
             forwarder.shutdown().unwrap();
-            panic!("authority failure was downgraded to a row report")
+            panic!("authority failure was not fatal")
         }
         Err(error) => error,
     };
@@ -304,6 +367,38 @@ fn authenticated_reverse_tcp_wildcard_bind_exposes_session_to_external_network()
             owner,
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn authenticated_reverse_tcp_accepts_resolved_non_loopback_address() {
+    // Given
+    let probe = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    probe.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).unwrap();
+    let external = match probe.local_addr().unwrap().ip() {
+        IpAddr::V4(address) if !address.is_loopback() => address,
+        address => panic!("route probe did not select a non-loopback IPv4 address: {address}"),
+    };
+    let owner = (
+        rustix::process::geteuid().as_raw(),
+        rustix::process::getegid().as_raw(),
+    );
+    let reservation = TcpListener::bind((external, 0)).unwrap();
+    let port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+
+    // When
+    let (forwarder, _) = Forwarder::start_with_user(
+        vec![request_on(&external.to_string(), port, 1)],
+        Some(owner),
+    )
+    .unwrap();
+    let connection =
+        TcpStream::connect_timeout(&SocketAddr::from((external, port)), TIMEOUT).unwrap();
+
+    // Then
+    drop(connection);
+    forwarder.shutdown().unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -327,7 +422,7 @@ fn imported_local_wildcard_is_externally_reachable_while_loopback_is_not() {
     let request = request_on("", wildcard_port, 1);
     let (wildcard, skipped) = Forwarder::start_with_origins(vec![ForwardSource {
         request,
-        origin: ForwardOrigin::SshConfig,
+        origin: ForwardOrigin::SshConfig { strict: false },
     }])
     .unwrap();
     assert!(skipped.is_empty());
@@ -339,7 +434,7 @@ fn imported_local_wildcard_is_externally_reachable_while_loopback_is_not() {
 
 #[cfg(unix)]
 #[test]
-fn reverse_listener_limit_is_transactional() {
+fn local_forwarding_exceeds_reverse_cap_while_reverse_limit_is_transactional() {
     struct RemoveDir(std::path::PathBuf);
     impl Drop for RemoveDir {
         fn drop(&mut self) {
@@ -353,7 +448,7 @@ fn reverse_listener_limit_is_transactional() {
     let paths: Vec<_> = (0..33)
         .map(|index| directory.join(format!("source-{index}.sock")))
         .collect();
-    let requests = paths
+    let requests: Vec<PortForwardSourceRequest> = paths
         .iter()
         .map(|path| PortForwardSourceRequest {
             source: Some(SocketEndpoint {
@@ -368,14 +463,28 @@ fn reverse_listener_limit_is_transactional() {
         })
         .collect();
 
-    let error = match Forwarder::start(requests) {
-        Ok(forwarder) => {
+    // When: client-local forwarding owns more than the server reverse cap.
+    let local = Forwarder::start(requests.clone()).unwrap();
+
+    // Then: every local listener is usable and cleanup is deterministic.
+    assert!(paths.iter().all(|path| path.exists()));
+    local.shutdown().unwrap();
+    assert!(paths.iter().all(|path| !path.exists()));
+
+    // When: the same multiset is requested as authenticated server reverse forwarding.
+    let owner = (
+        rustix::process::geteuid().as_raw(),
+        rustix::process::getegid().as_raw(),
+    );
+    let error = match Forwarder::start_with_user(requests, Some(owner)) {
+        Ok((forwarder, _)) => {
             forwarder.shutdown().unwrap();
-            panic!("listener cap was not enforced");
+            panic!("reverse listener cap was not enforced");
         }
         Err(error) => error,
     };
 
+    // Then: the cap fails transactionally before any sibling bind.
     assert!(
         error.to_string().contains("listener limit"),
         "unexpected error: {error}"

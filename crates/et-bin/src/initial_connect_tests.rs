@@ -1,9 +1,27 @@
-use et_core::proto::{ConnectResponse, ConnectStatus, InitialResponse};
-use et_net::forward::ForwardOrigin;
-use et_net::reverse_report::{encode_skipped_rows, SkipReason, SkippedRow};
-
 use super::{accept_initial_response, accept_reconnect_response, accept_response, ReconnectStatus};
 use crate::error::ClientError;
+use et_core::proto::{ConnectResponse, ConnectStatus, InitialResponse};
+
+#[test]
+fn initial_response_without_error_is_accepted() {
+    assert!(accept_initial_response(InitialResponse { error: None }).is_ok());
+}
+
+#[test]
+fn every_initial_response_error_is_fatal() {
+    for message in [
+        "reverse forwarding failed",
+        "ETRS-RF-SKIP/1 0 13",
+        "anything else",
+    ] {
+        assert!(matches!(
+            accept_initial_response(InitialResponse {
+                error: Some(message.to_owned()),
+            }),
+            Err(ClientError::InitialResponseRejected(error)) if error == message
+        ));
+    }
+}
 
 #[test]
 fn fresh_bootstrap_rejects_returning_status() {
@@ -14,58 +32,6 @@ fn fresh_bootstrap_rejects_returning_status() {
     assert!(matches!(
         accept_response(response),
         Err(ClientError::ReturningSessionRequiresRecovery)
-    ));
-}
-
-#[test]
-fn config_only_skip_report_continues_but_explicit_report_is_fatal() {
-    let report = encode_skipped_rows(&[SkippedRow {
-        index: 0,
-        reason: SkipReason::Bind,
-    }])
-    .unwrap();
-
-    assert!(accept_initial_response(
-        InitialResponse {
-            error: Some(report.clone()),
-        },
-        &[ForwardOrigin::SshConfig],
-    )
-    .is_ok());
-    for origin in [ForwardOrigin::Explicit, ForwardOrigin::Reported(0)] {
-        assert!(matches!(
-            accept_initial_response(
-                InitialResponse {
-                    error: Some(report.clone()),
-                },
-                &[origin],
-            ),
-            Err(ClientError::InitialResponseRejected(message))
-                if message == "explicit reverse forwarding row could not bind"
-        ));
-    }
-}
-
-#[test]
-fn old_server_error_and_malformed_reserved_report_fail_closed() {
-    assert!(matches!(
-        accept_initial_response(
-            InitialResponse {
-                error: Some("port forwarding I/O: address in use".to_owned()),
-            },
-            &[ForwardOrigin::SshConfig],
-        ),
-        Err(ClientError::InitialResponseRejected(_))
-    ));
-    assert!(matches!(
-        accept_initial_response(
-            InitialResponse {
-                error: Some("ETRS-RF-SKIP/2;0:B".to_owned()),
-            },
-            &[ForwardOrigin::SshConfig],
-        ),
-        Err(ClientError::InitialResponseRejected(message))
-            if message == "malformed reverse forwarding skip report"
     ));
 }
 

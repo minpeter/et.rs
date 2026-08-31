@@ -72,6 +72,15 @@ impl PreparedWrite {
             .map_err(ConnError::Io)
             .map_err(WritePacketError::ReplayOwned)
     }
+
+    fn send_until(self, deadline: Instant) -> Result<(), WritePacketError> {
+        let Some((mut stream, frame, _timeout)) = self.live else {
+            return Ok(());
+        };
+        write_live_frame_until(&mut stream, &frame, deadline)
+            .map_err(ConnError::Io)
+            .map_err(WritePacketError::ReplayOwned)
+    }
 }
 
 impl Connection {
@@ -102,12 +111,27 @@ impl Connection {
         header: u8,
         payload: &[u8],
     ) -> Result<(), WritePacketError> {
+        self.write_packet_owned_until(header, payload, None)
+    }
+
+    fn write_packet_owned_until(
+        &mut self,
+        header: u8,
+        payload: &[u8],
+        deadline: Option<Instant>,
+    ) -> Result<(), WritePacketError> {
         let prepared = self.prepare_write_packet(header, payload)?;
-        if let Err(error) = prepared.send() {
-            self.disconnect();
-            return Err(error);
+        let result = match deadline {
+            Some(deadline) => prepared.send_until(deadline),
+            None => prepared.send(),
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.disconnect();
+                Err(error)
+            }
         }
-        Ok(())
     }
 
     pub fn prepare_write_packet(
@@ -158,16 +182,47 @@ impl Connection {
         }
     }
 
-    /// Write a framed packet to a still-connected peer with a bounded timeout.
+    /// Write initialization traffic only while the current transport is live.
     ///
-    /// Uses a write loop (not bare `write_all`) so each `write` is capped by
-    /// the remaining deadline. On any incomplete write we error out and the
-    /// caller soft-disconnects: the old TCP path is abandoned (and shut down
-    /// by the soft-disconnect path) so a partial frame left on the wire cannot
-    /// desync a later recovery, which always uses a new stream.
-    ///
-    /// Restores a cleared write timeout afterwards so recovery / handshake
-    /// code that sets its own deadlines is not left with a stale value.
+    /// Active sessions intentionally buffer output after a soft disconnect,
+    /// but lifecycle transitions must not treat that buffered-only outcome as
+    /// proof that the peer received a handshake packet.
+    pub fn write_packet_live(&mut self, header: u8, payload: &[u8]) -> Result<(), ConnError> {
+        if !self.connected() {
+            return Err(io::Error::from(io::ErrorKind::NotConnected).into());
+        }
+        self.write_packet_owned(header, payload)
+            .map_err(WritePacketError::into_inner)?;
+        if self.connected() {
+            Ok(())
+        } else {
+            Err(io::Error::from(io::ErrorKind::NotConnected).into())
+        }
+    }
+
+    /// Write a handshake packet and require it to reach a live transport.
+    pub fn write_packet_strict(&mut self, header: u8, payload: &[u8]) -> Result<(), ConnError> {
+        self.write_packet_live(header, payload)
+    }
+
+    pub fn write_packet_live_until(
+        &mut self,
+        header: u8,
+        payload: &[u8],
+        deadline: Instant,
+    ) -> Result<(), ConnError> {
+        if !self.connected() {
+            return Err(io::Error::from(io::ErrorKind::NotConnected).into());
+        }
+        self.write_packet_owned_until(header, payload, Some(deadline))
+            .map_err(WritePacketError::into_inner)?;
+        if self.connected() {
+            Ok(())
+        } else {
+            Err(io::Error::from(io::ErrorKind::NotConnected).into())
+        }
+    }
+
     pub fn read_packet(&mut self) -> Result<Packet, ConnError> {
         loop {
             match self.reader.pop() {
@@ -187,6 +242,48 @@ impl Connection {
                 Ok(count) => self.reader.feed(&buffer[..count]),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
+                    self.disconnect();
+                    return Err(ConnError::Io(error));
+                }
+            }
+        }
+    }
+
+    pub fn read_packet_until(&mut self, deadline: Instant) -> Result<Packet, ConnError> {
+        loop {
+            match self.reader.pop() {
+                Ok(ReadItem::Packet(packet)) => {
+                    self.stream.set_read_timeout(None).map_err(ConnError::Io)?;
+                    return Ok(packet);
+                }
+                Ok(ReadItem::NeedMore) => {}
+                Err(error) => {
+                    let _ = self.stream.set_read_timeout(None);
+                    self.disconnect();
+                    return Err(ConnError::Read(error));
+                }
+            }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| {
+                    self.disconnect();
+                    ConnError::Io(io::ErrorKind::TimedOut.into())
+                })?;
+            self.stream
+                .set_read_timeout(Some(remaining))
+                .map_err(ConnError::Io)?;
+            let mut buffer = [0u8; 8192];
+            match self.stream.read(&mut buffer) {
+                Ok(0) => {
+                    let _ = self.stream.set_read_timeout(None);
+                    self.disconnect();
+                    return Err(ConnError::Io(io::ErrorKind::UnexpectedEof.into()));
+                }
+                Ok(count) => self.reader.feed(&buffer[..count]),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    let _ = self.stream.set_read_timeout(None);
                     self.disconnect();
                     return Err(ConnError::Io(error));
                 }
@@ -321,6 +418,18 @@ fn write_live_frame(stream: &mut TcpStream, frame: &[u8], timeout: Duration) -> 
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "live write deadline"))?;
+    write_live_frame_until(stream, frame, deadline)
+}
+
+/// Write a framed packet to a still-connected peer before an absolute deadline.
+///
+/// On an incomplete write, shut down the abandoned transport so a partial
+/// frame cannot desynchronize a later recovery on a replacement stream.
+fn write_live_frame_until(
+    stream: &mut TcpStream,
+    frame: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
     let result = write_all_until(stream, frame, deadline);
     // Best-effort restore: a failed clear must not hide a write error.
     let clear = stream.set_write_timeout(None);

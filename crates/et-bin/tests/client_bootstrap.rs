@@ -166,7 +166,7 @@ fn initial_payload_server_with_error(
 }
 
 #[test]
-fn ssh_config_local_and_remote_forwards_become_et_tunnels() {
+fn ssh_config_remote_forward_is_omitted_from_initial_payload() {
     let (port, server) = initial_payload_server_with_error(Some("stop after payload"));
     let fake = FakeSsh::new();
     let config = concat!(
@@ -185,24 +185,12 @@ fn ssh_config_local_and_remote_forwards_become_et_tunnels() {
         .unwrap();
     let payload = server.join().unwrap();
 
-    assert_eq!(payload.reversetunnels.len(), 1);
-    let reverse = &payload.reversetunnels[0];
-    assert_eq!(
-        reverse.source.as_ref().and_then(|source| source.port),
-        Some(1492)
-    );
-    assert_eq!(
-        reverse
-            .destination
-            .as_ref()
-            .and_then(|destination| destination.port),
-        Some(1492)
-    );
+    assert!(payload.reversetunnels.is_empty());
     assert_eq!(fake.invocations()[0], ["-G", "-T", "server-alias"]);
 }
 
 #[test]
-fn ssh_config_forwards_apply_on_the_unspecified_axis() {
+fn ssh_config_remote_forward_is_omitted_with_explicit_local_forward() {
     let (port, server) = initial_payload_server_with_error(Some("stop after payload"));
     let fake = FakeSsh::new();
     let config = concat!(
@@ -221,18 +209,11 @@ fn ssh_config_forwards_apply_on_the_unspecified_axis() {
         .unwrap();
     let payload = server.join().unwrap();
 
-    assert_eq!(payload.reversetunnels.len(), 1);
-    assert_eq!(
-        payload.reversetunnels[0]
-            .source
-            .as_ref()
-            .and_then(|source| source.port),
-        Some(1492)
-    );
+    assert!(payload.reversetunnels.is_empty());
 }
 
 #[test]
-fn ssh_config_hardening_nonlocal_destinations_warn_and_other_rows_continue() {
+fn ssh_config_nonlocal_local_destinations_are_accepted_and_remote_rows_omitted() {
     let (port, server) = initial_payload_server_with_error(Some("stop after payload"));
     let fake = FakeSsh::new();
     let config = concat!(
@@ -262,20 +243,13 @@ fn ssh_config_hardening_nonlocal_destinations_warn_and_other_rows_continue() {
     let payload = server.join().unwrap();
 
     assert_ne!(output.status.code(), Some(2), "{}", stderr(&output));
-    assert_eq!(payload.reversetunnels.len(), 1);
-    assert_eq!(
-        payload.reversetunnels[0]
-            .source
-            .as_ref()
-            .and_then(|source| source.port),
-        Some(25433)
-    );
+    assert!(payload.reversetunnels.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout)
             .lines()
             .filter(|line| line.contains("WARNING"))
             .count(),
-        4
+        0
     );
 }
 
@@ -329,17 +303,8 @@ fn ssh_config_hardening_unsupported_records_warn_and_base_session_continues() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert_ne!(output.status.code(), Some(2), "{}", stderr(&output));
-    assert_eq!(payload.reversetunnels.len(), 1);
-    assert_eq!(
-        payload.reversetunnels[0]
-            .source
-            .as_ref()
-            .and_then(|source| source.port),
-        Some(25433)
-    );
+    assert!(payload.reversetunnels.is_empty());
     for reason in [
-        "dynamic forwarding is unsupported",
-        "allocated remote port 0 is unsupported",
         "relative stream-local path is unsupported",
         "ambiguous stream-local path is unsupported",
         "stream-local bind policy is unsupported",
@@ -401,7 +366,7 @@ fn ssh_config_extra_forward_field_is_rejected_before_bootstrap() {
 }
 
 #[test]
-fn ssh_config_malformed_axis_is_rejected_even_with_explicit_forward() {
+fn only_malformed_imported_local_forwards_are_rejected() {
     // Given
     let base_config = concat!(
         "host server-alias\n",
@@ -410,40 +375,37 @@ fn ssh_config_malformed_axis_is_rejected_even_with_explicit_forward() {
         "port 22\n",
     );
 
-    for (option, value, malformed, row) in [
-        (
-            "-t",
-            "5555:22",
-            "localforward",
-            "localforward unsupported\n",
-        ),
-        (
-            "-r",
-            "3000:4000",
-            "remoteforward",
-            "remoteforward 1492 [127.0.0.1]:1492 unexpected\n",
-        ),
-    ] {
-        let fake = FakeSsh::new();
-        let config = format!("{base_config}{row}");
+    let fake = FakeSsh::new();
+    let local = fake
+        .command(
+            &format!("{base_config}localforward unsupported\n"),
+            VALID_MARKER,
+            0,
+            "",
+        )
+        .args(["-N", "-t", "5555:22", "server-alias:1"])
+        .output()
+        .unwrap();
+    assert_eq!(local.status.code(), Some(2), "{}", stderr(&local));
+    assert!(stderr(&local).contains("malformed localforward"));
 
-        // When
-        let output = fake
-            .command(&config, VALID_MARKER, 0, "")
-            .args(["-N", option, value, "server-alias:1"])
-            .output()
-            .unwrap();
-        let error = stderr(&output);
-
-        // Then
-        assert_eq!(output.status.code(), Some(2), "{option}: {error}");
-        assert!(error.contains(&format!("malformed {malformed}")), "{error}");
-        assert_eq!(fake.invocations(), [["-G", "-T", "server-alias"]]);
-    }
+    let fake = FakeSsh::new();
+    let remote = fake
+        .command(
+            &format!("{base_config}remoteforward 1492 [127.0.0.1]:1492 unexpected\n"),
+            VALID_MARKER,
+            0,
+            "",
+        )
+        .args(["-N", "-r", "3000:4000", "server-alias:1"])
+        .output()
+        .unwrap();
+    assert_eq!(remote.status.code(), Some(1), "{}", stderr(&remote));
+    assert!(!stderr(&remote).contains("malformed remoteforward"));
 }
 
 #[test]
-fn ssh_config_and_cli_remote_forwards_are_cumulative_and_exactly_deduplicated() {
+fn explicit_cli_remote_forwards_are_deduplicated_while_config_rows_are_omitted() {
     // Given
     let (port, server) = initial_payload_server_with_error(Some("stop after payload"));
     let fake = FakeSsh::new();
@@ -489,14 +451,7 @@ fn ssh_config_and_cli_remote_forwards_are_cumulative_and_exactly_deduplicated() 
             )
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        ports,
-        [
-            (Some(3000), Some(4000)),
-            (Some(1492), Some(1492)),
-            (Some(1492), Some(1493)),
-        ]
-    );
+    assert_eq!(ports, [(Some(3000), Some(4000)), (Some(1492), Some(1492)),]);
 }
 
 #[test]
@@ -565,22 +520,27 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
     assert!(invocations[1].last().unwrap().contains("__ET_COMSPEC__"));
     let argv = &invocations[2];
     assert_eq!(
-        &argv[..3],
+        &argv[..8],
         [
             "-oClearAllForwardings=yes",
+            "-oRemoteCommand=none",
+            "-oPermitLocalCommand=no",
+            "-oControlMaster=no",
+            "-oControlPath=none",
+            "-oSessionType=default",
             "-oStrictHostKeyChecking=no",
             "test-user@server-alias",
         ]
     );
     let prefix = "printf '%s\\n' '";
-    let value = argv[3].strip_prefix(prefix).unwrap();
+    let value = argv[8].strip_prefix(prefix).unwrap();
     let provisional = value.split_once("_xterm-256color'").unwrap().0;
     let (id, key) = parse_id_passkey(provisional).unwrap();
     assert!(id.starts_with("XXX"));
     assert_eq!(id.len(), 16);
     assert_eq!(key.len(), 32);
     assert_eq!(
-        argv[3],
+        argv[8],
         format!(
             "printf '%s\\n' '{provisional}_xterm-256color' | '/opt/et terminal' '--verbose=2' '--serverfifo=/tmp/server fifo'"
         )
@@ -885,9 +845,19 @@ fn explicit_posix_shell_skips_probe_and_uses_exact_posix_bootstrap() {
     assert_eq!(invocations.len(), 2, "{invocations:?}");
     assert_eq!(invocations[0], ["-G", "-T", "127.0.0.1"]);
     let bootstrap = &invocations[1];
-    assert_eq!(bootstrap[0], "-oClearAllForwardings=yes");
-    assert_eq!(bootstrap[1], "config-user@127.0.0.1");
-    let input = bootstrap[2]
+    assert_eq!(
+        &bootstrap[..6],
+        [
+            "-oClearAllForwardings=yes",
+            "-oRemoteCommand=none",
+            "-oPermitLocalCommand=no",
+            "-oControlMaster=no",
+            "-oControlPath=none",
+            "-oSessionType=default",
+        ]
+    );
+    assert_eq!(bootstrap[6], "config-user@127.0.0.1");
+    let input = bootstrap[7]
         .strip_prefix("printf '%s\\n' '")
         .unwrap()
         .strip_suffix("_xterm-256color' | 'etterminal' '--verbose=0'")
@@ -1276,9 +1246,19 @@ fn jumphost_starts_a_jump_terminal_and_connects_to_the_jumphost() {
     let destination = &invocations[2];
     assert_eq!(destination[0], "-J");
     assert_eq!(destination[1], "jump.example");
-    assert_eq!(destination[2], "-oClearAllForwardings=yes");
-    assert_eq!(destination[3], "test-user@server-alias");
-    let destination_command = &destination[4];
+    assert_eq!(
+        &destination[2..8],
+        [
+            "-oClearAllForwardings=yes",
+            "-oRemoteCommand=none",
+            "-oPermitLocalCommand=no",
+            "-oControlMaster=no",
+            "-oControlPath=none",
+            "-oSessionType=default",
+        ]
+    );
+    assert_eq!(destination[8], "test-user@server-alias");
+    let destination_command = &destination[9];
     assert!(
         destination_command.starts_with("echo "),
         "{destination_command:?}"
@@ -1297,9 +1277,19 @@ fn jumphost_starts_a_jump_terminal_and_connects_to_the_jumphost() {
     );
     assert_eq!(invocations[3], ["-G", "-T", "jump.example"]);
     let jump = &invocations[4];
-    assert_eq!(jump[0], "-oClearAllForwardings=yes");
-    assert_eq!(jump[1], "jump.example");
-    let jump_command = &jump[2];
+    assert_eq!(
+        &jump[..6],
+        [
+            "-oClearAllForwardings=yes",
+            "-oRemoteCommand=none",
+            "-oPermitLocalCommand=no",
+            "-oControlMaster=no",
+            "-oControlPath=none",
+            "-oSessionType=default",
+        ]
+    );
+    assert_eq!(jump[6], "jump.example");
+    let jump_command = &jump[7];
     // The jumphost remains POSIX even when the destination probe selects Cmd.
     assert!(jump_command.contains("'etterminal'"), "{jump_command:?}");
     assert!(!jump_command.contains("et.exe"), "{jump_command:?}");

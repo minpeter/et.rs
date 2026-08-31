@@ -185,13 +185,7 @@ fn load_credentials(args: &TerminalArgs) -> Result<CredentialInput, String> {
 fn register(router: &mut LocalStream, input: &CredentialInput) -> Result<(), String> {
     // Upstream uses these to chown forwarded named pipes; Windows has no
     // POSIX ids, so the session reports zero there.
-    #[cfg(unix)]
-    let (uid, gid) = (
-        i64::from(rustix::process::getuid().as_raw()),
-        i64::from(rustix::process::getgid().as_raw()),
-    );
-    #[cfg(windows)]
-    let (uid, gid) = (0i64, 0i64);
+    let (uid, gid) = registration_identity();
     let user = TerminalUserInfo {
         id: Some(input.id.clone()),
         passkey: Some(input.passkey.clone()),
@@ -207,6 +201,36 @@ fn register(router: &mut LocalStream, input: &CredentialInput) -> Result<(), Str
         .map_err(|error| format!("could not register terminal: {error}"))
 }
 
+#[cfg(unix)]
+fn registration_identity() -> (i64, i64) {
+    (
+        i64::from(rustix::process::geteuid().as_raw()),
+        i64::from(rustix::process::getegid().as_raw()),
+    )
+}
+
+#[cfg(windows)]
+fn registration_identity() -> (i64, i64) {
+    (0, 0)
+}
+
 fn clap_error(message: impl Into<String>) -> clap::Error {
     clap::Error::raw(ErrorKind::Io, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_registration_identity_matches_effective_peer_credentials() {
+        assert_eq!(
+            registration_identity(),
+            (
+                i64::from(rustix::process::geteuid().as_raw()),
+                i64::from(rustix::process::getegid().as_raw()),
+            )
+        );
+    }
 }

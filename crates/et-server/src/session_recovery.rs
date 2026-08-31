@@ -61,7 +61,7 @@ impl ActiveSession {
         }
         let ack = candidate.keepalive_ack();
         candidate
-            .write_packet(TerminalPacketType::KeepAlive as u8, &ack)
+            .write_packet_live(TerminalPacketType::KeepAlive as u8, &ack)
             .map_err(SessionError::Connection)?;
         let new_control = candidate
             .try_clone_stream()

@@ -78,7 +78,7 @@ pub fn run(
         }
         destination
             .connection
-            .write_packet(EtPacketType::Heartbeat as u8, &[])
+            .write_packet_live(EtPacketType::Heartbeat as u8, &[])
             .map_err(|error| format!("could not acknowledge destination response: {error}"))?;
     }
     destination
@@ -204,7 +204,7 @@ where
     }
     observe_before_payload(&connection)?;
     connection
-        .write_packet(EtPacketType::InitialPayload as u8, &payload.encode_to_vec())
+        .write_packet_live(EtPacketType::InitialPayload as u8, &payload.encode_to_vec())
         .map_err(|error| format!("could not send INITIAL_PAYLOAD: {error}"))?;
     let packet = connection
         .read_packet()
@@ -251,19 +251,16 @@ fn relay_with_output_observer(
     #[cfg(windows)]
     loop {
         let mut progress = write_pending_local(&mut router, &mut pending_output)?;
-        match read_router_packet(&mut router, &mut decoder)? {
-            Some(packet) => {
-                progress = true;
-                decoder = LocalPacketDecoder::new();
-                let packet = destination_packet(destination, packet);
-                if destination
-                    .write_packet(packet.header(), packet.payload())
-                    .is_err()
-                {
-                    return Ok(0);
-                }
+        if let Some(packet) = read_router_packet(&mut router, &mut decoder)? {
+            progress = true;
+            decoder = LocalPacketDecoder::new();
+            let packet = destination_packet(destination, packet);
+            if destination
+                .write_packet(packet.header(), packet.payload())
+                .is_err()
+            {
+                return Ok(0);
             }
-            None => {}
         }
         while pending_output.is_none() {
             match destination.try_read_packet() {

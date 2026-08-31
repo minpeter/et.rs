@@ -6,7 +6,7 @@ use std::os::unix::net::UnixStream;
 use std::thread::JoinHandle;
 
 use crossbeam_channel as channel;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use et_core::packet::Packet;
 use et_core::proto::{PortForwardSourceRequest, TerminalPacketType};
@@ -14,12 +14,11 @@ use et_core::proto::{PortForwardSourceRequest, TerminalPacketType};
 use crate::forward_endpoint::{Endpoint, ResolvedEndpoint};
 use crate::forward_io::BoundSource;
 use crate::forward_worker::{run, Command, WorkerChannels};
-use crate::reverse_report::SkipReason;
 
 const CHANNEL_CAPACITY: usize = 256;
 /// Maximum reverse listeners owned by one terminal session, after DNS fanout
 /// and address deduplication.
-const MAX_SESSION_LISTENERS: usize = 32;
+pub const MAX_SESSION_LISTENERS: usize = 32;
 
 #[derive(Debug)]
 pub enum ForwardError {
@@ -53,8 +52,7 @@ pub(crate) type Outbound = Result<Packet, ForwardError>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ForwardOrigin {
     Explicit,
-    SshConfig,
-    Reported(usize),
+    SshConfig { strict: bool },
 }
 
 pub struct ForwardSource {
@@ -70,10 +68,10 @@ impl ForwardSource {
         }
     }
 
-    pub const fn ssh_config(request: PortForwardSourceRequest) -> Self {
+    pub const fn ssh_config(request: PortForwardSourceRequest, strict: bool) -> Self {
         Self {
             request,
-            origin: ForwardOrigin::SshConfig,
+            origin: ForwardOrigin::SshConfig { strict },
         }
     }
 }
@@ -81,8 +79,6 @@ impl ForwardSource {
 pub struct SkippedForward {
     pub request: PortForwardSourceRequest,
     pub error: io::Error,
-    pub reason: SkipReason,
-    pub report_index: Option<usize>,
 }
 
 pub struct Forwarder {
@@ -101,13 +97,13 @@ pub struct Forwarder {
 impl Forwarder {
     pub fn start(sources: Vec<PortForwardSourceRequest>) -> Result<Self, ForwardError> {
         let sources = sources.into_iter().map(ForwardSource::explicit).collect();
-        start_forwarder(sources, None).map(|(forwarder, _, _)| forwarder)
+        start_forwarder(sources, None, None).map(|(forwarder, _, _)| forwarder)
     }
 
     pub fn start_with_origins(
         sources: Vec<ForwardSource>,
     ) -> Result<(Self, Vec<SkippedForward>), ForwardError> {
-        start_forwarder(sources, None).map(|(forwarder, _, skipped)| (forwarder, skipped))
+        start_forwarder(sources, None, None).map(|(forwarder, _, skipped)| (forwarder, skipped))
     }
 
     /// Bind all forwarding sources and return the forwarder together with the
@@ -120,30 +116,27 @@ impl Forwarder {
         owner: Option<(u32, u32)>,
     ) -> Result<(Self, ForwardEnvironment), ForwardError> {
         let sources = sources.into_iter().map(ForwardSource::explicit).collect();
-        start_forwarder(sources, owner).map(|(forwarder, environment, _)| (forwarder, environment))
+        start_forwarder(sources, owner, None)
+            .map(|(forwarder, environment, _)| (forwarder, environment))
     }
 
-    pub fn start_with_user_report(
+    pub fn start_with_user_until(
         sources: Vec<PortForwardSourceRequest>,
-        owner: Option<(u32, u32)>,
-    ) -> Result<(Self, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
-        let sources = sources
-            .into_iter()
-            .enumerate()
-            .map(|(index, request)| ForwardSource {
-                request,
-                origin: ForwardOrigin::Reported(index),
-            })
-            .collect();
-        start_forwarder(sources, owner)
+        owner: (u32, u32),
+        deadline: Instant,
+    ) -> Result<(Self, ForwardEnvironment), ForwardError> {
+        let sources = sources.into_iter().map(ForwardSource::explicit).collect();
+        start_forwarder(sources, Some(owner), Some(deadline))
+            .map(|(forwarder, environment, _)| (forwarder, environment))
     }
 }
 
 fn start_forwarder(
     sources: Vec<ForwardSource>,
     owner: Option<(u32, u32)>,
+    deadline: Option<Instant>,
 ) -> Result<(Forwarder, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
-    let (sources, environment, skipped) = bind_sources(sources, owner)?;
+    let (sources, environment, skipped) = bind_sources(sources, owner, deadline)?;
     let session_user = owner;
     let (commands_tx, commands_rx) = channel::bounded(CHANNEL_CAPACITY);
     let (outbound_tx, outbound_rx) = channel::bounded(CHANNEL_CAPACITY);
@@ -312,6 +305,7 @@ enum PlannedSource {
 fn bind_sources(
     sources: Vec<ForwardSource>,
     owner: Option<(u32, u32)>,
+    deadline: Option<Instant>,
 ) -> Result<(Vec<BoundSource>, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
     let mut plans = Vec::with_capacity(sources.len());
     let mut skipped = Vec::new();
@@ -348,28 +342,26 @@ fn bind_sources(
             }
         } else {
             let endpoint = Endpoint::parse(request.source).map_err(ForwardError::Io)?;
-            let resolved = endpoint.resolve_for_bind();
+            let resolved = match (owner, deadline) {
+                (Some(_), Some(deadline)) => endpoint.resolve_for_bind_until(
+                    deadline,
+                    MAX_SESSION_LISTENERS.saturating_sub(listener_count),
+                ),
+                _ => endpoint.resolve_for_bind(),
+            };
             let source = match (resolved, origin) {
                 (Ok(source), _) => source,
-                (Err(error), ForwardOrigin::SshConfig) => {
+                (Err(error), ForwardOrigin::SshConfig { strict: false }) => {
                     skipped.push(SkippedForward {
                         request: original,
                         error,
-                        reason: SkipReason::Resolve,
-                        report_index: None,
                     });
                     continue;
                 }
-                (Err(error), ForwardOrigin::Reported(index)) => {
-                    skipped.push(SkippedForward {
-                        request: original,
-                        error,
-                        reason: SkipReason::Resolve,
-                        report_index: Some(index),
-                    });
-                    continue;
-                }
-                (Err(error), ForwardOrigin::Explicit) => return Err(ForwardError::Io(error)),
+                (
+                    Err(error),
+                    ForwardOrigin::Explicit | ForwardOrigin::SshConfig { strict: true },
+                ) => return Err(ForwardError::Io(error)),
             };
             if owner.is_some() {
                 match &source {
@@ -402,7 +394,7 @@ fn bind_sources(
         listener_count = listener_count
             .checked_add(additional_listeners)
             .ok_or(ForwardError::Protocol("reverse listener limit exceeded"))?;
-        if listener_count > MAX_SESSION_LISTENERS {
+        if owner.is_some() && listener_count > MAX_SESSION_LISTENERS {
             return Err(ForwardError::Protocol("reverse listener limit exceeded"));
         }
         plans.push(plan);
@@ -418,7 +410,13 @@ fn bind_sources(
                 destination,
                 original,
                 origin,
-            } => match (source.bind_with_user(owner), origin) {
+            } => match (
+                match deadline {
+                    Some(deadline) => source.bind_with_user_until(owner, deadline),
+                    None => source.bind_with_user(owner),
+                },
+                origin,
+            ) {
                 (Ok(listeners), _) => {
                     for listener in listeners {
                         bound.push(BoundSource {
@@ -427,37 +425,32 @@ fn bind_sources(
                         });
                     }
                 }
-                (Err(error), ForwardOrigin::SshConfig) => {
+                (Err(error), ForwardOrigin::SshConfig { strict: false }) => {
                     skipped.push(SkippedForward {
                         request: original,
                         error,
-                        reason: SkipReason::Bind,
-                        report_index: None,
                     });
                 }
-                (Err(error), ForwardOrigin::Reported(index)) => {
-                    skipped.push(SkippedForward {
-                        request: original,
-                        error,
-                        reason: SkipReason::Bind,
-                        report_index: Some(index),
-                    });
-                }
-                (Err(error), ForwardOrigin::Explicit) => return Err(ForwardError::Io(error)),
+                (
+                    Err(error),
+                    ForwardOrigin::Explicit | ForwardOrigin::SshConfig { strict: true },
+                ) => return Err(ForwardError::Io(error)),
             },
             #[cfg(unix)]
             PlannedSource::Environment {
                 variable,
                 destination,
             } => {
-                let path = create_forward_pipe(owner)?;
-                let source = Endpoint::Unix(path.clone()).resolve_for_bind()?;
-                let mut listeners = source.bind_with_user(owner)?;
-                environment.push((variable, path.to_string_lossy().into_owned()));
+                let mut pipe = create_forward_pipe(owner)?;
+                let source = Endpoint::Unix(pipe.path.clone()).resolve_for_bind()?;
+                let mut listeners = match deadline {
+                    Some(deadline) => source.bind_with_user_until(owner, deadline)?,
+                    None => source.bind_with_user(owner)?,
+                };
+                environment.push((variable, pipe.path.to_string_lossy().into_owned()));
+                let directory = pipe.disarm()?;
                 for mut listener in listeners.drain(..) {
-                    if let Some(directory) = path.parent() {
-                        listener.also_remove_dir(directory.to_path_buf());
-                    }
+                    listener.also_remove_dir(directory.clone());
                     bound.push(BoundSource {
                         listener,
                         destination: destination.clone(),
@@ -472,7 +465,15 @@ fn bind_sources(
 /// Create the private directory for a named-pipe forward and return the
 /// socket path inside it (upstream `et_forward_sock_XXXXXX/sock`).
 #[cfg(unix)]
-fn create_forward_pipe(owner: Option<(u32, u32)>) -> Result<std::path::PathBuf, ForwardError> {
+fn create_forward_pipe(owner: Option<(u32, u32)>) -> Result<ForwardPipe, ForwardError> {
+    create_forward_pipe_with(owner, |_| Ok(()))
+}
+
+#[cfg(unix)]
+fn create_forward_pipe_with(
+    owner: Option<(u32, u32)>,
+    after_create: impl FnOnce(&std::path::Path) -> io::Result<()>,
+) -> Result<ForwardPipe, ForwardError> {
     use std::os::unix::fs::DirBuilderExt;
     let (suffix, _) = et_core::keys::gen_id_passkey();
     let directory = std::env::temp_dir().join(format!("et_forward_sock_{suffix}"));
@@ -480,10 +481,45 @@ fn create_forward_pipe(owner: Option<(u32, u32)>) -> Result<std::path::PathBuf, 
         .mode(0o700)
         .create(&directory)
         .map_err(ForwardError::Io)?;
-    if let Some((uid, gid)) = owner {
-        std::os::unix::fs::chown(&directory, Some(uid), Some(gid)).map_err(ForwardError::Io)?;
+    let pipe = ForwardPipe {
+        path: directory.join("sock"),
+        directory: Some(directory),
+    };
+    after_create(
+        pipe.directory
+            .as_deref()
+            .ok_or(ForwardError::Protocol("forward pipe directory missing"))?,
+    )
+    .map_err(ForwardError::Io)?;
+    if let (Some((uid, gid)), Some(directory)) = (owner, pipe.directory.as_deref()) {
+        std::os::unix::fs::chown(directory, Some(uid), Some(gid)).map_err(ForwardError::Io)?;
     }
-    Ok(directory.join("sock"))
+    Ok(pipe)
+}
+
+#[cfg(unix)]
+struct ForwardPipe {
+    path: std::path::PathBuf,
+    directory: Option<std::path::PathBuf>,
+}
+
+#[cfg(unix)]
+impl ForwardPipe {
+    fn disarm(&mut self) -> Result<std::path::PathBuf, ForwardError> {
+        self.directory
+            .take()
+            .ok_or(ForwardError::Protocol("forward pipe directory missing"))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ForwardPipe {
+    fn drop(&mut self) {
+        if let Some(directory) = self.directory.as_ref() {
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_dir(directory);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -504,4 +540,55 @@ pub fn is_forward_packet(header: u8) -> bool {
     header == TerminalPacketType::PortForwardDestinationRequest as u8
         || header == TerminalPacketType::PortForwardDestinationResponse as u8
         || header == TerminalPacketType::PortForwardData as u8
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn named_pipe_failure_after_directory_creation_cleans_and_retries() {
+        // Given
+        let created = RefCell::new(None);
+
+        // When
+        let error = match create_forward_pipe_with(None, |directory| {
+            *created.borrow_mut() = Some(directory.to_path_buf());
+            Err(io::Error::other("injected before chown"))
+        }) {
+            Ok(_) => panic!("injected directory failure succeeded"),
+            Err(error) => error,
+        };
+        let directory = created.into_inner().unwrap();
+
+        // Then
+        assert!(matches!(error, ForwardError::Io(_)));
+        assert!(!directory.exists());
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn named_pipe_post_bind_failure_cleans_socket_and_directory_then_retries() {
+        // Given
+        let pipe = create_forward_pipe(None).unwrap();
+        let directory = pipe.directory.as_ref().unwrap().clone();
+        let path = pipe.path.clone();
+        let listener = UnixListener::bind(&path).unwrap();
+
+        // When: a later bind/configuration step fails and ownership never transfers.
+        drop(pipe);
+
+        // Then
+        assert!(!path.exists());
+        assert!(!directory.exists());
+        drop(listener);
+        std::fs::create_dir(&directory).unwrap();
+        let retry = UnixListener::bind(&path).unwrap();
+        drop(retry);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&directory).unwrap();
+    }
 }

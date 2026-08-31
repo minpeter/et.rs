@@ -1,17 +1,21 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Reject partially unavailable forwarding sources\n\nTCP forwarding now fails when any resolved source address cannot be bound,\ninstead of silently listening on only one address family.\n"
-    filename: fix-forward-source-partial-bind.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Apply SSH configuration port forwarding\n\nThe client now reads effective `LocalForward` entries from OpenSSH\nconfiguration and applies them as ET tunnels alongside command-line tunnels.\nConfigured destination hostnames, explicit bind addresses, `GatewayPorts`, and\n`ExitOnForwardFailure` are preserved. `RemoteForward` remains available through\nthe explicit `-r` option and is not imported from SSH configuration.\n"
+    filename: add-ssh-config-forwarding.md
     v: 0.0.0
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Drain terminal output before disconnect\n\nTerminal sessions now drain final terminal output safely when the terminal\nexits or disconnects, preserving buffered output for the connected client\nbefore the session closes.\n"
-    filename: fix-terminal-hup-drain.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Show the login message of the day\n\nTerminal sessions now display the message of the day before the login shell\nstarts, matching an interactive `ssh` login. The banner includes Ubuntu's\ngenerated dynamic message followed by `pam_motd`'s default file and directory\nsources, honors `.hushlogin`, and never reaches the shell as input.\nReconnecting to the same session does not print it again.\n"
+    filename: feat-session-motd.md
     v: 0.0.0
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Fix Windows SSH configuration resolution\n\nSSH configuration expansion now disables PTY allocation, preventing Windows\nOpenSSH from stalling before the client bootstrap.\n"
-    filename: fix-windows-ssh-config-resolution.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Harden SSH configuration port forwarding\n\nOperational SSH commands now force isolated forwarding, command, session, and\ncontrol socket settings after filtering conflicting user options, while\nconfiguration queries still read supported `LocalForward` rows.\nThis intentionally overrides user `ClearAllForwardings`, `RemoteCommand`,\n`PermitLocalCommand`, `ControlMaster`, `ControlPath`, and `SessionType`\nsettings for ET's probe and bootstrap commands.\n\nReverse listeners bind with the authenticated session identity, reject wildcard\nor privileged authority escalation, and enforce a transactional per-session\nlistener limit without capping client-side local listeners. Unix forwarding\nhelpers clear supplementary groups, authenticate router peers, and roll back\nsocket paths and created directories on every failed setup or descriptor\ntransfer. Any explicit reverse bind failure aborts the session and releases\nsibling listeners without adding a protocol extension.\n\nForward initialization now has absolute payload, resolver, helper, and response\ndeadlines; resolver work and pending router registrations are bounded. Unix\nsocket teardown stays anchored in the session user's helper so privileged\ncleanup cannot follow a replaced parent path. Forwarded TCP destinations are\nalso resolved and connected as the authenticated session user.\n"
+    filename: fix-ssh-config-forwarding-hardening.md
+    v: 0.0.0
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Complete SSH forwarding compatibility and authority hardening\n\nSSH-config forwarding now preserves explicit bind and destination addresses,\nhonors `ExitOnForwardFailure`, and keeps setup failures transactional across\ndirect and native-jumphost sessions.\n\nReverse listeners remain bound to authenticated loopback authority, helper\nprocesses drop supplementary privileges portably, forwarding listener limits\napply only to server-side reverse tunnels, and failed Unix listener setup no\nlonger leaves filesystem residue.\n"
+    filename: fix-ssh-config-forwarding-postmerge-audit.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - fix-forward-source-partial-bind.md
-      - fix-terminal-hup-drain.md
-      - fix-windows-ssh-config-resolution.md
+      - add-ssh-config-forwarding.md
+      - feat-session-motd.md
+      - fix-ssh-config-forwarding-hardening.md
+      - fix-ssh-config-forwarding-postmerge-audit.md
     id: cargo:et
     updated: true

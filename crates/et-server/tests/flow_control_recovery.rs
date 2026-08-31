@@ -69,7 +69,13 @@ impl RecoveryGate {
 
     fn finish(&mut self) {
         let stream = self.stop.recv_timeout(TIMEOUT).unwrap();
-        stream.shutdown(Shutdown::Both).unwrap();
+        if let Err(error) = stream.shutdown(Shutdown::Both) {
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::NotConnected,
+                "could not stop the recovery proxy"
+            );
+        }
         self.worker.take().unwrap().join().unwrap().unwrap();
     }
 }

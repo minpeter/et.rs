@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
-use std::io::Read;
-use std::net::{TcpListener, TcpStream};
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,20 +22,47 @@ fn eof_invalidates_connection_so_future_output_is_buffered() {
 }
 
 #[test]
-fn strict_handshake_write_rejects_soft_disconnected_transport() {
-    // Given
+fn strict_write_rejects_a_synchronized_closed_peer() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let client_stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let (server_stream, _) = listener.accept().unwrap();
-    let mut client = Connection::new_client(client_stream, &[9; 32]);
-    server_stream.shutdown(std::net::Shutdown::Both).unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    let mut observer = server.try_clone().unwrap();
 
-    // When
-    let result = client.write_packet_strict(7, b"acknowledgement");
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut byte = [0_u8; 1];
+    assert_eq!(observer.read(&mut byte).unwrap(), 0);
 
-    // Then
-    assert!(result.is_err());
-    assert!(!client.connected());
+    let mut connection = Connection::new_server(server, &[3; 32]);
+    let error = connection
+        .write_packet_live(7, b"must-be-live")
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        et_net::connection::ConnError::Io(error)
+            if error.kind() == std::io::ErrorKind::NotConnected
+    ));
+    assert!(!connection.connected());
+}
+
+#[test]
+fn initialization_read_uses_one_absolute_deadline() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    client.write_all(&[0_u8; 1]).unwrap();
+    let mut connection = Connection::new_server(server, &[3; 32]);
+
+    let error = connection
+        .read_packet_until(Instant::now() + Duration::from_millis(50))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        et_net::connection::ConnError::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+    ));
 }
 
 #[test]

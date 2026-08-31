@@ -275,7 +275,7 @@ fn authenticated_reverse_tcp_wildcard_bind_exposes_session_to_external_network()
 
 #[cfg(target_os = "linux")]
 #[test]
-fn authenticated_reverse_tcp_rejects_resolved_non_loopback_address() {
+fn authenticated_reverse_tcp_accepts_resolved_non_loopback_address() {
     // Given
     let probe = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
     probe.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).unwrap();
@@ -287,24 +287,22 @@ fn authenticated_reverse_tcp_rejects_resolved_non_loopback_address() {
         rustix::process::geteuid().as_raw(),
         rustix::process::getegid().as_raw(),
     );
+    let reservation = TcpListener::bind((external, 0)).unwrap();
+    let port = reservation.local_addr().unwrap().port();
+    drop(reservation);
 
     // When
-    let error = match Forwarder::start_with_user(
-        vec![request_on(&external.to_string(), reserve_port(), 1)],
+    let (forwarder, _) = Forwarder::start_with_user(
+        vec![request_on(&external.to_string(), port, 1)],
         Some(owner),
-    ) {
-        Ok((forwarder, _)) => {
-            forwarder.shutdown().unwrap();
-            panic!("authenticated reverse listener accepted non-loopback authority")
-        }
-        Err(error) => error,
-    };
+    )
+    .unwrap();
+    let connection =
+        TcpStream::connect_timeout(&SocketAddr::from((external, port)), TIMEOUT).unwrap();
 
     // Then
-    match error {
-        ForwardError::Io(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
-        other => panic!("unexpected non-loopback result: {other}"),
-    }
+    drop(connection);
+    forwarder.shutdown().unwrap();
 }
 
 #[cfg(target_os = "linux")]

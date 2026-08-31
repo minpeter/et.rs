@@ -3,6 +3,7 @@ use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use et_core::packet::Packet;
 use et_net::local_packet::LocalPacketDecoder;
@@ -25,6 +26,7 @@ struct PendingConnection {
     stream: LocalStream,
     decoder: LocalPacketDecoder,
     peer: PeerIdentity,
+    deadline: Instant,
 }
 
 struct WatchedRegistration {
@@ -37,6 +39,10 @@ enum ReadOutcome {
     Packet(Packet),
     Reject,
 }
+
+const MAX_PENDING_REGISTRATIONS: usize = 64;
+const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 pub(crate) fn run(
     listener: OwnedRouterListener,
@@ -63,13 +69,25 @@ fn run_poll(
 ) -> Result<(), RouterError> {
     let mut pending = Vec::<PendingConnection>::new();
     let mut watched = Vec::<WatchedRegistration>::new();
+    let mut accept_retry_at = None;
     let idle = rustix::time::Timespec::try_from(std::time::Duration::from_millis(100))
         .expect("100ms fits in timespec");
     loop {
+        let now = Instant::now();
+        pending.retain(|connection| connection.deadline > now);
+        let can_accept = pending.len() < MAX_PENDING_REGISTRATIONS
+            && accept_retry_at.is_none_or(|retry_at| now >= retry_at);
         let pending_start = 2;
         let watched_start = pending_start + pending.len();
         let mut poll_fds = Vec::with_capacity(watched_start + watched.len());
-        poll_fds.push(PollFd::new(listener.listener(), PollFlags::IN));
+        poll_fds.push(PollFd::new(
+            listener.listener(),
+            if can_accept {
+                PollFlags::IN
+            } else {
+                PollFlags::empty()
+            },
+        ));
         poll_fds.push(PollFd::new(&wake_reader, PollFlags::IN));
         for connection in &pending {
             poll_fds.push(PollFd::new(
@@ -125,7 +143,8 @@ fn run_poll(
             .first()
             .is_some_and(|flags| flags.contains(PollFlags::IN))
         {
-            accept_ready(&listener, &mut pending)?;
+            accept_retry_at = accept_ready(&listener, &mut pending, MAX_PENDING_REGISTRATIONS)?
+                .then(|| Instant::now() + ACCEPT_RETRY_DELAY);
         }
         let ready_pending: Vec<usize> = readiness[pending_start..watched_start]
             .iter()
@@ -192,12 +211,17 @@ fn run_windows(
     const IDLE: std::time::Duration = std::time::Duration::from_millis(10);
     let mut pending = Vec::<PendingConnection>::new();
     let mut watched = Vec::<WatchedRegistration>::new();
+    let mut accept_retry_at = None;
     loop {
         if shutdown.load(Ordering::Acquire) {
             drain_waker(&mut wake_reader)?;
             return Ok(());
         }
         let mut progress = false;
+        let now = Instant::now();
+        let before_expiry = pending.len();
+        pending.retain(|connection| connection.deadline > now);
+        progress |= pending.len() != before_expiry;
 
         // Terminals that closed their connection release their registration.
         // The watcher shares the session socket, so this must never consume
@@ -229,10 +253,15 @@ fn run_windows(
             }
         }
 
-        let before = pending.len();
-        accept_ready(&listener, &mut pending)?;
-        if pending.len() != before {
-            progress = true;
+        if pending.len() < MAX_PENDING_REGISTRATIONS
+            && accept_retry_at.is_none_or(|retry_at| now >= retry_at)
+        {
+            let before = pending.len();
+            accept_retry_at = accept_ready(&listener, &mut pending, MAX_PENDING_REGISTRATIONS)?
+                .then(|| Instant::now() + ACCEPT_RETRY_DELAY);
+            if pending.len() != before {
+                progress = true;
+            }
         }
 
         for index in (0..pending.len()).rev() {
@@ -311,8 +340,9 @@ fn disconnect_ready(
 fn accept_ready(
     listener: &OwnedRouterListener,
     pending: &mut Vec<PendingConnection>,
-) -> Result<(), RouterError> {
-    loop {
+    max_pending: usize,
+) -> Result<bool, RouterError> {
+    while pending.len() < max_pending {
         match listener.accept() {
             Ok((stream, _)) => {
                 let peer = PeerIdentity::from_stream(&stream).map_err(RouterError::Io)?;
@@ -321,13 +351,31 @@ fn accept_ready(
                     stream,
                     decoder: LocalPacketDecoder::new(),
                     peer,
+                    deadline: Instant::now() + REGISTRATION_TIMEOUT,
                 });
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if accept_resource_exhausted(&error) => return Ok(true),
             Err(error) => return Err(RouterError::Io(error)),
         }
     }
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn accept_resource_exhausted(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code)
+            if code == rustix::io::Errno::MFILE.raw_os_error()
+                || code == rustix::io::Errno::NFILE.raw_os_error()
+    )
+}
+
+#[cfg(windows)]
+fn accept_resource_exhausted(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::OutOfMemory
 }
 
 fn read_ready(connection: &mut PendingConnection) -> Result<ReadOutcome, RouterError> {
@@ -369,5 +417,20 @@ fn drain_waker(wake_reader: &mut LocalStream) -> Result<(), RouterError> {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(RouterError::Io(error)),
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::accept_resource_exhausted;
+
+    #[test]
+    fn descriptor_exhaustion_is_transient() {
+        for errno in [rustix::io::Errno::MFILE, rustix::io::Errno::NFILE] {
+            assert!(accept_resource_exhausted(&std::io::Error::from(errno)));
+        }
+        assert!(!accept_resource_exhausted(&std::io::Error::from(
+            rustix::io::Errno::INVAL,
+        )));
     }
 }

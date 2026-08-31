@@ -71,7 +71,7 @@ pub fn connect_initial(
     ensure_deadline(deadline, "sending INITIAL_PAYLOAD")?;
     let mut connection = Connection::new_client(stream, &key);
     connection
-        .write_packet_strict(
+        .write_packet_live(
             EtPacketType::InitialPayload as u8,
             &initial_payload.encode_to_vec(),
         )

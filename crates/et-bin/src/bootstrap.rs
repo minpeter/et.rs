@@ -5,12 +5,13 @@ use crate::error::ClientError;
 const MARKER: &[u8] = b"IDPASSKEY:";
 const CREDENTIAL_LEN: usize = 16 + 1 + 32;
 pub const WINDOWS_SHELL_PROBE_SENTINEL: &str = "__ET_COMSPEC__";
-const OPERATIONAL_SSH_OPTIONS: [&str; 5] = [
+const OPERATIONAL_SSH_OPTIONS: [&str; 6] = [
     "ClearAllForwardings=yes",
     "RemoteCommand=none",
     "PermitLocalCommand=no",
     "ControlMaster=no",
     "ControlPath=none",
+    "SessionType=default",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -436,6 +437,7 @@ mod tests {
             "PermitLocalCommand=no",
             "ControlMaster=no",
             "ControlPath=none",
+            "SessionType=default",
         ] {
             assert_eq!(
                 invocation
@@ -461,6 +463,7 @@ mod tests {
             "permitlocalcommand yes".to_owned(),
             "CONTROLMASTER=auto".to_owned(),
             "controlpath ~/.ssh/et-master".to_owned(),
+            "SESSIONTYPE=none".to_owned(),
         ]);
         let invocation = build_invocation(&request, &provisional_credentials().unwrap());
 
@@ -536,6 +539,7 @@ mod tests {
         assert!(effective
             .lines()
             .any(|line| line == "clearallforwardings yes"));
+        assert!(effective.lines().any(|line| line == "sessiontype default"));
         assert!(!effective
             .lines()
             .any(|line| line.starts_with("localforward ")));
@@ -575,19 +579,20 @@ mod tests {
         let invocation = build_invocation(&request(), &credentials);
         assert_eq!(invocation.program, "ssh");
         assert_eq!(
-            invocation.args[0..7],
+            invocation.args[0..8],
             [
                 "-oClearAllForwardings=yes",
                 "-oRemoteCommand=none",
                 "-oPermitLocalCommand=no",
                 "-oControlMaster=no",
                 "-oControlPath=none",
+                "-oSessionType=default",
                 "-oPort=2222",
                 "alice@server",
             ]
         );
         assert_eq!(
-            invocation.args[7],
+            invocation.args[8],
             "printf '%s\\n' 'XXXdefghijklmnop/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef_xterm-256color' | 'etterminal' '--verbose=2'"
         );
     }
@@ -602,7 +607,7 @@ mod tests {
         req.jumphost = Some("jump.example,user@hop2".into());
         let invocation = build_invocation(&req, &credentials);
         assert_eq!(
-            invocation.args[0..9],
+            invocation.args[0..10],
             [
                 "-J",
                 "jump.example,user@hop2",
@@ -611,6 +616,7 @@ mod tests {
                 "-oPermitLocalCommand=no",
                 "-oControlMaster=no",
                 "-oControlPath=none",
+                "-oSessionType=default",
                 "-oPort=2222",
                 "alice@server",
             ]
@@ -764,7 +770,7 @@ mod tests {
         };
         let invocation = build_jump_invocation(&request, &credentials);
         assert_eq!(
-            invocation.args[0..9],
+            invocation.args[0..10],
             [
                 "-p",
                 "2200",
@@ -773,11 +779,12 @@ mod tests {
                 "-oPermitLocalCommand=no",
                 "-oControlMaster=no",
                 "-oControlPath=none",
+                "-oSessionType=default",
                 "-oStrictHostKeyChecking=no",
                 "user@jump.example"
             ]
         );
-        let command = &invocation.args[9];
+        let command = &invocation.args[10];
         assert!(command.contains("'--serverfifo=/tmp/jump.fifo'"));
         assert!(command.contains("'--jump'"));
         assert!(command.contains("'--dsthost=dst.internal'"));

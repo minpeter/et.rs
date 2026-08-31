@@ -58,6 +58,15 @@ impl Connection {
     }
 
     pub fn write_packet(&mut self, header: u8, payload: &[u8]) -> Result<(), ConnError> {
+        self.write_packet_with_deadline(header, payload, None)
+    }
+
+    fn write_packet_with_deadline(
+        &mut self,
+        header: u8,
+        payload: &[u8],
+        deadline: Option<Instant>,
+    ) -> Result<(), ConnError> {
         // Probe first so a half-closed peer (laptop sleep, Wi-Fi drop) moves
         // the writer into the disconnected catch-up buffer before we try to
         // push bytes onto a dead socket.
@@ -66,7 +75,12 @@ impl Connection {
         }
         match self.writer.write_packet(header, payload)? {
             WriterOutcome::Send(frame) => {
-                if let Err(_error) = self.write_live_frame(&frame) {
+                let deadline = deadline.unwrap_or_else(|| {
+                    Instant::now()
+                        .checked_add(DEFAULT_LIVE_WRITE_TIMEOUT)
+                        .unwrap_or_else(Instant::now)
+                });
+                if let Err(_error) = self.write_live_frame_until(&frame, deadline) {
                     // The encrypted packet is already in the replay backup
                     // (BackedWriter pushes before returning Send). Mark the
                     // transport disconnected so further writes buffer for a
@@ -80,17 +94,42 @@ impl Connection {
         }
     }
 
-    /// Write a handshake packet and require it to reach a live transport.
+    /// Write initialization traffic only while the current transport is live.
     ///
-    /// Active-session writes intentionally soft-disconnect and buffer for
-    /// recovery. Handshake acknowledgements and responses have no established
-    /// session to recover, so buffering them must fail the initialization.
-    pub fn write_packet_strict(&mut self, header: u8, payload: &[u8]) -> Result<(), ConnError> {
+    /// Active sessions intentionally buffer output after a soft disconnect,
+    /// but lifecycle transitions must not treat that buffered-only outcome as
+    /// proof that the peer received a handshake packet.
+    pub fn write_packet_live(&mut self, header: u8, payload: &[u8]) -> Result<(), ConnError> {
+        if !self.connected() {
+            return Err(io::Error::from(io::ErrorKind::NotConnected).into());
+        }
         self.write_packet(header, payload)?;
         if self.connected() {
             Ok(())
         } else {
-            Err(ConnError::Io(io::ErrorKind::NotConnected.into()))
+            Err(io::Error::from(io::ErrorKind::NotConnected).into())
+        }
+    }
+
+    /// Write a handshake packet and require it to reach a live transport.
+    pub fn write_packet_strict(&mut self, header: u8, payload: &[u8]) -> Result<(), ConnError> {
+        self.write_packet_live(header, payload)
+    }
+
+    pub fn write_packet_live_until(
+        &mut self,
+        header: u8,
+        payload: &[u8],
+        deadline: Instant,
+    ) -> Result<(), ConnError> {
+        if !self.connected() {
+            return Err(io::Error::from(io::ErrorKind::NotConnected).into());
+        }
+        self.write_packet_with_deadline(header, payload, Some(deadline))?;
+        if self.connected() {
+            Ok(())
+        } else {
+            Err(io::Error::from(io::ErrorKind::NotConnected).into())
         }
     }
 
@@ -104,10 +143,7 @@ impl Connection {
     ///
     /// Restores a cleared write timeout afterwards so recovery / handshake
     /// code that sets its own deadlines is not left with a stale value.
-    fn write_live_frame(&mut self, frame: &[u8]) -> io::Result<()> {
-        let deadline = Instant::now()
-            .checked_add(DEFAULT_LIVE_WRITE_TIMEOUT)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "live write deadline"))?;
+    fn write_live_frame_until(&mut self, frame: &[u8], deadline: Instant) -> io::Result<()> {
         let result = write_all_until(&mut self.stream, frame, deadline);
         // Best-effort restore: a failed clear must not hide a write error.
         let clear = self.stream.set_write_timeout(None);
@@ -142,6 +178,48 @@ impl Connection {
                 Ok(count) => self.reader.feed(&buffer[..count]),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
+                    self.disconnect();
+                    return Err(ConnError::Io(error));
+                }
+            }
+        }
+    }
+
+    pub fn read_packet_until(&mut self, deadline: Instant) -> Result<Packet, ConnError> {
+        loop {
+            match self.reader.pop() {
+                Ok(ReadItem::Packet(packet)) => {
+                    self.stream.set_read_timeout(None).map_err(ConnError::Io)?;
+                    return Ok(packet);
+                }
+                Ok(ReadItem::NeedMore) => {}
+                Err(error) => {
+                    let _ = self.stream.set_read_timeout(None);
+                    self.disconnect();
+                    return Err(ConnError::Read(error));
+                }
+            }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| {
+                    self.disconnect();
+                    ConnError::Io(io::ErrorKind::TimedOut.into())
+                })?;
+            self.stream
+                .set_read_timeout(Some(remaining))
+                .map_err(ConnError::Io)?;
+            let mut buffer = [0u8; 8192];
+            match self.stream.read(&mut buffer) {
+                Ok(0) => {
+                    let _ = self.stream.set_read_timeout(None);
+                    self.disconnect();
+                    return Err(ConnError::Io(io::ErrorKind::UnexpectedEof.into()));
+                }
+                Ok(count) => self.reader.feed(&buffer[..count]),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    let _ = self.stream.set_read_timeout(None);
                     self.disconnect();
                     return Err(ConnError::Io(error));
                 }

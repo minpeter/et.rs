@@ -6,6 +6,7 @@ mod support;
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::TcpStream;
+use std::time::Duration;
 
 use et_core::keys::passkey_to_key;
 use et_core::proto::{
@@ -49,6 +50,21 @@ fn bad_encrypted_initial_messages_reset_the_slot() {
             .wait_for_state(ID_A, SessionState::Registered, TIMEOUT)
             .unwrap();
     }
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
+fn incomplete_initial_payload_expires_and_resets_the_slot() {
+    let mut server = TestRuntime::start();
+    let _terminal = server.register(ID_A, KEY_A);
+    let (mut stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    stream.write_all(&[0_u8; 1]).unwrap();
+
+    server
+        .handle
+        .wait_for_state(ID_A, SessionState::Registered, Duration::from_secs(7))
+        .unwrap();
     server.runtime.shutdown().unwrap();
 }
 
@@ -110,6 +126,31 @@ fn occupied_reverse_row_is_fatal_and_rolls_back_sibling() {
         .wait_for_state(ID_A, SessionState::Registered, TIMEOUT)
         .unwrap();
     assert!(!usable_path.exists());
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
+fn client_close_before_initial_payload_rolls_back_the_session_claim() {
+    let mut server = TestRuntime::start();
+    let _terminal = server.register(ID_A, KEY_A);
+    let key = passkey_to_key(KEY_A).unwrap();
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    drop(stream);
+
+    server
+        .handle
+        .wait_for_state(ID_A, SessionState::Registered, TIMEOUT)
+        .unwrap();
+
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let (_client, initial) = runtime_support::initialize(stream, &key, default_payload());
+    assert_eq!(initial.error, None);
+    server
+        .handle
+        .wait_for_state(ID_A, SessionState::Active, TIMEOUT)
+        .unwrap();
     server.runtime.shutdown().unwrap();
 }
 

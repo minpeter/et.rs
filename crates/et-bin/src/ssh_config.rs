@@ -108,11 +108,6 @@ fn parse_ssh_config(
     let mut local_forwards = Vec::new();
     if parse_local_forwards {
         for _ in unsupported_dynamic_forwards(text) {
-            if exit_on_forward_failure {
-                return Err(ClientError::Unsupported(
-                    "SSH forwarding request is unsupported while ExitOnForwardFailure is enabled",
-                ));
-            }
             et_cli::logging::warn(
                 "SSH dynamicforward is unsupported by ET protocol v6; skipping forwarding row",
             );
@@ -132,11 +127,6 @@ fn parse_ssh_config(
                 match parse_forward(fields, policies)? {
                     ForwardRecord::Supported(forward) => local_forwards.push(forward),
                     ForwardRecord::Unsupported(reason) => {
-                        if exit_on_forward_failure {
-                            return Err(ClientError::Unsupported(
-                                "SSH forwarding request is unsupported while ExitOnForwardFailure is enabled",
-                            ));
-                        }
                         warn_unsupported("localforward", &reason);
                     }
                 }
@@ -454,13 +444,21 @@ mod tests {
     }
 
     #[test]
-    fn strict_exit_policy_rejects_unsupported_requested_rows() {
-        let result = parse_ssh_config(
-            b"hostname host\nexitonforwardfailure yes\ndynamicforward 1080\n",
+    fn strict_exit_policy_skips_unsupported_requested_rows() {
+        let resolved = parse_ssh_config(
+            b"hostname host\nexitonforwardfailure yes\n\
+              dynamicforward 1080\n\
+              localforward relative/source.sock /tmp/destination.sock\n\
+              localforward 10022 localhost:22\n",
             true,
-        );
+        )
+        .unwrap();
 
-        assert!(matches!(result, Err(ClientError::Unsupported(_))));
+        assert!(resolved.exit_on_forward_failure);
+        assert_eq!(
+            resolved.local_forwards,
+            [request("localhost", Some(10022), "localhost", Some(22))]
+        );
     }
 
     #[test]
@@ -775,7 +773,8 @@ mod tests {
     fn ssh_config_hardening_malformed_record_remains_typed() {
         assert!(matches!(
             parse_ssh_config(
-                b"hostname host\nlocalforward 1000 localhost:22 unexpected\n",
+                b"hostname host\nexitonforwardfailure yes\n\
+                  localforward 1000 localhost:22 unexpected\n",
                 true,
             ),
             Err(ClientError::SshConfigMalformedForward {

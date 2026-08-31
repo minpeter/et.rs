@@ -9,11 +9,15 @@ use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use et_core::proto::SocketEndpoint;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const RESOLVER_WORKERS: usize = 4;
+const RESOLVER_QUEUE: usize = 32;
 
 #[derive(Clone, Debug)]
 pub(crate) enum Endpoint {
@@ -119,6 +123,11 @@ impl Endpoint {
     pub(crate) fn connect_with_user(&self, user: Option<(u32, u32)>) -> io::Result<ForwardStream> {
         match (self, user) {
             #[cfg(unix)]
+            (Self::Tcp { host, port }, Some((uid, gid))) => {
+                crate::user_socket_ops::connect_tcp_as_user(host, *port, uid, gid)
+                    .map(ForwardStream::Tcp)
+            }
+            #[cfg(unix)]
             (Self::Unix(path), Some((uid, gid))) => {
                 crate::user_socket_ops::connect_unix_as_user(path, uid, gid)
                     .map(ForwardStream::Unix)
@@ -129,32 +138,7 @@ impl Endpoint {
 
     pub(crate) fn connect(&self) -> io::Result<ForwardStream> {
         match self {
-            Self::Tcp { host, port } => {
-                // Upstream connects to localhost destinations by trying ::1
-                // first and falling back to 127.0.0.1.
-                if host.eq_ignore_ascii_case("localhost") {
-                    let v6 = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, *port));
-                    match TcpStream::connect_timeout(&v6, CONNECT_TIMEOUT) {
-                        Ok(stream) => return Ok(ForwardStream::Tcp(stream)),
-                        Err(_) => {
-                            let v4 =
-                                std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, *port));
-                            return TcpStream::connect_timeout(&v4, CONNECT_TIMEOUT)
-                                .map(ForwardStream::Tcp);
-                        }
-                    }
-                }
-                let mut last_error = None;
-                for address in (host.as_str(), *port).to_socket_addrs()? {
-                    match TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) {
-                        Ok(stream) => return Ok(ForwardStream::Tcp(stream)),
-                        Err(error) => last_error = Some(error),
-                    }
-                }
-                Err(last_error.unwrap_or_else(|| {
-                    io::Error::new(io::ErrorKind::AddrNotAvailable, "endpoint did not resolve")
-                }))
-            }
+            Self::Tcp { host, port } => connect_tcp(host, *port).map(ForwardStream::Tcp),
             #[cfg(unix)]
             Self::Unix(path) => UnixStream::connect(path).map(ForwardStream::Unix),
         }
@@ -186,9 +170,169 @@ impl Endpoint {
         }
     }
 
+    pub(crate) fn resolve_for_bind_until(
+        &self,
+        deadline: Instant,
+        max_addresses: usize,
+    ) -> io::Result<ResolvedEndpoint> {
+        match self {
+            Self::Tcp { host, port } if host.is_empty() => Ok(ResolvedEndpoint::Tcp(vec![
+                (std::net::Ipv6Addr::UNSPECIFIED, *port).into(),
+                (std::net::Ipv4Addr::UNSPECIFIED, *port).into(),
+            ])),
+            Self::Tcp { host, port } => {
+                resolve_tcp_bounded(host.clone(), *port, deadline, max_addresses)
+                    .map(ResolvedEndpoint::Tcp)
+            }
+            #[cfg(unix)]
+            Self::Unix(path) => Ok(ResolvedEndpoint::Unix(path.clone())),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn bind(&self) -> io::Result<Vec<ForwardListener>> {
         self.resolve_for_bind()?.bind_with_user(None)
+    }
+}
+
+pub(crate) fn connect_tcp(host: &str, port: u16) -> io::Result<TcpStream> {
+    // Preserve upstream's dual-stack localhost ordering while allowing
+    // explicitly configured destination names under the session identity.
+    if host.eq_ignore_ascii_case("localhost") {
+        let v6 = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
+        match TcpStream::connect_timeout(&v6, CONNECT_TIMEOUT) {
+            Ok(stream) => return Ok(stream),
+            Err(_) => {
+                let v4 = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+                return TcpStream::connect_timeout(&v4, CONNECT_TIMEOUT);
+            }
+        }
+    }
+    let mut last_error = None;
+    for address in (host, port).to_socket_addrs()? {
+        match TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::AddrNotAvailable, "endpoint did not resolve")
+    }))
+}
+
+struct ResolveJob {
+    host: String,
+    port: u16,
+    deadline: Instant,
+    max_addresses: usize,
+    reply: SyncSender<io::Result<Vec<std::net::SocketAddr>>>,
+}
+
+fn resolve_tcp_bounded(
+    host: String,
+    port: u16,
+    deadline: Instant,
+    max_addresses: usize,
+) -> io::Result<Vec<std::net::SocketAddr>> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
+    let (reply, result) = sync_channel(1);
+    let job = ResolveJob {
+        host,
+        port,
+        deadline,
+        max_addresses,
+        reply,
+    };
+    match resolver_pool().try_send(job) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "forward resolver queue is full",
+            ));
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "forward resolver pool stopped",
+            ));
+        }
+    }
+    result
+        .recv_timeout(remaining)
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => io::Error::from(io::ErrorKind::TimedOut),
+            std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                io::Error::new(io::ErrorKind::BrokenPipe, "forward resolver worker stopped")
+            }
+        })?
+}
+
+fn resolver_pool() -> &'static SyncSender<ResolveJob> {
+    static POOL: OnceLock<SyncSender<ResolveJob>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let (sender, receiver) = sync_channel::<ResolveJob>(RESOLVER_QUEUE);
+        let receiver = Arc::new(Mutex::new(receiver));
+        for index in 0..RESOLVER_WORKERS {
+            let receiver = receiver.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("et-forward-resolver-{index}"))
+                .spawn(move || resolver_worker(&receiver));
+        }
+        sender
+    })
+}
+
+fn resolver_worker(receiver: &Mutex<std::sync::mpsc::Receiver<ResolveJob>>) {
+    loop {
+        let job = {
+            let Ok(receiver) = receiver.lock() else {
+                return;
+            };
+            let Ok(job) = receiver.recv() else {
+                return;
+            };
+            job
+        };
+        let result = if Instant::now() >= job.deadline {
+            Err(io::Error::from(io::ErrorKind::TimedOut))
+        } else {
+            collect_distinct_addresses(
+                (job.host.as_str(), job.port).to_socket_addrs(),
+                job.max_addresses,
+            )
+        };
+        let _ = job.reply.send(result);
+    }
+}
+
+fn collect_distinct_addresses(
+    addresses: io::Result<impl Iterator<Item = std::net::SocketAddr>>,
+    max_addresses: usize,
+) -> io::Result<Vec<std::net::SocketAddr>> {
+    let mut seen = HashSet::new();
+    let mut resolved = Vec::new();
+    for address in addresses? {
+        if seen.insert(address) {
+            if resolved.len() >= max_addresses {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "forward source exceeds listener limit",
+                ));
+            }
+            resolved.push(address);
+        }
+    }
+    if resolved.is_empty() {
+        Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "endpoint did not resolve",
+        ))
+    } else {
+        Ok(resolved)
     }
 }
 
@@ -222,10 +366,15 @@ impl ResolvedEndpoint {
             #[cfg(unix)]
             (Self::Unix(path), Some((uid, gid))) => {
                 let listener = crate::user_socket_ops::listen_unix_as_user(path, uid, gid)?;
-                finish_unix_listener_with(listener, path, None, |listener| {
-                    listener.set_nonblocking(true)
-                })
-                .map(|listener| vec![listener])
+                let (listener, cleanup) = listener.into_parts();
+                listener.set_nonblocking(true)?;
+                let path_cleanup = cleanup.is_none().then(|| path.clone());
+                Ok(vec![ForwardListener {
+                    inner: ListenerKind::Unix(listener),
+                    cleanup: path_cleanup,
+                    user_cleanup: cleanup,
+                    cleanup_dirs: Vec::new(),
+                }])
             }
             #[cfg(unix)]
             (Self::Unix(path), None) => bind_unix_locally_with(path, |listener| {
@@ -233,6 +382,37 @@ impl ResolvedEndpoint {
                 listener.set_nonblocking(true)
             })
             .map(|listener| vec![listener]),
+        }
+    }
+
+    pub(crate) fn bind_with_user_until(
+        &self,
+        user: Option<(u32, u32)>,
+        #[cfg_attr(windows, allow(unused_variables))] deadline: Instant,
+    ) -> io::Result<Vec<ForwardListener>> {
+        match (self, user) {
+            #[cfg(unix)]
+            (Self::Tcp(addresses), Some((uid, gid))) => {
+                bind_tcp_addresses_with(addresses.iter().copied(), |address| {
+                    crate::user_socket_ops::listen_tcp_as_user_until(address, uid, gid, deadline)
+                        .map(Some)
+                })
+            }
+            #[cfg(unix)]
+            (Self::Unix(path), Some((uid, gid))) => {
+                let listener =
+                    crate::user_socket_ops::listen_unix_as_user_until(path, uid, gid, deadline)?;
+                let (listener, cleanup) = listener.into_parts();
+                listener.set_nonblocking(true)?;
+                let path_cleanup = cleanup.is_none().then(|| path.clone());
+                Ok(vec![ForwardListener {
+                    inner: ListenerKind::Unix(listener),
+                    cleanup: path_cleanup,
+                    user_cleanup: cleanup,
+                    cleanup_dirs: Vec::new(),
+                }])
+            }
+            _ => self.bind_with_user(user),
         }
     }
 }
@@ -273,6 +453,7 @@ fn finish_unix_listener_with(
     Ok(ForwardListener {
         inner: ListenerKind::Unix(listener),
         cleanup: socket_cleanup.disarm(),
+        user_cleanup: None,
         cleanup_dirs: cleanup_dirs
             .as_mut()
             .and_then(PendingDirectories::disarm)
@@ -374,6 +555,8 @@ fn bind_tcp_addresses_with(
             listeners.push(ForwardListener {
                 inner: ListenerKind::Tcp(listener),
                 cleanup: None,
+                #[cfg(unix)]
+                user_cleanup: None,
                 cleanup_dirs: Vec::new(),
             });
         }
@@ -511,6 +694,8 @@ enum ListenerKind {
 pub(crate) struct ForwardListener {
     inner: ListenerKind,
     cleanup: Option<PathBuf>,
+    #[cfg(unix)]
+    user_cleanup: Option<crate::user_socket_ops::UserSocketCleanup>,
     cleanup_dirs: Vec<PathBuf>,
 }
 
@@ -550,6 +735,8 @@ impl std::os::fd::AsFd for ForwardListener {
 
 impl Drop for ForwardListener {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        drop(self.user_cleanup.take());
         if let Some(path) = self.cleanup.as_ref() {
             let _ = fs::remove_file(path);
         }
@@ -613,7 +800,7 @@ mod tests {
     #[test]
     fn unix_source_bind_uses_openssh_default_owner_only_mode() {
         // Given
-        let path = std::env::temp_dir().join(format!("et-forward-mode-{}", std::process::id()));
+        let path = PathBuf::from(format!("/tmp/et-forward-mode-{}", std::process::id()));
         let endpoint = ResolvedEndpoint::Unix(path.clone());
 
         // When
@@ -630,8 +817,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn failed_unix_listener_setup_removes_socket_and_created_parent() {
-        let base = std::env::temp_dir().join(format!(
-            "et-forward-rollback-{}",
+        let base = PathBuf::from(format!(
+            "/tmp/et-forward-rollback-{}",
             et_core::keys::gen_id_passkey().0
         ));
         fs::create_dir(&base).unwrap();
@@ -665,8 +852,8 @@ mod tests {
             }
         }
 
-        let base = std::env::temp_dir().join(format!(
-            "et-forward-directory-rollback-{}",
+        let base = PathBuf::from(format!(
+            "/tmp/et-forward-directory-rollback-{}",
             et_core::keys::gen_id_passkey().0
         ));
         fs::create_dir(&base).unwrap();
@@ -742,6 +929,19 @@ mod tests {
         let addresses = distinct_tcp_addresses([address, address]);
 
         assert_eq!(bind_tcp_addresses(addresses).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bounded_resolution_counts_only_distinct_addresses() {
+        let first = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 1));
+        let second = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 2));
+        let error =
+            collect_distinct_addresses(Ok(vec![first, first, second].into_iter()), 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            collect_distinct_addresses(Ok(vec![first, first].into_iter()), 1).unwrap(),
+            [first]
+        );
     }
 
     #[test]

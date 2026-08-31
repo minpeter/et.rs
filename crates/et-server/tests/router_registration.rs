@@ -271,3 +271,55 @@ fn malformed_local_frames_are_capped_and_classified() {
     expect_rejected(&router, RouterReject::MalformedFrame);
     router.shutdown().unwrap();
 }
+
+#[test]
+fn pending_registration_cap_releases_a_slot_after_peer_close() {
+    let dir = TestDir::new();
+    let path = dir.socket();
+    let registry = Registry::new();
+    let selected = select_router_path_for(1000, Some(&path), None, None).unwrap();
+    let mut router = Router::start(selected, registry).unwrap();
+    let mut idle: Vec<_> = (0..64)
+        .map(|_| UnixStream::connect(&path).unwrap())
+        .collect();
+
+    let (uid, gid) = peer_identity();
+    let packet = Packet::new(
+        TerminalPacketType::TerminalUserInfo as u8,
+        info(Some(ID), Some(KEY), Some(uid), Some(gid)).encode_to_vec(),
+    );
+    let _queued = connect_packet(&path, &packet);
+    drop(idle.pop());
+
+    expect_rejected(&router, RouterReject::MalformedFrame);
+    assert_eq!(
+        router.recv_event_timeout(Duration::from_secs(2)).unwrap(),
+        RouterEvent::Registered { id: ID.to_owned() }
+    );
+    router.shutdown().unwrap();
+}
+
+#[test]
+fn idle_pending_registration_expires_and_router_remains_live() {
+    let dir = TestDir::new();
+    let path = dir.socket();
+    let registry = Registry::new();
+    let selected = select_router_path_for(1000, Some(&path), None, None).unwrap();
+    let mut router = Router::start(selected, registry).unwrap();
+    let mut idle = UnixStream::connect(&path).unwrap();
+    idle.set_read_timeout(Some(Duration::from_secs(7))).unwrap();
+    let mut byte = [0_u8; 1];
+    assert_eq!(std::io::Read::read(&mut idle, &mut byte).unwrap(), 0);
+
+    let (uid, gid) = peer_identity();
+    let packet = Packet::new(
+        TerminalPacketType::TerminalUserInfo as u8,
+        info(Some(ID), Some(KEY), Some(uid), Some(gid)).encode_to_vec(),
+    );
+    let _terminal = connect_packet(&path, &packet);
+    assert_eq!(
+        router.recv_event_timeout(Duration::from_secs(2)).unwrap(),
+        RouterEvent::Registered { id: ID.to_owned() }
+    );
+    router.shutdown().unwrap();
+}

@@ -172,6 +172,7 @@ fn handle_new(
     id: &str,
     peer: &str,
 ) {
+    let initialization_deadline = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
     if send_status(&mut stream, ConnectStatus::NewClient).is_err() {
         crate::diag::info(format!(
             "id={id}: failed to send NewClient status to {peer}"
@@ -179,7 +180,7 @@ fn handle_new(
         return;
     }
     let mut connection = Connection::new_server(stream, &start.registration().key);
-    let packet = match connection.read_packet() {
+    let packet = match connection.read_packet_until(initialization_deadline) {
         Ok(packet) => packet,
         Err(error) => {
             crate::diag::info(format!(
@@ -208,13 +209,18 @@ fn handle_new(
         run_jumphost(connection, start, core, payload, id, peer);
         return;
     }
+    if payload.reversetunnels.len() > et_net::forward::MAX_SESSION_LISTENERS {
+        send_initial_error(&mut connection, "reverse listener limit exceeded");
+        return;
+    }
     let owner = {
         let registration = start.registration();
         (registration.uid, registration.gid)
     };
-    let (forwarder, forward_environment) = match et_net::forward::Forwarder::start_with_user(
+    let (forwarder, forward_environment) = match et_net::forward::Forwarder::start_with_user_until(
         payload.reversetunnels.clone(),
-        Some(owner),
+        owner,
+        initialization_deadline,
     ) {
         Ok(started) => started,
         Err(error) => {
@@ -226,9 +232,10 @@ fn handle_new(
         }
     };
     if connection
-        .write_packet_strict(
+        .write_packet_live_until(
             EtPacketType::InitialResponse as u8,
             &InitialResponse { error: None }.encode_to_vec(),
+            initialization_deadline,
         )
         .is_err()
     {
@@ -333,7 +340,7 @@ fn run_jumphost(
     };
     let response = InitialResponse::decode(response_packet.payload()).ok();
     if connection
-        .write_packet_strict(
+        .write_packet_live(
             EtPacketType::InitialResponse as u8,
             response_packet.payload(),
         )

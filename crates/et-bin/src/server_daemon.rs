@@ -6,7 +6,7 @@
 //! detached child: the parent returns after runtime-startup acknowledgement,
 //! and the child becomes a session leader before serving.
 
-use crate::detach::{ChildStdout, Stdio};
+use crate::detach::{ChildStderr, Stdio};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -47,7 +47,7 @@ pub fn spawn_detached(args: &[std::ffi::OsString]) -> Result<(), String> {
         .map_err(|error| format!("could not locate etserver executable: {error}"))?
         .canonicalize()
         .map_err(|error| format!("could not resolve etserver executable: {error}"))?;
-    let mut child = crate::detach::command(executable.as_os_str());
+    let mut child = crate::detach::direct_command(executable.as_os_str());
     child.arg("server");
     for argument in args {
         if argument == std::ffi::OsStr::new("--daemon") {
@@ -58,19 +58,19 @@ pub fn spawn_detached(args: &[std::ffi::OsString]) -> Result<(), String> {
     }
     child
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .env(STATUS_ENV, STATUS_TOKEN)
         .current_dir(root_directory());
     crate::detach::configure(&mut child);
     let mut child = crate::detach::spawn(&mut child)
         .map_err(|error| format!("could not start background etserver: {error}"))?;
-    let stdout = child
-        .stdout
+    let stderr = child
+        .stderr
         .take()
         .ok_or_else(|| "background etserver status pipe was not created".to_owned())?;
     let (sender, receiver) = mpsc::sync_channel(1);
-    let worker = match spawn_status_worker(stdout, sender) {
+    let worker = match spawn_status_worker(stderr, sender) {
         Ok(worker) => worker,
         Err(error) => {
             let _ = child.kill();
@@ -84,12 +84,24 @@ pub fn spawn_detached(args: &[std::ffi::OsString]) -> Result<(), String> {
         }
         Err(_) => Err("timed out waiting for background etserver to detach".to_owned()),
     };
-    if result.is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
     let _ = worker.join();
-    result
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let status = match child.try_wait() {
+                Ok(Some(status)) => format!("child exited with {status}"),
+                Ok(None) => {
+                    let _ = child.kill();
+                    match child.wait() {
+                        Ok(status) => format!("child was still running and was killed: {status}"),
+                        Err(wait_error) => format!("child kill/wait failed: {wait_error}"),
+                    }
+                }
+                Err(wait_error) => format!("could not inspect child exit status: {wait_error}"),
+            };
+            Err(format!("{error}; {status}"))
+        }
+    }
 }
 
 /// Finish detaching inside the re-executed child: become a session leader,
@@ -97,6 +109,8 @@ pub fn spawn_detached(args: &[std::ffi::OsString]) -> Result<(), String> {
 pub fn detach_child(pidfile: Option<&Path>) -> Result<(), String> {
     #[cfg(unix)]
     {
+        crate::detach::close_inherited_descriptors()
+            .map_err(|error| format!("could not close inherited descriptors: {error}"))?;
         // A fresh child of the original shell is not a process-group leader, so
         // this succeeds and drops the controlling terminal.
         rustix::process::setsid()
@@ -125,8 +139,8 @@ fn write_startup_status(code: u8, message: &str) -> Result<(), String> {
     let bytes = message.as_bytes();
     let bytes = &bytes[..bytes.len().min(MAX_STATUS_MESSAGE)];
     let length = u16::try_from(bytes.len()).expect("daemon status bound fits u16");
-    let stdout = std::io::stdout();
-    let mut output = stdout.lock();
+    let stderr = std::io::stderr();
+    let mut output = stderr.lock();
     output
         .write_all(STATUS_MAGIC)
         .and_then(|()| output.write_all(&[code]))
@@ -137,31 +151,50 @@ fn write_startup_status(code: u8, message: &str) -> Result<(), String> {
 }
 
 fn spawn_status_worker(
-    stdout: ChildStdout,
+    stderr: ChildStderr,
     sender: mpsc::SyncSender<Result<(), String>>,
 ) -> Result<std::thread::JoinHandle<()>, String> {
     std::thread::Builder::new()
         .name("et-server-daemon-status".to_owned())
         .spawn(move || {
-            let _ = sender.send(read_status(stdout));
+            let _ = sender.send(read_status(stderr));
         })
         .map_err(|error| format!("could not start daemon status worker: {error}"))
 }
 
-fn read_status(mut stdout: impl Read) -> Result<(), String> {
+fn read_status(mut status: impl Read) -> Result<(), String> {
     let mut header = [0u8; 7];
-    stdout
-        .read_exact(&mut header)
-        .map_err(|error| format!("daemon status channel closed: {error}"))?;
+    let mut filled = 0;
+    while filled < header.len() {
+        match status.read(&mut header[filled..]) {
+            Ok(0) => {
+                return Err(format!(
+                    "daemon status channel closed after {filled} header bytes: {}",
+                    escaped_status_bytes(&header[..filled])
+                ));
+            }
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                return Err(format!(
+                    "daemon status channel failed after {filled} header bytes: {error}; bytes={}",
+                    escaped_status_bytes(&header[..filled])
+                ));
+            }
+        }
+    }
     if &header[..4] != STATUS_MAGIC {
-        return Err("malformed daemon startup status".to_owned());
+        return Err(format!(
+            "malformed daemon startup status: {}",
+            escaped_status_bytes(&header)
+        ));
     }
     let length = usize::from(u16::from_be_bytes([header[5], header[6]]));
     if length > MAX_STATUS_MESSAGE {
         return Err("oversized daemon startup status".to_owned());
     }
     let mut message = vec![0u8; length];
-    stdout
+    status
         .read_exact(&mut message)
         .map_err(|error| format!("truncated daemon startup status: {error}"))?;
     match header[4] {
@@ -169,6 +202,14 @@ fn read_status(mut stdout: impl Read) -> Result<(), String> {
         STATUS_FAILED => Err(String::from_utf8_lossy(&message).into_owned()),
         _ => Err("malformed daemon startup status".to_owned()),
     }
+}
+
+fn escaped_status_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .flat_map(|byte| std::ascii::escape_default(*byte))
+        .map(char::from)
+        .collect()
 }
 
 /// Signal an opt-in test observer after signal handling and runtime startup.

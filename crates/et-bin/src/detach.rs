@@ -16,6 +16,8 @@ pub type Child = std::process::Child;
 pub type Stdio = std::process::Stdio;
 #[cfg(unix)]
 pub type ChildStdout = std::process::ChildStdout;
+#[cfg(unix)]
+pub type ChildStderr = std::process::ChildStderr;
 #[cfg(windows)]
 pub type Command = windows_spawn::Command;
 #[cfg(windows)]
@@ -24,6 +26,8 @@ pub type Child = windows_spawn::Child;
 pub type Stdio = windows_spawn::Stdio;
 #[cfg(windows)]
 pub type ChildStdout = windows_spawn::ChildStdout;
+#[cfg(windows)]
+pub type ChildStderr = windows_spawn::ChildStderr;
 
 /// Construct a re-exec command with inherited-resource hygiene.
 pub fn command(executable: &OsStr) -> Command {
@@ -46,6 +50,30 @@ exec "$@"
     {
         Command::new(executable)
     }
+}
+
+/// Construct a direct re-exec command. Unix children must close inherited
+/// descriptors before creating threads.
+pub fn direct_command(executable: &OsStr) -> Command {
+    Command::new(executable)
+}
+
+/// Close every inherited non-stdio descriptor after direct re-exec.
+#[cfg(unix)]
+pub fn close_inherited_descriptors() -> io::Result<()> {
+    let entries = std::fs::read_dir("/proc/self/fd")
+        .or_else(|_| std::fs::read_dir("/dev/fd"))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let descriptors = entries
+        .iter()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|descriptor| *descriptor >= 3)
+        .collect::<Vec<_>>();
+    drop(entries);
+    for descriptor in descriptors {
+        let _ = nix::unistd::close(descriptor);
+    }
+    Ok(())
 }
 
 /// Configure `command` to survive the current shell/session.

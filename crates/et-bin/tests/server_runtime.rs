@@ -123,9 +123,13 @@ fn daemon_mode_detaches_and_writes_a_pid_file() {
 
     // A real daemon run returns immediately and the child records its pid,
     // matching upstream `DaemonCreator::create`.
-    for (index, program) in [env!("CARGO_BIN_EXE_et"), busybox.to_str().unwrap()]
-        .into_iter()
-        .enumerate()
+    for (index, (program, explicit_server_role, log_to_stdout)) in [
+        (env!("CARGO_BIN_EXE_et"), true, false),
+        (busybox.to_str().unwrap(), false, false),
+        (env!("CARGO_BIN_EXE_et"), true, true),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let router = directory.join(format!("router-{index}"));
         let pidfile = directory.join(format!("etserver-{index}.pid"));
@@ -147,7 +151,7 @@ fn daemon_mode_detaches_and_writes_a_pid_file() {
             }
         });
         let mut arguments = Vec::new();
-        if index == 0 {
+        if explicit_server_role {
             arguments.push("server".to_owned());
         }
         arguments.extend([
@@ -159,6 +163,9 @@ fn daemon_mode_detaches_and_writes_a_pid_file() {
             "--serverfifo".to_owned(),
             router.to_str().unwrap().to_owned(),
         ]);
+        if log_to_stdout {
+            arguments.push("--logtostdout".to_owned());
+        }
         // Replace the rejected port with an ephemeral one the OS assigns.
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -173,7 +180,11 @@ fn daemon_mode_detaches_and_writes_a_pid_file() {
             .env("ET_RS_TEST_SERVER_SHUTDOWN_SOCKET", &shutdown_socket)
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "daemon scenario index={index} program={program} logtostdout={log_to_stdout}: {output:?}"
+        );
         assert!(output.stdout.is_empty(), "{output:?}");
 
         // The parent returns after the detached child starts its runtime; the

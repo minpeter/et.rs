@@ -312,6 +312,23 @@ fn bind_sources(
                 }
                 Err(error) => return Err(ForwardError::Io(error)),
             };
+            if owner.is_some() {
+                match &source {
+                    ResolvedEndpoint::Tcp(addresses)
+                        if addresses
+                            .iter()
+                            .any(|address| address.ip().is_unspecified()) =>
+                    {
+                        return Err(ForwardError::Io(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "authenticated reverse TCP wildcard bind is not permitted",
+                        )));
+                    }
+                    ResolvedEndpoint::Tcp(_) => {}
+                    #[cfg(unix)]
+                    ResolvedEndpoint::Unix(_) => {}
+                }
+            }
             let listener_count = source.listener_count();
             (
                 PlannedSource::Endpoint {

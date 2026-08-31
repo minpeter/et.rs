@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -164,6 +166,29 @@ fn reverse_tcp_bind_uses_session_identity() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn authenticated_reverse_tcp_wildcard_bind_exposes_session_to_external_network() {
+    let owner = (
+        rustix::process::geteuid().as_raw(),
+        rustix::process::getegid().as_raw(),
+    );
+    assert_authenticated_wildcard_rejected(
+        Ipv4Addr::LOCALHOST.into(),
+        Ipv4Addr::UNSPECIFIED.into(),
+        owner,
+    );
+
+    if let Ok(ipv6_probe) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) {
+        drop(ipv6_probe);
+        assert_authenticated_wildcard_rejected(
+            Ipv6Addr::LOCALHOST.into(),
+            Ipv6Addr::UNSPECIFIED.into(),
+            owner,
+        );
+    }
+}
+
 #[test]
 fn reverse_listener_limit_is_transactional() {
     let reservations: Vec<TcpListener> = (0..33)
@@ -200,10 +225,61 @@ fn reserve_port() -> u16 {
         .port()
 }
 
+#[cfg(unix)]
+fn assert_authenticated_wildcard_rejected(loopback: IpAddr, wildcard: IpAddr, owner: (u32, u32)) {
+    let reservation = TcpListener::bind((loopback, 0)).unwrap();
+    let allowed_port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+    let (allowed, _) = Forwarder::start_with_user(
+        vec![request_on(&loopback.to_string(), allowed_port, 1)],
+        Some(owner),
+    )
+    .unwrap();
+    allowed.shutdown().unwrap();
+
+    let reservations: Vec<TcpListener> = (0..2)
+        .map(|_| TcpListener::bind((loopback, 0)).unwrap())
+        .collect();
+    let ports: Vec<u16> = reservations
+        .iter()
+        .map(|listener| listener.local_addr().unwrap().port())
+        .collect();
+    drop(reservations);
+    let error = match Forwarder::start_with_user(
+        vec![
+            request_on(&loopback.to_string(), ports[0], 1),
+            request_on(&wildcard.to_string(), ports[1], 1),
+        ],
+        Some(owner),
+    ) {
+        Ok((forwarder, _)) => {
+            forwarder.shutdown().unwrap();
+            panic!("authenticated wildcard reverse bind was exposed")
+        }
+        Err(error) => error,
+    };
+    match error {
+        ForwardError::Io(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
+        other => panic!("unexpected wildcard bind result: {other}"),
+    }
+    let rebound: Vec<TcpListener> = [
+        SocketAddr::new(loopback, ports[0]),
+        SocketAddr::new(wildcard, ports[1]),
+    ]
+    .into_iter()
+    .map(|address| TcpListener::bind(address).unwrap())
+    .collect();
+    assert_eq!(rebound.len(), ports.len());
+}
+
 fn request(source: u16, destination: u16) -> PortForwardSourceRequest {
+    request_on("127.0.0.1", source, destination)
+}
+
+fn request_on(host: &str, source: u16, destination: u16) -> PortForwardSourceRequest {
     PortForwardSourceRequest {
         source: Some(SocketEndpoint {
-            name: Some("127.0.0.1".to_owned()),
+            name: Some(host.to_owned()),
             port: Some(i32::from(source)),
         }),
         destination: Some(SocketEndpoint {

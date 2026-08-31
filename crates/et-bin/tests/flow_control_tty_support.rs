@@ -1,9 +1,10 @@
 #![cfg(unix)]
 #![allow(dead_code)]
 
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -17,7 +18,8 @@ use wait_timeout::ChildExt;
 const TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_PROMPT_LATENCY: Duration = Duration::from_secs(5);
 pub const THROTTLE_BYTES_PER_SECOND: usize = 100 * 1024;
-pub const SATURATION_BYTES: usize = 128 * 1024;
+pub const BASELINE_BYTES_PER_SECOND: usize = 16 * 1024;
+pub const SATURATION_BYTES: usize = 64 * 1024;
 
 pub fn receive_until(
     receiver: &mpsc::Receiver<Vec<u8>>,
@@ -54,43 +56,87 @@ pub fn receive_bytes(
 
 pub struct ThrottleProxy {
     pub port: u16,
+    stop: mpsc::Receiver<TcpStream>,
+    worker: thread::JoinHandle<io::Result<()>>,
 }
 
 impl ThrottleProxy {
-    pub fn start(server_port: u16) -> Self {
+    pub fn start(server_port: u16, bytes_per_second: usize) -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        let _worker: thread::JoinHandle<io::Result<()>> = thread::spawn(move || {
+        let (stop_tx, stop) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
             let (mut client, _) = listener.accept()?;
-            let mut server = TcpStream::connect((Ipv4Addr::LOCALHOST, server_port))?;
+            let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+            socket.set_recv_buffer_size(64 * 1024)?;
+            socket.connect(&SockAddr::from(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                server_port,
+            )))?;
+            let mut server = TcpStream::from(socket);
+            stop_tx
+                .send(server.try_clone()?)
+                .map_err(|_| io::Error::other("proxy stop receiver closed"))?;
             let mut client_read = client.try_clone()?;
             let mut server_write = server.try_clone()?;
             let upstream = thread::spawn(move || io::copy(&mut client_read, &mut server_write));
 
-            let started = Instant::now();
-            let mut transferred = 0usize;
-            let mut chunk = [0u8; 8192];
-            loop {
-                let count = server.read(&mut chunk)?;
-                if count == 0 {
-                    break;
+            let downstream = (|| {
+                let started = Instant::now();
+                let mut transferred = 0usize;
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let count = server.read(&mut chunk)?;
+                    if count == 0 {
+                        return Ok(());
+                    }
+                    client.write_all(&chunk[..count])?;
+                    transferred += count;
+                    let expected =
+                        Duration::from_secs_f64(transferred as f64 / bytes_per_second as f64);
+                    if let Some(remaining) = expected.checked_sub(started.elapsed()) {
+                        thread::sleep(remaining);
+                    }
                 }
-                client.write_all(&chunk[..count])?;
-                transferred += count;
-                let expected =
-                    Duration::from_secs_f64(transferred as f64 / THROTTLE_BYTES_PER_SECOND as f64);
-                if let Some(remaining) = expected.checked_sub(started.elapsed()) {
-                    thread::sleep(remaining);
-                }
-            }
+            })();
             let _ = client.shutdown(Shutdown::Both);
             let _ = server.shutdown(Shutdown::Both);
-            upstream
+            let upstream = upstream
                 .join()
-                .map_err(|_| io::Error::other("proxy upload thread panicked"))??;
-            Ok(())
+                .map_err(|_| io::Error::other("proxy upload thread panicked"))?;
+            normalize_proxy_close(downstream)?;
+            normalize_proxy_close(upstream.map(|_| ()))
         });
-        Self { port }
+        Self { port, stop, worker }
+    }
+
+    pub fn finish(self) -> io::Result<()> {
+        let stream = self
+            .stop
+            .recv_timeout(TIMEOUT)
+            .map_err(|_| io::Error::other("proxy did not accept client"))?;
+        let _ = stream.shutdown(Shutdown::Both);
+        self.worker
+            .join()
+            .map_err(|_| io::Error::other("proxy worker panicked"))?
+    }
+}
+
+fn normalize_proxy_close(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::NotConnected
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 

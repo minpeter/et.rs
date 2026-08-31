@@ -361,6 +361,7 @@ dependencies = [
  "prost",
  "rustix",
  "signal-hook",
+ "socket2",
  "sysinfo",
  "wait-timeout",
 ]

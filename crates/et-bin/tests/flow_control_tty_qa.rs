@@ -10,21 +10,26 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use flow_control_tty_support::{
-    receive_bytes, receive_until, Stack, ThrottleProxy, MAX_PROMPT_LATENCY, SATURATION_BYTES,
-    THROTTLE_BYTES_PER_SECOND,
+    receive_bytes, receive_until, Stack, ThrottleProxy, BASELINE_BYTES_PER_SECOND,
+    MAX_PROMPT_LATENCY, SATURATION_BYTES, THROTTLE_BYTES_PER_SECOND,
 };
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 #[test]
 fn flow_control_keeps_ctrl_c_and_prompt_responsive_on_a_slow_link() {
-    let stack = Stack::start();
     let evidence = std::env::var_os("ET_FLOW_QA_EVIDENCE_DIR").map(std::path::PathBuf::from);
     if let Some(directory) = &evidence {
         fs::create_dir_all(directory).unwrap();
     }
 
-    for mode in ["backpressure", "discard"] {
-        let proxy = ThrottleProxy::start(stack.port);
+    for mode in ["none", "backpressure", "discard"] {
+        let stack = Stack::start();
+        let bytes_per_second = if mode == "none" {
+            BASELINE_BYTES_PER_SECOND
+        } else {
+            THROTTLE_BYTES_PER_SECOND
+        };
+        let proxy = ThrottleProxy::start(stack.port, bytes_per_second);
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -77,12 +82,13 @@ fn flow_control_keeps_ctrl_c_and_prompt_responsive_on_a_slow_link() {
                   '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'; done\n",
             )
             .unwrap();
-        let output = match receive_until(
-            &receiver,
-            Vec::new(),
-            b"FLOW-START\r\n",
-            Duration::from_secs(10),
-        ) {
+        let startup_timeout = if mode == "none" {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(10)
+        };
+        let output = match receive_until(&receiver, Vec::new(), b"FLOW-START\r\n", startup_timeout)
+        {
             Ok(output) => output,
             Err(error) => {
                 child.kill().unwrap();
@@ -92,9 +98,10 @@ fn flow_control_keeps_ctrl_c_and_prompt_responsive_on_a_slow_link() {
                 panic!("{mode}: waiting for FLOW-START: {error}");
             }
         };
-        let mut output =
-            match receive_bytes(&receiver, output, SATURATION_BYTES, Duration::from_secs(10)) {
-                Ok(output) => output,
+        let (mut output, baseline_saturation_failed) =
+            match receive_bytes(&receiver, output, SATURATION_BYTES, Duration::from_secs(20)) {
+                Ok(output) => (output, false),
+                Err(_) if mode == "none" => (Vec::new(), true),
                 Err(error) => {
                     child.kill().unwrap();
                     drop(writer);
@@ -107,39 +114,45 @@ fn flow_control_keeps_ctrl_c_and_prompt_responsive_on_a_slow_link() {
         writer
             .write_all(b"\x03printf 'FLOW-%s\\n' PROMPT\n")
             .unwrap();
-        output = match receive_until(&receiver, output, b"FLOW-PROMPT\r\n", MAX_PROMPT_LATENCY) {
-            Ok(output) => output,
-            Err(error) => {
-                child.kill().unwrap();
-                drop(writer);
-                let _ = child.wait();
-                reader_thread.join().unwrap();
-                panic!("{mode}: waiting for Ctrl-C prompt: {error}");
-            }
-        };
+        let prompt_timeout = MAX_PROMPT_LATENCY;
+        let prompt = receive_until(&receiver, output, b"FLOW-PROMPT\r\n", prompt_timeout);
         let latency = interrupted.elapsed();
-        assert!(
-            latency <= MAX_PROMPT_LATENCY,
-            "{mode} Ctrl-C-to-prompt latency {latency:?} exceeded {MAX_PROMPT_LATENCY:?}"
-        );
+        let baseline_failed = mode == "none" && (baseline_saturation_failed || prompt.is_err());
+        if mode == "none" {
+            assert!(
+                baseline_failed,
+                "none baseline unexpectedly met the {MAX_PROMPT_LATENCY:?} latency criterion"
+            );
+            output = Vec::new();
+        } else {
+            output = prompt.unwrap_or_else(|error| {
+                panic!("{mode}: waiting for Ctrl-C prompt within {prompt_timeout:?}: {error}")
+            });
+            assert!(
+                latency <= MAX_PROMPT_LATENCY,
+                "{mode} Ctrl-C-to-prompt latency {latency:?} exceeded {MAX_PROMPT_LATENCY:?}"
+            );
+        }
 
         child.kill().unwrap();
         drop(writer);
-        while let Ok(chunk) = receiver.recv_timeout(Duration::from_millis(100)) {
+        let _ = child.wait();
+        while let Ok(chunk) = receiver.recv() {
             output.extend(chunk);
         }
-        let _ = child.wait();
         reader_thread.join().unwrap();
+        proxy.finish().unwrap();
 
         if let Some(directory) = &evidence {
             fs::write(directory.join(format!("{mode}.ansi")), &output).unwrap();
             fs::write(
                 directory.join(format!("{mode}.json")),
                 format!(
-                    "{{\"mode\":\"{mode}\",\"rate_bytes_per_second\":{THROTTLE_BYTES_PER_SECOND},\
+                    "{{\"mode\":\"{mode}\",\"rate_bytes_per_second\":{bytes_per_second},\
                      \"saturation_bytes\":{SATURATION_BYTES},\"ctrl_c_prompt_millis\":{},\
-                     \"pass\":true}}\n",
-                    latency.as_millis()
+                     \"expected_latency_failure\":{},\"scenario_pass\":true}}\n",
+                    latency.as_millis(),
+                    mode == "none"
                 ),
             )
             .unwrap();

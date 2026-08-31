@@ -23,11 +23,18 @@
 use std::io;
 use std::path::Path;
 
+use socket2::SockRef;
+
 /// Stream type used for local server/terminal IPC.
 #[cfg(unix)]
 pub type LocalStream = std::os::unix::net::UnixStream;
 #[cfg(windows)]
 pub type LocalStream = std::net::TcpStream;
+
+/// Bound terminal-to-server buffering for opted-in flow-control sessions.
+pub fn set_receive_buffer_size(stream: &LocalStream, bytes: usize) -> io::Result<()> {
+    SockRef::from(stream).set_recv_buffer_size(bytes)
+}
 
 /// Length of the hex-encoded Windows registration token.
 #[cfg(windows)]

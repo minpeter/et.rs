@@ -65,6 +65,10 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
         .map_err(|error| clap_io("could not select terminal router path", error))?;
     let mut runtime = Runtime::start(config.bind_ip, config.port, router_path)
         .map_err(|error| clap_io("could not start ET server", error))?;
+    if parsed.daemon_child {
+        crate::server_daemon::signal_runtime_started()
+            .map_err(|error| clap::Error::raw(ErrorKind::Io, error))?;
+    }
     et_cli::logging::info(format!(
         "etserver listening on {:?} router {}",
         runtime.tcp_addresses(),
@@ -84,6 +88,10 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
     runtime
         .shutdown()
         .map_err(|error| clap_io("could not shut down ET server", error))?;
+    if parsed.daemon_child {
+        crate::server_daemon::signal_shutdown_complete()
+            .map_err(|error| clap::Error::raw(ErrorKind::Io, error))?;
+    }
     Ok(0)
 }
 

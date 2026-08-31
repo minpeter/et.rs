@@ -127,6 +127,22 @@ impl ResolverExecutor {
         port: u16,
         deadline: Instant,
     ) -> io::Result<Vec<std::net::SocketAddr>> {
+        self.resolve_with_observers(resolver, host, port, deadline, |_| {}, |_| {})
+    }
+
+    fn resolve_with_observers<F, G>(
+        &self,
+        resolver: Arc<dyn ForwardResolver>,
+        host: String,
+        port: u16,
+        deadline: Instant,
+        observe_wait: F,
+        observe_result: G,
+    ) -> io::Result<Vec<std::net::SocketAddr>>
+    where
+        F: FnOnce(Duration),
+        G: FnOnce(&io::Result<Vec<std::net::SocketAddr>>),
+    {
         deadline
             .checked_duration_since(Instant::now())
             .ok_or_else(|| {
@@ -185,6 +201,7 @@ impl ResolverExecutor {
                     "forwarding resolution deadline elapsed",
                 )
             })?;
+        observe_wait(remaining);
         let result = match receiver.recv_timeout(remaining) {
             Ok(_) if Instant::now() >= deadline => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -199,6 +216,7 @@ impl ResolverExecutor {
                 "forwarding resolver terminated unexpectedly",
             )),
         };
+        observe_result(&result);
         cancelled.store(true, Ordering::Release);
         self.queue.changed.notify_all();
         result
@@ -776,6 +794,7 @@ mod tests {
 
     struct GatedResolver {
         started: mpsc::SyncSender<()>,
+        completed: Option<mpsc::SyncSender<()>>,
         gate: Arc<(Mutex<bool>, Condvar)>,
     }
 
@@ -786,6 +805,9 @@ mod tests {
             let mut released = released.lock().unwrap();
             while !*released {
                 released = changed.wait(released).unwrap();
+            }
+            if let Some(completed) = self.completed.as_ref() {
+                completed.send(()).unwrap();
             }
             Ok(Vec::new())
         }
@@ -806,7 +828,11 @@ mod tests {
             active.push(std::thread::spawn(move || {
                 barrier.wait();
                 executor.resolve(
-                    Arc::new(GatedResolver { started, gate }),
+                    Arc::new(GatedResolver {
+                        started,
+                        completed: None,
+                        gate,
+                    }),
                     format!("active-{index}"),
                     1,
                     Instant::now() + Duration::from_secs(10),
@@ -844,20 +870,30 @@ mod tests {
         let target_deadline = target_start + Duration::from_secs(3);
         let target_gate = Arc::new((Mutex::new(false), Condvar::new()));
         let (target_started_tx, target_started_rx) = mpsc::sync_channel(1);
+        let (target_completed_tx, target_completed_rx) = mpsc::sync_channel(1);
+        let (target_wait_tx, target_wait_rx) = mpsc::sync_channel(1);
+        let (target_decision_tx, target_decision_rx) = mpsc::sync_channel(1);
         let (target_done_tx, target_done_rx) = mpsc::sync_channel(1);
         let target_executor = executor.clone();
         let target_gate_for_resolver = target_gate.clone();
         let target = std::thread::spawn(move || {
-            let result = target_executor.resolve(
+            let result = target_executor.resolve_with_observers(
                 Arc::new(GatedResolver {
                     started: target_started_tx,
+                    completed: Some(target_completed_tx),
                     gate: target_gate_for_resolver,
                 }),
                 "target".to_owned(),
                 1,
                 target_deadline,
+                |remaining| target_wait_tx.send(remaining).unwrap(),
+                |result| {
+                    target_decision_tx
+                        .send(result.as_ref().map(|_| ()).map_err(io::Error::kind))
+                        .unwrap()
+                },
             );
-            target_done_tx.send((Instant::now(), result)).unwrap();
+            target_done_tx.send(result).unwrap();
         });
 
         assert!(matches!(
@@ -870,25 +906,39 @@ mod tests {
             *released.lock().unwrap() = true;
             changed.notify_all();
         }
+        let target_wait = target_wait_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("target caller did not begin its result wait after admission");
         target_started_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("target resolver did not start after delayed admission");
-        let (completed, result) = target_done_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("target exceeded its original absolute deadline");
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
-        assert!(completed <= target_deadline + Duration::from_millis(100));
+        let decision = target_decision_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("target caller did not make a bounded timeout decision");
 
         {
             let (released, changed) = &*target_gate;
             *released.lock().unwrap() = true;
             changed.notify_all();
         }
+        target_completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("late target callback did not complete after release");
+        let result = target_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("target caller did not return its timeout decision");
         target.join().unwrap();
         for worker in active {
             worker.join().unwrap().unwrap();
         }
         drop(queued_receivers);
+
+        assert!(
+            target_wait <= target_deadline.duration_since(target_start) - admission_delay,
+            "queue admission extended the caller's result-wait budget"
+        );
+        assert_eq!(decision, Err(io::ErrorKind::TimedOut));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 
     #[cfg(unix)]

@@ -22,6 +22,12 @@ pub const DEFAULT_PID_FILE: &str = "etserver.pid";
 const STATUS_ENV: &str = "ET_SERVER_DAEMON_STATUS";
 const STATUS_TOKEN: &str = "ready-v1";
 const STATUS_FRAME: &[u8; 4] = b"ETD1";
+#[cfg(unix)]
+const SHUTDOWN_STATUS_ENV: &str = "ET_RS_TEST_SERVER_SHUTDOWN_SOCKET";
+#[cfg(unix)]
+const RUNTIME_STATUS_FRAME: &[u8; 4] = b"ETD0";
+#[cfg(unix)]
+const SHUTDOWN_STATUS_FRAME: &[u8; 4] = b"ETD2";
 const READY_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Re-exec this binary as a detached background server and return after the
@@ -129,6 +135,33 @@ fn read_status(mut stdout: impl Read) -> Result<(), String> {
         return Err("malformed daemon startup status".to_owned());
     }
     Ok(())
+}
+
+/// Signal an opt-in test observer after signal handling and runtime startup.
+pub fn signal_runtime_started() -> Result<(), String> {
+    #[cfg(unix)]
+    signal_test_status(RUNTIME_STATUS_FRAME, "runtime startup")?;
+    Ok(())
+}
+
+/// Signal an opt-in test observer after runtime shutdown and router cleanup.
+pub fn signal_shutdown_complete() -> Result<(), String> {
+    #[cfg(unix)]
+    signal_test_status(SHUTDOWN_STATUS_FRAME, "shutdown completion")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn signal_test_status(frame: &[u8; 4], phase: &str) -> Result<(), String> {
+    let Some(path) = std::env::var_os(SHUTDOWN_STATUS_ENV) else {
+        return Ok(());
+    };
+    let mut stream = std::os::unix::net::UnixStream::connect(path)
+        .map_err(|error| format!("could not connect daemon {phase} status: {error}"))?;
+    stream
+        .write_all(frame)
+        .and_then(|()| stream.flush())
+        .map_err(|error| format!("could not signal daemon {phase}: {error}"))
 }
 
 /// Working directory for the detached server.

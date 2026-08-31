@@ -405,16 +405,19 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::fs::FileTypeExt;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn temp_dir() -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("et_user_sock_{stamp}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+            let dir = PathBuf::from(format!("/tmp/e{:x}{sequence:x}", std::process::id()));
+            match fs::create_dir(&dir) {
+                Ok(()) => return dir,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!("could not create test directory: {error}"),
+            }
+        }
     }
 
     fn long_unix_path() -> PathBuf {

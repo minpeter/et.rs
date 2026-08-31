@@ -8,6 +8,7 @@ use std::thread;
 
 use et_core::keys::passkey_to_key;
 use et_core::proto::{ConnectResponse, ConnectStatus, TerminalPacketType};
+use et_net::connection::DEFAULT_LIVE_WRITE_TIMEOUT;
 use et_net::framing_io::{read_proto_limited, write_proto};
 use et_net::handshake::client_request;
 use et_net::local_packet::read_local_packet;
@@ -253,18 +254,28 @@ fn recover_succeeds_while_old_peer_blackholes_writes() {
     let _live = client.try_clone_stream().unwrap();
 
     let payload = vec![b'x'; 32 * 1024];
+    let mut timed_out_live_write = false;
     for round in 0..1_024u32 {
         let send_started = Instant::now();
         server
             .handle
             .send_packet(ID_A, 40, &payload)
             .unwrap_or_else(|error| panic!("flood round {round}: {error}"));
+        let elapsed = send_started.elapsed();
         assert!(
-            send_started.elapsed() < std::time::Duration::from_secs(8),
+            elapsed < std::time::Duration::from_secs(8),
             "send_packet round {round} blocked for {:?} — live write timeout not applied",
-            send_started.elapsed()
+            elapsed
         );
+        if elapsed >= DEFAULT_LIVE_WRITE_TIMEOUT / 2 {
+            timed_out_live_write = true;
+            break;
+        }
     }
+    assert!(
+        timed_out_live_write,
+        "socket flood never reached the bounded live-write timeout"
+    );
 
     let recover_started = Instant::now();
     let (returning, response) = server.handshake(ID_A);

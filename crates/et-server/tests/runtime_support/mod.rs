@@ -36,7 +36,8 @@ impl TestRuntime {
     pub fn start() -> Self {
         let dir = TestDir::new();
         let path = dir.socket();
-        let selected = select_router_path_for(1000, Some(&path), None, None).unwrap();
+        let uid = rustix::process::getuid().as_raw();
+        let selected = select_router_path_for(uid, Some(&path), None, None).unwrap();
         let runtime = Runtime::start(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, selected).unwrap();
         let handle = runtime.handle();
         let address = runtime.tcp_addresses()[0];
@@ -50,11 +51,13 @@ impl TestRuntime {
 
     pub fn register(&self, id: &str, passkey: &str) -> UnixStream {
         let mut stream = UnixStream::connect(self.dir.socket()).unwrap();
+        let uid = i64::from(rustix::process::getuid().as_raw());
+        let gid = i64::from(rustix::process::getgid().as_raw());
         let user = TerminalUserInfo {
             id: Some(id.to_owned()),
             passkey: Some(passkey.to_owned()),
-            uid: Some(501),
-            gid: Some(20),
+            uid: Some(uid),
+            gid: Some(gid),
             fd: None,
         };
         let packet = Packet::new(

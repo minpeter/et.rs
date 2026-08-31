@@ -314,13 +314,15 @@ mod tests {
         handle: &crate::runtime_handle::RuntimeHandle,
     ) -> et_net::local::LocalStream {
         let mut stream = et_net::local::connect(path).unwrap();
+        let uid = i64::from(rustix::process::getuid().as_raw());
+        let gid = i64::from(rustix::process::getgid().as_raw());
         let packet = Packet::new(
             TerminalPacketType::TerminalUserInfo as u8,
             TerminalUserInfo {
                 id: Some(ID.to_owned()),
                 passkey: Some(KEY.to_owned()),
-                uid: Some(501),
-                gid: Some(20),
+                uid: Some(uid),
+                gid: Some(gid),
                 fd: None,
             }
             .encode_to_vec(),

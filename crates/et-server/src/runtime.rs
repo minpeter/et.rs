@@ -233,11 +233,12 @@ fn remember(first: &mut Option<RuntimeError>, error: RuntimeError) {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::Read;
+    use std::io::{self, Read};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
     use std::time::Duration;
 
     use et_core::packet::Packet;
@@ -278,6 +279,43 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support networking")]
+    fn disconnect_between_registration_lookup_and_raw_assignment_closes_handler() {
+        let directory = TestDirectory::new();
+        let router_path =
+            select_router_path_for(1000, Some(&directory.socket()), None, None).unwrap();
+        let mut runtime = Runtime::start(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, router_path).unwrap();
+        let handle = runtime.handle();
+        let address = runtime.tcp_addresses()[0];
+        let terminal = register(&directory.socket(), &handle);
+        let (assignment_tx, assignment_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (scan_tx, scan_rx) = mpsc::sync_channel(1);
+        crate::runtime_handler::install_raw_assignment_hook(ID, assignment_tx, release_rx);
+        crate::runtime_lifecycle::install_raw_scan_hook(ID, scan_tx);
+
+        let mut client = connect_request(address);
+        assignment_rx
+            .recv_timeout(TIMEOUT)
+            .expect("handler did not reach the post-lookup assignment barrier");
+        drop(terminal);
+        scan_rx
+            .recv_timeout(TIMEOUT)
+            .expect("terminal lifecycle did not complete its raw-socket scan");
+        release_tx.send(()).unwrap();
+        assert_prompt_closed(&mut client);
+
+        let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = shutdown_tx.send(runtime.shutdown());
+        });
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("raced handler and pre-auth permit were not released promptly")
+            .unwrap();
     }
 
     #[test]
@@ -356,5 +394,30 @@ mod tests {
     fn assert_closed(stream: &mut TcpStream) {
         let mut byte = [0; 1];
         assert_eq!(stream.read(&mut byte).unwrap_or(0), 0);
+    }
+
+    fn assert_prompt_closed(stream: &mut TcpStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut byte = [0; 1];
+        match stream.read(&mut byte) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                ) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                panic!("raced initialization socket remained open: {error}")
+            }
+            Ok(read) => panic!("raced initialization socket produced {read} bytes before close"),
+            Err(error) => panic!("raced initialization socket close failed: {error}"),
+        }
     }
 }

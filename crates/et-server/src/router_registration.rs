@@ -5,12 +5,14 @@ use et_core::proto::{TerminalPacketType, TerminalUserInfo};
 use prost::Message;
 
 use crate::registry::{RegisteredTerminal, RegistrationError, Registry};
+use crate::registry_validation::PeerIdentity;
 use crate::router::RouterReject;
 
 pub(crate) fn process(
     packet: Packet,
     stream: LocalStream,
     registry: &Registry,
+    peer: PeerIdentity,
 ) -> Result<RegisteredTerminal, RouterReject> {
     if packet.is_encrypted() {
         return Err(RouterReject::Encrypted);
@@ -20,7 +22,7 @@ pub(crate) fn process(
     }
     let info =
         TerminalUserInfo::decode(packet.payload()).map_err(|_| RouterReject::MalformedUserInfo)?;
-    registry.register(info, stream).map_err(map_error)
+    registry.register(info, stream, peer).map_err(map_error)
 }
 
 fn map_error(error: RegistrationError) -> RouterReject {

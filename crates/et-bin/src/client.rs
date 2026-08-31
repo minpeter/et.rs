@@ -87,14 +87,8 @@ fn run_client(
 ) -> Result<(), ClientError> {
     let destination = parse_positional_host(&args.host, args.port)?;
     validate_bootstrap_mode(args)?;
-    let forward_config =
+    let mut forward_config =
         crate::forward_config::build(args, std::env::var("SSH_AUTH_SOCK").ok().as_deref())?;
-    let has_forwarding = !forward_config.local_sources.is_empty()
-        || !forward_config.initial_payload.reversetunnels.is_empty();
-    // Bind local sources only after the encrypted session exists so accepted
-    // tunnels can be multiplexed immediately (avoids pre-handshake accept races).
-    let local_sources = forward_config.local_sources;
-    let mut initial_payload = forward_config.initial_payload;
     let local_term = std::env::var("TERM").ok();
     let local_colorterm = std::env::var("COLORTERM").ok();
     let term = normalize_terminal_type(local_term.as_deref());
@@ -105,12 +99,14 @@ fn run_client(
         .then(|| ghostty_colorterm(local_term.as_deref(), local_colorterm.as_deref()))
         .flatten();
     let reserved_environment = reserved_environment_value_lengths(
-        initial_payload
+        forward_config
+            .initial_payload
             .environmentvariables
             .iter()
             .map(|(name, value)| (name.as_str(), value.len())),
         colorterm,
-        initial_payload
+        forward_config
+            .initial_payload
             .reversetunnels
             .iter()
             .filter_map(|request| request.environmentvariable.as_deref()),
@@ -127,8 +123,12 @@ fn run_client(
         bounded_locale_environment(ssh_locale_environment(), &reserved_environment)
             .map_err(crate::forward_config::ForwardConfigError::EnvironmentPacketTooLarge)?;
     if args.jumphost.is_some() {
-        bound_jumphost_locale_environment(&initial_payload, &mut locale_environment, colorterm)
-            .map_err(crate::forward_config::ForwardConfigError::JumphostPacketTooLarge)?;
+        bound_jumphost_locale_environment(
+            &forward_config.initial_payload,
+            &mut locale_environment,
+            colorterm,
+        )
+        .map_err(crate::forward_config::ForwardConfigError::JumphostPacketTooLarge)?;
     }
 
     let requested_user = command_user(destination.user, args.username.clone());
@@ -138,8 +138,26 @@ fn run_client(
         &destination.host,
         requested_user.as_deref(),
         &args.ssh_option,
+        true,
+        true,
         deadline,
     )?;
+    forward_config.apply_ssh_config(&resolved)?;
+    if args.jumphost.is_some() {
+        bound_jumphost_locale_environment(
+            &forward_config.initial_payload,
+            &mut locale_environment,
+            colorterm,
+        )
+        .map_err(crate::forward_config::ForwardConfigError::JumphostPacketTooLarge)?;
+    }
+    let has_forwarding = !forward_config.local_sources.is_empty()
+        || !forward_config.initial_payload.reversetunnels.is_empty();
+    // Bind local sources only after the encrypted session exists so accepted
+    // tunnels can be multiplexed immediately (avoids pre-handshake accept races).
+    let local_sources = forward_config.local_sources;
+    let remote_origins = forward_config.remote_origins;
+    let mut initial_payload = forward_config.initial_payload;
     let user = requested_user.or(resolved.user);
     validate_ssh_destination(&destination.host, user.as_deref())?;
     let probe_request = BootstrapRequest {
@@ -213,8 +231,15 @@ fn run_client(
             .to_owned();
         let jump_user = Some(parsed_jump.user.as_str()).filter(|user| !user.is_empty());
         validate_ssh_destination(&jump_host, jump_user)?;
-        let jump_resolved =
-            resolve_ssh_config(runner, &jump_host, jump_user, &args.ssh_option, deadline)?;
+        let jump_resolved = resolve_ssh_config(
+            runner,
+            &jump_host,
+            jump_user,
+            &args.ssh_option,
+            false,
+            false,
+            deadline,
+        )?;
         let jump_request = JumpBootstrapRequest {
             jumphost: jumphost.to_owned(),
             destination_host: endpoint.host.clone(),
@@ -251,6 +276,7 @@ fn run_client(
         &endpoint,
         &credentials,
         &initial_payload,
+        &remote_origins,
         resolver,
         deadline,
     )?;
@@ -258,8 +284,21 @@ fn run_client(
     if args.no_terminal && !has_forwarding {
         return Ok(());
     }
-    let forwarder = et_net::forward::Forwarder::start(local_sources)
+    let (forwarder, skipped) = et_net::forward::Forwarder::start_with_origins(local_sources)
         .map_err(|error| ClientError::Terminal(error.to_string()))?;
+    for skipped in skipped {
+        let source = skipped.request.source.unwrap_or_default();
+        let label = match (source.name.as_deref(), source.port) {
+            (Some(name), Some(port)) if !name.is_empty() => format!("{name}:{port}"),
+            (_, Some(port)) => port.to_string(),
+            (Some(name), None) => name.to_owned(),
+            (None, None) => "<missing>".to_owned(),
+        };
+        et_cli::logging::warn(format!(
+            "SSH localforward source '{label}' could not bind: {}; skipping forwarding row",
+            skipped.error
+        ));
+    }
     crate::client_terminal::run(
         connection,
         crate::client_terminal::TerminalOptions {

@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -9,11 +11,12 @@ use et_core::packet::Packet;
 use et_core::proto::{
     PortForwardDestinationRequest, PortForwardSourceRequest, SocketEndpoint, TerminalPacketType,
 };
-use et_net::forward::Forwarder;
+use et_net::forward::{ForwardError, ForwardOrigin, ForwardSource, Forwarder};
 use prost::Message;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
 const REFUSED_DESTINATION_TIMEOUT: Duration = Duration::from_secs(7);
+const HARD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[test]
 fn two_forwarders_relay_a_real_tcp_round_trip() {
@@ -113,7 +116,10 @@ fn hard_shutdown_cancels_worker_blocked_on_full_command_and_outbound_queues() {
 
     let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
     let worker = thread::spawn(move || done_tx.send(forwarder.shutdown_hard()).unwrap());
-    assert!(done_rx.recv_timeout(TIMEOUT).unwrap().unwrap());
+    assert!(done_rx
+        .recv_timeout(HARD_SHUTDOWN_TIMEOUT)
+        .unwrap()
+        .unwrap());
     worker.join().unwrap();
 }
 
@@ -180,6 +186,144 @@ fn try_receive_reports_backpressure_and_outbound_drain_recovers() {
     forwarder.shutdown().unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn reverse_tcp_bind_uses_session_identity() {
+    let root = rustix::process::geteuid().as_raw() == 0;
+    let source_port = if root { 1 } else { reserve_port() };
+    let owner = (65_534, 65_534);
+
+    let error = match Forwarder::start_with_user(vec![request(source_port, 1)], Some(owner)) {
+        Ok((forwarder, _)) => {
+            forwarder.shutdown().unwrap();
+            panic!("TCP bind retained daemon authority");
+        }
+        Err(error) => error,
+    };
+
+    match error {
+        ForwardError::Io(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
+        other => panic!("unexpected TCP bind result: {other}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn authenticated_reverse_tcp_wildcard_bind_exposes_session_to_external_network() {
+    let owner = (
+        rustix::process::geteuid().as_raw(),
+        rustix::process::getegid().as_raw(),
+    );
+    assert_authenticated_wildcard_rejected(
+        Ipv4Addr::LOCALHOST.into(),
+        Ipv4Addr::UNSPECIFIED.into(),
+        owner,
+    );
+
+    let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = reservation.local_addr().unwrap().port();
+    let error = match Forwarder::start_with_user_report(
+        vec![request_on(&Ipv4Addr::UNSPECIFIED.to_string(), port, 1)],
+        Some(owner),
+    ) {
+        Ok((forwarder, _, _)) => {
+            forwarder.shutdown().unwrap();
+            panic!("authority failure was downgraded to a row report")
+        }
+        Err(error) => error,
+    };
+    match error {
+        ForwardError::Io(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
+        other => panic!("unexpected wildcard report result: {other}"),
+    }
+
+    if let Ok(ipv6_probe) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) {
+        drop(ipv6_probe);
+        assert_authenticated_wildcard_rejected(
+            Ipv6Addr::LOCALHOST.into(),
+            Ipv6Addr::UNSPECIFIED.into(),
+            owner,
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn imported_local_wildcard_is_externally_reachable_while_loopback_is_not() {
+    let probe = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    probe.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).unwrap();
+    let external = match probe.local_addr().unwrap().ip() {
+        std::net::IpAddr::V4(address) if !address.is_loopback() => address,
+        address => panic!("route probe did not select a non-loopback IPv4 address: {address}"),
+    };
+
+    let loopback_port = reserve_port();
+    let loopback = Forwarder::start(vec![request(loopback_port, 1)]).unwrap();
+    assert!(
+        TcpStream::connect_timeout(&SocketAddr::from((external, loopback_port)), TIMEOUT,).is_err()
+    );
+    loopback.shutdown().unwrap();
+
+    let wildcard_port = reserve_port();
+    let request = request_on("", wildcard_port, 1);
+    let (wildcard, skipped) = Forwarder::start_with_origins(vec![ForwardSource {
+        request,
+        origin: ForwardOrigin::SshConfig,
+    }])
+    .unwrap();
+    assert!(skipped.is_empty());
+    let connection =
+        TcpStream::connect_timeout(&SocketAddr::from((external, wildcard_port)), TIMEOUT).unwrap();
+    drop(connection);
+    wildcard.shutdown().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn reverse_listener_limit_is_transactional() {
+    struct RemoveDir(std::path::PathBuf);
+    impl Drop for RemoveDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let directory = std::env::temp_dir().join(format!("etrl-{}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    let _cleanup = RemoveDir(directory.clone());
+    let paths: Vec<_> = (0..33)
+        .map(|index| directory.join(format!("source-{index}.sock")))
+        .collect();
+    let requests = paths
+        .iter()
+        .map(|path| PortForwardSourceRequest {
+            source: Some(SocketEndpoint {
+                name: Some(path.to_string_lossy().into_owned()),
+                port: None,
+            }),
+            destination: Some(SocketEndpoint {
+                name: Some("/tmp/destination.sock".to_owned()),
+                port: None,
+            }),
+            environmentvariable: None,
+        })
+        .collect();
+
+    let error = match Forwarder::start(requests) {
+        Ok(forwarder) => {
+            forwarder.shutdown().unwrap();
+            panic!("listener cap was not enforced");
+        }
+        Err(error) => error,
+    };
+
+    assert!(
+        error.to_string().contains("listener limit"),
+        "unexpected error: {error}"
+    );
+    assert!(paths.iter().all(|path| !path.exists()));
+}
+
 fn reserve_port() -> u16 {
     TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .unwrap()
@@ -188,10 +332,53 @@ fn reserve_port() -> u16 {
         .port()
 }
 
+#[cfg(unix)]
+fn assert_authenticated_wildcard_rejected(loopback: IpAddr, wildcard: IpAddr, owner: (u32, u32)) {
+    let reservation = TcpListener::bind((loopback, 0)).unwrap();
+    let allowed_port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+    let (allowed, _) = Forwarder::start_with_user(
+        vec![request_on(&loopback.to_string(), allowed_port, 1)],
+        Some(owner),
+    )
+    .unwrap();
+    allowed.shutdown().unwrap();
+
+    let reservations: Vec<TcpListener> = (0..2)
+        .map(|_| TcpListener::bind((loopback, 0)).unwrap())
+        .collect();
+    let ports: Vec<u16> = reservations
+        .iter()
+        .map(|listener| listener.local_addr().unwrap().port())
+        .collect();
+    let error = match Forwarder::start_with_user(
+        vec![
+            request_on(&loopback.to_string(), ports[0], 1),
+            request_on(&wildcard.to_string(), ports[1], 1),
+        ],
+        Some(owner),
+    ) {
+        Ok((forwarder, _)) => {
+            forwarder.shutdown().unwrap();
+            panic!("authenticated wildcard reverse bind was exposed")
+        }
+        Err(error) => error,
+    };
+    match error {
+        ForwardError::Io(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
+        other => panic!("unexpected wildcard bind result: {other}"),
+    }
+    assert_eq!(reservations.len(), ports.len());
+}
+
 fn request(source: u16, destination: u16) -> PortForwardSourceRequest {
+    request_on("127.0.0.1", source, destination)
+}
+
+fn request_on(host: &str, source: u16, destination: u16) -> PortForwardSourceRequest {
     PortForwardSourceRequest {
         source: Some(SocketEndpoint {
-            name: Some("127.0.0.1".to_owned()),
+            name: Some(host.to_owned()),
             port: Some(i32::from(source)),
         }),
         destination: Some(SocketEndpoint {

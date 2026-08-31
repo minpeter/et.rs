@@ -11,11 +11,15 @@ use std::time::Duration;
 use et_core::packet::Packet;
 use et_core::proto::{PortForwardSourceRequest, TerminalPacketType};
 
-use crate::forward_endpoint::Endpoint;
+use crate::forward_endpoint::{Endpoint, ResolvedEndpoint};
 use crate::forward_io::BoundSource;
 use crate::forward_worker::{run, Command, WorkerChannels};
+use crate::reverse_report::SkipReason;
 
 const CHANNEL_CAPACITY: usize = 256;
+/// Maximum reverse listeners owned by one terminal session, after DNS fanout
+/// and address deduplication.
+const MAX_SESSION_LISTENERS: usize = 32;
 
 #[derive(Debug)]
 pub enum ForwardError {
@@ -46,6 +50,41 @@ impl From<io::Error> for ForwardError {
 
 pub(crate) type Outbound = Result<Packet, ForwardError>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForwardOrigin {
+    Explicit,
+    SshConfig,
+    Reported(usize),
+}
+
+pub struct ForwardSource {
+    pub request: PortForwardSourceRequest,
+    pub origin: ForwardOrigin,
+}
+
+impl ForwardSource {
+    pub const fn explicit(request: PortForwardSourceRequest) -> Self {
+        Self {
+            request,
+            origin: ForwardOrigin::Explicit,
+        }
+    }
+
+    pub const fn ssh_config(request: PortForwardSourceRequest) -> Self {
+        Self {
+            request,
+            origin: ForwardOrigin::SshConfig,
+        }
+    }
+}
+
+pub struct SkippedForward {
+    pub request: PortForwardSourceRequest,
+    pub error: io::Error,
+    pub reason: SkipReason,
+    pub report_index: Option<usize>,
+}
+
 pub struct Forwarder {
     commands: channel::Sender<Command>,
     outbound: channel::Receiver<Outbound>,
@@ -61,7 +100,14 @@ pub struct Forwarder {
 
 impl Forwarder {
     pub fn start(sources: Vec<PortForwardSourceRequest>) -> Result<Self, ForwardError> {
-        Self::start_with_user(sources, None).map(|(forwarder, _)| forwarder)
+        let sources = sources.into_iter().map(ForwardSource::explicit).collect();
+        start_forwarder(sources, None).map(|(forwarder, _, _)| forwarder)
+    }
+
+    pub fn start_with_origins(
+        sources: Vec<ForwardSource>,
+    ) -> Result<(Self, Vec<SkippedForward>), ForwardError> {
+        start_forwarder(sources, None).map(|(forwarder, _, skipped)| (forwarder, skipped))
     }
 
     /// Bind all forwarding sources and return the forwarder together with the
@@ -73,59 +119,85 @@ impl Forwarder {
         sources: Vec<PortForwardSourceRequest>,
         owner: Option<(u32, u32)>,
     ) -> Result<(Self, ForwardEnvironment), ForwardError> {
-        let (sources, environment) = bind_sources(sources, owner)?;
-        let session_user = owner;
-        let (commands_tx, commands_rx) = channel::bounded(CHANNEL_CAPACITY);
-        let (outbound_tx, outbound_rx) = channel::bounded(CHANNEL_CAPACITY);
-        let (cancel_tx, cancel_rx) = channel::bounded(1);
-        #[cfg(unix)]
-        let (wake, wake_writer) = {
-            let (reader, writer) = UnixStream::pair()?;
-            reader.set_nonblocking(true)?;
-            (reader, writer)
-        };
-        #[cfg(unix)]
-        let (listener_stop, listener_stop_reader) = UnixStream::pair()?;
-        #[cfg(windows)]
-        let listener_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        #[cfg(windows)]
-        let listener_stop_reader = listener_stop.clone();
-        let worker_commands = commands_tx.clone();
-        let worker = std::thread::Builder::new()
-            .name("et-forwarding".to_owned())
-            .spawn(move || {
-                run(
-                    sources,
-                    WorkerChannels {
-                        receiver: commands_rx,
-                        sender: worker_commands,
-                        outbound: outbound_tx,
-                        cancel: cancel_rx,
-                    },
-                    #[cfg(unix)]
-                    wake_writer,
-                    listener_stop_reader,
-                    session_user,
-                );
-                #[cfg(unix)]
-                drop(listener_stop);
-                #[cfg(windows)]
-                listener_stop.store(true, std::sync::atomic::Ordering::Release);
-            })
-            .map_err(ForwardError::Io)?;
-        Ok((
-            Self {
-                commands: commands_tx,
-                outbound: outbound_rx,
-                cancel: cancel_tx,
-                #[cfg(unix)]
-                wake,
-                worker: Some(worker),
-            },
-            environment,
-        ))
+        let sources = sources.into_iter().map(ForwardSource::explicit).collect();
+        start_forwarder(sources, owner).map(|(forwarder, environment, _)| (forwarder, environment))
     }
 
+    pub fn start_with_user_report(
+        sources: Vec<PortForwardSourceRequest>,
+        owner: Option<(u32, u32)>,
+    ) -> Result<(Self, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
+        let sources = sources
+            .into_iter()
+            .enumerate()
+            .map(|(index, request)| ForwardSource {
+                request,
+                origin: ForwardOrigin::Reported(index),
+            })
+            .collect();
+        start_forwarder(sources, owner)
+    }
+}
+
+fn start_forwarder(
+    sources: Vec<ForwardSource>,
+    owner: Option<(u32, u32)>,
+) -> Result<(Forwarder, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
+    let (sources, environment, skipped) = bind_sources(sources, owner)?;
+    let session_user = owner;
+    let (commands_tx, commands_rx) = channel::bounded(CHANNEL_CAPACITY);
+    let (outbound_tx, outbound_rx) = channel::bounded(CHANNEL_CAPACITY);
+    let (cancel_tx, cancel_rx) = channel::bounded(1);
+    #[cfg(unix)]
+    let (wake, wake_writer) = {
+        let (reader, writer) = UnixStream::pair()?;
+        reader.set_nonblocking(true)?;
+        (reader, writer)
+    };
+    #[cfg(unix)]
+    let (listener_stop, listener_stop_reader) = UnixStream::pair()?;
+    #[cfg(windows)]
+    let listener_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(windows)]
+    let listener_stop_reader = listener_stop.clone();
+    let worker_commands = commands_tx.clone();
+    let worker = std::thread::Builder::new()
+        .name("et-forwarding".to_owned())
+        .spawn(move || {
+            run(
+                sources,
+                WorkerChannels {
+                    receiver: commands_rx,
+                    sender: worker_commands,
+                    outbound: outbound_tx,
+                    cancel: cancel_rx,
+                },
+                #[cfg(unix)]
+                wake_writer,
+                listener_stop_reader,
+                session_user,
+            );
+            #[cfg(unix)]
+            drop(listener_stop);
+            #[cfg(windows)]
+            listener_stop.store(true, std::sync::atomic::Ordering::Release);
+        })
+        .map_err(ForwardError::Io)?;
+    Ok((
+        Forwarder {
+            commands: commands_tx,
+            outbound: outbound_rx,
+            cancel: cancel_tx,
+            #[cfg(unix)]
+            wake,
+            worker: Some(worker),
+        },
+        environment,
+        skipped,
+    ))
+}
+
+impl Forwarder {
     /// Pollable readiness handle for outbound forwarding packets (Unix only).
     #[cfg(unix)]
     pub fn wake(&self) -> Result<&UnixStream, ForwardError> {
@@ -223,24 +295,35 @@ impl Drop for Forwarder {
 /// Environment variables created for named-pipe forwards.
 pub type ForwardEnvironment = Vec<(String, String)>;
 
+enum PlannedSource {
+    Endpoint {
+        source: ResolvedEndpoint,
+        destination: et_core::proto::SocketEndpoint,
+        original: PortForwardSourceRequest,
+        origin: ForwardOrigin,
+    },
+    #[cfg(unix)]
+    Environment {
+        variable: String,
+        destination: et_core::proto::SocketEndpoint,
+    },
+}
+
 fn bind_sources(
-    sources: Vec<PortForwardSourceRequest>,
+    sources: Vec<ForwardSource>,
     owner: Option<(u32, u32)>,
-) -> Result<(Vec<BoundSource>, ForwardEnvironment), ForwardError> {
-    let mut bound = Vec::with_capacity(sources.len());
-    #[cfg_attr(windows, allow(unused_mut))]
-    let mut environment = Vec::new();
-    for request in sources {
+) -> Result<(Vec<BoundSource>, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
+    let mut plans = Vec::with_capacity(sources.len());
+    let mut skipped = Vec::new();
+    let mut listener_count = 0usize;
+    for source in sources {
+        let origin = source.origin;
+        let original = source.request.clone();
+        let request = source.request;
         // The destination is passed through verbatim in the
-        // PORT_FORWARD_DESTINATION_REQUEST, exactly like upstream: it is only
-        // interpreted (and validated) by the remote side when a connection
-        // arrives.
+        // PORT_FORWARD_DESTINATION_REQUEST and parsed by the remote side.
         let destination = request.destination.unwrap_or_default();
-        if let Some(variable) = request.environmentvariable {
-            // Named-pipe forwarding: upstream creates a private temporary
-            // socket, exports its path through the environment variable, and
-            // rejects requests that also carry an explicit source. Upstream
-            // builds this path only on POSIX systems.
+        let (plan, additional_listeners) = if let Some(variable) = request.environmentvariable {
             if request.source.is_some() {
                 return Err(ForwardError::Protocol(
                     "Do not set a source when forwarding named pipes with environment variables",
@@ -248,10 +331,128 @@ fn bind_sources(
             }
             #[cfg(unix)]
             {
+                (
+                    PlannedSource::Environment {
+                        variable,
+                        destination,
+                    },
+                    1,
+                )
+            }
+            #[cfg(windows)]
+            {
+                let _ = (variable, destination, owner);
+                return Err(ForwardError::Protocol(
+                    "named-pipe forwarding is not supported on Windows",
+                ));
+            }
+        } else {
+            let endpoint = Endpoint::parse(request.source).map_err(ForwardError::Io)?;
+            let resolved = endpoint.resolve_for_bind();
+            let source = match (resolved, origin) {
+                (Ok(source), _) => source,
+                (Err(error), ForwardOrigin::SshConfig) => {
+                    skipped.push(SkippedForward {
+                        request: original,
+                        error,
+                        reason: SkipReason::Resolve,
+                        report_index: None,
+                    });
+                    continue;
+                }
+                (Err(error), ForwardOrigin::Reported(index)) => {
+                    skipped.push(SkippedForward {
+                        request: original,
+                        error,
+                        reason: SkipReason::Resolve,
+                        report_index: Some(index),
+                    });
+                    continue;
+                }
+                (Err(error), ForwardOrigin::Explicit) => return Err(ForwardError::Io(error)),
+            };
+            if owner.is_some() {
+                match &source {
+                    ResolvedEndpoint::Tcp(addresses)
+                        if addresses
+                            .iter()
+                            .any(|address| address.ip().is_unspecified()) =>
+                    {
+                        return Err(ForwardError::Io(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "authenticated reverse TCP wildcard bind is not permitted",
+                        )));
+                    }
+                    ResolvedEndpoint::Tcp(_) => {}
+                    #[cfg(unix)]
+                    ResolvedEndpoint::Unix(_) => {}
+                }
+            }
+            let listener_count = source.listener_count();
+            (
+                PlannedSource::Endpoint {
+                    source,
+                    destination,
+                    original,
+                    origin,
+                },
+                listener_count,
+            )
+        };
+        listener_count = listener_count
+            .checked_add(additional_listeners)
+            .ok_or(ForwardError::Protocol("reverse listener limit exceeded"))?;
+        if listener_count > MAX_SESSION_LISTENERS {
+            return Err(ForwardError::Protocol("reverse listener limit exceeded"));
+        }
+        plans.push(plan);
+    }
+
+    let mut bound = Vec::with_capacity(listener_count);
+    #[cfg_attr(windows, allow(unused_mut))]
+    let mut environment = Vec::new();
+    for plan in plans {
+        match plan {
+            PlannedSource::Endpoint {
+                source,
+                destination,
+                original,
+                origin,
+            } => match (source.bind_with_user(owner), origin) {
+                (Ok(listeners), _) => {
+                    for listener in listeners {
+                        bound.push(BoundSource {
+                            listener,
+                            destination: destination.clone(),
+                        });
+                    }
+                }
+                (Err(error), ForwardOrigin::SshConfig) => {
+                    skipped.push(SkippedForward {
+                        request: original,
+                        error,
+                        reason: SkipReason::Bind,
+                        report_index: None,
+                    });
+                }
+                (Err(error), ForwardOrigin::Reported(index)) => {
+                    skipped.push(SkippedForward {
+                        request: original,
+                        error,
+                        reason: SkipReason::Bind,
+                        report_index: Some(index),
+                    });
+                }
+                (Err(error), ForwardOrigin::Explicit) => return Err(ForwardError::Io(error)),
+            },
+            #[cfg(unix)]
+            PlannedSource::Environment {
+                variable,
+                destination,
+            } => {
                 let path = create_forward_pipe(owner)?;
-                // Bind as the session user (ET #784). Do not chmod/chown the
-                // client-visible socket path as root after bind.
-                let mut listeners = Endpoint::Unix(path.clone()).bind_with_user(owner)?;
+                let source = Endpoint::Unix(path.clone()).resolve_for_bind()?;
+                let mut listeners = source.bind_with_user(owner)?;
                 environment.push((variable, path.to_string_lossy().into_owned()));
                 for mut listener in listeners.drain(..) {
                     if let Some(directory) = path.parent() {
@@ -262,25 +463,10 @@ fn bind_sources(
                         destination: destination.clone(),
                     });
                 }
-                continue;
             }
-            #[cfg(windows)]
-            {
-                let _ = (&variable, owner);
-                return Err(ForwardError::Protocol(
-                    "named-pipe forwarding is not supported on Windows",
-                ));
-            }
-        }
-        let source = Endpoint::parse(request.source)?;
-        for listener in source.bind_with_user(owner)? {
-            bound.push(BoundSource {
-                listener,
-                destination: destination.clone(),
-            });
         }
     }
-    Ok((bound, environment))
+    Ok((bound, environment, skipped))
 }
 
 /// Create the private directory for a named-pipe forward and return the

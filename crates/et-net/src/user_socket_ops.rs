@@ -7,9 +7,11 @@
 //! `unsafe`); it re-execs a helper, drops with [`nix`] in that
 //! single-threaded process, and uses the same fd-passing protocol.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, IoSlice, IoSliceMut};
 use std::mem::MaybeUninit;
+use std::net::{SocketAddr, TcpListener};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -34,6 +36,7 @@ const UNIX_PATH_MAX: usize = 108;
 enum Op {
     Listen,
     Connect,
+    ListenTcp,
 }
 
 impl Op {
@@ -41,6 +44,7 @@ impl Op {
         match self {
             Self::Listen => "listen",
             Self::Connect => "connect",
+            Self::ListenTcp => "listen-tcp",
         }
     }
 
@@ -48,6 +52,7 @@ impl Op {
         match value {
             "listen" => Some(Self::Listen),
             "connect" => Some(Self::Connect),
+            "listen-tcp" => Some(Self::ListenTcp),
             _ => None,
         }
     }
@@ -70,32 +75,38 @@ pub fn run_helper() -> i32 {
     let op = std::env::var(OP_ENV)
         .ok()
         .and_then(|value| Op::parse(&value));
-    let path = std::env::var(PATH_ENV).unwrap_or_default();
-    match (op, path.is_empty()) {
-        (Some(Op::Listen), false) => match listen_at_path(Path::new(&path)) {
+    let argument = std::env::var(PATH_ENV).unwrap_or_default();
+    match op {
+        Some(Op::Listen) if !argument.is_empty() => match listen_at_path(Path::new(&argument)) {
             Ok(listener) => send_result(channel, Some(listener.as_fd()), 0, 0),
             Err(error) => send_error(channel, &error),
         },
-        (Some(Op::Connect), false) => match connect_at_path(Path::new(&path)) {
+        Some(Op::Connect) if !argument.is_empty() => match connect_at_path(Path::new(&argument)) {
             Ok(stream) => send_result(channel, Some(stream.as_fd()), 0, 0),
             Err(error) => send_error(channel, &error),
         },
-        _ => send_result(channel, None, -1, rustix::io::Errno::INVAL.raw_os_error()),
+        Some(Op::ListenTcp) => match argument.parse() {
+            Ok(address) => match listen_tcp_at_address(address) {
+                Ok(listener) => send_result(channel, Some(listener.as_fd()), 0, 0),
+                Err(error) => send_error(channel, &error),
+            },
+            Err(_) => send_result(channel, None, -1, rustix::io::Errno::INVAL.raw_os_error()),
+        },
+        Some(Op::Listen | Op::Connect) | None => {
+            send_result(channel, None, -1, rustix::io::Errno::INVAL.raw_os_error())
+        }
     }
 }
 
-/// unlink/bind/listen/fchmod a UNIX socket path with the current credentials.
+/// Bind/listen a new owner-only UNIX socket path with the current credentials.
 pub fn listen_at_path(path: &Path) -> io::Result<UnixListener> {
     if path_too_long(path) {
         return Err(io::Error::from_raw_os_error(
             rustix::io::Errno::NAMETOOLONG.raw_os_error(),
         ));
     }
-    let _ = fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
-    if rustix::fs::fchmod(&listener, rustix::fs::Mode::from_raw_mode(0o700)).is_err() {
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
-    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(listener)
 }
 
@@ -109,13 +120,18 @@ pub fn connect_at_path(path: &Path) -> io::Result<UnixStream> {
     UnixStream::connect(path)
 }
 
-/// unlink/bind/listen as `uid`/`gid`, returning the listening socket.
+/// Bind/listen as `uid`/`gid`, returning the listening socket.
 pub fn listen_unix_as_user(path: impl AsRef<Path>, uid: u32, gid: u32) -> io::Result<UnixListener> {
     let path = path.as_ref();
     if already_session_user(uid, gid) {
         return listen_at_path(path);
     }
-    Ok(UnixListener::from(run_as_user(Op::Listen, path, uid, gid)?))
+    Ok(UnixListener::from(run_as_user(
+        Op::Listen,
+        path.as_os_str(),
+        uid,
+        gid,
+    )?))
 }
 
 /// connect() as `uid`/`gid`, returning the connected socket.
@@ -124,25 +140,44 @@ pub fn connect_unix_as_user(path: impl AsRef<Path>, uid: u32, gid: u32) -> io::R
     if already_session_user(uid, gid) {
         return connect_at_path(path);
     }
-    Ok(UnixStream::from(run_as_user(Op::Connect, path, uid, gid)?))
+    Ok(UnixStream::from(run_as_user(
+        Op::Connect,
+        path.as_os_str(),
+        uid,
+        gid,
+    )?))
+}
+
+/// Bind one TCP address as `uid`/`gid`, returning the listening socket.
+pub fn listen_tcp_as_user(address: SocketAddr, uid: u32, gid: u32) -> io::Result<TcpListener> {
+    if already_session_user(uid, gid) {
+        return listen_tcp_at_address(address);
+    }
+    let argument = address.to_string();
+    Ok(TcpListener::from(run_as_user(
+        Op::ListenTcp,
+        OsStr::new(&argument),
+        uid,
+        gid,
+    )?))
+}
+
+fn listen_tcp_at_address(address: SocketAddr) -> io::Result<TcpListener> {
+    crate::forward_endpoint::bind_tcp_single_family(address)?
+        .ok_or_else(|| io::Error::from_raw_os_error(rustix::io::Errno::AFNOSUPPORT.raw_os_error()))
 }
 
 fn already_session_user(uid: u32, gid: u32) -> bool {
     rustix::process::geteuid().as_raw() == uid && rustix::process::getegid().as_raw() == gid
 }
 
-fn run_as_user(op: Op, path: &Path, uid: u32, gid: u32) -> io::Result<OwnedFd> {
-    if path_too_long(path) {
-        return Err(io::Error::from_raw_os_error(
-            rustix::io::Errno::NAMETOOLONG.raw_os_error(),
-        ));
-    }
+fn run_as_user(op: Op, argument: &OsStr, uid: u32, gid: u32) -> io::Result<OwnedFd> {
     let helper = helper_exe()?;
     let (parent, child) = UnixStream::pair()?;
     let mut command = Command::new(helper);
     command
         .env(OP_ENV, op.as_env())
-        .env(PATH_ENV, path)
+        .env(PATH_ENV, argument)
         .env(UID_ENV, uid.to_string())
         .env(GID_ENV, gid.to_string())
         .stdin(Stdio::from(OwnedFd::from(child)))
@@ -327,6 +362,7 @@ mod tests {
         let listener = listen_at_path(&path).unwrap();
         let metadata = fs::metadata(&path).unwrap();
         assert!(metadata.file_type().is_socket());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         let mut client = connect_at_path(&path).unwrap();
         let (mut accepted, _) = listener.accept().unwrap();
         client.write_all(b"ok").unwrap();
@@ -412,13 +448,19 @@ mod tests {
     }
 
     #[test]
-    fn listen_at_path_replaces_an_existing_socket() {
+    fn listen_at_path_refuses_to_unlink_an_existing_socket() {
+        // Given
         let dir = temp_dir();
         let path = dir.join("sock");
         let first = listen_at_path(&path).unwrap();
+
+        // When
+        let error = listen_at_path(&path).unwrap_err();
+
+        // Then
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(fs::metadata(&path).unwrap().file_type().is_socket());
         drop(first);
-        let second = listen_at_path(&path).unwrap();
-        drop(second);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&dir);
     }

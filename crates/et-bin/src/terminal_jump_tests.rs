@@ -10,6 +10,23 @@ const ID: &str = "abcdefghijklmnop";
 const KEY_TEXT: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
 
 #[test]
+fn malformed_downstream_initial_response_fails_closed() {
+    assert_eq!(
+        downstream_requires_ack(&[0xff]),
+        Err("destination sent a malformed INITIAL_RESPONSE".to_owned())
+    );
+    assert_eq!(
+        downstream_requires_ack(
+            &InitialResponse {
+                error: Some("ordinary fatal".to_owned()),
+            }
+            .encode_to_vec()
+        ),
+        Ok(true)
+    );
+}
+
+#[test]
 fn jumphost_clamps_destination_before_typed_initial_payload() {
     // Given: a destination requiring proof of the clamp before it accepts
     // INITIAL_PAYLOAD and starts terminal output.
@@ -146,6 +163,12 @@ fn jumphost_run_bounds_router_sender_before_destination_output() {
     );
     output_release_tx.send(()).unwrap();
     destination.join().unwrap();
+    let response = et_net::local_packet::read_local_packet(&mut router_peer).unwrap();
+    assert_eq!(response.header(), TerminalPacketType::JumphostInit as u8);
+    assert_eq!(
+        InitialResponse::decode(response.payload()).unwrap().error,
+        None
+    );
     drop(router_peer);
     assert_eq!(relay.join().unwrap().unwrap(), 0);
 }

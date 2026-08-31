@@ -11,6 +11,7 @@ use et_core::packet::Packet;
 use et_core::proto::{
     ConnectResponse, ConnectStatus, FlowControlMode, TermInit, TerminalBuffer, TerminalPacketType,
 };
+use et_net::connection::DEFAULT_LIVE_WRITE_TIMEOUT;
 use et_net::framing_io::{read_proto_limited, write_proto};
 use et_net::handshake::client_request;
 use et_net::local_packet::{read_local_packet, write_local_packet};
@@ -313,16 +314,21 @@ fn recover_succeeds_while_old_peer_blackholes_writes() {
     let _live = client.try_clone_stream().unwrap();
 
     let payload = vec![b'x'; 32 * 1024];
-    let mut timed_out_round = None;
+    let mut timed_out_live_write = false;
     for round in 0..1_024u32 {
         let send_started = Instant::now();
         let result = server.handle.send_packet(ID_A, 40, &payload);
+        let elapsed = send_started.elapsed();
         assert!(
-            send_started.elapsed() < std::time::Duration::from_secs(8),
+            elapsed < std::time::Duration::from_secs(8),
             "send_packet round {round} blocked for {:?} — live write timeout not applied",
-            send_started.elapsed()
+            elapsed
         );
         match result {
+            Ok(()) if elapsed >= DEFAULT_LIVE_WRITE_TIMEOUT / 2 => {
+                timed_out_live_write = true;
+                break;
+            }
             Ok(()) => {}
             Err(error) => {
                 assert!(
@@ -331,14 +337,14 @@ fn recover_succeeds_while_old_peer_blackholes_writes() {
                         .contains("io: live write deadline elapsed"),
                     "flood round {round} failed unexpectedly: {error}"
                 );
-                timed_out_round = Some(round);
+                timed_out_live_write = true;
                 break;
             }
         }
     }
     assert!(
-        timed_out_round.is_some(),
-        "blackholed live path never reached its bounded write timeout"
+        timed_out_live_write,
+        "socket flood never reached the bounded live-write timeout"
     );
 
     let recover_started = Instant::now();

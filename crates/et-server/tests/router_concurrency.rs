@@ -16,14 +16,20 @@ use prost::Message;
 use support::TestDir;
 
 const KEY: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
+const OTHER_KEY: &str = "0123456789abcdefghijklmnopqrstuv";
 
-fn register(path: &std::path::Path, id: String, uid: i64, barrier: Arc<Barrier>) -> UnixStream {
+fn register(
+    path: &std::path::Path,
+    id: String,
+    passkey: &str,
+    barrier: Arc<Barrier>,
+) -> UnixStream {
     let mut stream = UnixStream::connect(path).unwrap();
     let info = TerminalUserInfo {
         id: Some(id),
-        passkey: Some(KEY.to_owned()),
-        uid: Some(uid),
-        gid: Some(uid),
+        passkey: Some(passkey.to_owned()),
+        uid: Some(i64::from(rustix::process::getuid().as_raw())),
+        gid: Some(i64::from(rustix::process::getgid().as_raw())),
         fd: None,
     };
     let packet = Packet::new(
@@ -40,19 +46,20 @@ fn concurrent_distinct_registrations_are_all_retained() {
     let dir = TestDir::new();
     let path = dir.socket();
     let registry = Registry::new();
-    let selected = select_router_path_for(1000, Some(&path), None, None).unwrap();
+    let selected =
+        select_router_path_for(rustix::process::getuid().as_raw(), Some(&path), None, None)
+            .unwrap();
     let mut router = Router::start(selected, registry.clone()).unwrap();
     let ids = ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb", "cccccccccccccccc"];
     let barrier = Arc::new(Barrier::new(ids.len()));
 
     let workers: Vec<_> = ids
         .iter()
-        .enumerate()
-        .map(|(index, id)| {
+        .map(|id| {
             let path = path.clone();
             let barrier = barrier.clone();
             let id = (*id).to_owned();
-            thread::spawn(move || register(&path, id, index as i64, barrier))
+            thread::spawn(move || register(&path, id, KEY, barrier))
         })
         .collect();
     let terminals: Vec<_> = workers
@@ -75,17 +82,19 @@ fn concurrent_same_id_has_one_winner_and_never_overwrites_it() {
     let dir = TestDir::new();
     let path = dir.socket();
     let registry = Registry::new();
-    let selected = select_router_path_for(1000, Some(&path), None, None).unwrap();
+    let selected =
+        select_router_path_for(rustix::process::getuid().as_raw(), Some(&path), None, None)
+            .unwrap();
     let mut router = Router::start(selected, registry.clone()).unwrap();
     let barrier = Arc::new(Barrier::new(2));
     let mut workers = Vec::new();
     let id = "sameidentifier00";
     assert_eq!(id.len(), 16);
-    for uid in [101, 202] {
+    for passkey in [KEY, OTHER_KEY] {
         let path = path.clone();
         let barrier = barrier.clone();
         workers.push(thread::spawn(move || {
-            register(&path, id.to_owned(), uid, barrier)
+            register(&path, id.to_owned(), passkey, barrier)
         }));
     }
     let terminals: Vec<_> = workers
@@ -111,8 +120,10 @@ fn concurrent_same_id_has_one_winner_and_never_overwrites_it() {
             .count(),
         1
     );
-    let winner = registry.get(id).unwrap().unwrap().uid;
-    assert!(winner == 101 || winner == 202);
+    assert_eq!(
+        registry.get(id).unwrap().unwrap().uid,
+        rustix::process::getuid().as_raw()
+    );
     assert_eq!(registry.len().unwrap(), 1);
     router.shutdown().unwrap();
     drop(terminals);
@@ -121,7 +132,13 @@ fn concurrent_same_id_has_one_winner_and_never_overwrites_it() {
 #[test]
 fn shutdown_wakes_an_idle_router_without_timing_luck() {
     let dir = TestDir::new();
-    let selected = select_router_path_for(1000, Some(&dir.socket()), None, None).unwrap();
+    let selected = select_router_path_for(
+        rustix::process::getuid().as_raw(),
+        Some(&dir.socket()),
+        None,
+        None,
+    )
+    .unwrap();
     let router = Router::start(selected, Registry::new()).unwrap();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     thread::spawn(move || {

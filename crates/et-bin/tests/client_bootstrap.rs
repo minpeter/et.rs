@@ -250,6 +250,14 @@ fn ssh_config_hardening_nonlocal_destinations_warn_and_other_rows_continue() {
         .args(["--logtostdout", "-N", &format!("server-alias:{port}")])
         .output()
         .unwrap();
+    if output.status.code() == Some(2) {
+        let _ = TcpStream::connect(("127.0.0.1", port));
+        let _ = server.join();
+        panic!(
+            "expected unsupported rows to preserve the base session, got exit 2: {}",
+            stderr(&output)
+        );
+    }
     let payload = server.join().unwrap();
 
     assert_ne!(output.status.code(), Some(2), "{}", stderr(&output));
@@ -268,6 +276,75 @@ fn ssh_config_hardening_nonlocal_destinations_warn_and_other_rows_continue() {
             .count(),
         2
     );
+}
+
+#[test]
+fn ssh_config_hardening_unsupported_records_warn_and_base_session_continues() {
+    let (port, server) = initial_payload_server_with_error(Some("stop after payload"));
+    let fake = FakeSsh::new();
+    let config = concat!(
+        "host server-alias
+",
+        "user config-user
+",
+        "hostname 127.0.0.1
+",
+        "streamlocalbindunlink yes
+",
+        "streamlocalbindmask 0077
+",
+        "dynamicforward [*]:1080
+",
+        "remoteforward 2080 [socks]:0
+",
+        "remoteforward 0 [localhost]:22
+",
+        "localforward relative/source.sock /tmp/destination.sock
+",
+        "localforward /tmp/source path /tmp/destination path
+",
+        "localforward /tmp/source.sock /tmp/destination.sock
+",
+        "localforward 15433 [localhost]:5432
+",
+        "remoteforward 25433 [localhost]:5432
+",
+    );
+
+    let output = fake
+        .command(config, VALID_MARKER, 0, "")
+        .args(["--logtostdout", "-N", &format!("server-alias:{port}")])
+        .output()
+        .unwrap();
+    if output.status.code() == Some(2) {
+        let _ = TcpStream::connect(("127.0.0.1", port));
+        let _ = server.join();
+        panic!(
+            "expected unsupported rows to preserve the base session, got exit 2: {}",
+            stderr(&output)
+        );
+    }
+    let payload = server.join().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_ne!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(payload.reversetunnels.len(), 1);
+    assert_eq!(
+        payload.reversetunnels[0]
+            .source
+            .as_ref()
+            .and_then(|source| source.port),
+        Some(25433)
+    );
+    for reason in [
+        "dynamic forwarding is unsupported",
+        "allocated remote port 0 is unsupported",
+        "relative stream-local path is unsupported",
+        "ambiguous stream-local path is unsupported",
+        "stream-local bind policy is unsupported",
+    ] {
+        assert!(stdout.contains(reason), "missing {reason:?} in {stdout}");
+    }
 }
 
 #[test]

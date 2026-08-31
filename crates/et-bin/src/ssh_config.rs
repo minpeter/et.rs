@@ -21,6 +21,11 @@ pub struct ResolvedSshConfig {
     pub remote_forwards: Vec<PortForwardSourceRequest>,
 }
 
+enum ForwardRecord {
+    Supported(PortForwardSourceRequest),
+    Unsupported(String),
+}
+
 pub fn resolve_ssh_config(
     runner: &dyn SshRunner,
     host_alias: &str,
@@ -87,14 +92,23 @@ fn parse_ssh_config(
             Some(key) if key.eq_ignore_ascii_case("user") => {
                 user = fields.next().map(str::to_string);
             }
+            Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("dynamicforward") => {
+                et_cli::logging::warn(
+                    "SSH dynamicforward is unsupported by ET protocol v6; skipping forwarding row",
+                );
+            }
             Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("localforward") => {
-                if let Some(forward) = parse_forward(fields, "localforward", gateway_ports)? {
-                    local_forwards.push(forward);
+                match parse_forward(fields, "localforward", gateway_ports)? {
+                    ForwardRecord::Supported(forward) => local_forwards.push(forward),
+                    ForwardRecord::Unsupported(reason) => warn_unsupported("localforward", &reason),
                 }
             }
             Some(key) if parse_remote_forwards && key.eq_ignore_ascii_case("remoteforward") => {
-                if let Some(forward) = parse_forward(fields, "remoteforward", gateway_ports)? {
-                    remote_forwards.push(forward);
+                match parse_forward(fields, "remoteforward", gateway_ports)? {
+                    ForwardRecord::Supported(forward) => remote_forwards.push(forward),
+                    ForwardRecord::Unsupported(reason) => {
+                        warn_unsupported("remoteforward", &reason)
+                    }
                 }
             }
             _ => {}
@@ -113,18 +127,53 @@ fn parse_ssh_config(
     })
 }
 
+fn warn_unsupported(directive: &str, reason: &str) {
+    et_cli::logging::warn(format!("SSH {directive} {reason}; skipping forwarding row"));
+}
+
 fn parse_forward<'a>(
     fields: impl Iterator<Item = &'a str>,
     directive: &'static str,
     gateway_ports: GatewayPorts,
-) -> Result<Option<PortForwardSourceRequest>, ClientError> {
+) -> Result<ForwardRecord, ClientError> {
     let fields: Vec<&str> = fields.collect();
+    if fields.len() != 2 && fields.iter().any(|field| field.contains('/')) {
+        return Ok(ForwardRecord::Unsupported(
+            "ambiguous stream-local path is unsupported".to_owned(),
+        ));
+    }
     let [source, destination] = fields.as_slice() else {
         return Err(ClientError::SshConfigMalformedForward {
             directive,
             reason: "expected exactly two fields",
         });
     };
+    if directive.eq_ignore_ascii_case("remoteforward") && *destination == "[socks]:0" {
+        return Ok(ForwardRecord::Unsupported(
+            "dynamic forwarding is unsupported".to_owned(),
+        ));
+    }
+    if directive.eq_ignore_ascii_case("remoteforward") && endpoint_has_zero_port(source) {
+        return Ok(ForwardRecord::Unsupported(
+            "allocated remote port 0 is unsupported".to_owned(),
+        ));
+    }
+    if is_relative_stream_path(source) || is_relative_stream_path(destination) {
+        return Ok(ForwardRecord::Unsupported(
+            "relative stream-local path is unsupported".to_owned(),
+        ));
+    }
+    if source.starts_with('/') {
+        return Ok(ForwardRecord::Unsupported(
+            "stream-local bind policy is unsupported".to_owned(),
+        ));
+    }
+    #[cfg(not(unix))]
+    if destination.starts_with('/') {
+        return Ok(ForwardRecord::Unsupported(
+            "stream-local forwarding is unsupported on this platform".to_owned(),
+        ));
+    }
     let source = parse_source_endpoint(
         source,
         gateway_ports,
@@ -141,17 +190,27 @@ fn parse_forward<'a>(
         })?;
     if let (Some(host), Some(_)) = (destination.name.as_deref(), destination.port) {
         if !is_representable_tcp_destination(host) {
-            et_cli::logging::warn(format!(
-                "SSH {directive} destination host '{host}' is unsupported by ET protocol v6; skipping forwarding row"
-            ));
-            return Ok(None);
+            return Ok(ForwardRecord::Unsupported(format!(
+                "destination host '{host}' is unsupported by ET protocol v6"
+            )));
         }
     }
-    Ok(Some(PortForwardSourceRequest {
+    Ok(ForwardRecord::Supported(PortForwardSourceRequest {
         source: Some(source),
         destination: Some(destination),
         environmentvariable: None,
     }))
+}
+
+fn endpoint_has_zero_port(value: &str) -> bool {
+    value == "0"
+        || value
+            .strip_suffix(":0")
+            .is_some_and(|host| !host.is_empty())
+}
+
+fn is_relative_stream_path(value: &str) -> bool {
+    !value.starts_with('/') && value.contains('/')
 }
 
 fn is_representable_tcp_destination(host: &str) -> bool {
@@ -327,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_ordered_tcp_ipv6_unix_and_mixed_forwards() {
+    fn parses_supported_tcp_and_unix_destination_forwards() {
         let resolved = parse_ssh_config(
             b"hostname host\n\
               localforward 10022 [127.0.0.1]:22\n\
@@ -346,8 +405,6 @@ mod tests {
             [
                 request("localhost", Some(10022), "127.0.0.1", Some(22)),
                 request("localhost", Some(18080), "::1", Some(80)),
-                request("/tmp/local.sock", None, "/tmp/remote.sock", None),
-                request("/tmp/mixed.sock", None, "127.0.0.1", Some(8080)),
                 request("localhost", Some(9090), "/tmp/destination.sock", None,),
             ]
         );
@@ -478,6 +535,77 @@ mod tests {
             resolved.remote_forwards,
             [request("localhost", Some(25433), "::1", Some(5432))]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_config_hardening_real_openssh_unsupported_records_skip_per_row() {
+        struct RemoveFile(std::path::PathBuf);
+        impl Drop for RemoveFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let path = std::env::temp_dir().join(format!(
+            "et-ssh-unsupported-oracle-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("records")
+        ));
+        let _cleanup = RemoveFile(path.clone());
+        std::fs::write(
+            &path,
+            r#"Host oracle
+ HostName localhost
+ DynamicForward *:1080
+ RemoteForward 2080
+ RemoteForward 0 localhost:22
+ LocalForward relative/source.sock /tmp/destination.sock
+ LocalForward "/tmp/source path" "/tmp/destination path"
+ StreamLocalBindUnlink yes
+ StreamLocalBindMask 0077
+ LocalForward /tmp/source.sock /tmp/destination.sock
+ LocalForward 15433 localhost:5432
+ RemoteForward 25433 localhost:5432
+"#,
+        )
+        .unwrap();
+        let output = std::process::Command::new("ssh")
+            .args(["-G", "-F"])
+            .arg(&path)
+            .arg("oracle")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let resolved = parse_ssh_config(&output.stdout, true, true).unwrap();
+
+        assert_eq!(
+            resolved.local_forwards,
+            [request("localhost", Some(15433), "localhost", Some(5432))]
+        );
+        assert_eq!(
+            resolved.remote_forwards,
+            [request("localhost", Some(25433), "localhost", Some(5432))]
+        );
+    }
+
+    #[test]
+    fn ssh_config_hardening_malformed_record_remains_typed() {
+        assert!(matches!(
+            parse_ssh_config(
+                b"hostname host\nlocalforward 1000 localhost:22 unexpected\n",
+                true,
+                true,
+            ),
+            Err(ClientError::SshConfigMalformedForward {
+                directive: "localforward",
+                reason: "expected exactly two fields",
+            })
+        ));
     }
 
     #[test]

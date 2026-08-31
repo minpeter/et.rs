@@ -134,6 +134,66 @@ gatewayports no
 }
 
 #[test]
+fn cumulative_local_forwards_deduplicate_exact_rows_but_preserve_distinct_destinations() {
+    // Given
+    let mut stack = Stack::start();
+    let destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let destination_port = destination.local_addr().unwrap().port();
+    let echo = spawn_tcp_echo_once(destination, b"cumulative");
+    let distinct_destination_port = reserve_port();
+    let source_port = reserve_port();
+    let gate = stack.directory.join("cumulative-local-ready");
+    mkfifo(&gate);
+    let exact = format!("localhost:{source_port}:127.0.0.1:{destination_port}");
+    let config = format!(
+        "hostname 127.0.0.1\nuser tester\ngatewayports no\n\
+         localforward {source_port} [127.0.0.1]:{destination_port}\n\
+         localforward {source_port} [127.0.0.1]:{destination_port}\n\
+         localforward {source_port} [127.0.0.1]:{distinct_destination_port}\n"
+    );
+    let mut client = Command::new(env!("CARGO_BIN_EXE_et"));
+    client
+        .env("PATH", &stack.directory)
+        .env("ET_SSH_COUNT", &stack.ssh_count)
+        .env("ET_SSH_CONFIG", config)
+        .env("ET_SSH_READY", &gate)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(["--logtostdout", "--terminal-path"])
+        .arg(&stack.terminal)
+        .args(["--serverfifo"])
+        .arg(&stack.router)
+        .args(["-N", "--tunnel", &exact, "--tunnel", &exact])
+        .arg(format!("tester@127.0.0.1:{}", stack.port));
+
+    // When
+    let mut client = client.spawn().unwrap();
+    assert_eq!(await_fifo(&gate), "ready");
+    assert_ready_tcp_round_trip(source_port, b"cumulative");
+
+    // Then
+    stop(&mut client);
+    let mut output = String::new();
+    client
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert_eq!(
+        output
+            .lines()
+            .filter(|line| line.contains("WARNING"))
+            .count(),
+        1,
+        "only the distinct same-source row should reach bind-failure policy: {output}"
+    );
+    echo.join().unwrap();
+    stack.shutdown();
+}
+
+#[test]
 fn ssh_config_hardening_explicit_bind_failure_remains_fatal() {
     let mut stack = Stack::start();
     let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -274,6 +334,36 @@ fn cli_local_and_reverse_tunnels_relay_real_tcp_payloads() {
     assert_tcp_round_trip(reverse_source_port, b"reverse");
     stop(&mut reverse_client);
     reverse_echo.join().unwrap();
+    stack.shutdown();
+}
+
+#[test]
+fn cli_remote_unix_tunnel_relays_on_a_fresh_source_path() {
+    // Given
+    let mut stack = Stack::start();
+    let source = stack.directory.join("cli-remote-source.sock");
+    let destination_path = stack.directory.join("cli-remote-destination.sock");
+    let destination = UnixListener::bind(&destination_path).unwrap();
+    let echo = spawn_unix_echo(destination, b"cli-remote-unix");
+    let gate = stack.directory.join("cli-remote-unix-ready");
+    mkfifo(&gate);
+    let mut client = spawn_client(
+        &stack,
+        &format!("{}:{}", source.display(), destination_path.display()),
+        true,
+        &gate,
+        None,
+        true,
+        None,
+    );
+
+    // When
+    assert_eq!(await_fifo(&gate), "ready");
+    assert_unix_round_trip(&source, b"cli-remote-unix");
+
+    // Then
+    stop(&mut client);
+    echo.join().unwrap();
     stack.shutdown();
 }
 

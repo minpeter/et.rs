@@ -400,37 +400,50 @@ fn ssh_config_extra_forward_field_is_rejected_before_bootstrap() {
 }
 
 #[test]
-fn ssh_config_malformed_replaced_axis_is_ignored() {
-    let config = concat!(
+fn ssh_config_malformed_axis_is_rejected_even_with_explicit_forward() {
+    // Given
+    let base_config = concat!(
         "host server-alias\n",
         "user config-user\n",
         "hostname 127.0.0.1\n",
         "port 22\n",
-        "localforward unsupported\n",
-        "remoteforward 1492 [127.0.0.1]:1492 unexpected\n",
     );
 
-    for (option, value, rejected, ignored) in [
-        ("-t", "5555:22", "remoteforward", "localforward"),
-        ("-r", "3000:4000", "localforward", "remoteforward"),
+    for (option, value, malformed, row) in [
+        (
+            "-t",
+            "5555:22",
+            "localforward",
+            "localforward unsupported\n",
+        ),
+        (
+            "-r",
+            "3000:4000",
+            "remoteforward",
+            "remoteforward 1492 [127.0.0.1]:1492 unexpected\n",
+        ),
     ] {
         let fake = FakeSsh::new();
+        let config = format!("{base_config}{row}");
+
+        // When
         let output = fake
-            .command(config, VALID_MARKER, 0, "")
+            .command(&config, VALID_MARKER, 0, "")
             .args(["-N", option, value, "server-alias:1"])
             .output()
             .unwrap();
         let error = stderr(&output);
 
+        // Then
         assert_eq!(output.status.code(), Some(2), "{option}: {error}");
-        assert!(error.contains(&format!("malformed {rejected}")), "{error}");
-        assert!(!error.contains(&format!("malformed {ignored}")), "{error}");
+        assert!(error.contains(&format!("malformed {malformed}")), "{error}");
         assert_eq!(fake.invocations(), [["-G", "-T", "server-alias"]]);
     }
 }
 
 #[test]
-fn ssh_config_cli_same_axis_replaces_config() {
+fn ssh_config_and_cli_remote_forwards_are_cumulative_and_exactly_deduplicated() {
+    // Given
     let (port, server) = initial_payload_server_with_error(Some("stop after payload"));
     let fake = FakeSsh::new();
     let config = concat!(
@@ -440,27 +453,48 @@ fn ssh_config_cli_same_axis_replaces_config() {
         "port 22\n",
         "localforward 10022 [127.0.0.1]:22\n",
         "remoteforward 1492 [127.0.0.1]:1492\n",
+        "remoteforward 1492 [127.0.0.1]:1492\n",
+        "remoteforward 1492 [127.0.0.1]:1493\n",
     );
 
+    // When
     let _output = fake
         .command(config, VALID_MARKER, 0, "")
-        .args(["-N", "-r", "3000:4000", &format!("server-alias:{port}")])
+        .args([
+            "-N",
+            "-r",
+            "localhost:3000:127.0.0.1:4000",
+            "-r",
+            "localhost:3000:127.0.0.1:4000",
+            "-r",
+            "localhost:1492:127.0.0.1:1492",
+            &format!("server-alias:{port}"),
+        ])
         .output()
         .unwrap();
     let payload = server.join().unwrap();
 
-    assert_eq!(payload.reversetunnels.len(), 1);
-    let reverse = &payload.reversetunnels[0];
+    // Then
+    let ports = payload
+        .reversetunnels
+        .iter()
+        .map(|request| {
+            (
+                request.source.as_ref().and_then(|source| source.port),
+                request
+                    .destination
+                    .as_ref()
+                    .and_then(|destination| destination.port),
+            )
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        reverse.source.as_ref().and_then(|source| source.port),
-        Some(3000)
-    );
-    assert_eq!(
-        reverse
-            .destination
-            .as_ref()
-            .and_then(|destination| destination.port),
-        Some(4000)
+        ports,
+        [
+            (Some(3000), Some(4000)),
+            (Some(1492), Some(1492)),
+            (Some(1492), Some(1493)),
+        ]
     );
 }
 

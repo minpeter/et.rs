@@ -249,6 +249,7 @@ impl ResolvedEndpoint {
                     None
                 };
                 let listener = UnixListener::bind(path)?;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
                 listener.set_nonblocking(true)?;
                 Ok(vec![ForwardListener {
                     inner: ListenerKind::Unix(listener),
@@ -464,6 +465,24 @@ impl Drop for ForwardListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_source_bind_uses_openssh_default_owner_only_mode() {
+        // Given
+        let path = std::env::temp_dir().join(format!("et-forward-mode-{}", std::process::id()));
+        let endpoint = ResolvedEndpoint::Unix(path.clone());
+
+        // When
+        let listeners = endpoint.bind_with_user(None).unwrap();
+
+        // Then
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(listeners);
+    }
 
     #[test]
     fn localhost_bind_rejects_one_occupied_address_family() {

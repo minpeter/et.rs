@@ -13,6 +13,18 @@ enum GatewayPorts {
     ClientSpecified,
 }
 
+#[derive(Clone, Copy)]
+enum StreamLocalBindPolicy {
+    Default,
+    Unsupported,
+}
+
+#[derive(Clone, Copy)]
+struct ForwardPolicies {
+    gateway_ports: GatewayPorts,
+    stream_local_bind: StreamLocalBindPolicy,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedSshConfig {
     pub hostname: String,
@@ -79,6 +91,10 @@ fn parse_ssh_config(
         .map(GatewayPorts::parse)
         .transpose()?
         .unwrap_or(GatewayPorts::No);
+    let policies = ForwardPolicies {
+        gateway_ports,
+        stream_local_bind: StreamLocalBindPolicy::parse(text),
+    };
     let mut hostname = None;
     let mut user = None;
     let mut local_forwards = Vec::new();
@@ -98,13 +114,13 @@ fn parse_ssh_config(
                 );
             }
             Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("localforward") => {
-                match parse_forward(fields, "localforward", gateway_ports)? {
+                match parse_forward(fields, "localforward", policies)? {
                     ForwardRecord::Supported(forward) => local_forwards.push(forward),
                     ForwardRecord::Unsupported(reason) => warn_unsupported("localforward", &reason),
                 }
             }
             Some(key) if parse_remote_forwards && key.eq_ignore_ascii_case("remoteforward") => {
-                match parse_forward(fields, "remoteforward", gateway_ports)? {
+                match parse_forward(fields, "remoteforward", policies)? {
                     ForwardRecord::Supported(forward) => remote_forwards.push(forward),
                     ForwardRecord::Unsupported(reason) => {
                         warn_unsupported("remoteforward", &reason)
@@ -134,7 +150,7 @@ fn warn_unsupported(directive: &str, reason: &str) {
 fn parse_forward<'a>(
     fields: impl Iterator<Item = &'a str>,
     directive: &'static str,
-    gateway_ports: GatewayPorts,
+    policies: ForwardPolicies,
 ) -> Result<ForwardRecord, ClientError> {
     let fields: Vec<&str> = fields.collect();
     if fields.len() != 2 && fields.iter().any(|field| field.contains('/')) {
@@ -164,8 +180,17 @@ fn parse_forward<'a>(
         ));
     }
     if source.starts_with('/') {
+        match policies.stream_local_bind {
+            StreamLocalBindPolicy::Default => {}
+            StreamLocalBindPolicy::Unsupported => {
+                return Ok(ForwardRecord::Unsupported(
+                    "stream-local bind policy is unsupported".to_owned(),
+                ));
+            }
+        }
+        #[cfg(not(unix))]
         return Ok(ForwardRecord::Unsupported(
-            "stream-local bind policy is unsupported".to_owned(),
+            "stream-local forwarding is unsupported on this platform".to_owned(),
         ));
     }
     #[cfg(not(unix))]
@@ -176,7 +201,7 @@ fn parse_forward<'a>(
     }
     let source = parse_source_endpoint(
         source,
-        gateway_ports,
+        policies.gateway_ports,
         directive.eq_ignore_ascii_case("localforward"),
     )
     .ok_or(ClientError::SshConfigMalformedForward {
@@ -231,6 +256,32 @@ impl GatewayPorts {
             "clientspecified" => Ok(Self::ClientSpecified),
             _ => Err(ClientError::SshConfigMalformed("gatewayports")),
         }
+    }
+}
+
+impl StreamLocalBindPolicy {
+    fn parse(text: &str) -> Self {
+        let mut policy = Self::Default;
+        for line in text.lines() {
+            let mut fields = line.split_whitespace();
+            match (fields.next(), fields.next()) {
+                (Some(key), Some(value))
+                    if key.eq_ignore_ascii_case("streamlocalbindunlink")
+                        && !value.eq_ignore_ascii_case("no") =>
+                {
+                    policy = Self::Unsupported;
+                }
+                (Some(key), Some(value))
+                    if key.eq_ignore_ascii_case("streamlocalbindmask")
+                        && value != "0177"
+                        && value != "177" =>
+                {
+                    policy = Self::Unsupported;
+                }
+                _ => {}
+            }
+        }
+        policy
     }
 }
 
@@ -405,6 +456,8 @@ mod tests {
             [
                 request("localhost", Some(10022), "127.0.0.1", Some(22)),
                 request("localhost", Some(18080), "::1", Some(80)),
+                request("/tmp/local.sock", None, "/tmp/remote.sock", None),
+                request("/tmp/mixed.sock", None, "127.0.0.1", Some(8080)),
                 request("localhost", Some(9090), "/tmp/destination.sock", None,),
             ]
         );
@@ -539,6 +592,96 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn ssh_config_hardening_real_openssh_defaults_preserve_absolute_unix_forwards() {
+        // Given
+        struct RemoveFile(std::path::PathBuf);
+        impl Drop for RemoveFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let path = std::env::temp_dir().join(format!(
+            "et-ssh-streamlocal-oracle-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("defaults")
+        ));
+        let _cleanup = RemoveFile(path.clone());
+        std::fs::write(
+            &path,
+            "Host oracle\n HostName localhost\n\
+             LocalForward /tmp/local.sock /tmp/local-destination.sock\n\
+             RemoteForward /tmp/remote.sock /tmp/remote-destination.sock\n",
+        )
+        .unwrap();
+
+        // When
+        let output = std::process::Command::new("ssh")
+            .args(["-G", "-F"])
+            .arg(&path)
+            .arg("oracle")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let resolved = parse_ssh_config(&output.stdout, true, true).unwrap();
+
+        // Then
+        assert_eq!(
+            resolved.local_forwards,
+            [request(
+                "/tmp/local.sock",
+                None,
+                "/tmp/local-destination.sock",
+                None,
+            )]
+        );
+        assert_eq!(
+            resolved.remote_forwards,
+            [request(
+                "/tmp/remote.sock",
+                None,
+                "/tmp/remote-destination.sock",
+                None,
+            )]
+        );
+    }
+
+    #[test]
+    fn ssh_config_hardening_emitted_nondefault_streamlocal_policy_skips_unix_sources() {
+        // Given / When
+        let unlink = parse_ssh_config(
+            b"hostname host\nstreamlocalbindunlink yes\n\
+              localforward /tmp/source.sock /tmp/destination.sock\n\
+              localforward 15433 localhost:5432\n",
+            true,
+            true,
+        )
+        .unwrap();
+        let mask = parse_ssh_config(
+            b"hostname host\nstreamlocalbindmask 0077\n\
+              remoteforward /tmp/source.sock /tmp/destination.sock\n\
+              remoteforward 25433 localhost:5432\n",
+            true,
+            true,
+        )
+        .unwrap();
+
+        // Then
+        assert_eq!(
+            unlink.local_forwards,
+            [request("localhost", Some(15433), "localhost", Some(5432))]
+        );
+        assert_eq!(
+            mask.remote_forwards,
+            [request("localhost", Some(25433), "localhost", Some(5432))]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn ssh_config_hardening_real_openssh_unsupported_records_skip_per_row() {
         struct RemoveFile(std::path::PathBuf);
         impl Drop for RemoveFile {
@@ -561,8 +704,6 @@ mod tests {
  RemoteForward 0 localhost:22
  LocalForward relative/source.sock /tmp/destination.sock
  LocalForward "/tmp/source path" "/tmp/destination path"
- StreamLocalBindUnlink yes
- StreamLocalBindMask 0077
  LocalForward /tmp/source.sock /tmp/destination.sock
  LocalForward 15433 localhost:5432
  RemoteForward 25433 localhost:5432
@@ -585,7 +726,10 @@ mod tests {
 
         assert_eq!(
             resolved.local_forwards,
-            [request("localhost", Some(15433), "localhost", Some(5432))]
+            [
+                request("/tmp/source.sock", None, "/tmp/destination.sock", None,),
+                request("localhost", Some(15433), "localhost", Some(5432)),
+            ]
         );
         assert_eq!(
             resolved.remote_forwards,

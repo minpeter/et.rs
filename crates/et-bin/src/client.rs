@@ -138,11 +138,11 @@ fn run_client(
         &destination.host,
         requested_user.as_deref(),
         &args.ssh_option,
-        args.tunnel.is_empty(),
-        args.reverse_tunnel.is_empty(),
+        true,
+        true,
         deadline,
     )?;
-    forward_config.apply_ssh_config(args, &resolved)?;
+    forward_config.apply_ssh_config(&resolved)?;
     if args.jumphost.is_some() {
         bound_jumphost_locale_environment(
             &forward_config.initial_payload,

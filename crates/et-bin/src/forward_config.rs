@@ -77,21 +77,43 @@ pub struct ForwardConfig {
 impl ForwardConfig {
     pub fn apply_ssh_config(
         &mut self,
-        args: &ClientArgs,
         resolved: &ResolvedSshConfig,
     ) -> Result<(), ForwardConfigError> {
-        if args.tunnel.is_empty() {
-            self.local_sources = resolved
-                .local_forwards
-                .iter()
-                .cloned()
-                .map(ForwardSource::ssh_config)
-                .collect();
+        let mut local_requests = Vec::new();
+        self.local_sources.retain(|source| {
+            if local_requests.contains(&source.request) {
+                false
+            } else {
+                local_requests.push(source.request.clone());
+                true
+            }
+        });
+        for request in &resolved.local_forwards {
+            if !local_requests.contains(request) {
+                local_requests.push(request.clone());
+                self.local_sources
+                    .push(ForwardSource::ssh_config(request.clone()));
+            }
         }
-        if args.reverse_tunnel.is_empty() {
-            let mut configured = resolved.remote_forwards.clone();
-            configured.append(&mut self.initial_payload.reversetunnels);
-            self.initial_payload.reversetunnels = configured;
+
+        let mut remote_requests = Vec::new();
+        self.initial_payload.reversetunnels.retain(|request| {
+            let is_agent_forward = request.source.is_none()
+                && request.environmentvariable.as_deref() == Some("SSH_AUTH_SOCK");
+            if is_agent_forward {
+                true
+            } else if remote_requests.contains(request) {
+                false
+            } else {
+                remote_requests.push(request.clone());
+                true
+            }
+        });
+        for request in &resolved.remote_forwards {
+            if !remote_requests.contains(request) {
+                remote_requests.push(request.clone());
+                self.initial_payload.reversetunnels.push(request.clone());
+            }
         }
         validate_environment_names(&self.initial_payload.reversetunnels)
     }

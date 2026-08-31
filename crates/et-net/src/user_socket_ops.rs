@@ -98,18 +98,15 @@ pub fn run_helper() -> i32 {
     }
 }
 
-/// unlink/bind/listen/fchmod a UNIX socket path with the current credentials.
+/// Bind/listen a new owner-only UNIX socket path with the current credentials.
 pub fn listen_at_path(path: &Path) -> io::Result<UnixListener> {
     if path_too_long(path) {
         return Err(io::Error::from_raw_os_error(
             rustix::io::Errno::NAMETOOLONG.raw_os_error(),
         ));
     }
-    let _ = fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
-    if rustix::fs::fchmod(&listener, rustix::fs::Mode::from_raw_mode(0o700)).is_err() {
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
-    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(listener)
 }
 
@@ -123,7 +120,7 @@ pub fn connect_at_path(path: &Path) -> io::Result<UnixStream> {
     UnixStream::connect(path)
 }
 
-/// unlink/bind/listen as `uid`/`gid`, returning the listening socket.
+/// Bind/listen as `uid`/`gid`, returning the listening socket.
 pub fn listen_unix_as_user(path: impl AsRef<Path>, uid: u32, gid: u32) -> io::Result<UnixListener> {
     let path = path.as_ref();
     if already_session_user(uid, gid) {
@@ -365,6 +362,7 @@ mod tests {
         let listener = listen_at_path(&path).unwrap();
         let metadata = fs::metadata(&path).unwrap();
         assert!(metadata.file_type().is_socket());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         let mut client = connect_at_path(&path).unwrap();
         let (mut accepted, _) = listener.accept().unwrap();
         client.write_all(b"ok").unwrap();
@@ -450,13 +448,19 @@ mod tests {
     }
 
     #[test]
-    fn listen_at_path_replaces_an_existing_socket() {
+    fn listen_at_path_refuses_to_unlink_an_existing_socket() {
+        // Given
         let dir = temp_dir();
         let path = dir.join("sock");
         let first = listen_at_path(&path).unwrap();
+
+        // When
+        let error = listen_at_path(&path).unwrap_err();
+
+        // Then
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(fs::metadata(&path).unwrap().file_type().is_socket());
         drop(first);
-        let second = listen_at_path(&path).unwrap();
-        drop(second);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&dir);
     }

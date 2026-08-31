@@ -345,13 +345,11 @@ fn bind_sources(
             if owner.is_some() {
                 match &source {
                     ResolvedEndpoint::Tcp(addresses)
-                        if addresses
-                            .iter()
-                            .any(|address| address.ip().is_unspecified()) =>
+                        if addresses.iter().any(|address| !address.ip().is_loopback()) =>
                     {
                         return Err(ForwardError::Io(io::Error::new(
                             io::ErrorKind::PermissionDenied,
-                            "authenticated reverse TCP wildcard bind is not permitted",
+                            "authenticated reverse TCP bind must resolve only to loopback addresses",
                         )));
                     }
                     ResolvedEndpoint::Tcp(_) => {}

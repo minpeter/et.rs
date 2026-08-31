@@ -208,6 +208,40 @@ fn authenticated_reverse_tcp_wildcard_bind_exposes_session_to_external_network()
 
 #[cfg(target_os = "linux")]
 #[test]
+fn authenticated_reverse_tcp_rejects_resolved_non_loopback_address() {
+    // Given
+    let probe = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    probe.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).unwrap();
+    let external = match probe.local_addr().unwrap().ip() {
+        IpAddr::V4(address) if !address.is_loopback() => address,
+        address => panic!("route probe did not select a non-loopback IPv4 address: {address}"),
+    };
+    let owner = (
+        rustix::process::geteuid().as_raw(),
+        rustix::process::getegid().as_raw(),
+    );
+
+    // When
+    let error = match Forwarder::start_with_user(
+        vec![request_on(&external.to_string(), reserve_port(), 1)],
+        Some(owner),
+    ) {
+        Ok((forwarder, _)) => {
+            forwarder.shutdown().unwrap();
+            panic!("authenticated reverse listener accepted non-loopback authority")
+        }
+        Err(error) => error,
+    };
+
+    // Then
+    match error {
+        ForwardError::Io(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
+        other => panic!("unexpected non-loopback result: {other}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn imported_local_wildcard_is_externally_reachable_while_loopback_is_not() {
     let probe = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
     probe.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).unwrap();

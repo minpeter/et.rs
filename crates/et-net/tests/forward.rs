@@ -9,7 +9,7 @@ use et_core::packet::Packet;
 use et_core::proto::{
     PortForwardDestinationRequest, PortForwardSourceRequest, SocketEndpoint, TerminalPacketType,
 };
-use et_net::forward::Forwarder;
+use et_net::forward::{ForwardError, Forwarder};
 use prost::Message;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
@@ -141,6 +141,55 @@ fn try_receive_reports_backpressure_and_outbound_drain_recovers() {
         outbound += 1;
     }
     forwarder.shutdown().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn reverse_tcp_bind_uses_session_identity() {
+    let root = rustix::process::geteuid().as_raw() == 0;
+    let source_port = if root { 1 } else { reserve_port() };
+    let owner = (65_534, 65_534);
+
+    let error = match Forwarder::start_with_user(vec![request(source_port, 1)], Some(owner)) {
+        Ok((forwarder, _)) => {
+            forwarder.shutdown().unwrap();
+            panic!("TCP bind retained daemon authority");
+        }
+        Err(error) => error,
+    };
+
+    match error {
+        ForwardError::Io(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
+        other => panic!("unexpected TCP bind result: {other}"),
+    }
+}
+
+#[test]
+fn reverse_listener_limit_is_transactional() {
+    let reservations: Vec<TcpListener> = (0..33)
+        .map(|_| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
+        .collect();
+    let ports: Vec<u16> = reservations
+        .iter()
+        .map(|listener| listener.local_addr().unwrap().port())
+        .collect();
+    drop(reservations);
+    let requests = ports.iter().map(|port| request(*port, 1)).collect();
+
+    let error = match Forwarder::start(requests) {
+        Ok(forwarder) => {
+            forwarder.shutdown().unwrap();
+            panic!("listener cap was not enforced");
+        }
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("listener limit"));
+    let rebound: Vec<TcpListener> = ports
+        .iter()
+        .map(|port| TcpListener::bind((Ipv4Addr::LOCALHOST, *port)).unwrap())
+        .collect();
+    assert_eq!(rebound.len(), 33);
 }
 
 fn reserve_port() -> u16 {

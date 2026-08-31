@@ -10,11 +10,14 @@ use std::time::Duration;
 use et_core::packet::Packet;
 use et_core::proto::{PortForwardSourceRequest, TerminalPacketType};
 
-use crate::forward_endpoint::Endpoint;
+use crate::forward_endpoint::{Endpoint, ResolvedEndpoint};
 use crate::forward_io::BoundSource;
 use crate::forward_worker::{run, Command};
 
 const CHANNEL_CAPACITY: usize = 256;
+/// Maximum reverse listeners owned by one terminal session, after DNS fanout
+/// and address deduplication.
+const MAX_SESSION_LISTENERS: usize = 32;
 
 #[derive(Debug)]
 pub enum ForwardError {
@@ -194,24 +197,29 @@ impl Drop for Forwarder {
 /// Environment variables created for named-pipe forwards.
 pub type ForwardEnvironment = Vec<(String, String)>;
 
+enum PlannedSource {
+    Endpoint {
+        source: ResolvedEndpoint,
+        destination: et_core::proto::SocketEndpoint,
+    },
+    #[cfg(unix)]
+    Environment {
+        variable: String,
+        destination: et_core::proto::SocketEndpoint,
+    },
+}
+
 fn bind_sources(
     sources: Vec<PortForwardSourceRequest>,
     owner: Option<(u32, u32)>,
 ) -> Result<(Vec<BoundSource>, ForwardEnvironment), ForwardError> {
-    let mut bound = Vec::with_capacity(sources.len());
-    #[cfg_attr(windows, allow(unused_mut))]
-    let mut environment = Vec::new();
+    let mut plans = Vec::with_capacity(sources.len());
+    let mut listener_count = 0usize;
     for request in sources {
         // The destination is passed through verbatim in the
-        // PORT_FORWARD_DESTINATION_REQUEST, exactly like upstream: it is only
-        // interpreted (and validated) by the remote side when a connection
-        // arrives.
+        // PORT_FORWARD_DESTINATION_REQUEST and parsed by the remote side.
         let destination = request.destination.unwrap_or_default();
-        if let Some(variable) = request.environmentvariable {
-            // Named-pipe forwarding: upstream creates a private temporary
-            // socket, exports its path through the environment variable, and
-            // rejects requests that also carry an explicit source. Upstream
-            // builds this path only on POSIX systems.
+        let (plan, additional_listeners) = if let Some(variable) = request.environmentvariable {
             if request.source.is_some() {
                 return Err(ForwardError::Protocol(
                     "Do not set a source when forwarding named pipes with environment variables",
@@ -219,10 +227,65 @@ fn bind_sources(
             }
             #[cfg(unix)]
             {
+                (
+                    PlannedSource::Environment {
+                        variable,
+                        destination,
+                    },
+                    1,
+                )
+            }
+            #[cfg(windows)]
+            {
+                let _ = (variable, destination, owner);
+                return Err(ForwardError::Protocol(
+                    "named-pipe forwarding is not supported on Windows",
+                ));
+            }
+        } else {
+            let source = Endpoint::parse(request.source)?.resolve_for_bind()?;
+            let listener_count = source.listener_count();
+            (
+                PlannedSource::Endpoint {
+                    source,
+                    destination,
+                },
+                listener_count,
+            )
+        };
+        listener_count = listener_count
+            .checked_add(additional_listeners)
+            .ok_or(ForwardError::Protocol("reverse listener limit exceeded"))?;
+        if listener_count > MAX_SESSION_LISTENERS {
+            return Err(ForwardError::Protocol("reverse listener limit exceeded"));
+        }
+        plans.push(plan);
+    }
+
+    let mut bound = Vec::with_capacity(listener_count);
+    #[cfg_attr(windows, allow(unused_mut))]
+    let mut environment = Vec::new();
+    for plan in plans {
+        match plan {
+            PlannedSource::Endpoint {
+                source,
+                destination,
+            } => {
+                for listener in source.bind_with_user(owner)? {
+                    bound.push(BoundSource {
+                        listener,
+                        destination: destination.clone(),
+                    });
+                }
+            }
+            #[cfg(unix)]
+            PlannedSource::Environment {
+                variable,
+                destination,
+            } => {
                 let path = create_forward_pipe(owner)?;
-                // Bind as the session user (ET #784). Do not chmod/chown the
-                // client-visible socket path as root after bind.
-                let mut listeners = Endpoint::Unix(path.clone()).bind_with_user(owner)?;
+                let source = Endpoint::Unix(path.clone()).resolve_for_bind()?;
+                let mut listeners = source.bind_with_user(owner)?;
                 environment.push((variable, path.to_string_lossy().into_owned()));
                 for mut listener in listeners.drain(..) {
                     if let Some(directory) = path.parent() {
@@ -233,22 +296,7 @@ fn bind_sources(
                         destination: destination.clone(),
                     });
                 }
-                continue;
             }
-            #[cfg(windows)]
-            {
-                let _ = (&variable, owner);
-                return Err(ForwardError::Protocol(
-                    "named-pipe forwarding is not supported on Windows",
-                ));
-            }
-        }
-        let source = Endpoint::parse(request.source)?;
-        for listener in source.bind_with_user(owner)? {
-            bound.push(BoundSource {
-                listener,
-                destination: destination.clone(),
-            });
         }
     }
     Ok((bound, environment))

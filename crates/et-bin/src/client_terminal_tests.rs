@@ -7,13 +7,25 @@ use et_net::connection::{ConnError, Connection, WritePacketError};
 use prost::Message;
 
 use super::{
-    command_payload, recover_initial_transport, recover_transport, write_owned_recovering_with,
-    write_owned_with_policy, OwnedWriteOutcome, OwnedWritePolicy, RetainedCompletion,
-    TerminalModeState, TerminalReset, GRACEFUL_TERMINAL_MODE_RESET, TERMINAL_MODE_RESET,
+    classify_forward_completion, command_payload, recover_initial_transport, recover_transport,
+    write_owned_recovering_with, write_owned_with_policy, OwnedWriteOutcome, OwnedWritePolicy,
+    RetainedCompletion, TerminalModeState, TerminalReset, GRACEFUL_TERMINAL_MODE_RESET,
+    TERMINAL_MODE_RESET,
 };
 use crate::client_terminal::{connection_ended, RemoteLines};
 use crate::error::ClientError;
 use crate::initial_connect::ReconnectOutcome;
+
+#[test]
+fn outbound_forwarding_prevents_successful_remote_completion() {
+    let current = Packet::new(
+        TerminalPacketType::PortForwardData as u8,
+        b"current".as_slice(),
+    );
+    assert!(classify_forward_completion(Some(current), false).is_err());
+    assert!(classify_forward_completion(None, true).is_err());
+    assert!(classify_forward_completion(None, false).is_ok());
+}
 
 #[test]
 fn retained_completion_waits_for_terminal_and_forward_capacity() {

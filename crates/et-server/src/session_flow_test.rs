@@ -99,6 +99,62 @@ fn graceful_hup_drains_and_joins_a_deliberately_blocked_writer() {
 }
 
 #[test]
+fn terminal_finish_fails_and_joins_after_unrecoverable_before_replay() {
+    let (server, mut client) = connection_pair();
+    client.set_io_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
+    let session = Arc::new(
+        ActiveSession::new(
+            server,
+            &terminal,
+            Some(FlowControlMode::Backpressure as i32),
+        )
+        .unwrap(),
+    );
+    let flow = Arc::clone(session.flow_control.as_ref().unwrap());
+    flow.enqueue(et_core::packet::Packet::new(55, b"retained".as_slice()))
+        .unwrap();
+    let (attempt_tx, attempt_rx) = mpsc::sync_channel(0);
+    let (release_tx, release_rx) = mpsc::sync_channel(0);
+    let worker_session = Arc::clone(&session);
+    let worker_flow = Arc::clone(&flow);
+    let handle = thread::spawn(move || {
+        while let Some(packet) = worker_flow.next_packet() {
+            attempt_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let (result, connected) = super::session_flow::writer::write_packet_with(
+                &worker_session,
+                &worker_flow,
+                &packet,
+                |connection, packet| {
+                    connection.prepare_write_packet_with(packet.header(), packet.payload(), |_| {
+                        Err(std::io::Error::other("injected clone failure"))
+                    })
+                },
+            );
+            if !worker_flow.complete(packet, &result, connected) {
+                break;
+            }
+        }
+    });
+    *session.flow_writer.lock().unwrap() = Some(handle);
+    attempt_rx.recv().unwrap();
+
+    let (finished_tx, finished_rx) = mpsc::sync_channel(0);
+    let finishing = Arc::clone(&session);
+    let finisher = thread::spawn(move || finished_tx.send(finishing.finish_terminal()).unwrap());
+    flow.wait_for_stop(true);
+    release_tx.send(()).unwrap();
+
+    let error = finished_rx.recv_timeout(TEST_TIMEOUT).unwrap().unwrap_err();
+    assert!(matches!(error, SessionError::Connection(ConnError::Io(_))));
+    finisher.join().unwrap();
+    assert!(attempt_rx.try_recv().is_err());
+    assert!(session.flow_writer.lock().unwrap().is_none());
+    assert!(client.read_packet().is_err());
+}
+
+#[test]
 fn hard_shutdown_wakes_and_joins_a_deliberately_blocked_writer() {
     // Given: a writer blocked after taking ownership of a queued packet.
     let (server, _client) = connection_pair();
@@ -209,7 +265,7 @@ fn non_transport_before_replay_is_fatal_instead_of_pausing_as_disconnected() {
 }
 
 #[test]
-fn graceful_before_replay_waits_for_explicit_resume_without_spinning() {
+fn before_replay_waits_for_explicit_resume_while_session_is_recoverable() {
     let (server, _client) = connection_pair();
     let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
     let session = Arc::new(
@@ -271,7 +327,6 @@ fn graceful_before_replay_waits_for_explicit_resume_without_spinning() {
     result_tx.send(true).unwrap();
     assert_eq!(completed_rx.recv().unwrap(), 1);
     assert!(!session.connection.lock().unwrap().connected());
-    flow.stop_gracefully();
     assert!(attempt_rx.try_recv().is_err());
     assert!(done_rx.try_recv().is_err());
 
@@ -288,6 +343,7 @@ fn graceful_before_replay_waits_for_explicit_resume_without_spinning() {
     assert_eq!(attempt_rx.recv().unwrap(), 3);
     result_tx.send(false).unwrap();
     assert_eq!(completed_rx.recv().unwrap(), 3);
+    flow.stop_gracefully();
     done_rx.recv().unwrap();
     worker.join().unwrap();
 }

@@ -5,8 +5,10 @@ use std::io::{self};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::AtomicI32;
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
 use std::thread::JoinHandle;
+
+use crossbeam_channel as channel;
 
 use crate::forward::{ForwardError, Outbound};
 use crate::forward_endpoint::ForwardStream;
@@ -55,35 +57,51 @@ pub(crate) enum Command {
     Stop,
 }
 
+pub(crate) struct WorkerChannels {
+    pub(crate) receiver: channel::Receiver<Command>,
+    pub(crate) sender: channel::Sender<Command>,
+    pub(crate) outbound: channel::Sender<Outbound>,
+    pub(crate) cancel: channel::Receiver<()>,
+}
+
 pub(crate) fn run(
     sources: Vec<BoundSource>,
-    commands: mpsc::Receiver<Command>,
-    command_sender: mpsc::SyncSender<Command>,
-    outbound: mpsc::SyncSender<Outbound>,
+    channels: WorkerChannels,
     #[cfg(unix)] mut outbound_wake: UnixStream,
     listener_stop: ListenerStop,
     session_user: Option<(u32, u32)>,
 ) {
+    let WorkerChannels {
+        receiver: commands,
+        sender: command_sender,
+        outbound,
+        cancel,
+    } = channels;
     #[cfg(unix)]
     let result = Worker::new(
         command_sender,
         outbound.clone(),
         outbound_wake.try_clone().ok(),
+        cancel.clone(),
     )
     .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user));
     #[cfg(windows)]
-    let result = Worker::new(command_sender, outbound.clone())
+    let result = Worker::new(command_sender, outbound.clone(), cancel.clone())
         .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user));
     if let Err(error) = result {
-        let _ = outbound.send(Err(error));
+        channel::select! {
+            send(outbound, Err(error)) -> _ => {}
+            recv(cancel) -> _ => {}
+        }
         #[cfg(unix)]
         let _ = outbound_wake.write(&[1]);
     }
 }
 
 struct Worker {
-    commands: mpsc::SyncSender<Command>,
-    outbound: mpsc::SyncSender<Outbound>,
+    commands: channel::Sender<Command>,
+    outbound: channel::Sender<Outbound>,
+    cancel: channel::Receiver<()>,
     #[cfg(unix)]
     outbound_wake: UnixStream,
     pending: HashMap<i32, ForwardStream>,
@@ -96,9 +114,10 @@ struct Worker {
 
 impl Worker {
     fn new(
-        commands: mpsc::SyncSender<Command>,
-        outbound: mpsc::SyncSender<Outbound>,
+        commands: channel::Sender<Command>,
+        outbound: channel::Sender<Outbound>,
         #[cfg(unix)] outbound_wake: Option<UnixStream>,
+        cancel: channel::Receiver<()>,
     ) -> Result<Self, ForwardError> {
         #[cfg(unix)]
         let outbound_wake = {
@@ -109,6 +128,7 @@ impl Worker {
         Ok(Self {
             commands,
             outbound,
+            cancel,
             #[cfg(unix)]
             outbound_wake,
             pending: HashMap::new(),
@@ -123,7 +143,7 @@ impl Worker {
     fn run(
         &mut self,
         sources: Vec<BoundSource>,
-        commands: mpsc::Receiver<Command>,
+        commands: channel::Receiver<Command>,
         listener_stop: ListenerStop,
         session_user: Option<(u32, u32)>,
     ) -> Result<(), ForwardError> {
@@ -142,9 +162,12 @@ impl Worker {
             ));
         }
         let result = loop {
-            let command = match commands.recv() {
-                Ok(command) => command,
-                Err(_) => break Ok(()),
+            let command = channel::select! {
+                recv(self.cancel) -> _ => break Ok(()),
+                recv(commands) -> command => match command {
+                    Ok(command) => command,
+                    Err(_) => break Ok(()),
+                },
             };
             let step = match command {
                 Command::Packet(packet) => self.handle_packet(packet),

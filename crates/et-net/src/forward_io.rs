@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 
+use crossbeam_channel as channel;
+
 #[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags};
 
@@ -49,7 +51,7 @@ const ACCEPT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10
 
 pub(crate) fn spawn_listener(
     source: BoundSource,
-    commands: mpsc::SyncSender<Command>,
+    commands: channel::Sender<Command>,
     stop: ListenerStop,
     next_client_fd: Arc<AtomicI32>,
 ) -> JoinHandle<()> {
@@ -125,7 +127,7 @@ pub(crate) fn spawn_connector(
     client_fd: i32,
     socket_id: i32,
     destination: Endpoint,
-    commands: mpsc::SyncSender<Command>,
+    commands: channel::Sender<Command>,
     session_user: Option<(u32, u32)>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -142,7 +144,7 @@ pub(crate) fn spawn_io(
     role: Role,
     socket_id: i32,
     stream: ForwardStream,
-    commands: mpsc::SyncSender<Command>,
+    commands: channel::Sender<Command>,
 ) -> io::Result<(ActiveIo, [JoinHandle<()>; 2])> {
     let mut reader = stream.try_clone()?;
     let control = stream.try_clone()?;

@@ -2,6 +2,7 @@
 use std::io::Write;
 use std::io::{self};
 
+use crossbeam_channel as channel;
 use et_core::packet::Packet;
 use et_core::proto::{
     PortForwardData, PortForwardDestinationRequest, PortForwardDestinationResponse, SocketEndpoint,
@@ -250,9 +251,13 @@ impl Worker {
     }
 
     fn emit<M: Message>(&mut self, header: u8, message: M) -> Result<(), ForwardError> {
-        self.outbound
-            .send(Ok(Packet::new(header, message.encode_to_vec())))
-            .map_err(|_| ForwardError::Unavailable)?;
+        let packet = Ok(Packet::new(header, message.encode_to_vec()));
+        channel::select! {
+            send(self.outbound, packet) -> result => {
+                result.map_err(|_| ForwardError::Unavailable)?;
+            }
+            recv(self.cancel) -> _ => return Err(ForwardError::Unavailable),
+        }
         // Unix consumers poll the wake socket; Windows consumers drain
         // `try_outbound` on the client loop's 10ms cadence.
         #[cfg(unix)]

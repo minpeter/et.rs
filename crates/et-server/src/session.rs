@@ -243,7 +243,7 @@ impl ActiveSession {
 
     pub(crate) fn finish_terminal(&self) -> Result<(), SessionError> {
         self.shutdown.store(true, Ordering::Release);
-        self.join_flow_writer(true)?;
+        let flow_result = self.join_flow_writer(true);
         let _ = self.signal();
         let terminal = self
             .terminal_control
@@ -252,11 +252,26 @@ impl ActiveSession {
         let _ = terminal.shutdown(Shutdown::Both);
         drop(terminal);
         let control = self.control.lock().map_err(|_| SessionError::Unavailable)?;
-        match control.shutdown(Shutdown::Write) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
-            Err(error) => Err(SessionError::Io(error)),
+        let control_result = if flow_result.is_err() {
+            control.shutdown(Shutdown::Both)
+        } else {
+            control.shutdown(Shutdown::Write)
+        };
+        match control_result {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotConnected => {}
+            Err(error) => return Err(SessionError::Io(error)),
         }
+        drop(control);
+        if let Err(error) = flow_result {
+            let mut connection = self
+                .connection
+                .lock()
+                .map_err(|_| SessionError::Unavailable)?;
+            let _ = connection.shutdown();
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) fn shutdown(&self) -> Result<(), SessionError> {
@@ -298,6 +313,17 @@ impl ActiveSession {
             .take();
         if handle.is_some_and(|handle| handle.join().is_err()) {
             return Err(SessionError::Unavailable);
+        }
+        if graceful
+            && self
+                .flow_control
+                .as_ref()
+                .is_some_and(|state| state.unrecoverable())
+        {
+            return Err(SessionError::Connection(ConnError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "terminal ended before retained flow output could be delivered",
+            ))));
         }
         Ok(())
     }

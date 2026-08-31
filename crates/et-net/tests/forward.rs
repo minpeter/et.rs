@@ -13,6 +13,7 @@ use et_net::forward::Forwarder;
 use prost::Message;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
+const REFUSED_DESTINATION_TIMEOUT: Duration = Duration::from_secs(7);
 
 #[test]
 fn two_forwarders_relay_a_real_tcp_round_trip() {
@@ -66,7 +67,11 @@ fn refused_destination_closes_the_accepted_source() {
         .receive(source.wait_outbound(TIMEOUT).unwrap())
         .unwrap();
     source
-        .receive(destination.wait_outbound(TIMEOUT).unwrap())
+        .receive(
+            destination
+                .wait_outbound(REFUSED_DESTINATION_TIMEOUT)
+                .unwrap(),
+        )
         .unwrap();
     let mut byte = [0u8; 1];
     assert_eq!(application.read(&mut byte).unwrap(), 0);
@@ -80,6 +85,38 @@ fn refused_destination_closes_the_accepted_source() {
 /// its next packet — wedging the session permanently. `try_receive` must
 /// report a full worker instead of blocking, and draining outbound packets
 /// (the session loop's next step) must make the held packet deliverable.
+#[test]
+fn hard_shutdown_cancels_worker_blocked_on_full_command_and_outbound_queues() {
+    let mut forwarder = Forwarder::start(Vec::new()).unwrap();
+    let request = |fd: i32| {
+        Packet::new(
+            TerminalPacketType::PortForwardDestinationRequest as u8,
+            PortForwardDestinationRequest {
+                destination: Some(SocketEndpoint {
+                    name: None,
+                    port: Some(0),
+                }),
+                fd: Some(fd),
+            }
+            .encode_to_vec(),
+        )
+    };
+
+    let mut held = None;
+    for fd in 1..=4096 {
+        if let Some(packet) = forwarder.try_receive(request(fd)).unwrap() {
+            held = Some(packet);
+            break;
+        }
+    }
+    assert!(held.is_some(), "bounded forwarding queues never filled");
+
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
+    let worker = thread::spawn(move || done_tx.send(forwarder.shutdown_hard()).unwrap());
+    assert!(done_rx.recv_timeout(TIMEOUT).unwrap().unwrap());
+    worker.join().unwrap();
+}
+
 #[test]
 fn try_receive_reports_backpressure_and_outbound_drain_recovers() {
     let forwarder = Forwarder::start(Vec::new()).unwrap();

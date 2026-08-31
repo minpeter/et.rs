@@ -3,8 +3,9 @@ use std::io::Read;
 use std::io::{self};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::sync::mpsc;
 use std::thread::JoinHandle;
+
+use crossbeam_channel as channel;
 use std::time::Duration;
 
 use et_core::packet::Packet;
@@ -12,7 +13,7 @@ use et_core::proto::{PortForwardSourceRequest, TerminalPacketType};
 
 use crate::forward_endpoint::Endpoint;
 use crate::forward_io::BoundSource;
-use crate::forward_worker::{run, Command};
+use crate::forward_worker::{run, Command, WorkerChannels};
 
 const CHANNEL_CAPACITY: usize = 256;
 
@@ -46,8 +47,9 @@ impl From<io::Error> for ForwardError {
 pub(crate) type Outbound = Result<Packet, ForwardError>;
 
 pub struct Forwarder {
-    commands: mpsc::SyncSender<Command>,
-    outbound: mpsc::Receiver<Outbound>,
+    commands: channel::Sender<Command>,
+    outbound: channel::Receiver<Outbound>,
+    cancel: channel::Sender<()>,
     /// Readiness channel for outbound packets. Unix callers poll it exactly
     /// like upstream's `select()`; Windows callers drain [`Forwarder::try_outbound`]
     /// on the client loop's 10ms cadence instead, because a socket pair created
@@ -73,8 +75,9 @@ impl Forwarder {
     ) -> Result<(Self, ForwardEnvironment), ForwardError> {
         let (sources, environment) = bind_sources(sources, owner)?;
         let session_user = owner;
-        let (commands_tx, commands_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
-        let (outbound_tx, outbound_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let (commands_tx, commands_rx) = channel::bounded(CHANNEL_CAPACITY);
+        let (outbound_tx, outbound_rx) = channel::bounded(CHANNEL_CAPACITY);
+        let (cancel_tx, cancel_rx) = channel::bounded(1);
         #[cfg(unix)]
         let (wake, wake_writer) = {
             let (reader, writer) = UnixStream::pair()?;
@@ -93,9 +96,12 @@ impl Forwarder {
             .spawn(move || {
                 run(
                     sources,
-                    commands_rx,
-                    worker_commands,
-                    outbound_tx,
+                    WorkerChannels {
+                        receiver: commands_rx,
+                        sender: worker_commands,
+                        outbound: outbound_tx,
+                        cancel: cancel_rx,
+                    },
                     #[cfg(unix)]
                     wake_writer,
                     listener_stop_reader,
@@ -111,6 +117,7 @@ impl Forwarder {
             Self {
                 commands: commands_tx,
                 outbound: outbound_rx,
+                cancel: cancel_tx,
                 #[cfg(unix)]
                 wake,
                 worker: Some(worker),
@@ -149,8 +156,8 @@ impl Forwarder {
     pub fn try_receive(&self, packet: Packet) -> Result<Option<Packet>, ForwardError> {
         match self.commands.try_send(Command::Packet(packet)) {
             Ok(()) => Ok(None),
-            Err(mpsc::TrySendError::Full(Command::Packet(packet))) => Ok(Some(packet)),
-            Err(mpsc::TrySendError::Full(_)) | Err(mpsc::TrySendError::Disconnected(_)) => {
+            Err(channel::TrySendError::Full(Command::Packet(packet))) => Ok(Some(packet)),
+            Err(channel::TrySendError::Full(_)) | Err(channel::TrySendError::Disconnected(_)) => {
                 Err(ForwardError::Unavailable)
             }
         }
@@ -161,8 +168,8 @@ impl Forwarder {
         drain_wake(&self.wake)?;
         match self.outbound.try_recv() {
             Ok(result) => result.map(Some),
-            Err(mpsc::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::TryRecvError::Disconnected) => Err(ForwardError::Unavailable),
+            Err(channel::TryRecvError::Empty) => Ok(None),
+            Err(channel::TryRecvError::Disconnected) => Err(ForwardError::Unavailable),
         }
     }
 
@@ -176,9 +183,29 @@ impl Forwarder {
         self.stop()
     }
 
+    /// Cancel independently of bounded command/output capacity and join the
+    /// worker. Returns true when queued commands or outbound packets could not
+    /// be completed and were explicitly abandoned.
+    pub fn shutdown_hard(&mut self) -> Result<bool, ForwardError> {
+        let _ = self.cancel.try_send(());
+        let mut abandoned = !self.commands.is_empty() || !self.outbound.is_empty();
+        if let Some(worker) = self.worker.take() {
+            worker.join().map_err(|_| ForwardError::Unavailable)?;
+        }
+        while self.outbound.try_recv().is_ok() {
+            abandoned = true;
+        }
+        if !self.commands.is_empty() {
+            abandoned = true;
+        }
+        Ok(abandoned)
+    }
+
     fn stop(&mut self) -> Result<(), ForwardError> {
         if let Some(worker) = self.worker.take() {
-            let _ = self.commands.send(Command::Stop);
+            if self.commands.send(Command::Stop).is_err() {
+                let _ = self.cancel.try_send(());
+            }
             worker.join().map_err(|_| ForwardError::Unavailable)?;
         }
         Ok(())
@@ -187,7 +214,9 @@ impl Forwarder {
 
 impl Drop for Forwarder {
     fn drop(&mut self) {
-        let _ = self.stop();
+        // Drop is an abort path and must not block behind bounded forwarding
+        // queues. Callers that require graceful completion use `shutdown`.
+        let _ = self.shutdown_hard();
     }
 }
 

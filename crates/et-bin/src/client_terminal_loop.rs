@@ -23,9 +23,9 @@ use crate::client_terminal::DisplayOutcome;
 use crate::client_terminal::TerminalModeState;
 #[cfg(unix)]
 use crate::client_terminal::{
-    connection_ended, encoded_buffer, recover_transport, terminal_error, terminal_io,
-    terminal_size_payload, terminal_text, write_owned_recovering, write_terminal_size_recovering,
-    OwnedWriteOutcome, RetainedCompletion,
+    classify_forward_completion, connection_ended, encoded_buffer, recover_transport,
+    terminal_error, terminal_io, terminal_size_payload, terminal_text, write_owned_recovering,
+    write_terminal_size_recovering, OwnedWriteOutcome, RetainedCompletion,
 };
 #[cfg(unix)]
 use crate::error::ClientError;
@@ -52,7 +52,7 @@ pub fn pump<F>(
     connection: &mut Connection,
     wake: &mut UnixStream,
     options: PumpOptions<'_>,
-    forwarder: &Forwarder,
+    forwarder: &mut Forwarder,
     mut reconnect: F,
 ) -> Result<(), ClientError>
 where
@@ -120,6 +120,7 @@ where
                             terminal_enabled,
                             terminal_modes,
                             forwarder,
+                            None,
                         );
                     }
                 }
@@ -220,6 +221,7 @@ where
                             terminal_enabled,
                             terminal_modes,
                             forwarder,
+                            None,
                         );
                     }
                 }
@@ -248,6 +250,7 @@ where
                             terminal_enabled,
                             terminal_modes,
                             forwarder,
+                            None,
                         );
                     }
                 }
@@ -294,6 +297,7 @@ where
                                         terminal_enabled,
                                         terminal_modes,
                                         forwarder,
+                                        None,
                                     );
                                 }
                             }
@@ -336,6 +340,7 @@ where
                             terminal_enabled,
                             terminal_modes,
                             forwarder,
+                            Some(packet),
                         );
                     }
                 }
@@ -354,6 +359,7 @@ where
                     terminal_enabled,
                     terminal_modes,
                     forwarder,
+                    None,
                 );
             }
             last_received = Instant::now();
@@ -393,6 +399,7 @@ where
                         terminal_enabled,
                         terminal_modes,
                         forwarder,
+                        None,
                     );
                 }
             }
@@ -425,6 +432,7 @@ where
                     terminal_enabled,
                     terminal_modes,
                     forwarder,
+                    None,
                 );
             }
             next_keepalive = Instant::now() + interval;
@@ -464,7 +472,8 @@ fn finish_remote_completion(
     pending_forward: Option<et_core::packet::Packet>,
     terminal_enabled: bool,
     terminal_modes: &mut TerminalModeState,
-    forwarder: &Forwarder,
+    forwarder: &mut Forwarder,
+    current_outbound: Option<et_core::packet::Packet>,
 ) -> Result<(), ClientError> {
     let mut retained = RetainedCompletion::new(pending_output, pending_forward);
     loop {
@@ -482,18 +491,22 @@ fn finish_remote_completion(
                     .map_err(|error| terminal_text(error.to_string()))
             },
         )? {
+            let abandoned = forwarder
+                .shutdown_hard()
+                .map_err(|error| terminal_text(error.to_string()))?;
+            classify_forward_completion(current_outbound, abandoned)?;
             return output
                 .complete(ConsoleCompletion::RemoteSessionEnded)
                 .map_err(|error| terminal_io("draining terminal output", error));
         }
-        if forwarder
+        if let Some(packet) = forwarder
             .try_outbound()
             .map_err(|error| terminal_text(error.to_string()))?
-            .is_some()
         {
-            return Err(terminal_text(
-                "remote session ended with undeliverable local forwarding output",
-            ));
+            let abandoned = forwarder
+                .shutdown_hard()
+                .map_err(|error| terminal_text(error.to_string()))?;
+            classify_forward_completion(Some(packet), abandoned)?;
         }
 
         let (output_ready, output_status) = {

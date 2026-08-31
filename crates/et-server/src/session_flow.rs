@@ -25,6 +25,7 @@ struct WriterState {
     in_flight: bool,
     reader_waiting: bool,
     stop: StopMode,
+    unrecoverable: bool,
 }
 
 pub(super) struct FlowControl {
@@ -42,6 +43,7 @@ impl FlowControl {
                 in_flight: false,
                 reader_waiting: false,
                 stop: StopMode::Running,
+                unrecoverable: false,
             }),
             wake: Condvar::new(),
         }
@@ -124,10 +126,19 @@ impl FlowControl {
             // must not bypass that pause and drain queued output onto the old
             // stream; RecoverPermit::drop resumes the writer atomically.
             if state.stop == StopMode::Running {
-                state.stop = StopMode::Graceful;
+                if !state.connected {
+                    state.unrecoverable = true;
+                    state.stop = StopMode::Hard;
+                } else {
+                    state.stop = StopMode::Graceful;
+                }
                 self.wake.notify_all();
             }
         }
+    }
+
+    pub(super) fn unrecoverable(&self) -> bool {
+        self.state.lock().map_or(true, |state| state.unrecoverable)
     }
 
     pub(super) fn stop_hard(&self) {
@@ -212,10 +223,18 @@ impl FlowControl {
             writer::FlowWriteResult::BeforeReplay(_error) => {
                 state.queue.restore_front(packet);
                 state.connected = false;
+                if state.stop == StopMode::Graceful {
+                    state.unrecoverable = true;
+                    state.stop = StopMode::Hard;
+                }
             }
             writer::FlowWriteResult::ReplayOwned(_error) => {
                 state.queue.complete(&packet);
                 state.connected = false;
+                if state.stop == StopMode::Graceful {
+                    state.unrecoverable = true;
+                    state.stop = StopMode::Hard;
+                }
             }
             writer::FlowWriteResult::Fatal(error) => {
                 state.queue.complete(&packet);

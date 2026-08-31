@@ -12,6 +12,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+crossbeam-channel = "0.5"
 et-core = { path = "../et-core" }
 prost = "0.13"
 rustix = { version = "1.1.4", features = ["event"] }

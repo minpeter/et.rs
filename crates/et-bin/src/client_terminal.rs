@@ -53,7 +53,7 @@ pub struct TerminalOptions<'a> {
 pub fn run<F>(
     mut connection: Connection,
     options: TerminalOptions<'_>,
-    forwarder: Forwarder,
+    mut forwarder: Forwarder,
     mut reconnect: F,
 ) -> Result<(), ClientError>
 where
@@ -156,7 +156,7 @@ where
                 auto_cursor_report,
                 terminal_modes: &mut terminal_modes,
             },
-            &forwarder,
+            &mut forwarder,
             reconnect,
         );
         signal_handle.close();
@@ -174,7 +174,7 @@ where
             auto_cursor_report,
             terminal_modes: &mut terminal_modes,
         },
-        &forwarder,
+        &mut forwarder,
         reconnect,
     );
     raw_mode.finish(result, close_message, terminal_modes.alternate_screen())
@@ -199,6 +199,18 @@ pub(crate) enum DisplayOutcome {
 pub(crate) struct RetainedCompletion {
     terminal: Option<et_core::packet::Packet>,
     forwarding: Option<et_core::packet::Packet>,
+}
+
+pub(crate) fn classify_forward_completion(
+    current_outbound: Option<et_core::packet::Packet>,
+    abandoned: bool,
+) -> Result<(), ClientError> {
+    if current_outbound.is_some() || abandoned {
+        return Err(terminal_text(
+            "remote session ended with undeliverable outbound forwarding data",
+        ));
+    }
+    Ok(())
 }
 
 impl RetainedCompletion {

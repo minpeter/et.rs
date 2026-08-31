@@ -252,6 +252,65 @@ fn native_jumphost_relays_imported_remote_skip_report_and_acknowledgement() {
 }
 
 #[test]
+fn native_jumphost_strict_imported_remote_skip_withholds_ack_and_releases_sibling() {
+    // Given
+    let mut destination = Stack::start();
+    let mut jump = Stack::start();
+    let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let occupied_port = occupied.local_addr().unwrap().port();
+    let sibling_port = reserve_port();
+    let config = format!(
+        "hostname 127.0.0.1\nuser tester\nexitonforwardfailure yes\n\
+         remoteforward {occupied_port} [127.0.0.1]:1\n\
+         remoteforward {sibling_port} [127.0.0.1]:1\n"
+    );
+    let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env("PATH", &destination.directory)
+        .env("ET_SSH_COUNT", &destination.ssh_count)
+        .env("ET_SSH_CONFIG", config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .args(["--terminal-path"])
+        .arg(&destination.terminal)
+        .args(["--serverfifo"])
+        .arg(&destination.router)
+        .args(["--jumphost", "jump.example", "--jport"])
+        .arg(jump.port.to_string())
+        .args(["--jserverfifo"])
+        .arg(&jump.router)
+        .arg("-N")
+        .arg(format!("tester@127.0.0.1:{}", destination.port))
+        .spawn()
+        .unwrap();
+
+    // When
+    let status = client
+        .wait_timeout(TIMEOUT)
+        .unwrap()
+        .expect("strict imported native-jumphost skip did not terminate the client");
+    let mut error = String::new();
+    client
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut error)
+        .unwrap();
+
+    // Then
+    assert!(!status.success());
+    assert!(
+        error.contains("required reverse forwarding row could not bind"),
+        "{error}"
+    );
+    jump.shutdown();
+    destination.shutdown();
+    let rebound = TcpListener::bind((Ipv4Addr::LOCALHOST, sibling_port)).unwrap();
+    drop(rebound);
+    drop(occupied);
+}
+
+#[test]
 fn native_jumphost_explicit_remote_skip_aborts_and_releases_final_sibling() {
     let mut destination = Stack::start();
     let mut jump = Stack::start();
@@ -294,7 +353,7 @@ fn native_jumphost_explicit_remote_skip_aborts_and_releases_final_sibling() {
 
     assert!(!status.success());
     assert!(
-        error.contains("explicit reverse forwarding row could not bind"),
+        error.contains("required reverse forwarding row could not bind"),
         "{error}"
     );
     jump.shutdown();
@@ -342,7 +401,7 @@ fn explicit_remote_bind_report_aborts_and_releases_sibling_listener() {
 
     assert!(!status.success());
     assert!(
-        error.contains("explicit reverse forwarding row could not bind"),
+        error.contains("required reverse forwarding row could not bind"),
         "{error}"
     );
     stack.shutdown();

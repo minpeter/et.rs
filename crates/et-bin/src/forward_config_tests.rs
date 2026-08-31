@@ -72,6 +72,7 @@ fn ssh_config_reverse_forwards_follow_cli_agent_forwarding() {
             }),
             environmentvariable: None,
         }],
+        exit_on_forward_failure: false,
     };
 
     // When
@@ -149,6 +150,7 @@ fn ssh_config_forwards_are_cumulative_stable_and_exactly_deduplicated() {
                 environmentvariable: None,
             },
         ],
+        exit_on_forward_failure: true,
     };
 
     // When
@@ -176,14 +178,14 @@ fn ssh_config_forwards_are_cumulative_stable_and_exactly_deduplicated() {
     );
     assert_eq!(
         config.local_sources[2].origin,
-        et_net::forward::ForwardOrigin::SshConfig
+        et_net::forward::ForwardOrigin::SshConfig { strict: true }
     );
     assert_eq!(config.initial_payload.reversetunnels.len(), 2);
     assert_eq!(
         config.remote_origins,
         [
             et_net::forward::ForwardOrigin::Explicit,
-            et_net::forward::ForwardOrigin::SshConfig,
+            et_net::forward::ForwardOrigin::SshConfig { strict: true },
         ]
     );
     assert_eq!(

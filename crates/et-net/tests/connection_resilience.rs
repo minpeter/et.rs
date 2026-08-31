@@ -22,6 +22,23 @@ fn eof_invalidates_connection_so_future_output_is_buffered() {
 }
 
 #[test]
+fn strict_handshake_write_rejects_soft_disconnected_transport() {
+    // Given
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client_stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server_stream, _) = listener.accept().unwrap();
+    let mut client = Connection::new_client(client_stream, &[9; 32]);
+    server_stream.shutdown(std::net::Shutdown::Both).unwrap();
+
+    // When
+    let result = client.write_packet_strict(7, b"acknowledgement");
+
+    // Then
+    assert!(result.is_err());
+    assert!(!client.connected());
+}
+
+#[test]
 fn recovery_protobuf_limit_is_explicit_and_enforced() {
     let old_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let old_client = TcpStream::connect(old_listener.local_addr().unwrap()).unwrap();

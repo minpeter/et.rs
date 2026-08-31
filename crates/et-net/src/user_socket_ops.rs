@@ -7,6 +7,7 @@
 //! `unsafe`); it re-execs a helper, drops with [`nix`] in that
 //! single-threaded process, and uses the same fd-passing protocol.
 
+use std::error::Error;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, IoSlice, IoSliceMut};
@@ -100,14 +101,34 @@ pub fn run_helper() -> i32 {
 
 /// Bind/listen a new owner-only UNIX socket path with the current credentials.
 pub fn listen_at_path(path: &Path) -> io::Result<UnixListener> {
+    listen_at_path_with(path, || Ok(()))
+}
+
+fn listen_at_path_with(
+    path: &Path,
+    after_bind: impl FnOnce() -> io::Result<()>,
+) -> io::Result<UnixListener> {
     if path_too_long(path) {
         return Err(io::Error::from_raw_os_error(
             rustix::io::Errno::NAMETOOLONG.raw_os_error(),
         ));
     }
     let listener = UnixListener::bind(path)?;
+    let mut cleanup = SocketPathCleanup(Some(path.to_path_buf()));
+    after_bind()?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    cleanup.0 = None;
     Ok(listener)
+}
+
+struct SocketPathCleanup(Option<PathBuf>);
+
+impl Drop for SocketPathCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.as_ref() {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 /// connect() to a UNIX socket path with the current credentials.
@@ -198,21 +219,66 @@ fn drop_helper_privileges() -> io::Result<()> {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or_else(|| rustix::process::getgid().as_raw());
-    let uid = nix::unistd::Uid::from_raw(uid);
-    let gid = nix::unistd::Gid::from_raw(gid);
-    // Match ET: setgroups/setgid/setuid while still root. nix `setgroups` is
-    // unavailable on Apple targets; Linux is the etserver-as-root case.
-    if nix::unistd::geteuid().as_raw() == 0 {
-        #[cfg(target_os = "linux")]
-        nix::unistd::setgroups(&[gid]).map_err(from_nix)?;
+    if !rustix::process::geteuid().is_root()
+        && (rustix::process::geteuid().as_raw() != uid
+            || rustix::process::getegid().as_raw() != gid)
+    {
+        return Err(io::Error::from_raw_os_error(
+            rustix::io::Errno::PERM.raw_os_error(),
+        ));
     }
-    nix::unistd::setgid(gid).map_err(from_nix)?;
-    nix::unistd::setuid(uid).map_err(from_nix)?;
+    let uid_text = uid.to_string();
+    let gid_text = gid.to_string();
+    privdrop::PrivDrop::default()
+        .user(&uid_text)
+        .group(&gid_text)
+        .group_list(&[&gid_text])
+        .fallback_to_ids_if_names_are_numeric()
+        .apply()
+        .map_err(privdrop_io_error)?;
+    let identity = HelperIdentity {
+        euid: rustix::process::geteuid().as_raw(),
+        egid: rustix::process::getegid().as_raw(),
+        groups: rustix::process::getgroups()?
+            .into_iter()
+            .map(rustix::process::Gid::as_raw)
+            .collect(),
+    };
+    if !helper_identity_matches((uid, gid), &[gid], &identity) {
+        return Err(io::Error::from_raw_os_error(
+            rustix::io::Errno::PERM.raw_os_error(),
+        ));
+    }
     Ok(())
 }
 
-fn from_nix(error: nix::errno::Errno) -> io::Error {
-    io::Error::from_raw_os_error(error as i32)
+fn privdrop_io_error(error: privdrop::PrivDropError) -> io::Error {
+    let errno = error
+        .source()
+        .and_then(|source| source.downcast_ref::<privdrop::reexports::nix::errno::Errno>())
+        .copied();
+    match errno {
+        Some(errno) => io::Error::from_raw_os_error(errno as i32),
+        None => io::Error::other(error),
+    }
+}
+
+struct HelperIdentity {
+    euid: u32,
+    egid: u32,
+    groups: Vec<u32>,
+}
+
+fn helper_identity_matches(
+    target: (u32, u32),
+    expected_groups: &[u32],
+    identity: &HelperIdentity,
+) -> bool {
+    let mut expected = expected_groups.to_vec();
+    expected.sort_unstable();
+    let mut observed = identity.groups.clone();
+    observed.sort_unstable();
+    identity.euid == target.0 && identity.egid == target.1 && observed == expected
 }
 
 fn helper_exe() -> io::Result<PathBuf> {
@@ -339,20 +405,75 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::fs::FileTypeExt;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn temp_dir() -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("et_user_sock_{stamp}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+            let dir = PathBuf::from(format!("/tmp/e{:x}{sequence:x}", std::process::id()));
+            match fs::create_dir(&dir) {
+                Ok(()) => return dir,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!("could not create test directory: {error}"),
+            }
+        }
     }
 
     fn long_unix_path() -> PathBuf {
         PathBuf::from("x".repeat(UNIX_PATH_MAX + 8))
+    }
+
+    #[test]
+    fn privilege_drop_errno_preserves_io_error_kind() {
+        // Given
+        let denied = privdrop::PrivDropError::from(privdrop::reexports::nix::errno::Errno::EPERM);
+
+        // When
+        let error = privdrop_io_error(denied);
+
+        // Then
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn helper_identity_rejects_inherited_privileged_supplementary_group() {
+        // Given
+        let target = (65_534, 65_534);
+        let inherited = HelperIdentity {
+            euid: 65_534,
+            egid: 65_534,
+            groups: vec![0, 65_534],
+        };
+        let dropped = HelperIdentity {
+            euid: 65_534,
+            egid: 65_534,
+            groups: vec![65_534],
+        };
+
+        // When / Then
+        assert!(!helper_identity_matches(target, &[65_534], &inherited));
+        assert!(helper_identity_matches(target, &[65_534], &dropped));
+    }
+
+    #[test]
+    fn listen_failure_after_bind_cleans_socket_and_immediate_retry_succeeds() {
+        // Given
+        let dir = temp_dir();
+        let path = dir.join("post-bind-failure.sock");
+
+        // When
+        let error = listen_at_path_with(&path, || Err(io::Error::other("injected before chmod")))
+            .unwrap_err();
+
+        // Then
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(!path.exists());
+        let listener = listen_at_path(&path).unwrap();
+        assert!(path.exists());
+        drop(listener);
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&dir).unwrap();
     }
 
     #[test]

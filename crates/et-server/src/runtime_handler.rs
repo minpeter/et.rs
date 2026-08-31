@@ -260,7 +260,7 @@ fn handle_new(
     };
     let requires_ack = response_error.is_some();
     if connection
-        .write_packet(
+        .write_packet_strict(
             EtPacketType::InitialResponse as u8,
             &InitialResponse {
                 error: response_error,
@@ -381,7 +381,7 @@ fn run_jumphost(
     };
     let response = InitialResponse::decode(response_packet.payload()).ok();
     if connection
-        .write_packet(
+        .write_packet_strict(
             EtPacketType::InitialResponse as u8,
             response_packet.payload(),
         )

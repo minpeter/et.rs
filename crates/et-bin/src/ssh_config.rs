@@ -1,5 +1,3 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
-
 use crate::bootstrap::{validate_ssh_destination, InvocationCompletion, SshInvocation};
 use crate::deadline::Deadline;
 use crate::error::ClientError;
@@ -31,6 +29,7 @@ pub struct ResolvedSshConfig {
     pub user: Option<String>,
     pub local_forwards: Vec<PortForwardSourceRequest>,
     pub remote_forwards: Vec<PortForwardSourceRequest>,
+    pub exit_on_forward_failure: bool,
 }
 
 enum ForwardRecord {
@@ -78,6 +77,23 @@ fn parse_ssh_config(
 ) -> Result<ResolvedSshConfig, ClientError> {
     let text =
         std::str::from_utf8(stdout).map_err(|_| ClientError::SshConfigMalformed("UTF-8 output"))?;
+    let exit_on_forward_failure = text
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            fields
+                .next()
+                .is_some_and(|key| key.eq_ignore_ascii_case("exitonforwardfailure"))
+                .then(|| fields.next())
+                .flatten()
+        })
+        .map(|value| match value {
+            "yes" => Ok(true),
+            "no" => Ok(false),
+            _ => Err(ClientError::SshConfigMalformed("exitonforwardfailure")),
+        })
+        .transpose()?
+        .unwrap_or(false);
     let gateway_ports = text
         .lines()
         .find_map(|line| {
@@ -99,6 +115,18 @@ fn parse_ssh_config(
     let mut user = None;
     let mut local_forwards = Vec::new();
     let mut remote_forwards = Vec::new();
+    if parse_local_forwards {
+        for _ in unsupported_dynamic_forwards(text) {
+            if exit_on_forward_failure {
+                return Err(ClientError::Unsupported(
+                    "SSH forwarding request is unsupported while ExitOnForwardFailure is enabled",
+                ));
+            }
+            et_cli::logging::warn(
+                "SSH dynamicforward is unsupported by ET protocol v6; skipping forwarding row",
+            );
+        }
+    }
     for line in text.lines() {
         let mut fields = line.split_whitespace();
         match fields.next() {
@@ -108,22 +136,30 @@ fn parse_ssh_config(
             Some(key) if key.eq_ignore_ascii_case("user") => {
                 user = fields.next().map(str::to_string);
             }
-            Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("dynamicforward") => {
-                et_cli::logging::warn(
-                    "SSH dynamicforward is unsupported by ET protocol v6; skipping forwarding row",
-                );
-            }
+            Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("dynamicforward") => {}
             Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("localforward") => {
                 match parse_forward(fields, "localforward", policies)? {
                     ForwardRecord::Supported(forward) => local_forwards.push(forward),
-                    ForwardRecord::Unsupported(reason) => warn_unsupported("localforward", &reason),
+                    ForwardRecord::Unsupported(reason) => {
+                        if exit_on_forward_failure {
+                            return Err(ClientError::Unsupported(
+                                "SSH forwarding request is unsupported while ExitOnForwardFailure is enabled",
+                            ));
+                        }
+                        warn_unsupported("localforward", &reason);
+                    }
                 }
             }
             Some(key) if parse_remote_forwards && key.eq_ignore_ascii_case("remoteforward") => {
                 match parse_forward(fields, "remoteforward", policies)? {
                     ForwardRecord::Supported(forward) => remote_forwards.push(forward),
                     ForwardRecord::Unsupported(reason) => {
-                        warn_unsupported("remoteforward", &reason)
+                        if exit_on_forward_failure {
+                            return Err(ClientError::Unsupported(
+                                "SSH forwarding request is unsupported while ExitOnForwardFailure is enabled",
+                            ));
+                        }
+                        warn_unsupported("remoteforward", &reason);
                     }
                 }
             }
@@ -140,7 +176,39 @@ fn parse_ssh_config(
         user,
         local_forwards,
         remote_forwards,
+        exit_on_forward_failure,
     })
+}
+
+fn unsupported_dynamic_forwards(text: &str) -> Vec<&str> {
+    let mut dynamic: Vec<&str> = text
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            fields
+                .next()
+                .is_some_and(|key| key.eq_ignore_ascii_case("dynamicforward"))
+                .then(|| fields.next())
+                .flatten()
+        })
+        .collect();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let is_local = fields
+            .next()
+            .is_some_and(|key| key.eq_ignore_ascii_case("localforward"));
+        let source = fields.next();
+        let destination = fields.next();
+        if is_local && destination.is_some_and(|value| value.starts_with('/')) {
+            if let Some(index) = dynamic
+                .iter()
+                .position(|candidate| Some(*candidate) == source)
+            {
+                dynamic.remove(index);
+            }
+        }
+    }
+    dynamic
 }
 
 fn warn_unsupported(directive: &str, reason: &str) {
@@ -216,13 +284,6 @@ fn parse_forward<'a>(
             directive,
             reason: "invalid destination endpoint",
         })?;
-    if let (Some(host), Some(_)) = (destination.name.as_deref(), destination.port) {
-        if !is_representable_tcp_destination(host) {
-            return Ok(ForwardRecord::Unsupported(format!(
-                "destination host '{host}' is unsupported by ET protocol v6"
-            )));
-        }
-    }
     Ok(ForwardRecord::Supported(PortForwardSourceRequest {
         source: Some(source),
         destination: Some(destination),
@@ -239,16 +300,6 @@ fn endpoint_has_zero_port(value: &str) -> bool {
 
 fn is_relative_stream_path(value: &str) -> bool {
     !value.starts_with('/') && value.contains('/')
-}
-
-fn is_representable_tcp_destination(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<Ipv4Addr>()
-            .is_ok_and(|address| address == Ipv4Addr::LOCALHOST)
-        || host
-            .parse::<Ipv6Addr>()
-            .is_ok_and(|address| address == Ipv6Addr::LOCALHOST)
 }
 
 impl GatewayPorts {
@@ -320,15 +371,14 @@ fn normalize_tcp_source(
         (false, _, None) => "localhost".to_owned(),
         (false, _, Some(requested)) if requested == "*" || requested == "[*]" => String::new(),
         (false, _, Some(requested)) => requested,
-        (true, GatewayPorts::No, _) => "localhost".to_owned(),
-        (true, GatewayPorts::Yes, _) => String::new(),
-        (true, GatewayPorts::ClientSpecified, None) => "localhost".to_owned(),
-        (true, GatewayPorts::ClientSpecified, Some(requested))
+        (true, GatewayPorts::No | GatewayPorts::ClientSpecified, None) => "localhost".to_owned(),
+        (true, GatewayPorts::Yes, None) => String::new(),
+        (true, _, Some(requested))
             if requested.is_empty() || requested == "*" || requested == "[*]" =>
         {
             String::new()
         }
-        (true, GatewayPorts::ClientSpecified, Some(requested)) => requested,
+        (true, _, Some(requested)) => requested,
     };
     endpoint.name = Some(normalized);
     endpoint
@@ -425,8 +475,51 @@ mod tests {
                 user: Some("config-user".to_string()),
                 local_forwards: Vec::new(),
                 remote_forwards: Vec::new(),
+                exit_on_forward_failure: false,
             }
         );
+    }
+
+    #[test]
+    fn parses_effective_exit_on_forward_failure_policy() {
+        // Given / When
+        let nonfatal =
+            parse_ssh_config(b"hostname host\nexitonforwardfailure no\n", true, true).unwrap();
+        let strict =
+            parse_ssh_config(b"hostname host\nexitonforwardfailure yes\n", true, true).unwrap();
+
+        // Then
+        assert!(!nonfatal.exit_on_forward_failure);
+        assert!(strict.exit_on_forward_failure);
+    }
+
+    #[test]
+    fn strict_exit_policy_ignores_unix_destination_pseudo_dynamic_row() {
+        // Given / When
+        let resolved = parse_ssh_config(
+            b"hostname host\nexitonforwardfailure yes\n\
+              dynamicforward 15002\nlocalforward 15002 /tmp/destination.sock\n",
+            true,
+            true,
+        )
+        .unwrap();
+
+        // Then
+        assert_eq!(resolved.local_forwards.len(), 1);
+        assert!(resolved.exit_on_forward_failure);
+    }
+
+    #[test]
+    fn strict_exit_policy_rejects_unsupported_requested_rows() {
+        // Given / When
+        let result = parse_ssh_config(
+            b"hostname host\nexitonforwardfailure yes\ndynamicforward 1080\n",
+            true,
+            true,
+        );
+
+        // Then
+        assert!(matches!(result, Err(ClientError::Unsupported(_))));
     }
 
     #[test]
@@ -460,10 +553,10 @@ mod tests {
             resolved.local_forwards,
             [
                 request("localhost", Some(10022), "127.0.0.1", Some(22)),
-                request("localhost", Some(18080), "::1", Some(80)),
+                request("::1", Some(18080), "::1", Some(80)),
                 request("/tmp/local.sock", None, "/tmp/remote.sock", None),
                 request("/tmp/mixed.sock", None, "127.0.0.1", Some(8080)),
-                request("localhost", Some(9090), "/tmp/destination.sock", None,),
+                request("127.0.0.1", Some(9090), "/tmp/destination.sock", None,),
             ]
         );
         assert_eq!(
@@ -523,7 +616,7 @@ mod tests {
                 .iter()
                 .map(|request| request.source.as_ref().unwrap().name.as_deref().unwrap())
                 .collect::<Vec<_>>(),
-            ["localhost", "localhost", "localhost"]
+            ["", "", "127.0.0.2"]
         );
         assert_eq!(
             no.remote_forwards
@@ -539,7 +632,7 @@ mod tests {
                 .iter()
                 .map(|request| request.source.as_ref().unwrap().name.as_deref().unwrap())
                 .collect::<Vec<_>>(),
-            ["", "", ""]
+            ["", "", "127.0.0.2"]
         );
         assert_eq!(
             yes.remote_forwards
@@ -577,6 +670,127 @@ mod tests {
     }
 
     #[test]
+    fn local_forward_normalized_bind_shapes_preserve_explicit_precedence() {
+        for (gateway_ports, source, expected_name, expected_port) in [
+            ("yes", "15430", "", 15430),
+            ("yes", "localhost:15431", "localhost", 15431),
+            ("no", "*:15432", "", 15432),
+            ("no", "127.0.0.2:15433", "127.0.0.2", 15433),
+        ] {
+            // Given
+            let config = format!(
+                "hostname host\ngatewayports {gateway_ports}\n\
+                 localforward {source} localhost:9\n"
+            );
+
+            // When
+            let resolved = parse_ssh_config(config.as_bytes(), true, false).unwrap();
+
+            // Then
+            let source = resolved.local_forwards[0].source.as_ref().unwrap();
+            assert_eq!(source.name.as_deref(), Some(expected_name));
+            assert_eq!(source.port, Some(expected_port));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_forward_listener_exposure_matches_explicit_bind_precedence() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+
+        // GitHub macOS runners do not configure a second loopback alias. C001's
+        // real OpenSSH/runtime evidence proves external-interface exposure;
+        // this in-process reachability matrix is deterministic on Linux only.
+        let loopback_alias = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        for (gateway_ports, source, reachable, unreachable) in [
+            ("yes", "", loopback_alias, None),
+            (
+                "yes",
+                "localhost:",
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                Some(loopback_alias),
+            ),
+            ("no", "*:", loopback_alias, None),
+            (
+                "no",
+                "127.0.0.2:",
+                loopback_alias,
+                Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            ),
+        ] {
+            // Given
+            let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = reservation.local_addr().unwrap().port();
+            drop(reservation);
+            let config = format!(
+                "hostname host\ngatewayports {gateway_ports}\n\
+                 localforward {source}{port} localhost:9\n"
+            );
+            let resolved = parse_ssh_config(config.as_bytes(), true, false).unwrap();
+
+            // When
+            let forwarder =
+                et_net::forward::Forwarder::start(resolved.local_forwards.clone()).unwrap();
+
+            // Then
+            TcpStream::connect_timeout(&SocketAddr::new(reachable, port), Duration::from_secs(1))
+                .unwrap();
+            if let Some(unreachable) = unreachable {
+                assert!(TcpStream::connect_timeout(
+                    &SocketAddr::new(unreachable, port),
+                    Duration::from_millis(100),
+                )
+                .is_err());
+            }
+            forwarder.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn local_forward_preserves_explicit_bind_and_applies_gateway_ports_to_omitted_bind() {
+        for (gateway_ports, omitted) in [("no", "localhost"), ("yes", "")] {
+            // Given
+            let config = format!(
+                "hostname host\ngatewayports {gateway_ports}\n\
+                 localforward 15430 localhost:5432\n\
+                 localforward localhost:15431 localhost:5432\n\
+                 localforward 127.0.0.2:15432 localhost:5432\n\
+                 localforward *:15433 localhost:5432\n"
+            );
+
+            // When
+            let resolved = parse_ssh_config(config.as_bytes(), true, false).unwrap();
+
+            // Then
+            assert_eq!(
+                resolved
+                    .local_forwards
+                    .iter()
+                    .map(|request| request.source.as_ref().unwrap().name.as_deref().unwrap())
+                    .collect::<Vec<_>>(),
+                [omitted, "localhost", "127.0.0.2", ""]
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_forward_classifier_consumes_unix_destination_pseudo_rows_as_a_multiset() {
+        // Given
+        let config = "hostname host\n\
+            dynamicforward 15002\n\
+            localforward 15002 /tmp/tcp-destination.sock\n\
+            dynamicforward /tmp/unix-source.sock\n\
+            localforward /tmp/unix-source.sock /tmp/unix-destination.sock\n\
+            dynamicforward 1080\n";
+
+        // When
+        let unsupported = unsupported_dynamic_forwards(config);
+
+        // Then
+        assert_eq!(unsupported, ["1080"]);
+    }
+
+    #[test]
     fn ssh_config_hardening_clientspecified_distinguishes_omitted_and_empty_binds() {
         let resolved = parse_ssh_config(
             b"hostname host\ngatewayports clientspecified\n\
@@ -608,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn ssh_config_hardening_nonlocal_tcp_destinations_are_skipped_per_row() {
+    fn ssh_config_preserves_explicit_tcp_destination_names() {
         let resolved = parse_ssh_config(
             b"hostname host\n\
               localforward 15432 db.internal:5432\n\
@@ -623,11 +837,18 @@ mod tests {
 
         assert_eq!(
             resolved.local_forwards,
-            [request("localhost", Some(15434), "LocalHost", Some(5432))]
+            [
+                request("localhost", Some(15432), "db.internal", Some(5432)),
+                request("localhost", Some(15433), "127.0.0.2", Some(5432)),
+                request("localhost", Some(15434), "LocalHost", Some(5432)),
+            ]
         );
         assert_eq!(
             resolved.remote_forwards,
-            [request("localhost", Some(25433), "::1", Some(5432))]
+            [
+                request("localhost", Some(25432), "db.internal", Some(5432)),
+                request("localhost", Some(25433), "::1", Some(5432)),
+            ]
         );
     }
 

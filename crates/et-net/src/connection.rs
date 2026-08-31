@@ -80,6 +80,20 @@ impl Connection {
         }
     }
 
+    /// Write a handshake packet and require it to reach a live transport.
+    ///
+    /// Active-session writes intentionally soft-disconnect and buffer for
+    /// recovery. Handshake acknowledgements and responses have no established
+    /// session to recover, so buffering them must fail the initialization.
+    pub fn write_packet_strict(&mut self, header: u8, payload: &[u8]) -> Result<(), ConnError> {
+        self.write_packet(header, payload)?;
+        if self.connected() {
+            Ok(())
+        } else {
+            Err(ConnError::Io(io::ErrorKind::NotConnected.into()))
+        }
+    }
+
     /// Write a framed packet to a still-connected peer with a bounded timeout.
     ///
     /// Uses a write loop (not bare `write_all`) so each `write` is capped by

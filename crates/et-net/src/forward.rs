@@ -52,7 +52,7 @@ pub(crate) type Outbound = Result<Packet, ForwardError>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ForwardOrigin {
     Explicit,
-    SshConfig,
+    SshConfig { strict: bool },
     Reported(usize),
 }
 
@@ -69,10 +69,10 @@ impl ForwardSource {
         }
     }
 
-    pub const fn ssh_config(request: PortForwardSourceRequest) -> Self {
+    pub const fn ssh_config(request: PortForwardSourceRequest, strict: bool) -> Self {
         Self {
             request,
-            origin: ForwardOrigin::SshConfig,
+            origin: ForwardOrigin::SshConfig { strict },
         }
     }
 }
@@ -322,7 +322,7 @@ fn bind_sources(
             let resolved = endpoint.resolve_for_bind();
             let source = match (resolved, origin) {
                 (Ok(source), _) => source,
-                (Err(error), ForwardOrigin::SshConfig) => {
+                (Err(error), ForwardOrigin::SshConfig { strict: false }) => {
                     skipped.push(SkippedForward {
                         request: original,
                         error,
@@ -340,18 +340,19 @@ fn bind_sources(
                     });
                     continue;
                 }
-                (Err(error), ForwardOrigin::Explicit) => return Err(ForwardError::Io(error)),
+                (
+                    Err(error),
+                    ForwardOrigin::Explicit | ForwardOrigin::SshConfig { strict: true },
+                ) => return Err(ForwardError::Io(error)),
             };
             if owner.is_some() {
                 match &source {
                     ResolvedEndpoint::Tcp(addresses)
-                        if addresses
-                            .iter()
-                            .any(|address| address.ip().is_unspecified()) =>
+                        if addresses.iter().any(|address| !address.ip().is_loopback()) =>
                     {
                         return Err(ForwardError::Io(io::Error::new(
                             io::ErrorKind::PermissionDenied,
-                            "authenticated reverse TCP wildcard bind is not permitted",
+                            "authenticated reverse TCP bind must resolve only to loopback addresses",
                         )));
                     }
                     ResolvedEndpoint::Tcp(_) => {}
@@ -373,7 +374,7 @@ fn bind_sources(
         listener_count = listener_count
             .checked_add(additional_listeners)
             .ok_or(ForwardError::Protocol("reverse listener limit exceeded"))?;
-        if listener_count > MAX_SESSION_LISTENERS {
+        if owner.is_some() && listener_count > MAX_SESSION_LISTENERS {
             return Err(ForwardError::Protocol("reverse listener limit exceeded"));
         }
         plans.push(plan);
@@ -398,7 +399,7 @@ fn bind_sources(
                         });
                     }
                 }
-                (Err(error), ForwardOrigin::SshConfig) => {
+                (Err(error), ForwardOrigin::SshConfig { strict: false }) => {
                     skipped.push(SkippedForward {
                         request: original,
                         error,
@@ -414,21 +415,23 @@ fn bind_sources(
                         report_index: Some(index),
                     });
                 }
-                (Err(error), ForwardOrigin::Explicit) => return Err(ForwardError::Io(error)),
+                (
+                    Err(error),
+                    ForwardOrigin::Explicit | ForwardOrigin::SshConfig { strict: true },
+                ) => return Err(ForwardError::Io(error)),
             },
             #[cfg(unix)]
             PlannedSource::Environment {
                 variable,
                 destination,
             } => {
-                let path = create_forward_pipe(owner)?;
-                let source = Endpoint::Unix(path.clone()).resolve_for_bind()?;
+                let mut pipe = create_forward_pipe(owner)?;
+                let source = Endpoint::Unix(pipe.path.clone()).resolve_for_bind()?;
                 let mut listeners = source.bind_with_user(owner)?;
-                environment.push((variable, path.to_string_lossy().into_owned()));
+                environment.push((variable, pipe.path.to_string_lossy().into_owned()));
+                let directory = pipe.disarm()?;
                 for mut listener in listeners.drain(..) {
-                    if let Some(directory) = path.parent() {
-                        listener.also_remove_dir(directory.to_path_buf());
-                    }
+                    listener.also_remove_dir(directory.clone());
                     bound.push(BoundSource {
                         listener,
                         destination: destination.clone(),
@@ -443,7 +446,15 @@ fn bind_sources(
 /// Create the private directory for a named-pipe forward and return the
 /// socket path inside it (upstream `et_forward_sock_XXXXXX/sock`).
 #[cfg(unix)]
-fn create_forward_pipe(owner: Option<(u32, u32)>) -> Result<std::path::PathBuf, ForwardError> {
+fn create_forward_pipe(owner: Option<(u32, u32)>) -> Result<ForwardPipe, ForwardError> {
+    create_forward_pipe_with(owner, |_| Ok(()))
+}
+
+#[cfg(unix)]
+fn create_forward_pipe_with(
+    owner: Option<(u32, u32)>,
+    after_create: impl FnOnce(&std::path::Path) -> io::Result<()>,
+) -> Result<ForwardPipe, ForwardError> {
     use std::os::unix::fs::DirBuilderExt;
     let (suffix, _) = et_core::keys::gen_id_passkey();
     let directory = std::env::temp_dir().join(format!("et_forward_sock_{suffix}"));
@@ -451,10 +462,45 @@ fn create_forward_pipe(owner: Option<(u32, u32)>) -> Result<std::path::PathBuf, 
         .mode(0o700)
         .create(&directory)
         .map_err(ForwardError::Io)?;
-    if let Some((uid, gid)) = owner {
-        std::os::unix::fs::chown(&directory, Some(uid), Some(gid)).map_err(ForwardError::Io)?;
+    let pipe = ForwardPipe {
+        path: directory.join("sock"),
+        directory: Some(directory),
+    };
+    after_create(
+        pipe.directory
+            .as_deref()
+            .ok_or(ForwardError::Protocol("forward pipe directory missing"))?,
+    )
+    .map_err(ForwardError::Io)?;
+    if let (Some((uid, gid)), Some(directory)) = (owner, pipe.directory.as_deref()) {
+        std::os::unix::fs::chown(directory, Some(uid), Some(gid)).map_err(ForwardError::Io)?;
     }
-    Ok(directory.join("sock"))
+    Ok(pipe)
+}
+
+#[cfg(unix)]
+struct ForwardPipe {
+    path: std::path::PathBuf,
+    directory: Option<std::path::PathBuf>,
+}
+
+#[cfg(unix)]
+impl ForwardPipe {
+    fn disarm(&mut self) -> Result<std::path::PathBuf, ForwardError> {
+        self.directory
+            .take()
+            .ok_or(ForwardError::Protocol("forward pipe directory missing"))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ForwardPipe {
+    fn drop(&mut self) {
+        if let Some(directory) = self.directory.as_ref() {
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_dir(directory);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -475,4 +521,55 @@ pub fn is_forward_packet(header: u8) -> bool {
     header == TerminalPacketType::PortForwardDestinationRequest as u8
         || header == TerminalPacketType::PortForwardDestinationResponse as u8
         || header == TerminalPacketType::PortForwardData as u8
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn named_pipe_failure_after_directory_creation_cleans_and_retries() {
+        // Given
+        let created = RefCell::new(None);
+
+        // When
+        let error = match create_forward_pipe_with(None, |directory| {
+            *created.borrow_mut() = Some(directory.to_path_buf());
+            Err(io::Error::other("injected before chown"))
+        }) {
+            Ok(_) => panic!("injected directory failure succeeded"),
+            Err(error) => error,
+        };
+        let directory = created.into_inner().unwrap();
+
+        // Then
+        assert!(matches!(error, ForwardError::Io(_)));
+        assert!(!directory.exists());
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn named_pipe_post_bind_failure_cleans_socket_and_directory_then_retries() {
+        // Given
+        let pipe = create_forward_pipe(None).unwrap();
+        let directory = pipe.directory.as_ref().unwrap().clone();
+        let path = pipe.path.clone();
+        let listener = UnixListener::bind(&path).unwrap();
+
+        // When: a later bind/configuration step fails and ownership never transfers.
+        drop(pipe);
+
+        // Then
+        assert!(!path.exists());
+        assert!(!directory.exists());
+        drop(listener);
+        std::fs::create_dir(&directory).unwrap();
+        let retry = UnixListener::bind(&path).unwrap();
+        drop(retry);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&directory).unwrap();
+    }
 }

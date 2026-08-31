@@ -29,10 +29,14 @@ fn config_only_skip_report_continues_but_explicit_report_is_fatal() {
         InitialResponse {
             error: Some(report.clone()),
         },
-        &[ForwardOrigin::SshConfig],
+        &[ForwardOrigin::SshConfig { strict: false }],
     )
     .is_ok());
-    for origin in [ForwardOrigin::Explicit, ForwardOrigin::Reported(0)] {
+    for origin in [
+        ForwardOrigin::Explicit,
+        ForwardOrigin::SshConfig { strict: true },
+        ForwardOrigin::Reported(0),
+    ] {
         assert!(matches!(
             accept_initial_response(
                 InitialResponse {
@@ -41,7 +45,7 @@ fn config_only_skip_report_continues_but_explicit_report_is_fatal() {
                 &[origin],
             ),
             Err(ClientError::InitialResponseRejected(message))
-                if message == "explicit reverse forwarding row could not bind"
+                if message == "required reverse forwarding row could not bind"
         ));
     }
 }
@@ -53,7 +57,7 @@ fn old_server_error_and_malformed_reserved_report_fail_closed() {
             InitialResponse {
                 error: Some("port forwarding I/O: address in use".to_owned()),
             },
-            &[ForwardOrigin::SshConfig],
+            &[ForwardOrigin::SshConfig { strict: false }],
         ),
         Err(ClientError::InitialResponseRejected(_))
     ));
@@ -62,7 +66,7 @@ fn old_server_error_and_malformed_reserved_report_fail_closed() {
             InitialResponse {
                 error: Some("ETRS-RF-SKIP/2;0:B".to_owned()),
             },
-            &[ForwardOrigin::SshConfig],
+            &[ForwardOrigin::SshConfig { strict: false }],
         ),
         Err(ClientError::InitialResponseRejected(message))
             if message == "malformed reverse forwarding skip report"

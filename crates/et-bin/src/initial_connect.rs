@@ -190,10 +190,12 @@ fn accept_initial_response(
     };
     for row in &rows {
         match remote_origins[row.index] {
-            ForwardOrigin::SshConfig => {}
-            ForwardOrigin::Explicit | ForwardOrigin::Reported(_) => {
+            ForwardOrigin::SshConfig { strict: false } => {}
+            ForwardOrigin::Explicit
+            | ForwardOrigin::SshConfig { strict: true }
+            | ForwardOrigin::Reported(_) => {
                 return Err(ClientError::InitialResponseRejected(
-                    "explicit reverse forwarding row could not bind".to_owned(),
+                    "required reverse forwarding row could not bind".to_owned(),
                 ));
             }
         }

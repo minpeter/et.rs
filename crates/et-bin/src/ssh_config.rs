@@ -29,6 +29,7 @@ pub struct ResolvedSshConfig {
     pub user: Option<String>,
     pub local_forwards: Vec<PortForwardSourceRequest>,
     pub remote_forwards: Vec<PortForwardSourceRequest>,
+    pub exit_on_forward_failure: bool,
 }
 
 enum ForwardRecord {
@@ -76,6 +77,23 @@ fn parse_ssh_config(
 ) -> Result<ResolvedSshConfig, ClientError> {
     let text =
         std::str::from_utf8(stdout).map_err(|_| ClientError::SshConfigMalformed("UTF-8 output"))?;
+    let exit_on_forward_failure = text
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            fields
+                .next()
+                .is_some_and(|key| key.eq_ignore_ascii_case("exitonforwardfailure"))
+                .then(|| fields.next())
+                .flatten()
+        })
+        .map(|value| match value {
+            "yes" => Ok(true),
+            "no" => Ok(false),
+            _ => Err(ClientError::SshConfigMalformed("exitonforwardfailure")),
+        })
+        .transpose()?
+        .unwrap_or(false);
     let gateway_ports = text
         .lines()
         .find_map(|line| {
@@ -99,6 +117,11 @@ fn parse_ssh_config(
     let mut remote_forwards = Vec::new();
     if parse_local_forwards {
         for _ in unsupported_dynamic_forwards(text) {
+            if exit_on_forward_failure {
+                return Err(ClientError::Unsupported(
+                    "SSH forwarding request is unsupported while ExitOnForwardFailure is enabled",
+                ));
+            }
             et_cli::logging::warn(
                 "SSH dynamicforward is unsupported by ET protocol v6; skipping forwarding row",
             );
@@ -117,14 +140,26 @@ fn parse_ssh_config(
             Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("localforward") => {
                 match parse_forward(fields, "localforward", policies)? {
                     ForwardRecord::Supported(forward) => local_forwards.push(forward),
-                    ForwardRecord::Unsupported(reason) => warn_unsupported("localforward", &reason),
+                    ForwardRecord::Unsupported(reason) => {
+                        if exit_on_forward_failure {
+                            return Err(ClientError::Unsupported(
+                                "SSH forwarding request is unsupported while ExitOnForwardFailure is enabled",
+                            ));
+                        }
+                        warn_unsupported("localforward", &reason);
+                    }
                 }
             }
             Some(key) if parse_remote_forwards && key.eq_ignore_ascii_case("remoteforward") => {
                 match parse_forward(fields, "remoteforward", policies)? {
                     ForwardRecord::Supported(forward) => remote_forwards.push(forward),
                     ForwardRecord::Unsupported(reason) => {
-                        warn_unsupported("remoteforward", &reason)
+                        if exit_on_forward_failure {
+                            return Err(ClientError::Unsupported(
+                                "SSH forwarding request is unsupported while ExitOnForwardFailure is enabled",
+                            ));
+                        }
+                        warn_unsupported("remoteforward", &reason);
                     }
                 }
             }
@@ -141,6 +176,7 @@ fn parse_ssh_config(
         user,
         local_forwards,
         remote_forwards,
+        exit_on_forward_failure,
     })
 }
 
@@ -439,8 +475,51 @@ mod tests {
                 user: Some("config-user".to_string()),
                 local_forwards: Vec::new(),
                 remote_forwards: Vec::new(),
+                exit_on_forward_failure: false,
             }
         );
+    }
+
+    #[test]
+    fn parses_effective_exit_on_forward_failure_policy() {
+        // Given / When
+        let nonfatal =
+            parse_ssh_config(b"hostname host\nexitonforwardfailure no\n", true, true).unwrap();
+        let strict =
+            parse_ssh_config(b"hostname host\nexitonforwardfailure yes\n", true, true).unwrap();
+
+        // Then
+        assert!(!nonfatal.exit_on_forward_failure);
+        assert!(strict.exit_on_forward_failure);
+    }
+
+    #[test]
+    fn strict_exit_policy_ignores_unix_destination_pseudo_dynamic_row() {
+        // Given / When
+        let resolved = parse_ssh_config(
+            b"hostname host\nexitonforwardfailure yes\n\
+              dynamicforward 15002\nlocalforward 15002 /tmp/destination.sock\n",
+            true,
+            true,
+        )
+        .unwrap();
+
+        // Then
+        assert_eq!(resolved.local_forwards.len(), 1);
+        assert!(resolved.exit_on_forward_failure);
+    }
+
+    #[test]
+    fn strict_exit_policy_rejects_unsupported_requested_rows() {
+        // Given / When
+        let result = parse_ssh_config(
+            b"hostname host\nexitonforwardfailure yes\ndynamicforward 1080\n",
+            true,
+            true,
+        );
+
+        // Then
+        assert!(matches!(result, Err(ClientError::Unsupported(_))));
     }
 
     #[test]

@@ -52,7 +52,7 @@ pub(crate) type Outbound = Result<Packet, ForwardError>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ForwardOrigin {
     Explicit,
-    SshConfig,
+    SshConfig { strict: bool },
     Reported(usize),
 }
 
@@ -69,10 +69,10 @@ impl ForwardSource {
         }
     }
 
-    pub const fn ssh_config(request: PortForwardSourceRequest) -> Self {
+    pub const fn ssh_config(request: PortForwardSourceRequest, strict: bool) -> Self {
         Self {
             request,
-            origin: ForwardOrigin::SshConfig,
+            origin: ForwardOrigin::SshConfig { strict },
         }
     }
 }
@@ -322,7 +322,7 @@ fn bind_sources(
             let resolved = endpoint.resolve_for_bind();
             let source = match (resolved, origin) {
                 (Ok(source), _) => source,
-                (Err(error), ForwardOrigin::SshConfig) => {
+                (Err(error), ForwardOrigin::SshConfig { strict: false }) => {
                     skipped.push(SkippedForward {
                         request: original,
                         error,
@@ -340,7 +340,10 @@ fn bind_sources(
                     });
                     continue;
                 }
-                (Err(error), ForwardOrigin::Explicit) => return Err(ForwardError::Io(error)),
+                (
+                    Err(error),
+                    ForwardOrigin::Explicit | ForwardOrigin::SshConfig { strict: true },
+                ) => return Err(ForwardError::Io(error)),
             };
             if owner.is_some() {
                 match &source {
@@ -396,7 +399,7 @@ fn bind_sources(
                         });
                     }
                 }
-                (Err(error), ForwardOrigin::SshConfig) => {
+                (Err(error), ForwardOrigin::SshConfig { strict: false }) => {
                     skipped.push(SkippedForward {
                         request: original,
                         error,
@@ -412,7 +415,10 @@ fn bind_sources(
                         report_index: Some(index),
                     });
                 }
-                (Err(error), ForwardOrigin::Explicit) => return Err(ForwardError::Io(error)),
+                (
+                    Err(error),
+                    ForwardOrigin::Explicit | ForwardOrigin::SshConfig { strict: true },
+                ) => return Err(ForwardError::Io(error)),
             },
             #[cfg(unix)]
             PlannedSource::Environment {

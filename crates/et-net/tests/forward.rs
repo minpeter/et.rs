@@ -147,6 +147,67 @@ fn try_receive_reports_backpressure_and_outbound_drain_recovers() {
 
 #[cfg(unix)]
 #[test]
+fn imported_local_bind_failure_obeys_strict_policy_transactionally() {
+    // Given
+    struct RemoveDir(std::path::PathBuf);
+    impl Drop for RemoveDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let directory = std::env::temp_dir().join(format!("et-fp-{}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    let _cleanup = RemoveDir(directory.clone());
+    let usable_path = directory.join("usable.sock");
+    let occupied_path = directory.join("occupied.sock");
+    let occupied = std::os::unix::net::UnixListener::bind(&occupied_path).unwrap();
+    let imported = |path: &std::path::Path, strict| ForwardSource {
+        request: PortForwardSourceRequest {
+            source: Some(SocketEndpoint {
+                name: Some(path.to_string_lossy().into_owned()),
+                port: None,
+            }),
+            destination: Some(SocketEndpoint {
+                name: Some("/tmp/destination.sock".to_owned()),
+                port: None,
+            }),
+            environmentvariable: None,
+        },
+        origin: ForwardOrigin::SshConfig { strict },
+    };
+
+    // When: nonfatal import contains one occupied row.
+    let (forwarder, skipped) = Forwarder::start_with_origins(vec![
+        imported(&usable_path, false),
+        imported(&occupied_path, false),
+    ])
+    .unwrap();
+
+    // Then: one warning record remains and the usable sibling stays bound.
+    assert_eq!(skipped.len(), 1);
+    assert!(usable_path.exists());
+    forwarder.shutdown().unwrap();
+
+    // When: strict import contains the same occupied row after a usable sibling.
+    let error = match Forwarder::start_with_origins(vec![
+        imported(&usable_path, true),
+        imported(&occupied_path, true),
+    ]) {
+        Ok((forwarder, _)) => {
+            forwarder.shutdown().unwrap();
+            panic!("strict imported bind failure was downgraded")
+        }
+        Err(error) => error,
+    };
+
+    // Then: strict setup fails and rolls the provisional sibling back.
+    assert!(matches!(error, ForwardError::Io(_)));
+    assert!(!usable_path.exists());
+    drop(occupied);
+}
+
+#[cfg(unix)]
+#[test]
 fn reverse_tcp_bind_uses_session_identity() {
     let root = rustix::process::geteuid().as_raw() == 0;
     let source_port = if root { 1 } else { reserve_port() };
@@ -261,7 +322,7 @@ fn imported_local_wildcard_is_externally_reachable_while_loopback_is_not() {
     let request = request_on("", wildcard_port, 1);
     let (wildcard, skipped) = Forwarder::start_with_origins(vec![ForwardSource {
         request,
-        origin: ForwardOrigin::SshConfig,
+        origin: ForwardOrigin::SshConfig { strict: false },
     }])
     .unwrap();
     assert!(skipped.is_empty());

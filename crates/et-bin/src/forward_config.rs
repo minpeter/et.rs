@@ -92,8 +92,10 @@ impl ForwardConfig {
         for request in &resolved.local_forwards {
             if !local_requests.contains(request) {
                 local_requests.push(request.clone());
-                self.local_sources
-                    .push(ForwardSource::ssh_config(request.clone()));
+                self.local_sources.push(ForwardSource::ssh_config(
+                    request.clone(),
+                    resolved.exit_on_forward_failure,
+                ));
             }
         }
 
@@ -116,7 +118,9 @@ impl ForwardConfig {
             if !remote_requests.contains(request) {
                 remote_requests.push(request.clone());
                 deduplicated.push(request.clone());
-                origins.push(et_net::forward::ForwardOrigin::SshConfig);
+                origins.push(et_net::forward::ForwardOrigin::SshConfig {
+                    strict: resolved.exit_on_forward_failure,
+                });
             }
         }
         self.initial_payload.reversetunnels = deduplicated;

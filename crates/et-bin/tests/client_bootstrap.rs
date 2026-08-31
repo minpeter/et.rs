@@ -232,6 +232,45 @@ fn ssh_config_forwards_apply_on_the_unspecified_axis() {
 }
 
 #[test]
+fn ssh_config_hardening_nonlocal_destinations_warn_and_other_rows_continue() {
+    let (port, server) = initial_payload_server_with_error(Some("stop after payload"));
+    let fake = FakeSsh::new();
+    let config = concat!(
+        "host server-alias\n",
+        "user config-user\n",
+        "hostname 127.0.0.1\n",
+        "localforward 15432 db.internal:5432\n",
+        "localforward 15433 127.0.0.2:5432\n",
+        "remoteforward 25432 db.internal:5432\n",
+        "remoteforward 25433 [::1]:5432\n",
+    );
+
+    let output = fake
+        .command(config, VALID_MARKER, 0, "")
+        .args(["--logtostdout", "-N", &format!("server-alias:{port}")])
+        .output()
+        .unwrap();
+    let payload = server.join().unwrap();
+
+    assert_ne!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(payload.reversetunnels.len(), 1);
+    assert_eq!(
+        payload.reversetunnels[0]
+            .source
+            .as_ref()
+            .and_then(|source| source.port),
+        Some(25433)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.contains("WARNING"))
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn ssh_config_malformed_forward_is_rejected() {
     let fake = FakeSsh::new();
     let config = concat!(

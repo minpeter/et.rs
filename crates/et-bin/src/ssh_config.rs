@@ -1,3 +1,5 @@
+use std::net::{Ipv4Addr, Ipv6Addr};
+
 use crate::bootstrap::{validate_ssh_destination, InvocationCompletion, SshInvocation};
 use crate::deadline::Deadline;
 use crate::error::ClientError;
@@ -66,10 +68,14 @@ fn parse_ssh_config(
                 user = fields.next().map(str::to_string);
             }
             Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("localforward") => {
-                local_forwards.push(parse_forward(fields, "localforward")?);
+                if let Some(forward) = parse_forward(fields, "localforward")? {
+                    local_forwards.push(forward);
+                }
             }
             Some(key) if parse_remote_forwards && key.eq_ignore_ascii_case("remoteforward") => {
-                remote_forwards.push(parse_forward(fields, "remoteforward")?);
+                if let Some(forward) = parse_forward(fields, "remoteforward")? {
+                    remote_forwards.push(forward);
+                }
             }
             _ => {}
         }
@@ -90,7 +96,7 @@ fn parse_ssh_config(
 fn parse_forward<'a>(
     fields: impl Iterator<Item = &'a str>,
     directive: &'static str,
-) -> Result<PortForwardSourceRequest, ClientError> {
+) -> Result<Option<PortForwardSourceRequest>, ClientError> {
     let fields: Vec<&str> = fields.collect();
     let [source, destination] = fields.as_slice() else {
         return Err(ClientError::SshConfigMalformedForward {
@@ -107,11 +113,29 @@ fn parse_forward<'a>(
             directive,
             reason: "invalid destination endpoint",
         })?;
-    Ok(PortForwardSourceRequest {
+    if let (Some(host), Some(_)) = (destination.name.as_deref(), destination.port) {
+        if !is_representable_tcp_destination(host) {
+            et_cli::logging::warn(format!(
+                "SSH {directive} destination host '{host}' is unsupported by ET protocol v6; skipping forwarding row"
+            ));
+            return Ok(None);
+        }
+    }
+    Ok(Some(PortForwardSourceRequest {
         source: Some(source),
         destination: Some(destination),
         environmentvariable: None,
-    })
+    }))
+}
+
+fn is_representable_tcp_destination(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<Ipv4Addr>()
+            .is_ok_and(|address| address.is_loopback())
+        || host
+            .parse::<Ipv6Addr>()
+            .is_ok_and(|address| address == Ipv6Addr::LOCALHOST)
 }
 
 fn parse_source_endpoint(value: &str) -> Option<SocketEndpoint> {
@@ -262,6 +286,33 @@ mod tests {
         assert_eq!(
             resolved.remote_forwards,
             [request("localhost", Some(1492), "127.0.0.1", Some(1492))]
+        );
+    }
+
+    #[test]
+    fn ssh_config_hardening_nonlocal_tcp_destinations_are_skipped_per_row() {
+        let resolved = parse_ssh_config(
+            b"hostname host\n\
+              localforward 15432 db.internal:5432\n\
+              localforward 15433 127.0.0.2:5432\n\
+              localforward 15434 LocalHost:5432\n\
+              remoteforward 25432 db.internal:5432\n\
+              remoteforward 25433 [::1]:5432\n",
+            true,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.local_forwards,
+            [
+                request("localhost", Some(15433), "127.0.0.2", Some(5432)),
+                request("localhost", Some(15434), "LocalHost", Some(5432)),
+            ]
+        );
+        assert_eq!(
+            resolved.remote_forwards,
+            [request("localhost", Some(25433), "::1", Some(5432))]
         );
     }
 

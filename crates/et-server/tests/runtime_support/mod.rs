@@ -76,8 +76,10 @@ impl TestRuntime {
             user.encode_to_vec(),
         );
         write_local_packet(&mut stream, &packet).unwrap();
-        let acknowledgement = read_local_packet(&mut stream).unwrap();
-        parse_status(&acknowledgement, REGISTRATION_STATUS).unwrap();
+        if startup_ack {
+            let acknowledgement = read_local_packet(&mut stream).unwrap();
+            parse_status(&acknowledgement, REGISTRATION_STATUS).unwrap();
+        }
         self.handle.wait_registered(id, TIMEOUT).unwrap();
         stream
     }

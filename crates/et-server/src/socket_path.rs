@@ -53,6 +53,25 @@ impl OwnedRouterListener {
             path: selected.path().to_path_buf(),
             source,
         })?;
+        let capability = et_net::local::capability_path(selected.path());
+        match fs::remove_file(&capability) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(PathError::Io {
+                    operation: "remove stale router capability",
+                    path: capability,
+                    source,
+                });
+            }
+        }
+        et_net::local::write_registration_ack_capability(selected.path()).map_err(|source| {
+            PathError::Io {
+                operation: "write router capability",
+                path: et_net::local::capability_path(selected.path()),
+                source,
+            }
+        })?;
         owned
             .listener
             .set_nonblocking(true)
@@ -83,6 +102,7 @@ impl Drop for OwnedRouterListener {
             && metadata.uid() == rustix::process::geteuid().as_raw()
         {
             let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(et_net::local::capability_path(&self.path));
         }
     }
 }

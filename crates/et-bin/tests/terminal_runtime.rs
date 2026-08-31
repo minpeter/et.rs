@@ -32,7 +32,7 @@ fn bootstrap_parent_reports_marker_and_leaves_registered_session_running() {
     let fixture = Fixture::new("bootstrap-parent");
     let mut parent = fixture.spawn_parent();
     write_credentials(&mut parent);
-    let (mut router, _) = fixture.listener.accept().unwrap();
+    let mut router = fixture.accept();
     router.set_read_timeout(Some(TIMEOUT)).unwrap();
     let registration = read_local_packet(&mut router).unwrap();
     assert_eq!(
@@ -87,6 +87,33 @@ fn bootstrap_parent_reports_marker_and_leaves_registered_session_running() {
     }
 }
 
+#[test]
+fn registration_delayed_beyond_ten_seconds_still_completes_before_absolute_deadline() {
+    let fixture = Fixture::new("delayed-registration");
+    let mut parent = fixture.spawn_parent();
+    write_credentials(&mut parent);
+    let mut router = fixture.accept();
+    let _registration = read_local_packet(&mut router).unwrap();
+    let (marker_tx, marker_rx) = std::sync::mpsc::sync_channel(1);
+    let stdout = parent.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
+        let _ = marker_tx.send(result);
+    });
+    assert!(matches!(
+        marker_rx.recv_timeout(Duration::from_secs(11)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    acknowledge_registration(&mut router);
+    assert_eq!(
+        marker_rx.recv_timeout(TIMEOUT).unwrap().unwrap(),
+        format!("IDPASSKEY:{ID}/{KEY}\n")
+    );
+    assert!(parent.wait_timeout(TIMEOUT).unwrap().unwrap().success());
+    drop(router);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn detached_terminal_is_session_leader_and_closes_inherited_descriptors() {
@@ -103,7 +130,7 @@ fn detached_terminal_is_session_leader_and_closes_inherited_descriptors() {
     let fixture = Fixture::new("session-leader");
     let mut parent = fixture.spawn_parent();
     write_credentials(&mut parent);
-    let (mut router, _) = fixture.listener.accept().unwrap();
+    let mut router = fixture.accept();
     let credentials = getsockopt(&router, PeerCredentials).unwrap();
     let pid = credentials.pid();
     let _registration = read_local_packet(&mut router).unwrap();
@@ -132,11 +159,42 @@ fn detached_terminal_is_session_leader_and_closes_inherited_descriptors() {
 }
 
 #[test]
+fn new_terminal_uses_legacy_sequence_with_old_router() {
+    let fixture = Fixture::new_legacy("old-router-new-terminal");
+    let mut child = fixture.spawn();
+    write_credentials(&mut child);
+    let mut router = fixture.accept();
+    router.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let registration = read_local_packet(&mut router).unwrap();
+    let user = TerminalUserInfo::decode(registration.payload()).unwrap();
+    assert_eq!(user.fd, None);
+    fixture.wait_ready();
+    send(
+        &mut router,
+        TerminalPacketType::TerminalInit,
+        &TermInit {
+            environmentnames: Vec::new(),
+            environmentvalues: Vec::new(),
+        },
+    );
+    send(
+        &mut router,
+        TerminalPacketType::TerminalBuffer,
+        &TerminalBuffer {
+            buffer: Some(b"printf 'MIXED-OLD-ROUTER\\n'; exit\n".to_vec()),
+        },
+    );
+    let output = collect_until(&mut router, |output| contains(output, b"MIXED-OLD-ROUTER"));
+    assert!(contains(&output, b"MIXED-OLD-ROUTER"));
+    assert!(child.wait_timeout(TIMEOUT).unwrap().unwrap().success());
+}
+
+#[test]
 fn real_terminal_registers_runs_shell_and_resizes_pty() {
     let fixture = Fixture::new("shell");
     let mut child = fixture.spawn();
     write_credentials(&mut child);
-    let (mut router, _) = fixture.listener.accept().unwrap();
+    let mut router = fixture.accept();
     router.set_read_timeout(Some(TIMEOUT)).unwrap();
     let registration = read_local_packet(&mut router).unwrap();
     acknowledge_registration(&mut router);
@@ -253,7 +311,7 @@ fn router_disconnect_terminates_the_shell() {
     let fixture = Fixture::new("disconnect");
     let mut child = fixture.spawn();
     write_credentials(&mut child);
-    let (mut router, _) = fixture.listener.accept().unwrap();
+    let mut router = fixture.accept();
     let _ = read_local_packet(&mut router).unwrap();
     acknowledge_registration(&mut router);
     fixture.wait_ready();
@@ -277,7 +335,7 @@ fn real_terminal_starts_login_shell_and_loads_profile_color() {
     let shell = fixture.login_probe_shell();
     let mut child = fixture.spawn_with_shell(shell.to_str().unwrap());
     write_credentials(&mut child);
-    let (mut router, _) = fixture.listener.accept().unwrap();
+    let mut router = fixture.accept();
     router.set_read_timeout(Some(TIMEOUT)).unwrap();
     let _ = read_local_packet(&mut router).unwrap();
     acknowledge_registration(&mut router);
@@ -321,7 +379,7 @@ fn real_terminal_login_shell_preserves_term_without_colorterm() {
     let shell = fixture.login_probe_shell();
     let mut child = fixture.spawn_with_shell(shell.to_str().unwrap());
     write_credentials(&mut child);
-    let (mut router, _) = fixture.listener.accept().unwrap();
+    let mut router = fixture.accept();
     router.set_read_timeout(Some(TIMEOUT)).unwrap();
     let _ = read_local_packet(&mut router).unwrap();
     acknowledge_registration(&mut router);

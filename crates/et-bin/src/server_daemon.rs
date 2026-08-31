@@ -6,10 +6,10 @@
 //! detached child: the parent returns immediately (exit 0), and the child
 //! becomes a session leader before serving.
 
+use crate::detach::Stdio;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 #[cfg(unix)]
 pub const DEFAULT_PID_FILE: &str = "/var/run/etserver.pid";

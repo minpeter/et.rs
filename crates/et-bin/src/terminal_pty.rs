@@ -1,5 +1,5 @@
 use std::io::{self, Read, Write};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use et_core::packet::Packet;
@@ -93,13 +93,25 @@ where
             return Err(format!("could not start PTY output worker: {error}"));
         }
     };
+    let child_owner = Arc::new(Mutex::new(Some(child)));
+    let waiter_owner = child_owner.clone();
     let child_worker = match thread::Builder::new()
         .name("et-pty-child".to_owned())
         .spawn(move || {
-            let result = child
-                .wait()
-                .map(|status| status.exit_code())
-                .map_err(|error| format!("could not wait for terminal shell: {error}"));
+            let result = waiter_owner
+                .lock()
+                .map_err(|_| "terminal shell owner is unavailable".to_owned())
+                .and_then(|mut owner| {
+                    owner
+                        .take()
+                        .ok_or_else(|| "terminal shell is not owned".to_owned())
+                })
+                .and_then(|mut child| {
+                    child
+                        .wait()
+                        .map(|status| status.exit_code())
+                        .map_err(|error| format!("could not wait for terminal shell: {error}"))
+                });
             let _ = events_tx.send(WorkerEvent::Child(result));
             signal(wake_writer);
         }) {
@@ -107,6 +119,11 @@ where
         Err(error) => {
             kill_process_group(child_pid);
             let _ = killer.kill();
+            if let Ok(mut owner) = child_owner.lock() {
+                if let Some(mut child) = owner.take() {
+                    let _ = child.wait();
+                }
+            }
             drop(pty_writer);
             let _ = output_worker.join();
             return Err(format!("could not start PTY child worker: {error}"));

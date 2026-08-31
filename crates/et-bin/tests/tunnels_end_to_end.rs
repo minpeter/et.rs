@@ -16,7 +16,9 @@ use reconnect_stack::{mkfifo, shell_quote, Stack};
 use tunnel_support::SingleCutProxy;
 use wait_timeout::ChildExt;
 
-const TIMEOUT: Duration = Duration::from_secs(10);
+// Process creation can legitimately exceed ten seconds under the load this
+// suite exercises; every wait remains bounded by the exact FIFO/process event.
+const TIMEOUT: Duration = Duration::from_secs(30);
 
 #[test]
 fn ssh_config_local_tunnel_relays_while_remote_forward_is_omitted() {

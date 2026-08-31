@@ -4,6 +4,7 @@ mod runtime_support;
 mod support;
 
 use std::thread;
+use std::time::Duration;
 
 use et_core::keys::passkey_to_key;
 use et_core::proto::{ConnectStatus, TerminalPacketType};
@@ -75,6 +76,51 @@ fn successful_initial_response_waits_for_terminal_startup_acknowledgement() {
         .handle
         .wait_for_state(ID_A, SessionState::Active, TIMEOUT)
         .unwrap();
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
+fn stalled_startup_does_not_block_another_registration() {
+    let mut server = TestRuntime::start();
+    let mut terminal_a = server.register_with_capability(ID_A, KEY_A, true);
+    let (stream, _) = server.handshake(ID_A);
+    let key = passkey_to_key(KEY_A).unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = done_tx.send(initialize(stream, &key, default_payload()).1);
+    });
+    let init = read_local_packet(&mut terminal_a).unwrap();
+    assert_eq!(init.header(), TerminalPacketType::TerminalInit as u8);
+
+    let _terminal_b = server.register_with_capability(ID_B, KEY_B, true);
+    assert!(server.handle.wait_registered(ID_B, TIMEOUT).is_ok());
+    assert!(matches!(
+        done_rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    write_local_packet(&mut terminal_a, &status_packet(STARTUP_STATUS, Ok(()))).unwrap();
+    assert_eq!(done_rx.recv_timeout(TIMEOUT).unwrap().error, None);
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
+fn server_startup_deadline_precedes_client_socket_timeout() {
+    let mut server = TestRuntime::start();
+    let mut terminal = server.register_with_capability(ID_A, KEY_A, true);
+    let (stream, _) = server.handshake(ID_A);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let key = passkey_to_key(KEY_A).unwrap();
+    let started = std::time::Instant::now();
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = done_tx.send(initialize(stream, &key, default_payload()).1);
+    });
+    let _init = read_local_packet(&mut terminal).unwrap();
+    let response = done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(response.error.unwrap().contains("startup acknowledgement"));
+    assert!(started.elapsed() < Duration::from_secs(10));
     server.runtime.shutdown().unwrap();
 }
 

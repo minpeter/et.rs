@@ -46,7 +46,11 @@ impl OwnedRouterListener {
             source,
         })?;
         let token = et_net::local::new_token();
-        fs::write(&path, format!("{address}\n{token}\n")).map_err(|source| PathError::Io {
+        fs::write(
+            &path,
+            format!("{address}\n{token}\net-registration-ack-v1\n"),
+        )
+        .map_err(|source| PathError::Io {
             operation: "write router endpoint file",
             path: path.clone(),
             source,

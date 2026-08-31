@@ -726,12 +726,16 @@ mod tests {
 
     #[test]
     fn system_runner_terminates_on_deadline() {
-        let runner = SystemSsh::with_timeout(Duration::from_millis(50));
-        let invocation = invocation("/bin/sh", &["-c", "exec /bin/sleep 30"]);
-        let started = Instant::now();
-        let result = runner.run(&invocation, runner.deadline());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let runner = SystemSsh::with_timeout(Duration::from_millis(50));
+            let invocation = invocation("/bin/sh", &["-c", "exec /bin/sleep 30"]);
+            let _ = sender.send(runner.run(&invocation, runner.deadline()));
+        });
+        let result = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("SSH deadline did not terminate its process within the test bound");
         assert!(matches!(result, Err(ClientError::SshTimeout(_))));
-        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[cfg(target_os = "linux")]

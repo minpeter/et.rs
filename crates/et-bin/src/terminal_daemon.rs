@@ -1,13 +1,16 @@
 //! Detached per-session terminal startup over an inherited, bounded status pipe.
 //!
 //! The bootstrap parent owns the child until it receives a structured
-//! `Registered` status. Every earlier return kills and reaps the child. The
+//! `Registered` status. That phase means credentials are committed and the
+//! client may connect; full PTY/relay readiness is acknowledged separately by
+//! `STARTUP_STATUS` before the server sends successful `INITIAL_RESPONSE`.
+//! Every earlier return kills and reaps the child. The
 //! anonymous stdout pipe is inherited across exec, unlike the old discoverable
 //! readiness listener, so unrelated local processes cannot forge readiness.
 
+use crate::detach::{Child, ChildStdout, Stdio};
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Child, Stdio};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -15,6 +18,10 @@ use std::time::Duration;
 use crate::terminal_credentials::CredentialInput;
 
 pub(crate) const READY_TIMEOUT: Duration = Duration::from_secs(45);
+
+pub(crate) const fn registration_timeout() -> Duration {
+    READY_TIMEOUT
+}
 const STATUS_MAGIC: &[u8; 4] = b"ETS1";
 const STATUS_REGISTERED: u8 = 1;
 const STATUS_FAILED: u8 = 2;
@@ -71,12 +78,7 @@ pub fn spawn_with_args(
         .take()
         .ok_or_else(|| "terminal child status pipe was not created".to_owned())?;
     let (sender, receiver) = mpsc::sync_channel(1);
-    let worker = std::thread::Builder::new()
-        .name("et-terminal-status".to_owned())
-        .spawn(move || {
-            let _ = sender.send(read_status(stdout));
-        })
-        .map_err(|error| format!("could not start terminal status worker: {error}"))?;
+    let worker = spawn_status_worker(stdout, sender, false)?;
     startup.worker = Some(worker);
 
     let result = receiver
@@ -87,6 +89,22 @@ pub fn spawn_with_args(
         startup.commit();
     }
     result
+}
+
+fn spawn_status_worker(
+    stdout: ChildStdout,
+    sender: mpsc::SyncSender<Result<(), String>>,
+    force_failure: bool,
+) -> Result<JoinHandle<()>, String> {
+    if force_failure {
+        return Err("could not start terminal status worker: injected failure".to_owned());
+    }
+    std::thread::Builder::new()
+        .name("et-terminal-status".to_owned())
+        .spawn(move || {
+            let _ = sender.send(read_status(stdout));
+        })
+        .map_err(|error| format!("could not start terminal status worker: {error}"))
 }
 
 /// Report committed router registration over the inherited stdout pipe.
@@ -241,6 +259,23 @@ mod tests {
             .unwrap();
         let pid = i32::try_from(child.id()).unwrap();
         drop(StartupChild::new(child));
+        assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn waiter_spawn_failure_leaves_guard_owning_and_reaping_child() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let guard = StartupChild::new(child);
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        assert!(spawn_status_worker(stdout, sender, true).is_err());
+        drop(guard);
         assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err());
     }
 

@@ -38,6 +38,8 @@ signal-hook = "0.3.18"
 [target.'cfg(windows)'.dependencies]
 # Ctrl+C / console shutdown signalling, the Windows analogue of SIGINT/SIGTERM.
 ctrlc = "3.5"
+# Safe CreateProcessW wrapper with an explicit inherited-handle allowlist.
+windows-spawn = "0.1.0"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 nix = { version = "0.31.3", default-features = false, features = ["fs", "poll"] }

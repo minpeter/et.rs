@@ -21,7 +21,13 @@
 //! the user's files can register a terminal.
 
 use std::io;
+#[cfg(unix)]
+use std::io::Write;
 use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
+
+const REGISTRATION_ACK_CAPABILITY: &str = "et-registration-ack-v1";
 
 /// Stream type used for local server/terminal IPC.
 #[cfg(unix)]
@@ -60,6 +66,58 @@ pub fn wake_pair() -> io::Result<(LocalStream, LocalStream)> {
         writer.set_nodelay(true)?;
         Ok((reader, writer))
     }
+}
+
+/// Sidecar used to negotiate the local-only registration acknowledgement.
+/// It does not alter the protocol-v6 network wire format.
+#[cfg(unix)]
+pub fn capability_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_owned();
+    value.push(".cap");
+    PathBuf::from(value)
+}
+
+/// Whether the selected router advertises registration acknowledgements.
+pub fn supports_registration_ack(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return false;
+        };
+        std::fs::read_to_string(capability_path(path)).is_ok_and(|value| {
+            let mut fields = value.split_whitespace();
+            fields.next() == Some(REGISTRATION_ACK_CAPABILITY)
+                && fields.next().and_then(|value| value.parse::<u64>().ok()) == Some(metadata.dev())
+                && fields.next().and_then(|value| value.parse::<u64>().ok()) == Some(metadata.ino())
+                && fields.next().is_none()
+        })
+    }
+    #[cfg(windows)]
+    {
+        std::fs::read_to_string(path).is_ok_and(|value| {
+            value.lines().nth(2).map(str::trim) == Some(REGISTRATION_ACK_CAPABILITY)
+        })
+    }
+}
+
+#[cfg(unix)]
+pub fn write_registration_ack_capability(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let metadata = std::fs::symlink_metadata(path)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(capability_path(path))?
+        .write_all(
+            format!(
+                "{REGISTRATION_ACK_CAPABILITY} {} {}\n",
+                metadata.dev(),
+                metadata.ino()
+            )
+            .as_bytes(),
+        )
 }
 
 /// Connect to a local endpoint described by `path`.
@@ -159,6 +217,36 @@ pub fn new_token() -> String {
         let _ = write!(token, "{byte:02x}");
     }
     token
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+
+    #[test]
+    fn capability_is_bound_to_current_socket_inode() {
+        let directory = std::env::temp_dir().join(format!(
+            "et-capability-test-{}-{}",
+            std::process::id(),
+            et_core::keys::gen_id_passkey().0
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("router.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        write_registration_ack_capability(&path).unwrap();
+        assert!(supports_registration_ack(&path));
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        let replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::fs::write(
+            capability_path(&path),
+            format!("{REGISTRATION_ACK_CAPABILITY} 0 0\n"),
+        )
+        .unwrap();
+        assert!(!supports_registration_ack(&path));
+        drop(replacement);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }
 
 #[cfg(all(test, windows))]

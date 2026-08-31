@@ -65,11 +65,9 @@ impl Endpoint {
         }
     }
 
-    /// Resolve a `PORT_FORWARD_DESTINATION_REQUEST` endpoint with upstream
-    /// semantics (`PortForwardHandler::createDestination`): when a port is
-    /// present the name is ignored entirely and the connection always goes
-    /// to localhost (`::1` first, then `127.0.0.1`); otherwise the name is a
-    /// Unix socket path.
+    /// Parse a `PORT_FORWARD_DESTINATION_REQUEST`, preserving explicit TCP
+    /// names so resolution happens on the destination side. An absent name
+    /// retains protocol-v6's localhost default.
     pub(crate) fn parse_destination(endpoint: Option<SocketEndpoint>) -> io::Result<Self> {
         let endpoint = endpoint
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "endpoint is missing"))?;
@@ -84,10 +82,11 @@ impl Endpoint {
                         "endpoint port is invalid",
                     ));
                 }
-                Ok(Self::Tcp {
-                    host: "localhost".to_owned(),
-                    port,
-                })
+                let host = endpoint
+                    .name
+                    .filter(|name| !name.contains('\0'))
+                    .unwrap_or_else(|| "localhost".to_owned());
+                Ok(Self::Tcp { host, port })
             }
             None => {
                 let name = endpoint
@@ -131,7 +130,7 @@ impl Endpoint {
             Self::Tcp { host, port } => {
                 // Upstream connects to localhost destinations by trying ::1
                 // first and falling back to 127.0.0.1.
-                if host == "localhost" || host == "127.0.0.1" || host == "::1" || host.is_empty() {
+                if host.eq_ignore_ascii_case("localhost") {
                     let v6 = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, *port));
                     match TcpStream::connect_timeout(&v6, CONNECT_TIMEOUT) {
                         Ok(stream) => return Ok(ForwardStream::Tcp(stream)),
@@ -464,6 +463,52 @@ impl Drop for ForwardListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn destination_parser_preserves_explicit_tcp_names_and_families() {
+        for name in ["127.0.0.1", "::1", "backend.internal"] {
+            // Given
+            let endpoint = SocketEndpoint {
+                name: Some(name.to_owned()),
+                port: Some(4242),
+            };
+
+            // When
+            let parsed = Endpoint::parse_destination(Some(endpoint)).unwrap();
+
+            // Then
+            match parsed {
+                Endpoint::Tcp { host, port } => {
+                    assert_eq!(host, name);
+                    assert_eq!(port, 4242);
+                }
+                #[cfg(unix)]
+                Endpoint::Unix(_) => panic!("TCP destination parsed as Unix"),
+            }
+        }
+    }
+
+    #[test]
+    fn destination_parser_defaults_only_absent_tcp_name_to_localhost() {
+        // Given
+        let endpoint = SocketEndpoint {
+            name: None,
+            port: Some(4242),
+        };
+
+        // When
+        let parsed = Endpoint::parse_destination(Some(endpoint)).unwrap();
+
+        // Then
+        match parsed {
+            Endpoint::Tcp { host, port } => {
+                assert_eq!(host, "localhost");
+                assert_eq!(port, 4242);
+            }
+            #[cfg(unix)]
+            Endpoint::Unix(_) => panic!("TCP destination parsed as Unix"),
+        }
+    }
 
     #[cfg(unix)]
     #[test]

@@ -1,5 +1,3 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
-
 use crate::bootstrap::{validate_ssh_destination, InvocationCompletion, SshInvocation};
 use crate::deadline::Deadline;
 use crate::error::ClientError;
@@ -216,13 +214,6 @@ fn parse_forward<'a>(
             directive,
             reason: "invalid destination endpoint",
         })?;
-    if let (Some(host), Some(_)) = (destination.name.as_deref(), destination.port) {
-        if !is_representable_tcp_destination(host) {
-            return Ok(ForwardRecord::Unsupported(format!(
-                "destination host '{host}' is unsupported by ET protocol v6"
-            )));
-        }
-    }
     Ok(ForwardRecord::Supported(PortForwardSourceRequest {
         source: Some(source),
         destination: Some(destination),
@@ -239,16 +230,6 @@ fn endpoint_has_zero_port(value: &str) -> bool {
 
 fn is_relative_stream_path(value: &str) -> bool {
     !value.starts_with('/') && value.contains('/')
-}
-
-fn is_representable_tcp_destination(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<Ipv4Addr>()
-            .is_ok_and(|address| address == Ipv4Addr::LOCALHOST)
-        || host
-            .parse::<Ipv6Addr>()
-            .is_ok_and(|address| address == Ipv6Addr::LOCALHOST)
 }
 
 impl GatewayPorts {
@@ -577,7 +558,7 @@ mod tests {
 
     #[test]
     fn local_forward_listener_exposure_matches_explicit_bind_precedence() {
-        use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 
         let route = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
         route.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).unwrap();
@@ -687,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn ssh_config_hardening_nonlocal_tcp_destinations_are_skipped_per_row() {
+    fn ssh_config_preserves_explicit_tcp_destination_names() {
         let resolved = parse_ssh_config(
             b"hostname host\n\
               localforward 15432 db.internal:5432\n\
@@ -702,11 +683,18 @@ mod tests {
 
         assert_eq!(
             resolved.local_forwards,
-            [request("localhost", Some(15434), "LocalHost", Some(5432))]
+            [
+                request("localhost", Some(15432), "db.internal", Some(5432)),
+                request("localhost", Some(15433), "127.0.0.2", Some(5432)),
+                request("localhost", Some(15434), "LocalHost", Some(5432)),
+            ]
         );
         assert_eq!(
             resolved.remote_forwards,
-            [request("localhost", Some(25433), "::1", Some(5432))]
+            [
+                request("localhost", Some(25432), "db.internal", Some(5432)),
+                request("localhost", Some(25433), "::1", Some(5432)),
+            ]
         );
     }
 

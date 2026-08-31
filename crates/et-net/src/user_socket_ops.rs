@@ -14,40 +14,106 @@ use std::io::{self, IoSlice, IoSliceMut};
 use std::mem::MaybeUninit;
 use std::net::{SocketAddr, TcpListener};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use wait_timeout::ChildExt;
 
 use rustix::net::{
     recvmsg, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
     SendAncillaryMessage, SendFlags,
 };
-use wait_timeout::ChildExt;
 
 const OP_ENV: &str = "ET_RS_USER_SOCKET_OP";
 const PATH_ENV: &str = "ET_RS_USER_SOCKET_PATH";
-const PORT_ENV: &str = "ET_RS_USER_SOCKET_PORT";
+const PUBLIC_PATH_ENV: &str = "ET_RS_USER_SOCKET_PUBLIC_PATH";
 const UID_ENV: &str = "ET_RS_USER_SOCKET_UID";
 const GID_ENV: &str = "ET_RS_USER_SOCKET_GID";
 const HELPER_ENV: &str = "ET_RS_USER_SOCKET_HELPER";
+const GENERATION_ENV: &str = "ET_RS_USER_SOCKET_GENERATION";
+const GENERATION_PATH_ENV: &str = "ET_RS_USER_SOCKET_GENERATION_PATH";
 const HELPER_NAME: &str = "et-user-socket-helper";
 /// `sockaddr_un.sun_path` on Linux, including the trailing NUL.
 const UNIX_PATH_MAX: usize = 108;
-const HELPER_TIMEOUT: Duration = Duration::from_secs(5);
-const ATOMIC_SCM_RIGHTS_CLOEXEC: bool = cfg!(any(target_os = "linux", target_os = "android"));
-static HELPER_SPAWN_LOCK: HelperSpawnLock = HelperSpawnLock {
-    held: Mutex::new(false),
-    available: Condvar::new(),
-};
+static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UnixSocketIdentity {
+    fd_device: u64,
+    fd_inode: u64,
+    node_device: u64,
+    node_inode: u64,
+}
+
+impl UnixSocketIdentity {
+    fn from_fd_and_node(fd: BorrowedFd<'_>, node: &Path) -> io::Result<Self> {
+        let stat = rustix::fs::fstat(fd)?;
+        let metadata = fs::symlink_metadata(node)?;
+        Ok(Self {
+            fd_device: stat.st_dev as u64,
+            fd_inode: stat.st_ino as u64,
+            node_device: metadata.dev(),
+            node_inode: metadata.ino(),
+        })
+    }
+
+    fn node_matches(self, path: &Path) -> bool {
+        fs::symlink_metadata(path).is_ok_and(|metadata| {
+            metadata.dev() == self.node_device && metadata.ino() == self.node_inode
+        })
+    }
+}
+
+fn path_operations() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+pub(crate) fn remove_socket_if_owned(path: &Path, identity: UnixSocketIdentity) {
+    remove_socket_if_owned_with_hook(path, identity, || {});
+}
+
+fn remove_socket_if_owned_with_hook(
+    path: &Path,
+    identity: UnixSocketIdentity,
+    after_retire: impl FnOnce(),
+) {
+    let Ok(_guard) = path_operations().lock() else {
+        return;
+    };
+    let retired = staging_path(
+        path,
+        &format!(
+            "retired-{}",
+            NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
+    );
+    if fs::rename(path, &retired).is_err() {
+        return;
+    }
+    after_retire();
+    if identity.node_matches(&retired) {
+        let _ = fs::remove_file(retired);
+        return;
+    }
+    // We retired a replacement rather than our generation. Restore it only
+    // if no newer publisher has already occupied the public path.
+    let _ = rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        &retired,
+        rustix::fs::CWD,
+        path,
+        rustix::fs::RenameFlags::NOREPLACE,
+    );
+}
 
 #[derive(Clone, Copy)]
 enum Op {
     Listen,
     Connect,
-    ConnectTcp,
     ListenTcp,
 }
 
@@ -56,7 +122,6 @@ impl Op {
         match self {
             Self::Listen => "listen",
             Self::Connect => "connect",
-            Self::ConnectTcp => "connect-tcp",
             Self::ListenTcp => "listen-tcp",
         }
     }
@@ -65,7 +130,6 @@ impl Op {
         match value {
             "listen" => Some(Self::Listen),
             "connect" => Some(Self::Connect),
-            "connect-tcp" => Some(Self::ConnectTcp),
             "listen-tcp" => Some(Self::ListenTcp),
             _ => None,
         }
@@ -89,33 +153,31 @@ pub fn run_helper() -> i32 {
     let op = std::env::var(OP_ENV)
         .ok()
         .and_then(|value| Op::parse(&value));
-    let argument = std::env::var(PATH_ENV).unwrap_or_default();
-    match op {
-        Some(Op::Listen) if !argument.is_empty() => {
-            match PendingUnixListener::bind_anchored(Path::new(&argument)) {
-                Ok(listener) => listener.send_and_serve(channel),
-                Err(error) => send_error(channel, &error),
-            }
-        }
-        Some(Op::Connect) if !argument.is_empty() => match connect_at_path(Path::new(&argument)) {
-            Ok(stream) => send_result(channel, Some(stream.as_fd()), 0, 0),
-            Err(error) => send_error(channel, &error),
-        },
-        Some(Op::ConnectTcp) if !argument.is_empty() => match env_u16(PORT_ENV) {
-            Ok(port) => match crate::forward_endpoint::connect_tcp(&argument, port) {
-                Ok(stream) => send_result(channel, Some(stream.as_fd()), 0, 0),
-                Err(error) => send_error(channel, &error),
+    let path = std::env::var(PATH_ENV).unwrap_or_default();
+    match (op, path.is_empty()) {
+        (Some(Op::Listen), false) => match listen_at_path(Path::new(&path)) {
+            Ok(listener) => match publish_helper_generation(&listener, Path::new(&path)) {
+                Ok(()) => send_result(channel, Some(listener.as_fd()), 0, 0),
+                Err(error) => {
+                    drop(listener);
+                    let _ = fs::remove_file(&path);
+                    send_error(channel, &error)
+                }
             },
             Err(error) => send_error(channel, &error),
         },
-        Some(Op::ListenTcp) => match argument.parse() {
+        (Some(Op::Connect), false) => match connect_at_path(Path::new(&path)) {
+            Ok(stream) => send_result(channel, Some(stream.as_fd()), 0, 0),
+            Err(error) => send_error(channel, &error),
+        },
+        (Some(Op::ListenTcp), _) => match path.parse() {
             Ok(address) => match listen_tcp_at_address(address) {
                 Ok(listener) => send_result(channel, Some(listener.as_fd()), 0, 0),
                 Err(error) => send_error(channel, &error),
             },
             Err(_) => send_result(channel, None, -1, rustix::io::Errno::INVAL.raw_os_error()),
         },
-        Some(Op::Listen | Op::Connect | Op::ConnectTcp) | None => {
+        (Some(Op::Listen | Op::Connect), true) | (None, _) => {
             send_result(channel, None, -1, rustix::io::Errno::INVAL.raw_os_error())
         }
     }
@@ -123,84 +185,31 @@ pub fn run_helper() -> i32 {
 
 /// Bind/listen a new owner-only UNIX socket path with the current credentials.
 pub fn listen_at_path(path: &Path) -> io::Result<UnixListener> {
-    PendingUnixListener::bind(path).map(PendingUnixListener::into_listener)
+    listen_at_path_with(path, || Ok(()))
 }
 
-struct PendingUnixListener {
-    listener: Option<UnixListener>,
-    cleanup: PendingSocketPath,
+fn listen_at_path_with(
+    path: &Path,
+    after_bind: impl FnOnce() -> io::Result<()>,
+) -> io::Result<UnixListener> {
+    if path_too_long(path) {
+        return Err(io::Error::from_raw_os_error(
+            rustix::io::Errno::NAMETOOLONG.raw_os_error(),
+        ));
+    }
+    let listener = UnixListener::bind(path)?;
+    let mut cleanup = SocketPathCleanup(Some(path.to_path_buf()));
+    after_bind()?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    cleanup.0 = None;
+    Ok(listener)
 }
 
-impl PendingUnixListener {
-    fn bind(path: &Path) -> io::Result<Self> {
-        if path_too_long(path) {
-            return Err(io::Error::from_raw_os_error(
-                rustix::io::Errno::NAMETOOLONG.raw_os_error(),
-            ));
-        }
-        let listener = UnixListener::bind(path)?;
-        let cleanup = PendingSocketPath(Some(path.to_path_buf()));
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        Ok(Self {
-            listener: Some(listener),
-            cleanup,
-        })
-    }
+struct SocketPathCleanup(Option<PathBuf>);
 
-    fn into_listener(mut self) -> UnixListener {
-        self.cleanup.0.take();
-        self.listener.take().expect("bound Unix listener")
-    }
-
-    fn send_and_serve(mut self, channel: BorrowedFd<'_>) -> i32 {
-        let status = send_result(
-            channel,
-            Some(self.listener.as_ref().expect("bound Unix listener").as_fd()),
-            0,
-            0,
-        );
-        if status != 0 {
-            return status;
-        }
-        drop(self.listener.take());
-        let mut buffer = [0_u8; 1];
-        loop {
-            match rustix::io::read(channel, &mut buffer) {
-                Ok(0) => return 0,
-                Ok(_) => {}
-                Err(rustix::io::Errno::INTR) => {}
-                Err(_) => return 1,
-            }
-        }
-    }
-
-    fn bind_anchored(path: &Path) -> io::Result<Self> {
-        if path_too_long(path) {
-            return Err(io::Error::from_raw_os_error(
-                rustix::io::Errno::NAMETOOLONG.raw_os_error(),
-            ));
-        }
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty());
-        if let Some(parent) = parent {
-            std::env::set_current_dir(parent)?;
-        }
-        let name = path.file_name().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Unix socket path has no file name",
-            )
-        })?;
-        Self::bind(Path::new(name))
-    }
-}
-
-struct PendingSocketPath(Option<PathBuf>);
-
-impl Drop for PendingSocketPath {
+impl Drop for SocketPathCleanup {
     fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
+        if let Some(path) = self.0.as_ref() {
             let _ = fs::remove_file(path);
         }
     }
@@ -217,75 +226,24 @@ pub fn connect_at_path(path: &Path) -> io::Result<UnixStream> {
 }
 
 /// Bind/listen as `uid`/`gid`, returning the listening socket.
-pub fn listen_unix_as_user(
-    path: impl AsRef<Path>,
-    uid: u32,
-    gid: u32,
-) -> io::Result<UserUnixListener> {
-    listen_unix_as_user_until(path, uid, gid, Instant::now() + HELPER_TIMEOUT)
+pub fn listen_unix_as_user(path: impl AsRef<Path>, uid: u32, gid: u32) -> io::Result<UnixListener> {
+    listen_unix_as_user_deadline(path, uid, gid, Instant::now() + Duration::from_secs(30))
 }
 
-pub(crate) fn listen_unix_as_user_until(
+pub fn listen_unix_as_user_deadline(
     path: impl AsRef<Path>,
     uid: u32,
     gid: u32,
     deadline: Instant,
-) -> io::Result<UserUnixListener> {
+) -> io::Result<UnixListener> {
     let path = path.as_ref();
-    if already_session_user(uid, gid) {
-        return listen_at_path(path).map(|listener| UserUnixListener {
-            listener,
-            cleanup: None,
-        });
+    if path_too_long(path) {
+        return Err(io::Error::from_raw_os_error(
+            rustix::io::Errno::NAMETOOLONG.raw_os_error(),
+        ));
     }
-    run_listener_as_user(path, uid, gid, deadline)
-}
-
-pub struct UserUnixListener {
-    listener: UnixListener,
-    cleanup: Option<UserSocketCleanup>,
-}
-
-impl std::fmt::Debug for UserUnixListener {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("UserUnixListener")
-            .finish_non_exhaustive()
-    }
-}
-
-impl std::ops::Deref for UserUnixListener {
-    type Target = UnixListener;
-
-    fn deref(&self) -> &Self::Target {
-        &self.listener
-    }
-}
-
-impl UserUnixListener {
-    pub(crate) fn into_parts(self) -> (UnixListener, Option<UserSocketCleanup>) {
-        (self.listener, self.cleanup)
-    }
-}
-
-pub(crate) struct UserSocketCleanup {
-    channel: Option<UnixStream>,
-    child: Option<std::process::Child>,
-}
-
-impl Drop for UserSocketCleanup {
-    fn drop(&mut self) {
-        drop(self.channel.take());
-        if let Some(mut child) = self.child.take() {
-            match child.wait_timeout(HELPER_TIMEOUT) {
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-            }
-        }
-    }
+    ensure_deadline(deadline)?;
+    Ok(listen_unix_as_user_owned_deadline(path, uid, gid, deadline)?.0)
 }
 
 /// connect() as `uid`/`gid`, returning the connected socket.
@@ -294,55 +252,68 @@ pub fn connect_unix_as_user(path: impl AsRef<Path>, uid: u32, gid: u32) -> io::R
     if already_session_user(uid, gid) {
         return connect_at_path(path);
     }
-    Ok(UnixStream::from(run_as_user(
-        Op::Connect,
-        path.as_os_str(),
-        uid,
-        gid,
-    )?))
+    if path_too_long(path) {
+        return Err(io::Error::from_raw_os_error(
+            rustix::io::Errno::NAMETOOLONG.raw_os_error(),
+        ));
+    }
+    Ok(UnixStream::from(
+        run_as_user(Op::Connect, path.as_os_str(), uid, gid)?.fd,
+    ))
 }
 
 /// Bind one TCP address as `uid`/`gid`, returning the listening socket.
 pub fn listen_tcp_as_user(address: SocketAddr, uid: u32, gid: u32) -> io::Result<TcpListener> {
-    listen_tcp_as_user_until(address, uid, gid, Instant::now() + HELPER_TIMEOUT)
+    listen_tcp_as_user_deadline(address, uid, gid, Instant::now() + Duration::from_secs(30))
 }
 
-pub(crate) fn connect_tcp_as_user(
-    host: &str,
-    port: u16,
-    uid: u32,
-    gid: u32,
-) -> io::Result<std::net::TcpStream> {
-    if already_session_user(uid, gid) {
-        return crate::forward_endpoint::connect_tcp(host, port);
-    }
-    Ok(std::net::TcpStream::from(run_as_user_until_with_port(
-        Op::ConnectTcp,
-        OsStr::new(host),
-        uid,
-        gid,
-        Instant::now() + HELPER_TIMEOUT,
-        Some(port),
-    )?))
-}
-
-pub(crate) fn listen_tcp_as_user_until(
+/// Bind one TCP address as `uid`/`gid` within the caller's absolute deadline.
+pub fn listen_tcp_as_user_deadline(
     address: SocketAddr,
     uid: u32,
     gid: u32,
     deadline: Instant,
 ) -> io::Result<TcpListener> {
+    ensure_deadline(deadline)?;
     if already_session_user(uid, gid) {
-        return listen_tcp_at_address(address);
+        let listener = listen_tcp_at_address(address)?;
+        ensure_deadline(deadline)?;
+        return Ok(listener);
     }
     let argument = address.to_string();
-    Ok(TcpListener::from(run_as_user_until(
+    let helper = helper_exe()?;
+    let received = run_as_user_deadline_argument_with_helper(
         Op::ListenTcp,
         OsStr::new(&argument),
         uid,
         gid,
         deadline,
-    )?))
+        &helper,
+    )?;
+    ensure_deadline(deadline)?;
+    Ok(TcpListener::from(received.fd))
+}
+
+#[doc(hidden)]
+pub fn listen_tcp_as_user_deadline_with_helper(
+    address: SocketAddr,
+    uid: u32,
+    gid: u32,
+    deadline: Instant,
+    helper: &Path,
+) -> io::Result<TcpListener> {
+    ensure_deadline(deadline)?;
+    let argument = address.to_string();
+    let received = run_as_user_deadline_argument_with_helper(
+        Op::ListenTcp,
+        OsStr::new(&argument),
+        uid,
+        gid,
+        deadline,
+        helper,
+    )?;
+    ensure_deadline(deadline)?;
+    Ok(TcpListener::from(received.fd))
 }
 
 fn listen_tcp_at_address(address: SocketAddr) -> io::Result<TcpListener> {
@@ -350,254 +321,423 @@ fn listen_tcp_at_address(address: SocketAddr) -> io::Result<TcpListener> {
         .ok_or_else(|| io::Error::from_raw_os_error(rustix::io::Errno::AFNOSUPPORT.raw_os_error()))
 }
 
-fn already_session_user(uid: u32, gid: u32) -> bool {
-    rustix::process::geteuid().as_raw() == uid && rustix::process::getegid().as_raw() == gid
-}
-
-fn run_as_user(op: Op, argument: &OsStr, uid: u32, gid: u32) -> io::Result<OwnedFd> {
-    run_as_user_until(op, argument, uid, gid, Instant::now() + HELPER_TIMEOUT)
-}
-
-fn run_as_user_until(
-    op: Op,
-    argument: &OsStr,
-    uid: u32,
-    gid: u32,
-    deadline: Instant,
-) -> io::Result<OwnedFd> {
-    run_as_user_until_with_port(op, argument, uid, gid, deadline, None)
-}
-
-fn run_as_user_until_with_port(
-    op: Op,
-    argument: &OsStr,
-    uid: u32,
-    gid: u32,
-    deadline: Instant,
-    port: Option<u16>,
-) -> io::Result<OwnedFd> {
-    let mut helper = spawn_helper(op, argument, uid, gid, port, deadline)?;
-    let result = recv_result_until(helper.channel(), deadline);
-    helper.release_spawn_guard();
-    finish_helper(&mut helper, result, deadline)
-}
-
-fn run_listener_as_user(
+pub(crate) fn listen_unix_as_user_owned_deadline(
     path: &Path,
     uid: u32,
     gid: u32,
     deadline: Instant,
-) -> io::Result<UserUnixListener> {
-    let mut helper = spawn_helper(Op::Listen, path.as_os_str(), uid, gid, None, deadline)?;
-    let result = recv_result_until(helper.channel(), deadline);
-    helper.release_spawn_guard();
-    match reject_success_after_deadline(result, deadline) {
-        Ok(fd) => {
-            let (channel, child) = helper.take_persistent();
-            Ok(UserUnixListener {
-                listener: UnixListener::from(fd),
-                cleanup: Some(UserSocketCleanup {
-                    channel: Some(channel),
-                    child: Some(child),
-                }),
-            })
-        }
-        Err(error) => Err(error),
+) -> io::Result<(UnixListener, UnixSocketIdentity)> {
+    ensure_deadline(deadline)?;
+    if already_session_user(uid, gid) {
+        return bind_staged(path, deadline);
     }
+    let received = run_as_user_deadline(Op::Listen, path, uid, gid, deadline)?;
+    let listener = UnixListener::from(received.fd);
+    let fd_stat = rustix::fs::fstat(&listener)?;
+    if fd_stat.st_dev as u64 != received.identity.fd_device
+        || fd_stat.st_ino as u64 != received.identity.fd_inode
+    {
+        return Err(io::Error::other("received listener identity changed"));
+    }
+    Ok((listener, received.identity))
 }
 
-trait KillAndWait {
-    fn kill_and_wait(&mut self);
+fn already_session_user(uid: u32, gid: u32) -> bool {
+    rustix::process::geteuid().as_raw() == uid && rustix::process::getegid().as_raw() == gid
 }
 
-impl KillAndWait for std::process::Child {
-    fn kill_and_wait(&mut self) {
-        let _ = self.kill();
-        let _ = self.wait();
-    }
+#[derive(Debug)]
+struct ReceivedSocket {
+    fd: OwnedFd,
+    identity: UnixSocketIdentity,
 }
 
-struct ChildLease<C: KillAndWait> {
-    child: Option<C>,
+fn run_as_user(op: Op, argument: &OsStr, uid: u32, gid: u32) -> io::Result<ReceivedSocket> {
+    let helper = helper_exe()?;
+    run_as_user_deadline_argument_with_helper(
+        op,
+        argument,
+        uid,
+        gid,
+        Instant::now() + Duration::from_secs(30),
+        &helper,
+    )
 }
 
-impl<C: KillAndWait> ChildLease<C> {
-    fn new(child: C) -> Self {
-        Self { child: Some(child) }
+fn run_as_user_deadline(
+    op: Op,
+    path: &Path,
+    uid: u32,
+    gid: u32,
+    deadline: Instant,
+) -> io::Result<ReceivedSocket> {
+    if path_too_long(path) {
+        return Err(io::Error::from_raw_os_error(
+            rustix::io::Errno::NAMETOOLONG.raw_os_error(),
+        ));
     }
-
-    fn as_mut(&mut self) -> &mut C {
-        self.child.as_mut().expect("live helper child")
-    }
-
-    fn take(&mut self) -> Option<C> {
-        self.child.take()
-    }
-
-    fn reap(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            child.kill_and_wait();
-        }
-    }
+    let helper = helper_exe()?;
+    run_as_user_deadline_with_helper(op, path, uid, gid, deadline, &helper)
 }
 
-impl<C: KillAndWait> Drop for ChildLease<C> {
-    fn drop(&mut self) {
-        self.reap();
-    }
+fn run_as_user_deadline_with_helper(
+    op: Op,
+    path: &Path,
+    uid: u32,
+    gid: u32,
+    deadline: Instant,
+    helper: &Path,
+) -> io::Result<ReceivedSocket> {
+    run_as_user_deadline_with_helper_cancelled(
+        op,
+        path,
+        uid,
+        gid,
+        deadline,
+        helper,
+        &AtomicBool::new(false),
+    )
 }
 
-struct SpawnedHelper {
-    channel: Option<UnixStream>,
-    child: ChildLease<std::process::Child>,
-    spawn_guard: Option<HelperSpawnGuard>,
+fn run_as_user_deadline_with_helper_cancelled(
+    op: Op,
+    path: &Path,
+    uid: u32,
+    gid: u32,
+    deadline: Instant,
+    helper: &Path,
+    cancelled: &AtomicBool,
+) -> io::Result<ReceivedSocket> {
+    run_as_user_deadline_argument_with_helper_cancelled(
+        op,
+        path.as_os_str(),
+        uid,
+        gid,
+        deadline,
+        helper,
+        cancelled,
+    )
 }
 
-impl SpawnedHelper {
-    fn channel(&self) -> &UnixStream {
-        self.channel.as_ref().expect("live helper channel")
-    }
-
-    fn release_spawn_guard(&mut self) {
-        drop(self.spawn_guard.take());
-    }
-
-    fn take_persistent(&mut self) -> (UnixStream, std::process::Child) {
-        (
-            self.channel.take().expect("live helper channel"),
-            self.child.take().expect("live helper child"),
-        )
-    }
-}
-
-fn spawn_helper(
+fn run_as_user_deadline_argument_with_helper(
     op: Op,
     argument: &OsStr,
     uid: u32,
     gid: u32,
-    port: Option<u16>,
     deadline: Instant,
-) -> io::Result<SpawnedHelper> {
-    let helper = helper_exe()?;
+    helper: &Path,
+) -> io::Result<ReceivedSocket> {
+    run_as_user_deadline_argument_with_helper_cancelled(
+        op,
+        argument,
+        uid,
+        gid,
+        deadline,
+        helper,
+        &AtomicBool::new(false),
+    )
+}
+
+fn run_as_user_deadline_argument_with_helper_cancelled(
+    op: Op,
+    argument: &OsStr,
+    uid: u32,
+    gid: u32,
+    deadline: Instant,
+    helper: &Path,
+    cancelled: &AtomicBool,
+) -> io::Result<ReceivedSocket> {
+    let path = Path::new(argument);
     let (parent, child) = UnixStream::pair()?;
+    let generation = format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let generation_path = generation_path(path, &generation);
+    let helper_path = if matches!(op, Op::Listen) {
+        staging_path(path, &generation)
+    } else {
+        path.to_path_buf()
+    };
     let mut command = Command::new(helper);
     command
         .env(OP_ENV, op.as_env())
-        .env(PATH_ENV, argument)
+        .env(PATH_ENV, &helper_path)
+        .env(PUBLIC_PATH_ENV, path)
         .env(UID_ENV, uid.to_string())
-        .env(GID_ENV, gid.to_string());
-    if let Some(port) = port {
-        command.env(PORT_ENV, port.to_string());
-    }
-    command
+        .env(GID_ENV, gid.to_string())
+        .env(GENERATION_ENV, &generation)
+        .env(GENERATION_PATH_ENV, &generation_path)
         .stdin(Stdio::from(OwnedFd::from(child)))
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let spawn_guard = helper_spawn_guard(ATOMIC_SCM_RIGHTS_CLOEXEC, deadline)?;
-    let child = command.spawn()?;
-    Ok(SpawnedHelper {
-        channel: Some(parent),
-        child: ChildLease::new(child),
-        spawn_guard,
+    let mut child_proc = command.spawn()?;
+    let result = (|| {
+        let result = recv_result_until(&parent, deadline, cancelled).and_then(|fd| {
+            let stat = rustix::fs::fstat(&fd)?;
+            let identity = if matches!(op, Op::Listen) {
+                let (owner, identity) = read_generation_marker(&generation_path)
+                    .ok_or_else(|| io::Error::other("user-socket helper omitted its generation"))?;
+                if owner != generation
+                    || identity.fd_device != stat.st_dev as u64
+                    || identity.fd_inode != stat.st_ino as u64
+                {
+                    return Err(io::Error::other("user-socket helper identity mismatch"));
+                }
+                identity
+            } else {
+                UnixSocketIdentity {
+                    fd_device: stat.st_dev as u64,
+                    fd_inode: stat.st_ino as u64,
+                    node_device: 0,
+                    node_inode: 0,
+                }
+            };
+            Ok(ReceivedSocket { fd, identity })
+        });
+        if wait_for_helper_exit(&mut child_proc, deadline, cancelled)? {
+            ensure_deadline(deadline)?;
+            result
+        } else {
+            Err(timeout_error())
+        }
+    })();
+    let timed_out = result.as_ref().is_err_and(|error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        )
+    });
+    if timed_out {
+        let _ = child_proc.kill();
+    }
+    let _ = child_proc.wait();
+    if matches!(op, Op::Listen) {
+        let _ = fs::remove_file(&helper_path);
+        if result.is_err() {
+            cleanup_helper_generation(path, &generation_path, &generation);
+        } else {
+            remove_generation_marker(&generation_path, &generation);
+        }
+    }
+    if timed_out {
+        Err(timeout_error())
+    } else {
+        result
+    }
+}
+
+fn recv_result_until(
+    channel: &UnixStream,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> io::Result<OwnedFd> {
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(timeout_error());
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(timeout_error)?;
+        channel.set_read_timeout(Some(remaining.min(Duration::from_millis(25))))?;
+        match recv_result(channel) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) => {}
+            result => return result,
+        }
+    }
+}
+
+fn wait_for_helper_exit(
+    child: &mut std::process::Child,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> io::Result<bool> {
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(timeout_error)?;
+        if child
+            .wait_timeout(remaining.min(Duration::from_millis(25)))?
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+}
+
+fn staging_path(path: &Path, generation: &str) -> PathBuf {
+    path.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".et-forward-{}-{generation}", std::process::id()))
+}
+
+pub(crate) fn bind_staged(
+    public_path: &Path,
+    deadline: Instant,
+) -> io::Result<(UnixListener, UnixSocketIdentity)> {
+    bind_staged_with_hook(public_path, deadline, || {})
+}
+
+fn bind_staged_with_hook(
+    public_path: &Path,
+    deadline: Instant,
+    before_publish: impl FnOnce(),
+) -> io::Result<(UnixListener, UnixSocketIdentity)> {
+    let generation = format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let staged = staging_path(public_path, &generation);
+    let listener = listen_at_path(&staged)?;
+    let identity = UnixSocketIdentity::from_fd_and_node(listener.as_fd(), &staged)?;
+    ensure_deadline(deadline)?;
+    let _guard = path_operations()
+        .lock()
+        .map_err(|_| io::Error::other("socket path lock unavailable"))?;
+    ensure_deadline(deadline)?;
+    before_publish();
+    if let Err(error) = publish_noreplace(&staged, public_path) {
+        drop(listener);
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
+    Ok((listener, identity))
+}
+
+fn generation_path(path: &Path, generation: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_owned();
+    value.push(format!(".et-generation-{generation}"));
+    PathBuf::from(value)
+}
+
+fn publish_helper_generation(listener: &UnixListener, staged: &Path) -> io::Result<()> {
+    publish_helper_generation_with_hook(listener, staged, || {})
+}
+
+fn publish_helper_generation_with_hook(
+    listener: &UnixListener,
+    staged: &Path,
+    before_publish: impl FnOnce(),
+) -> io::Result<()> {
+    let generation = std::env::var(GENERATION_ENV)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "helper generation is missing"))?;
+    let marker = std::env::var_os(GENERATION_PATH_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "helper marker path is missing")
+        })?;
+    let public = std::env::var_os(PUBLIC_PATH_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "public socket path is missing")
+        })?;
+    publish_helper_generation_paths(
+        listener,
+        staged,
+        &public,
+        &marker,
+        &generation,
+        before_publish,
+    )
+}
+
+fn publish_helper_generation_paths(
+    listener: &UnixListener,
+    staged: &Path,
+    public: &Path,
+    marker: &Path,
+    generation: &str,
+    before_publish: impl FnOnce(),
+) -> io::Result<()> {
+    let identity = UnixSocketIdentity::from_fd_and_node(listener.as_fd(), staged)?;
+    fs::write(
+        marker,
+        format!(
+            "{generation} {} {} {} {}\n",
+            identity.fd_device, identity.fd_inode, identity.node_device, identity.node_inode
+        ),
+    )?;
+    before_publish();
+    publish_noreplace(staged, public)
+}
+
+fn publish_noreplace(staged: &Path, public: &Path) -> io::Result<()> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        staged,
+        rustix::fs::CWD,
+        public,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| {
+        if error == rustix::io::Errno::EXIST {
+            io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "Unix source socket was published by another generation",
+            )
+        } else {
+            io::Error::from(error)
+        }
     })
 }
 
-struct HelperSpawnLock {
-    held: Mutex<bool>,
-    available: Condvar,
+fn read_generation_marker(path: &Path) -> Option<(String, UnixSocketIdentity)> {
+    let value = fs::read_to_string(path).ok()?;
+    let mut fields = value.split_whitespace();
+    let generation = fields.next()?.to_owned();
+    let fd_device = fields.next()?.parse().ok()?;
+    let fd_inode = fields.next()?.parse().ok()?;
+    let node_device = fields.next()?.parse().ok()?;
+    let node_inode = fields.next()?.parse().ok()?;
+    fields.next().is_none().then_some((
+        generation,
+        UnixSocketIdentity {
+            fd_device,
+            fd_inode,
+            node_device,
+            node_inode,
+        },
+    ))
 }
 
-impl HelperSpawnLock {
-    fn acquire(&'static self, deadline: Instant) -> io::Result<HelperSpawnGuard> {
-        let mut held = self
-            .held
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        loop {
-            let remaining = remaining_until(deadline)?;
-            if !*held {
-                *held = true;
-                return Ok(HelperSpawnGuard(self));
-            }
-            let (next, _) = self
-                .available
-                .wait_timeout(held, remaining)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            held = next;
-        }
-    }
-}
-
-struct HelperSpawnGuard(&'static HelperSpawnLock);
-
-impl Drop for HelperSpawnGuard {
-    fn drop(&mut self) {
-        let mut held = self
-            .0
-            .held
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *held = false;
-        self.0.available.notify_one();
-    }
-}
-
-fn helper_spawn_guard(
-    atomic_cloexec: bool,
-    deadline: Instant,
-) -> io::Result<Option<HelperSpawnGuard>> {
-    remaining_until(deadline)?;
-    if atomic_cloexec {
-        Ok(None)
-    } else {
-        HELPER_SPAWN_LOCK.acquire(deadline).map(Some)
-    }
-}
-
-fn finish_helper(
-    helper: &mut SpawnedHelper,
-    result: io::Result<OwnedFd>,
-    deadline: Instant,
-) -> io::Result<OwnedFd> {
-    let fd = match result {
-        Ok(fd) => fd,
-        Err(error) => {
-            helper.child.reap();
-            return Err(error);
-        }
+fn cleanup_helper_generation(path: &Path, marker: &Path, generation: &str) {
+    let Some((owner, identity)) = read_generation_marker(marker) else {
+        return;
     };
-    let remaining = remaining_until(deadline)?;
-    match helper.child.as_mut().wait_timeout(remaining) {
-        Ok(Some(_)) => {
-            helper.child.take();
-            Ok(fd)
-        }
-        Ok(None) | Err(_) => {
-            helper.child.reap();
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "socket helper timed out",
-            ))
-        }
+    if owner == generation {
+        remove_socket_if_owned(path, identity);
+        remove_generation_marker(marker, generation);
     }
 }
 
-fn remaining_until_at(deadline: Instant, now: Instant) -> io::Result<Duration> {
-    deadline
-        .checked_duration_since(now)
-        .filter(|remaining| !remaining.is_zero())
-        .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
-}
-
-fn remaining_until(deadline: Instant) -> io::Result<Duration> {
-    remaining_until_at(deadline, Instant::now())
-}
-
-fn reject_success_after_deadline<T>(result: io::Result<T>, deadline: Instant) -> io::Result<T> {
-    if result.is_ok() {
-        remaining_until(deadline)?;
+fn remove_generation_marker(marker: &Path, generation: &str) {
+    if read_generation_marker(marker).is_some_and(|(owner, _)| owner == generation) {
+        let _ = fs::remove_file(marker);
     }
-    result
+}
+
+fn timeout_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "user-socket helper deadline elapsed",
+    )
+}
+
+fn ensure_deadline(deadline: Instant) -> io::Result<()> {
+    if Instant::now() >= deadline {
+        Err(timeout_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn drop_helper_privileges() -> io::Result<()> {
@@ -609,14 +749,10 @@ fn drop_helper_privileges() -> io::Result<()> {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or_else(|| rustix::process::getgid().as_raw());
-    if !rustix::process::geteuid().is_root() {
-        if rustix::process::geteuid().as_raw() == uid && rustix::process::getegid().as_raw() == gid
-        {
-            // An unprivileged process cannot change its supplementary groups.
-            // It also cannot have inherited groups from a more privileged
-            // daemon identity, so retaining its own groups adds no authority.
-            return Ok(());
-        }
+    if !rustix::process::geteuid().is_root()
+        && (rustix::process::geteuid().as_raw() != uid
+            || rustix::process::getegid().as_raw() != gid)
+    {
         return Err(io::Error::from_raw_os_error(
             rustix::io::Errno::PERM.raw_os_error(),
         ));
@@ -673,13 +809,6 @@ fn helper_identity_matches(
     let mut observed = identity.groups.clone();
     observed.sort_unstable();
     identity.euid == target.0 && identity.egid == target.1 && observed == expected
-}
-
-fn env_u16(name: &str) -> io::Result<u16> {
-    std::env::var(name)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("missing {name}")))?
-        .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid {name}")))
 }
 
 fn helper_exe() -> io::Result<PathBuf> {
@@ -753,9 +882,7 @@ fn send_result(channel: BorrowedFd<'_>, fd: Option<BorrowedFd<'_>>, status: i32,
     if status == 0 {
         if let Some(fd) = fd {
             rights = [fd];
-            if !control.push(SendAncillaryMessage::ScmRights(&rights)) {
-                return 1;
-            }
+            let _ = control.push(SendAncillaryMessage::ScmRights(&rights));
         }
     }
     match sendmsg(
@@ -764,63 +891,20 @@ fn send_result(channel: BorrowedFd<'_>, fd: Option<BorrowedFd<'_>>, status: i32,
         &mut control,
         SendFlags::empty(),
     ) {
-        Ok(sent) if sent == header.len() => i32::from(status != 0),
-        Ok(_) => 1,
+        Ok(_) => i32::from(status != 0),
         Err(_) => 1,
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn recv_cloexec_flags() -> RecvFlags {
-    RecvFlags::CMSG_CLOEXEC
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn recv_cloexec_flags() -> RecvFlags {
-    RecvFlags::empty()
-}
-
-fn ensure_cloexec(fd: &OwnedFd) -> io::Result<()> {
-    let flags = rustix::io::fcntl_getfd(fd)?;
-    if !flags.contains(rustix::io::FdFlags::CLOEXEC) {
-        rustix::io::fcntl_setfd(fd, flags | rustix::io::FdFlags::CLOEXEC)?;
-    }
-    Ok(())
-}
-
-fn retry_on_intr_until<T>(
-    deadline: Instant,
-    mut now: impl FnMut() -> Instant,
-    mut before_attempt: impl FnMut(Duration) -> io::Result<()>,
-    mut operation: impl FnMut() -> Result<T, rustix::io::Errno>,
-) -> io::Result<T> {
-    loop {
-        let remaining = remaining_until_at(deadline, now())?;
-        before_attempt(remaining)?;
-        match operation() {
-            Err(rustix::io::Errno::INTR) => {}
-            Err(error) => return Err(error.into()),
-            Ok(value) => return Ok(value),
-        }
-    }
-}
-
-fn recv_result_until(channel: &UnixStream, deadline: Instant) -> io::Result<OwnedFd> {
+fn recv_result(channel: &UnixStream) -> io::Result<OwnedFd> {
     let mut header = [0u8; 8];
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut control = RecvAncillaryBuffer::new(&mut space);
-    let received = retry_on_intr_until(
-        deadline,
-        Instant::now,
-        |remaining| channel.set_read_timeout(Some(remaining)),
-        || {
-            recvmsg(
-                channel,
-                &mut [IoSliceMut::new(&mut header)],
-                &mut control,
-                recv_cloexec_flags(),
-            )
-        },
+    let received = recvmsg(
+        channel,
+        &mut [IoSliceMut::new(&mut header)],
+        &mut control,
+        RecvFlags::empty(),
     )?;
     if received.bytes != header.len() {
         return Err(io::Error::other(
@@ -839,7 +923,6 @@ fn recv_result_until(channel: &UnixStream, deadline: Instant) -> io::Result<Owne
     for message in control.drain() {
         if let RecvAncillaryMessage::ScmRights(mut rights) = message {
             if let Some(fd) = rights.next() {
-                ensure_cloexec(&fd)?;
                 return Ok(fd);
             }
         }
@@ -850,11 +933,10 @@ fn recv_result_until(channel: &UnixStream, deadline: Instant) -> io::Result<Owne
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
     use std::io::{Read, Write};
-    #[cfg(target_os = "linux")]
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::FileTypeExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::sync::atomic::AtomicU64;
 
     fn temp_dir() -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -871,6 +953,27 @@ mod tests {
 
     fn long_unix_path() -> PathBuf {
         PathBuf::from("x".repeat(UNIX_PATH_MAX + 8))
+    }
+
+    fn socket_helper(directory: &Path, behavior: &str) -> PathBuf {
+        let helper = directory.join(format!("helper-{behavior}.py"));
+        let tail = match behavior {
+            "block" => "open(public + '.event', 'wb').write(b'x')\nos.read(0, 1)\n",
+            "short" => "os.write(0, b'x')\n",
+            "missing" => "os.write(0, struct.pack('ii', 0, 0))\n",
+            "error" => "os.write(0, struct.pack('ii', -1, 5))\n",
+            "handoff" => "channel=socket.socket(fileno=0)\nfds=array.array('i', [s.fileno()])\nchannel.sendmsg([struct.pack('ii', 0, 0)], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds)])\nopen(public + '.event', 'wb').write(b'x')\nopen(public + '.release', 'rb').read(1)\n",
+            _ => unreachable!(),
+        };
+        fs::write(
+            &helper,
+            format!(
+                "#!/usr/bin/python3\nimport array, os, socket, struct\npath=os.environ['{PATH_ENV}']\npublic=os.environ['{PUBLIC_PATH_ENV}']\nmarker=os.environ['{GENERATION_PATH_ENV}']\ngeneration=os.environ['{GENERATION_ENV}']\ntry: os.unlink(path)\nexcept FileNotFoundError: pass\ns=socket.socket(socket.AF_UNIX)\ns.bind(path)\nfdst=os.fstat(s.fileno())\nnodest=os.stat(path)\nopen(marker, 'w').write(f'{{generation}} {{fdst.st_dev}} {{fdst.st_ino}} {{nodest.st_dev}} {{nodest.st_ino}}\\n')\nos.link(path, public)\nos.unlink(path)\n{tail}"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        helper
     }
 
     #[test]
@@ -906,71 +1009,23 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_descriptor_receive_does_not_extend_deadline() {
-        let start = Instant::now();
-        let deadline = start + Duration::from_secs(1);
-        let mut times = [start, deadline].into_iter();
-        let attempts = std::cell::Cell::new(0);
-        let configured = std::cell::RefCell::new(Vec::new());
-        let result = retry_on_intr_until(
-            deadline,
-            || times.next().expect("one clock read per attempt"),
-            |remaining| {
-                configured.borrow_mut().push(remaining);
-                Ok(())
-            },
-            || {
-                attempts.set(attempts.get() + 1);
-                Err::<(), _>(rustix::io::Errno::INTR)
-            },
-        );
+    fn listen_failure_after_bind_cleans_socket_and_immediate_retry_succeeds() {
+        // Given
+        let dir = temp_dir();
+        let path = dir.join("post-bind-failure.sock");
 
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
-        assert_eq!(attempts.get(), 1);
-        assert_eq!(&*configured.borrow(), &[Duration::from_secs(1)]);
-    }
+        // When
+        let error = listen_at_path_with(&path, || Err(io::Error::other("injected before chmod")))
+            .unwrap_err();
 
-    #[test]
-    fn fallback_helper_spawn_lock_obeys_deadline() {
-        let first =
-            helper_spawn_guard(false, Instant::now().checked_add(HELPER_TIMEOUT).unwrap()).unwrap();
-        assert!(first.is_some());
-
-        let error = match helper_spawn_guard(false, Instant::now()) {
-            Ok(_) => panic!("contended fallback lock succeeded after deadline"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(helper_spawn_guard(true, Instant::now()).is_err());
-
-        drop(first);
-    }
-
-    #[test]
-    fn late_listener_result_is_rejected() {
-        let error = reject_success_after_deadline(Ok("listener"), Instant::now()).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-    }
-
-    #[test]
-    fn child_lease_reaps_on_error_and_transfers_on_success() {
-        struct MockChild(std::rc::Rc<std::cell::Cell<usize>>);
-        impl KillAndWait for MockChild {
-            fn kill_and_wait(&mut self) {
-                self.0.set(self.0.get() + 1);
-            }
-        }
-
-        let reaped = std::rc::Rc::new(std::cell::Cell::new(0));
-        drop(ChildLease::new(MockChild(reaped.clone())));
-        assert_eq!(reaped.get(), 1);
-
-        let mut lease = ChildLease::new(MockChild(reaped.clone()));
-        let child = lease.take().unwrap();
-        drop(lease);
-        assert_eq!(reaped.get(), 1);
-        drop(child);
-        assert_eq!(reaped.get(), 1);
+        // Then
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(!path.exists());
+        let listener = listen_at_path(&path).unwrap();
+        assert!(path.exists());
+        drop(listener);
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&dir).unwrap();
     }
 
     #[test]
@@ -1029,6 +1084,440 @@ mod tests {
     }
 
     #[test]
+    fn helper_no_reply_is_killed_reaped_and_socket_path_rolled_back() {
+        let dir = temp_dir();
+        let path = dir.join("listener.sock");
+        let event = PathBuf::from(format!("{}.event", path.display()));
+        assert!(Command::new("mkfifo")
+            .arg(&event)
+            .status()
+            .unwrap()
+            .success());
+        let event_control = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&event)
+            .unwrap();
+        let helper = dir.join("helper.sh");
+        fs::write(
+            &helper,
+            "#!/bin/sh\nprintf x > \"${ET_RS_USER_SOCKET_PUBLIC_PATH}.event\"\nexec cat\n",
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let worker_path = path.clone();
+        std::thread::spawn(move || {
+            let result = run_as_user_deadline_with_helper(
+                Op::Listen,
+                &worker_path,
+                rustix::process::geteuid().as_raw(),
+                rustix::process::getegid().as_raw(),
+                Instant::now() + Duration::from_millis(100),
+                &helper,
+            );
+            let _ = done_tx.send(result);
+        });
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut event_control = event_control;
+            let mut byte = [0];
+            let result = event_control.read_exact(&mut byte);
+            let _ = event_tx.send(result);
+        });
+        event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("helper did not enter its no-reply state")
+            .unwrap();
+        let error = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("timed-out helper was not killed and reaped")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(!path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stalled_tcp_helper_honors_caller_deadline_and_is_killed_reaped() {
+        let dir = temp_dir();
+        let event = dir.join("tcp-helper.event");
+        assert!(Command::new("mkfifo")
+            .arg(&event)
+            .status()
+            .unwrap()
+            .success());
+        let event_control = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&event)
+            .unwrap();
+        let pid_path = dir.join("tcp-helper.pid");
+        let helper = dir.join("tcp-helper.py");
+        fs::write(
+            &helper,
+            format!(
+                "#!/usr/bin/python3\nimport os, socket\nhost, port = os.environ['{PATH_ENV}'].rsplit(':', 1)\ns = socket.socket(socket.AF_INET)\ns.bind((host, int(port)))\ns.listen(1)\nopen(r'{}', 'w').write(str(os.getpid()))\nopen(r'{}', 'wb').write(b'x')\nos.read(0, 1)\n",
+                pid_path.display(),
+                event.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        let probe = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let argument = address.to_string();
+            let result = run_as_user_deadline_argument_with_helper(
+                Op::ListenTcp,
+                OsStr::new(&argument),
+                rustix::process::geteuid().as_raw(),
+                rustix::process::getegid().as_raw(),
+                deadline,
+                &helper,
+            );
+            let _ = done_tx.send((Instant::now(), result));
+        });
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut event_control = event_control;
+            let mut byte = [0];
+            let result = event_control.read_exact(&mut byte);
+            let _ = event_tx.send(result);
+        });
+        event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("TCP helper did not bind and enter its no-reply state")
+            .unwrap();
+        let (completed, result) = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("TCP helper exceeded the caller deadline without being reaped");
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(completed <= deadline + Duration::from_millis(100));
+        let pid = fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .unwrap();
+        assert_eq!(
+            rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG).unwrap_err(),
+            rustix::io::Errno::CHILD,
+            "timed-out TCP helper was not killed and reaped"
+        );
+        TcpListener::bind(address).expect("timed-out TCP helper left its listener behind");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn older_helper_timeout_does_not_unlink_replacement_generation() {
+        let dir = temp_dir();
+        let path = dir.join("overlap.sock");
+        let event = PathBuf::from(format!("{}.event", path.display()));
+        assert!(Command::new("mkfifo")
+            .arg(&event)
+            .status()
+            .unwrap()
+            .success());
+        let event_control = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&event)
+            .unwrap();
+        let helper = socket_helper(&dir, "block");
+        enum HelperLifecycle {
+            Published(io::Result<()>),
+            Done(io::Result<ReceivedSocket>),
+        }
+        let (lifecycle_tx, lifecycle_rx) = std::sync::mpsc::sync_channel(2);
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let worker_tx = lifecycle_tx.clone();
+        let old_path = path.clone();
+        std::thread::spawn(move || {
+            let result = run_as_user_deadline_with_helper_cancelled(
+                Op::Listen,
+                &old_path,
+                rustix::process::geteuid().as_raw(),
+                rustix::process::getegid().as_raw(),
+                Instant::now() + Duration::from_secs(30),
+                &helper,
+                &worker_cancelled,
+            );
+            let _ = worker_tx.send(HelperLifecycle::Done(result));
+        });
+        std::thread::spawn(move || {
+            let mut event_control = event_control;
+            let mut byte = [0];
+            let result = event_control.read_exact(&mut byte);
+            let _ = lifecycle_tx.send(HelperLifecycle::Published(result));
+        });
+        match lifecycle_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(HelperLifecycle::Published(Ok(()))) => {}
+            Ok(HelperLifecycle::Published(Err(error))) => {
+                panic!("helper publication event failed: {error}")
+            }
+            Ok(HelperLifecycle::Done(Ok(_))) => {
+                panic!("helper returned a listener before entering no-reply")
+            }
+            Ok(HelperLifecycle::Done(Err(error))) => {
+                panic!("helper failed before publishing its generation: {error}")
+            }
+            Err(error) => panic!("helper lifecycle produced no event: {error}"),
+        }
+        assert!(fs::metadata(&path).unwrap().file_type().is_socket());
+        let marker = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|candidate| candidate.to_string_lossy().contains(".et-generation-"))
+            .expect("published helper generation has no ownership marker");
+        let (_, identity) = read_generation_marker(&marker)
+            .expect("published helper generation marker is malformed");
+        assert!(identity.node_matches(&path));
+
+        fs::remove_file(&path).unwrap();
+        let replacement = listen_at_path(&path).unwrap();
+        cancelled.store(true, Ordering::Release);
+        let error = match lifecycle_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(HelperLifecycle::Done(result)) => result.unwrap_err(),
+            Ok(HelperLifecycle::Published(_)) => panic!("duplicate helper publication event"),
+            Err(error) => panic!("cancelled helper was not killed and reaped: {error}"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let client = UnixStream::connect(&path)
+            .expect("older helper timeout unlinked replacement generation");
+        replacement.accept().unwrap();
+        drop(client);
+        drop(replacement);
+        let _ = fs::remove_file(&path);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn successful_handoff_does_not_adopt_replacement_before_helper_exit() {
+        let dir = temp_dir();
+        let path = dir.join("handoff.sock");
+        for suffix in ["event", "release"] {
+            assert!(Command::new("mkfifo")
+                .arg(format!("{}.{}", path.display(), suffix))
+                .status()
+                .unwrap()
+                .success());
+        }
+        let event = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("{}.event", path.display()))
+            .unwrap();
+        let mut release = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("{}.release", path.display()))
+            .unwrap();
+        let helper = socket_helper(&dir, "handoff");
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let worker_path = path.clone();
+        std::thread::spawn(move || {
+            let result = run_as_user_deadline_with_helper(
+                Op::Listen,
+                &worker_path,
+                rustix::process::geteuid().as_raw(),
+                rustix::process::getegid().as_raw(),
+                Instant::now() + Duration::from_secs(2),
+                &helper,
+            );
+            let _ = done_tx.send(result);
+        });
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut event = event;
+            let mut byte = [0];
+            let _ = event_tx.send(event.read_exact(&mut byte));
+        });
+        event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        fs::remove_file(&path).unwrap();
+        let replacement = listen_at_path(&path).unwrap();
+        release.write_all(b"x").unwrap();
+        let received = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert!(!received.identity.node_matches(&path));
+        remove_socket_if_owned(&path, received.identity);
+        drop(received);
+        let client = UnixStream::connect(&path)
+            .expect("successful older handoff adopted replacement identity");
+        replacement.accept().unwrap();
+        drop(client);
+        drop(replacement);
+        let _ = fs::remove_file(&path);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn premarker_short_reply_leaves_no_public_or_staged_socket() {
+        let dir = temp_dir();
+        let path = dir.join("premarker.sock");
+        let helper = dir.join("premarker.py");
+        fs::write(
+            &helper,
+            format!(
+                "#!/usr/bin/python3\nimport os,socket\np=os.environ['{PATH_ENV}']\ns=socket.socket(socket.AF_UNIX)\ns.bind(p)\nos.write(0,b'x')\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(run_as_user_deadline_with_helper(
+            Op::Listen,
+            &path,
+            rustix::process::geteuid().as_raw(),
+            rustix::process::getegid().as_raw(),
+            Instant::now() + Duration::from_secs(1),
+            &helper,
+        )
+        .is_err());
+        assert!(!path.exists());
+        assert!(fs::read_dir(&dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".et-forward-")
+        }));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_fd_and_explicit_helper_error_remove_owned_generation() {
+        for behavior in ["missing", "error"] {
+            let dir = temp_dir();
+            let path = dir.join(format!("{behavior}.sock"));
+            let helper = socket_helper(&dir, behavior);
+            assert!(run_as_user_deadline_with_helper(
+                Op::Listen,
+                &path,
+                rustix::process::geteuid().as_raw(),
+                rustix::process::getegid().as_raw(),
+                Instant::now() + Duration::from_secs(1),
+                &helper,
+            )
+            .is_err());
+            assert!(!path.exists(), "{behavior} left the public socket");
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn malformed_helper_reply_reaps_helper_and_removes_owned_stale_path() {
+        let dir = temp_dir();
+        let path = dir.join("malformed.sock");
+        let helper = socket_helper(&dir, "short");
+        let error = run_as_user_deadline_with_helper(
+            Op::Listen,
+            &path,
+            rustix::process::geteuid().as_raw(),
+            rustix::process::getegid().as_raw(),
+            Instant::now() + Duration::from_secs(1),
+            &helper,
+        )
+        .unwrap_err();
+        assert_ne!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(!path.exists(), "malformed helper left a stale socket path");
+        assert!(
+            fs::read_dir(&dir).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("et-generation")),
+            "malformed helper left a generation marker"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn replacement_published_after_retirement_is_never_unlinked() {
+        let dir = temp_dir();
+        let path = dir.join("retire-race.sock");
+        let (old, identity) = bind_staged(&path, Instant::now() + Duration::from_secs(1)).unwrap();
+        fs::remove_file(&path).unwrap();
+        let displaced = UnixListener::bind(&path).unwrap();
+        let mut newest = None;
+        remove_socket_if_owned_with_hook(&path, identity, || {
+            newest = Some(UnixListener::bind(&path).unwrap());
+        });
+        let client = UnixStream::connect(&path)
+            .expect("retirement cleanup unlinked newly published generation");
+        newest.as_ref().unwrap().accept().unwrap();
+        drop(client);
+        drop(old);
+        drop(displaced);
+        drop(newest);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn helper_publication_loses_atomically_to_final_window_replacement() {
+        let dir = temp_dir();
+        let public = dir.join("helper-race.sock");
+        let staged = dir.join("helper-race.staged");
+        let marker = dir.join("helper-race.marker");
+        let generation = "test-generation";
+        let listener = listen_at_path(&staged).unwrap();
+        let mut replacement = None;
+        let error = publish_helper_generation_paths(
+            &listener,
+            &staged,
+            &public,
+            &marker,
+            generation,
+            || replacement = Some(listen_at_path(&public).unwrap()),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        drop(listener);
+        let _ = fs::remove_file(&staged);
+        cleanup_helper_generation(&public, &marker, generation);
+        assert!(!staged.exists());
+        assert!(!marker.exists());
+        let client = UnixStream::connect(&public).unwrap();
+        replacement.as_ref().unwrap().accept().unwrap();
+        drop(client);
+        drop(replacement);
+        fs::remove_file(public).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn direct_bind_replacement_during_identity_capture_is_preserved() {
+        let dir = temp_dir();
+        let path = dir.join("direct-race.sock");
+        let mut replacement = None;
+        let error =
+            match bind_staged_with_hook(&path, Instant::now() + Duration::from_secs(1), || {
+                replacement = Some(UnixListener::bind(&path).unwrap())
+            }) {
+                Ok(_) => panic!("older direct bind overwrote replacement generation"),
+                Err(error) => error,
+            };
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        let client = UnixStream::connect(&path).unwrap();
+        replacement.as_ref().unwrap().accept().unwrap();
+        drop(client);
+        drop(replacement);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn listen_unix_as_user_rejects_oversized_path() {
         let uid = rustix::process::getuid().as_raw();
         let gid = rustix::process::getgid().as_raw();
@@ -1083,123 +1572,6 @@ mod tests {
         let _ = fs::remove_dir(&dir);
     }
 
-    #[test]
-    fn failed_listener_descriptor_transfer_removes_socket_path() {
-        let dir = temp_dir();
-        let path = dir.join("sock");
-        let listener = PendingUnixListener::bind(&path).unwrap();
-        let (channel, peer) = UnixStream::pair().unwrap();
-        drop(peer);
-
-        assert_eq!(listener.send_and_serve(channel.as_fd()), 1);
-        assert!(!path.exists());
-
-        fs::remove_dir(dir).unwrap();
-    }
-
-    #[test]
-    fn listener_cleanup_is_anchored_to_the_bound_parent() {
-        if helper_exe().is_err() {
-            eprintln!("skipping helper-dependent test: et-user-socket-helper is unavailable");
-            return;
-        }
-        let base = temp_dir();
-        let live = base.join("live");
-        let parked = base.join("parked");
-        let target = base.join("target");
-        fs::create_dir(&live).unwrap();
-        fs::create_dir(&target).unwrap();
-        let socket = live.join("victim");
-        let uid = rustix::process::geteuid().as_raw();
-        let gid = rustix::process::getegid().as_raw();
-        let listener =
-            run_listener_as_user(&socket, uid, gid, Instant::now() + HELPER_TIMEOUT).unwrap();
-
-        fs::rename(&live, &parked).unwrap();
-        let sentinel = target.join("victim");
-        fs::write(&sentinel, b"keep").unwrap();
-        std::os::unix::fs::symlink(&target, &live).unwrap();
-        drop(listener);
-
-        assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
-        assert!(!parked.join("victim").exists());
-        fs::remove_file(&live).unwrap();
-        fs::remove_file(&sentinel).unwrap();
-        fs::remove_dir(&target).unwrap();
-        fs::remove_dir(&parked).unwrap();
-        fs::remove_dir(&base).unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn descriptor_received_from_helper_is_not_inherited_by_next_helper() {
-        let dir = temp_dir();
-        let uid = rustix::process::geteuid().as_raw();
-        let gid = rustix::process::getegid().as_raw();
-        let first = run_listener_as_user(
-            &dir.join("first"),
-            uid,
-            gid,
-            Instant::now() + HELPER_TIMEOUT,
-        )
-        .unwrap();
-        let received_socket =
-            fs::read_link(format!("/proc/self/fd/{}", first.listener.as_raw_fd(),)).unwrap();
-
-        let second = run_listener_as_user(
-            &dir.join("second"),
-            uid,
-            gid,
-            Instant::now() + HELPER_TIMEOUT,
-        )
-        .unwrap();
-        let second_helper = second
-            .cleanup
-            .as_ref()
-            .and_then(|cleanup| cleanup.child.as_ref())
-            .expect("persistent listener helper");
-        let inherited = fs::read_dir(format!("/proc/{}/fd", second_helper.id()))
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter_map(|entry| fs::read_link(entry.path()).ok())
-            .any(|target| target == received_socket);
-
-        assert!(
-            !inherited,
-            "subsequent helper inherited received fd {received_socket:?}"
-        );
-        drop(second);
-        drop(first);
-        fs::remove_dir(dir).unwrap();
-    }
-
-    #[test]
-    fn tcp_destination_connect_runs_through_the_session_helper() {
-        if helper_exe().is_err() {
-            eprintln!("skipping helper-dependent test: et-user-socket-helper is unavailable");
-            return;
-        }
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let uid = rustix::process::geteuid().as_raw();
-        let gid = rustix::process::getegid().as_raw();
-        let fd = run_as_user_until_with_port(
-            Op::ConnectTcp,
-            OsStr::new("127.0.0.1"),
-            uid,
-            gid,
-            Instant::now() + HELPER_TIMEOUT,
-            Some(port),
-        )
-        .unwrap();
-        let mut client = std::net::TcpStream::from(fd);
-        let (mut server, _) = listener.accept().unwrap();
-        client.write_all(b"session-user").unwrap();
-        let mut payload = [0_u8; 12];
-        server.read_exact(&mut payload).unwrap();
-        assert_eq!(&payload, b"session-user");
-    }
-
     fn unprivileged_drop_user() -> Option<(u32, u32)> {
         if rustix::process::getuid().as_raw() != 0 {
             return None;
@@ -1227,20 +1599,6 @@ mod tests {
             return Some((uid, gid));
         }
         None
-    }
-
-    #[test]
-    fn helper_command_clears_privileged_supplementary_groups() {
-        let Some((uid, gid)) = unprivileged_drop_user() else {
-            eprintln!("skipping helper group-drop test: not root or no nobody user");
-            return;
-        };
-        let identity = HelperIdentity {
-            euid: uid,
-            egid: gid,
-            groups: vec![gid],
-        };
-        assert!(helper_identity_matches((uid, gid), &[gid], &identity));
     }
 
     /// ANT-2026-AVTT7HQH: privilege-dropped listen cannot unlink a root-owned

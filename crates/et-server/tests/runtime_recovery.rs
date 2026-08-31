@@ -3,9 +3,11 @@
 mod runtime_support;
 mod support;
 
+use std::net::Shutdown;
+use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use et_core::keys::passkey_to_key;
 use et_core::proto::{ConnectResponse, ConnectStatus, TerminalPacketType};
@@ -15,6 +17,98 @@ use et_net::handshake::client_request;
 use et_net::local_packet::read_local_packet;
 use et_server::SessionState;
 use runtime_support::{default_payload, initialize, TestRuntime, ID_A, KEY_A, TIMEOUT};
+
+// Deadlock watchdog only. Success is driven by exact bridge-generation and
+// terminal-packet events, not by elapsed time.
+const PACKET_EVENT_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_INTERVENING_PACKETS: usize = 32;
+
+type PacketEvent = Result<Vec<(u8, Vec<u8>)>, String>;
+
+fn subscribe_to_terminal_packet(
+    mut terminal: UnixStream,
+    expected_header: u8,
+    expected_payload: &'static [u8],
+) -> (
+    UnixStream,
+    mpsc::Receiver<PacketEvent>,
+    thread::JoinHandle<()>,
+) {
+    terminal.set_read_timeout(None).unwrap();
+    let control = terminal.try_clone().unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (event_tx, event_rx) = mpsc::sync_channel(1);
+    let observer = thread::spawn(move || {
+        ready_tx.send(()).unwrap();
+        let mut intervening = Vec::new();
+        loop {
+            let packet = match read_local_packet(&mut terminal) {
+                Ok(packet) => packet,
+                Err(error) => {
+                    let _ = event_tx.send(Err(format!(
+                        "terminal channel ended before post-recovery packet: {error}"
+                    )));
+                    return;
+                }
+            };
+            if packet.header() == expected_header && packet.payload() == expected_payload {
+                let _ = event_tx.send(Ok(intervening));
+                return;
+            }
+            if packet.header() != TerminalPacketType::TerminalBuffer as u8
+                && packet.header() != TerminalPacketType::TerminalInfo as u8
+            {
+                let _ = event_tx.send(Err(format!(
+                    "unexpected intervening terminal packet header {}",
+                    packet.header()
+                )));
+                return;
+            }
+            intervening.push((packet.header(), packet.payload().to_vec()));
+            if intervening.len() > MAX_INTERVENING_PACKETS {
+                let _ = event_tx.send(Err(
+                    "too many intervening packets before post-recovery traffic".to_owned(),
+                ));
+                return;
+            }
+        }
+    });
+    ready_rx
+        .recv_timeout(TIMEOUT)
+        .expect("terminal packet observer did not subscribe");
+    (control, event_rx, observer)
+}
+
+fn await_terminal_packet(
+    control: UnixStream,
+    events: mpsc::Receiver<PacketEvent>,
+    observer: thread::JoinHandle<()>,
+) -> Vec<(u8, Vec<u8>)> {
+    let event = events.recv_timeout(PACKET_EVENT_TIMEOUT);
+    if event.is_err() {
+        let _ = control.shutdown(Shutdown::Both);
+    }
+    let joined = observer.join();
+    assert!(joined.is_ok(), "terminal packet observer panicked");
+    event
+        .expect("post-recovery terminal packet did not arrive within the bounded event wait")
+        .unwrap_or_else(|error| panic!("post-recovery terminal packet failed: {error}"))
+}
+
+#[test]
+fn terminal_packet_observer_fails_if_recovery_traffic_never_flows() {
+    let (terminal, peer) = UnixStream::pair().unwrap();
+    let (control, events, observer) = subscribe_to_terminal_packet(
+        terminal,
+        TerminalPacketType::TerminalInfo as u8,
+        b"required-packet",
+    );
+    drop(peer);
+    let event = events.recv_timeout(TIMEOUT).unwrap();
+    assert!(event.is_err(), "EOF without the target packet was accepted");
+    drop(control);
+    observer.join().unwrap();
+}
 
 #[test]
 fn same_id_startup_is_newest_wins_then_returning() {
@@ -267,18 +361,42 @@ fn recover_succeeds_while_old_peer_blackholes_writes() {
         Some(ConnectStatus::ReturningClient as i32),
         "expected ReturningClient after blackhole, got {response:?}"
     );
+    let (terminal_control, packet_events, packet_observer) = subscribe_to_terminal_packet(
+        terminal,
+        TerminalPacketType::TerminalInfo as u8,
+        b"after-blackhole",
+    );
+    let bridge_handle = server.handle.clone();
+    let (bridge_ready_tx, bridge_ready_rx) = mpsc::sync_channel(1);
+    let (bridge_tx, bridge_rx) = mpsc::sync_channel(1);
+    let bridge_waiter = thread::spawn(move || {
+        bridge_ready_tx.send(()).unwrap();
+        let result = bridge_handle.wait_for_bridge_generation(ID_A, 1, PACKET_EVENT_TIMEOUT);
+        let _ = bridge_tx.send(result);
+    });
+    bridge_ready_rx
+        .recv_timeout(TIMEOUT)
+        .expect("bridge-generation observer did not subscribe");
+
     client.recover(returning).unwrap();
+    // The first encrypted packet authenticates the candidate and allows the
+    // server to install it. Wait for the bridge's exact generation event after
+    // sending that proof, before sending traffic whose forwarding we assert.
     client
         .write_packet(TerminalPacketType::KeepAlive as u8, &[])
         .unwrap();
+    bridge_rx
+        .recv_timeout(PACKET_EVENT_TIMEOUT)
+        .expect("bridge did not observe the recovered connection")
+        .unwrap();
+    bridge_waiter.join().unwrap();
 
-    // Post-recovery traffic must flow on the new stream.
+    // Post-recovery traffic must flow on the new stream. The terminal observer
+    // is subscribed before this write and classifies any valid replay packet.
     client
         .write_packet(TerminalPacketType::TerminalInfo as u8, b"after-blackhole")
         .unwrap();
-    let forwarded = read_local_packet(&mut terminal).unwrap();
-    assert_eq!(forwarded.header(), TerminalPacketType::TerminalInfo as u8);
-    assert_eq!(forwarded.payload(), b"after-blackhole");
+    let _intervening = await_terminal_packet(terminal_control, packet_events, packet_observer);
     server.runtime.shutdown().unwrap();
 }
 

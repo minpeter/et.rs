@@ -66,6 +66,7 @@ fn run_mode_poll(
     wake.set_nonblocking(true).map_err(SessionError::Io)?;
     let mut decoder = LocalPacketDecoder::new();
     let (mut connected, mut connection_generation) = session.connection_state()?;
+    session.note_bridge_generation(connection_generation)?;
     // A forwarding packet the worker had no room for. While it is held, no
     // further client packets are read (ordering) and the client socket is not
     // watched for readability (it would busy-loop the poll).
@@ -126,6 +127,7 @@ fn run_mode_poll(
                 return Ok(());
             }
             (connected, connection_generation) = session.connection_state()?;
+            session.note_bridge_generation(connection_generation)?;
         }
         let terminal_closed = terminal_events.intersects(PollFlags::HUP | PollFlags::ERR);
         if terminal_closed || terminal_events.contains(PollFlags::IN) {
@@ -243,6 +245,7 @@ fn run_mode_windows(
     wake.set_nonblocking(true).map_err(SessionError::Io)?;
     let mut decoder = LocalPacketDecoder::new();
     let (mut connected, mut connection_generation) = session.connection_state()?;
+    session.note_bridge_generation(connection_generation)?;
     // A forwarding packet the worker had no room for; while it is held, no
     // further client packets are read so forwarding data stays ordered.
     let mut pending_forward: Option<Packet> = None;
@@ -274,6 +277,7 @@ fn run_mode_windows(
                 return Ok(());
             }
             (connected, connection_generation) = session.connection_state()?;
+            session.note_bridge_generation(connection_generation)?;
             progress = true;
         }
 

@@ -2,7 +2,7 @@ use et_net::local::LocalStream;
 use std::io::{self, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use et_core::proto::TerminalPacketType;
@@ -34,6 +34,8 @@ pub(crate) struct ActiveSession {
     /// to queue on the connection mutex for minutes after a blackhole write.
     recovering: AtomicBool,
     connection_generation: AtomicU64,
+    bridge_generation: Mutex<u64>,
+    bridge_changed: Condvar,
 }
 
 pub(crate) enum SessionConnection {
@@ -95,6 +97,8 @@ impl ActiveSession {
             shutdown: AtomicBool::new(false),
             recovering: AtomicBool::new(false),
             connection_generation: AtomicU64::new(0),
+            bridge_generation: Mutex::new(0),
+            bridge_changed: Condvar::new(),
         })
     }
 
@@ -312,6 +316,46 @@ impl ActiveSession {
             .map_err(|_| SessionError::Unavailable)?
             .try_read_packet()
             .map_err(SessionError::Connection)
+    }
+
+    pub(crate) fn note_bridge_generation(&self, generation: u64) -> Result<(), SessionError> {
+        let mut observed = self
+            .bridge_generation
+            .lock()
+            .map_err(|_| SessionError::Unavailable)?;
+        if generation > *observed {
+            *observed = generation;
+            self.bridge_changed.notify_all();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn wait_for_bridge_generation(
+        &self,
+        expected: u64,
+        timeout: Duration,
+    ) -> Result<(), SessionError> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(SessionError::Unavailable)?;
+        let mut observed = self
+            .bridge_generation
+            .lock()
+            .map_err(|_| SessionError::Unavailable)?;
+        while *observed < expected {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(SessionError::RecoverBusy)?;
+            let (next, result) = self
+                .bridge_changed
+                .wait_timeout(observed, remaining)
+                .map_err(|_| SessionError::Unavailable)?;
+            observed = next;
+            if result.timed_out() && *observed < expected {
+                return Err(SessionError::RecoverBusy);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn connection_state(&self) -> Result<(bool, u64), SessionError> {

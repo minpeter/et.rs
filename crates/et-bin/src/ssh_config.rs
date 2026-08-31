@@ -670,9 +670,37 @@ mod tests {
     }
 
     #[test]
+    fn local_forward_normalized_bind_shapes_preserve_explicit_precedence() {
+        for (gateway_ports, source, expected_name, expected_port) in [
+            ("yes", "15430", "", 15430),
+            ("yes", "localhost:15431", "localhost", 15431),
+            ("no", "*:15432", "", 15432),
+            ("no", "127.0.0.2:15433", "127.0.0.2", 15433),
+        ] {
+            // Given
+            let config = format!(
+                "hostname host\ngatewayports {gateway_ports}\n\
+                 localforward {source} localhost:9\n"
+            );
+
+            // When
+            let resolved = parse_ssh_config(config.as_bytes(), true, false).unwrap();
+
+            // Then
+            let source = resolved.local_forwards[0].source.as_ref().unwrap();
+            assert_eq!(source.name.as_deref(), Some(expected_name));
+            assert_eq!(source.port, Some(expected_port));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn local_forward_listener_exposure_matches_explicit_bind_precedence() {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 
+        // GitHub macOS runners do not configure a second loopback alias. C001's
+        // real OpenSSH/runtime evidence proves external-interface exposure;
+        // this in-process reachability matrix is deterministic on Linux only.
         let loopback_alias = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
         for (gateway_ports, source, reachable, unreachable) in [
             ("yes", "", loopback_alias, None),

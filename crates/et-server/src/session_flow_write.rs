@@ -1,5 +1,5 @@
 use et_core::packet::Packet;
-use et_net::connection::WritePacketError;
+use et_net::connection::{ConnError, WritePacketError};
 
 use super::FlowControl;
 use crate::session::{ActiveSession, SessionError};
@@ -44,8 +44,11 @@ where
     };
     let result = match prepared.and_then(et_net::connection::PreparedWrite::send) {
         Ok(()) => FlowWriteResult::Delivered,
+        Err(WritePacketError::BeforeReplay(ConnError::Io(error))) => {
+            FlowWriteResult::BeforeReplay(SessionError::Connection(ConnError::Io(error)))
+        }
         Err(WritePacketError::BeforeReplay(error)) => {
-            FlowWriteResult::BeforeReplay(SessionError::Connection(error))
+            FlowWriteResult::Fatal(SessionError::Connection(error))
         }
         Err(WritePacketError::ReplayOwned(error)) => {
             FlowWriteResult::ReplayOwned(SessionError::Connection(error))
@@ -53,7 +56,10 @@ where
     };
     match session.connection.lock() {
         Ok(mut connection) => {
-            if matches!(result, FlowWriteResult::ReplayOwned(_)) {
+            if matches!(
+                result,
+                FlowWriteResult::BeforeReplay(_) | FlowWriteResult::ReplayOwned(_)
+            ) {
                 connection.disconnect();
             }
             (result, connection.connected())
@@ -75,8 +81,12 @@ pub(crate) fn write_packet(
         Ok(mut connection) => {
             let result = match connection.write_packet_owned(packet.header(), packet.payload()) {
                 Ok(()) => FlowWriteResult::Delivered,
+                Err(WritePacketError::BeforeReplay(ConnError::Io(error))) => {
+                    connection.disconnect();
+                    FlowWriteResult::BeforeReplay(SessionError::Connection(ConnError::Io(error)))
+                }
                 Err(WritePacketError::BeforeReplay(error)) => {
-                    FlowWriteResult::BeforeReplay(SessionError::Connection(error))
+                    FlowWriteResult::Fatal(SessionError::Connection(error))
                 }
                 Err(WritePacketError::ReplayOwned(error)) => {
                     FlowWriteResult::ReplayOwned(SessionError::Connection(error))

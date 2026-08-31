@@ -127,8 +127,7 @@ fn hard_shutdown_wakes_and_joins_a_deliberately_blocked_writer() {
 #[test]
 fn before_replay_failure_waits_for_resume_then_delivers_once() {
     // Given: the flow writer owns one packet and socket cloning fails before replay admission.
-    let (server, mut client) = connection_pair();
-    client.set_io_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let (server, _client) = connection_pair();
     let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
     let session = ActiveSession::new(
         server,
@@ -153,11 +152,16 @@ fn before_replay_failure_waits_for_resume_then_delivers_once() {
         },
     );
     assert!(matches!(failed, FlowWriteResult::BeforeReplay(_)));
+    assert!(!connected);
+    assert!(!session.connection.lock().unwrap().connected());
     assert!(flow.complete(packet, &failed, connected));
     let (restored_tx, restored_rx) = mpsc::sync_channel(0);
     let flow_waiter = Arc::clone(session.flow_control.as_ref().unwrap());
     let waiting = thread::spawn(move || restored_tx.send(flow_waiter.next_packet()).unwrap());
     assert!(restored_rx.try_recv().is_err());
+    let (recovered_server, mut recovered_client) = connection_pair();
+    recovered_client.set_io_timeout(Some(TEST_TIMEOUT)).unwrap();
+    *session.connection.lock().unwrap() = recovered_server;
     flow.resume(true);
     let restored = restored_rx.recv_timeout(TEST_TIMEOUT).unwrap().unwrap();
     waiting.join().unwrap();
@@ -166,15 +170,126 @@ fn before_replay_failure_waits_for_resume_then_delivers_once() {
     assert!(flow.complete(restored, &delivered, connected));
 
     // Then: the restored plaintext is encrypted under one sequence and delivered once.
-    let received = client.read_packet().unwrap();
+    let received = recovered_client.read_packet().unwrap();
     assert_eq!(
         (received.header(), received.payload()),
         (40, b"clone-retry".as_slice())
     );
-    client
+    recovered_client
         .set_io_timeout(Some(Duration::from_millis(50)))
         .unwrap();
-    assert!(client.read_packet().is_err());
+    assert!(recovered_client.read_packet().is_err());
+}
+
+#[test]
+fn non_transport_before_replay_is_fatal_instead_of_pausing_as_disconnected() {
+    let (server, _client) = connection_pair();
+    let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
+    let session = ActiveSession::new(
+        server,
+        &terminal,
+        Some(FlowControlMode::Backpressure as i32),
+    )
+    .unwrap();
+    let flow = session.flow_control.as_ref().unwrap();
+    flow.enqueue(et_core::packet::Packet::new(
+        53,
+        b"semantic-failure".as_slice(),
+    ))
+    .unwrap();
+    let packet = flow.next_packet().unwrap();
+    let (result, connected) =
+        super::session_flow::writer::write_packet_with(&session, flow, &packet, |_, _| {
+            Err(WritePacketError::BeforeReplay(ConnError::Backpressure))
+        });
+
+    assert!(matches!(result, FlowWriteResult::Fatal(_)));
+    assert!(connected);
+    assert!(!flow.complete(packet, &result, connected));
+}
+
+#[test]
+fn graceful_before_replay_waits_for_explicit_resume_without_spinning() {
+    let (server, _client) = connection_pair();
+    let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
+    let session = Arc::new(
+        ActiveSession::new(
+            server,
+            &terminal,
+            Some(FlowControlMode::Backpressure as i32),
+        )
+        .unwrap(),
+    );
+    let flow = Arc::clone(session.flow_control.as_ref().unwrap());
+    flow.enqueue(et_core::packet::Packet::new(
+        54,
+        b"graceful-retry".as_slice(),
+    ))
+    .unwrap();
+    let (attempt_tx, attempt_rx) = mpsc::sync_channel(0);
+    let (result_tx, result_rx) = mpsc::sync_channel(0);
+    let (completed_tx, completed_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    let worker_session = Arc::clone(&session);
+    let worker_flow = Arc::clone(&flow);
+    let worker = thread::spawn(move || {
+        let mut attempt = 0;
+        while let Some(packet) = worker_flow.next_packet() {
+            attempt += 1;
+            attempt_tx.send(attempt).unwrap();
+            let fail = result_rx.recv().unwrap();
+            let (result, connected) = match (attempt, fail) {
+                (1, true) => super::session_flow::writer::write_packet_with(
+                    &worker_session,
+                    &worker_flow,
+                    &packet,
+                    |connection, packet| {
+                        connection.prepare_write_packet_with(
+                            packet.header(),
+                            packet.payload(),
+                            |_| Err(std::io::Error::other("persistent clone failure")),
+                        )
+                    },
+                ),
+                (_, true) => (
+                    FlowWriteResult::BeforeReplay(SessionError::Connection(ConnError::Io(
+                        std::io::Error::other("persistent clone failure"),
+                    ))),
+                    false,
+                ),
+                (_, false) => (FlowWriteResult::Delivered, true),
+            };
+            if !worker_flow.complete(packet, &result, connected) {
+                break;
+            }
+            completed_tx.send(attempt).unwrap();
+        }
+        done_tx.send(()).unwrap();
+    });
+
+    assert_eq!(attempt_rx.recv().unwrap(), 1);
+    result_tx.send(true).unwrap();
+    assert_eq!(completed_rx.recv().unwrap(), 1);
+    assert!(!session.connection.lock().unwrap().connected());
+    flow.stop_gracefully();
+    assert!(attempt_rx.try_recv().is_err());
+    assert!(done_rx.try_recv().is_err());
+
+    flow.resume(true);
+    assert_eq!(attempt_rx.recv().unwrap(), 2);
+    result_tx.send(true).unwrap();
+    assert_eq!(completed_rx.recv().unwrap(), 2);
+    assert!(attempt_rx.try_recv().is_err());
+    assert!(done_rx.try_recv().is_err());
+
+    // Installing/authorizing a usable transport and resuming permits exactly
+    // one final delivery, after which graceful join can complete.
+    flow.resume(true);
+    assert_eq!(attempt_rx.recv().unwrap(), 3);
+    result_tx.send(false).unwrap();
+    assert_eq!(completed_rx.recv().unwrap(), 3);
+    done_rx.recv().unwrap();
+    worker.join().unwrap();
 }
 
 #[test]

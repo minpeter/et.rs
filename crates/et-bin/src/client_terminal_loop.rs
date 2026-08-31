@@ -24,7 +24,8 @@ use crate::client_terminal::TerminalModeState;
 #[cfg(unix)]
 use crate::client_terminal::{
     connection_ended, encoded_buffer, recover_transport, terminal_error, terminal_io,
-    terminal_size_payload, terminal_text, write_owned_recovering, OwnedWriteOutcome,
+    terminal_size_payload, terminal_text, write_owned_recovering, write_terminal_size_recovering,
+    OwnedWriteOutcome, RetainedCompletion,
 };
 #[cfg(unix)]
 use crate::error::ClientError;
@@ -112,9 +113,14 @@ where
                         )?,
                         OwnedWriteOutcome::SessionEnded
                     ) {
-                        return console_output
-                            .complete(ConsoleCompletion::RemoteSessionEnded)
-                            .map_err(|error| terminal_io("draining terminal output", error));
+                        return finish_remote_completion(
+                            console_output,
+                            pending_output,
+                            pending_forward,
+                            terminal_enabled,
+                            terminal_modes,
+                            forwarder,
+                        );
                     }
                 }
                 DisplayOutcome::Displayed { .. } => {}
@@ -207,9 +213,14 @@ where
                         )?,
                         OwnedWriteOutcome::SessionEnded
                     ) {
-                        return console_output
-                            .complete(ConsoleCompletion::RemoteSessionEnded)
-                            .map_err(|error| terminal_io("draining terminal output", error));
+                        return finish_remote_completion(
+                            console_output,
+                            pending_output,
+                            pending_forward,
+                            terminal_enabled,
+                            terminal_modes,
+                            forwarder,
+                        );
                     }
                 }
             }
@@ -227,19 +238,17 @@ where
             if terminal_enabled {
                 if let Some(payload) = terminal_size_payload()? {
                     if matches!(
-                        write_owned(
-                            connection,
-                            TerminalPacketType::TerminalInfo as u8,
-                            &payload,
-                            &mut reconnect,
-                            &mut stream,
-                            false,
-                        )?,
+                        write_terminal_size(connection, &payload, &mut reconnect, &mut stream)?,
                         OwnedWriteOutcome::SessionEnded
                     ) {
-                        return console_output
-                            .complete(ConsoleCompletion::RemoteSessionEnded)
-                            .map_err(|error| terminal_io("draining terminal output", error));
+                        return finish_remote_completion(
+                            console_output,
+                            pending_output,
+                            pending_forward,
+                            terminal_enabled,
+                            terminal_modes,
+                            forwarder,
+                        );
                     }
                 }
             }
@@ -278,11 +287,14 @@ where
                                     )?,
                                     OwnedWriteOutcome::SessionEnded
                                 ) {
-                                    return console_output
-                                        .complete(ConsoleCompletion::RemoteSessionEnded)
-                                        .map_err(|error| {
-                                            terminal_io("draining terminal output", error)
-                                        });
+                                    return finish_remote_completion(
+                                        console_output,
+                                        pending_output,
+                                        pending_forward,
+                                        terminal_enabled,
+                                        terminal_modes,
+                                        forwarder,
+                                    );
                                 }
                             }
                             DisplayOutcome::Displayed { .. } => {}
@@ -317,9 +329,14 @@ where
                         next_keepalive = last_received + interval;
                     }
                     OwnedWriteOutcome::SessionEnded => {
-                        return console_output
-                            .complete(ConsoleCompletion::RemoteSessionEnded)
-                            .map_err(|error| terminal_io("draining terminal output", error));
+                        return finish_remote_completion(
+                            console_output,
+                            pending_output,
+                            pending_forward,
+                            terminal_enabled,
+                            terminal_modes,
+                            forwarder,
+                        );
                     }
                 }
             }
@@ -330,9 +347,14 @@ where
         }
         if reconnect_needed {
             if !recover(connection, &mut reconnect, &mut stream, terminal_enabled)? {
-                return console_output
-                    .complete(ConsoleCompletion::RemoteSessionEnded)
-                    .map_err(|error| terminal_io("draining terminal output", error));
+                return finish_remote_completion(
+                    console_output,
+                    pending_output,
+                    pending_forward,
+                    terminal_enabled,
+                    terminal_modes,
+                    forwarder,
+                );
             }
             last_received = Instant::now();
             next_keepalive = last_received + interval;
@@ -364,9 +386,14 @@ where
                     next_keepalive = last_received + interval;
                 }
                 OwnedWriteOutcome::SessionEnded => {
-                    return console_output
-                        .complete(ConsoleCompletion::RemoteSessionEnded)
-                        .map_err(|error| terminal_io("draining terminal output", error));
+                    return finish_remote_completion(
+                        console_output,
+                        pending_output,
+                        pending_forward,
+                        terminal_enabled,
+                        terminal_modes,
+                        forwarder,
+                    );
                 }
             }
         }
@@ -391,9 +418,14 @@ where
                 )?,
                 OwnedWriteOutcome::SessionEnded
             ) {
-                return console_output
-                    .complete(ConsoleCompletion::RemoteSessionEnded)
-                    .map_err(|error| terminal_io("draining terminal output", error));
+                return finish_remote_completion(
+                    console_output,
+                    pending_output,
+                    pending_forward,
+                    terminal_enabled,
+                    terminal_modes,
+                    forwarder,
+                );
             }
             next_keepalive = Instant::now() + interval;
         }
@@ -426,6 +458,83 @@ fn route_server_packet(
 }
 
 #[cfg(unix)]
+fn finish_remote_completion(
+    mut output: crate::client_output::ConsoleOutput,
+    pending_output: Option<et_core::packet::Packet>,
+    pending_forward: Option<et_core::packet::Packet>,
+    terminal_enabled: bool,
+    terminal_modes: &mut TerminalModeState,
+    forwarder: &Forwarder,
+) -> Result<(), ClientError> {
+    let mut retained = RetainedCompletion::new(pending_output, pending_forward);
+    loop {
+        output
+            .check_error()
+            .map_err(|error| terminal_io("writing retained terminal output", error))?;
+        if retained.advance(
+            |packet| match route_server_packet(packet, terminal_enabled, terminal_modes, &output)? {
+                DisplayOutcome::Displayed { .. } => Ok(None),
+                DisplayOutcome::Pending(packet) => Ok(Some(packet)),
+            },
+            |packet| {
+                forwarder
+                    .try_receive(packet)
+                    .map_err(|error| terminal_text(error.to_string()))
+            },
+        )? {
+            return output
+                .complete(ConsoleCompletion::RemoteSessionEnded)
+                .map_err(|error| terminal_io("draining terminal output", error));
+        }
+        if forwarder
+            .try_outbound()
+            .map_err(|error| terminal_text(error.to_string()))?
+            .is_some()
+        {
+            return Err(terminal_text(
+                "remote session ended with undeliverable local forwarding output",
+            ));
+        }
+
+        let (output_ready, output_status) = {
+            let mut descriptors = [
+                PollFd::new(
+                    forwarder
+                        .wake()
+                        .map_err(|error| terminal_text(error.to_string()))?,
+                    PollFlags::IN | PollFlags::HUP,
+                ),
+                PollFd::new(output.wake(), PollFlags::IN | PollFlags::HUP),
+                PollFd::new(output.status_wake(), PollFlags::IN | PollFlags::HUP),
+            ];
+            let timeout = Timespec::try_from(Duration::from_millis(100))
+                .map_err(|_| terminal_text("completion wait exceeds poll range"))?;
+            match poll(&mut descriptors, Some(&timeout)) {
+                Ok(_) => {}
+                Err(error) if error == rustix::io::Errno::INTR => continue,
+                Err(error) => {
+                    return Err(terminal_io(
+                        "waiting to drain retained session packets",
+                        io::Error::from(error),
+                    ));
+                }
+            }
+            (descriptors[1].revents(), descriptors[2].revents())
+        };
+        if output_ready.intersects(PollFlags::IN | PollFlags::HUP) {
+            output
+                .drain_wake()
+                .map_err(|error| terminal_io("draining console output wakeup", error))?;
+        }
+        if output_status.intersects(PollFlags::IN | PollFlags::HUP) {
+            output
+                .drain_status_wake()
+                .map_err(|error| terminal_io("draining console status wakeup", error))?;
+        }
+    }
+}
+
+#[cfg(unix)]
 fn write_cursor_report<F>(
     connection: &mut Connection,
     reconnect: &mut F,
@@ -444,6 +553,23 @@ where
         stream,
         send_terminal_size,
     )
+}
+
+#[cfg(unix)]
+fn write_terminal_size<F>(
+    connection: &mut Connection,
+    payload: &[u8],
+    reconnect: &mut F,
+    stream: &mut std::net::TcpStream,
+) -> Result<OwnedWriteOutcome, ClientError>
+where
+    F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
+{
+    let outcome = write_terminal_size_recovering(connection, payload, reconnect)?;
+    if matches!(outcome, OwnedWriteOutcome::Recovered) {
+        *stream = connection.try_clone_stream().map_err(terminal_error)?;
+    }
+    Ok(outcome)
 }
 
 #[cfg(unix)]

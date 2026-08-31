@@ -176,7 +176,11 @@ impl FlowControl {
             .wake
             .wait_while(state, |state| match state.stop {
                 StopMode::Hard => false,
-                StopMode::Graceful => state.paused || (state.queue.is_empty() && state.in_flight),
+                StopMode::Graceful => {
+                    state.paused
+                        || (!state.connected && !state.queue.is_empty())
+                        || (state.queue.is_empty() && state.in_flight)
+                }
                 StopMode::Running => state.paused || !state.connected || state.queue.is_empty(),
             })
             .ok()?;

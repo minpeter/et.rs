@@ -86,13 +86,7 @@ where
     if terminal_enabled {
         if let Some(initial_size) = terminal_size_payload()? {
             if matches!(
-                write_owned_recovering(
-                    &mut connection,
-                    TerminalPacketType::TerminalInfo as u8,
-                    &initial_size,
-                    &mut reconnect,
-                    terminal_enabled,
-                )?,
+                write_terminal_size_recovering(&mut connection, &initial_size, &mut reconnect)?,
                 OwnedWriteOutcome::SessionEnded
             ) {
                 return raw_mode.finish(Ok(()), close_message, terminal_modes.alternate_screen());
@@ -202,6 +196,41 @@ pub(crate) enum DisplayOutcome {
     Pending(et_core::packet::Packet),
 }
 
+pub(crate) struct RetainedCompletion {
+    terminal: Option<et_core::packet::Packet>,
+    forwarding: Option<et_core::packet::Packet>,
+}
+
+impl RetainedCompletion {
+    pub(crate) fn new(
+        terminal: Option<et_core::packet::Packet>,
+        forwarding: Option<et_core::packet::Packet>,
+    ) -> Self {
+        Self {
+            terminal,
+            forwarding,
+        }
+    }
+
+    pub(crate) fn advance<T, F>(
+        &mut self,
+        mut admit_terminal: T,
+        mut admit_forwarding: F,
+    ) -> Result<bool, ClientError>
+    where
+        T: FnMut(et_core::packet::Packet) -> Result<Option<et_core::packet::Packet>, ClientError>,
+        F: FnMut(et_core::packet::Packet) -> Result<Option<et_core::packet::Packet>, ClientError>,
+    {
+        if let Some(packet) = self.forwarding.take() {
+            self.forwarding = admit_forwarding(packet)?;
+        }
+        if let Some(packet) = self.terminal.take() {
+            self.terminal = admit_terminal(packet)?;
+        }
+        Ok(self.forwarding.is_none() && self.terminal.is_none())
+    }
+}
+
 pub(crate) fn display_packet_with<F>(
     packet: et_core::packet::Packet,
     mut output: F,
@@ -281,6 +310,12 @@ pub(crate) enum OwnedWriteOutcome {
     SessionEnded,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum OwnedWritePolicy {
+    ExactPlaintext,
+    ReplaceableTerminalSize,
+}
+
 pub(crate) fn write_owned_recovering<F>(
     connection: &mut Connection,
     header: u8,
@@ -307,11 +342,33 @@ fn write_owned_recovering_with<F, W>(
     payload: &[u8],
     reconnect: &mut F,
     send_terminal_size: bool,
-    mut write: W,
+    write: W,
 ) -> Result<OwnedWriteOutcome, ClientError>
 where
     F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
     W: FnMut(&mut Connection, u8, &[u8]) -> Result<(), WritePacketError>,
+{
+    write_owned_with_policy(
+        connection,
+        header,
+        payload,
+        OwnedWritePolicy::ExactPlaintext,
+        write,
+        |connection, _policy| recover_transport(connection, reconnect, send_terminal_size),
+    )
+}
+
+fn write_owned_with_policy<W, R>(
+    connection: &mut Connection,
+    header: u8,
+    payload: &[u8],
+    policy: OwnedWritePolicy,
+    mut write: W,
+    mut recover: R,
+) -> Result<OwnedWriteOutcome, ClientError>
+where
+    W: FnMut(&mut Connection, u8, &[u8]) -> Result<(), WritePacketError>,
+    R: FnMut(&mut Connection, OwnedWritePolicy) -> Result<bool, ClientError>,
 {
     let mut recovered = false;
     loop {
@@ -325,23 +382,42 @@ where
             }
             Err(WritePacketError::BeforeReplay(error)) if connection_ended(&error) => {
                 connection.disconnect();
-                if !recover_transport(connection, reconnect, send_terminal_size)? {
+                if !recover(connection, policy)? {
                     return Ok(OwnedWriteOutcome::SessionEnded);
                 }
                 recovered = true;
+                if matches!(policy, OwnedWritePolicy::ReplaceableTerminalSize) {
+                    return Ok(OwnedWriteOutcome::Recovered);
+                }
             }
             Err(WritePacketError::ReplayOwned(error)) if connection_ended(&error) => {
-                return Ok(
-                    if recover_transport(connection, reconnect, send_terminal_size)? {
-                        OwnedWriteOutcome::Recovered
-                    } else {
-                        OwnedWriteOutcome::SessionEnded
-                    },
-                );
+                return Ok(if recover(connection, policy)? {
+                    OwnedWriteOutcome::Recovered
+                } else {
+                    OwnedWriteOutcome::SessionEnded
+                });
             }
             Err(error) => return Err(terminal_error(error.into_inner())),
         }
     }
+}
+
+pub(crate) fn write_terminal_size_recovering<F>(
+    connection: &mut Connection,
+    payload: &[u8],
+    reconnect: &mut F,
+) -> Result<OwnedWriteOutcome, ClientError>
+where
+    F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
+{
+    write_owned_with_policy(
+        connection,
+        TerminalPacketType::TerminalInfo as u8,
+        payload,
+        OwnedWritePolicy::ReplaceableTerminalSize,
+        |connection, header, payload| connection.write_packet_owned(header, payload),
+        |connection, _policy| recover_transport(connection, reconnect, true),
+    )
 }
 
 pub(crate) fn terminal_size_payload() -> Result<Option<Vec<u8>>, ClientError> {

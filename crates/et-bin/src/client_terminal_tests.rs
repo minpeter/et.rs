@@ -1,18 +1,125 @@
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 
 use et_core::crypto::KEY_LEN;
-use et_core::proto::{TerminalBuffer, TerminalPacketType};
+use et_core::packet::Packet;
+use et_core::proto::{TerminalBuffer, TerminalInfo, TerminalPacketType};
 use et_net::connection::{ConnError, Connection, WritePacketError};
 use prost::Message;
 
 use super::{
     command_payload, recover_initial_transport, recover_transport, write_owned_recovering_with,
-    OwnedWriteOutcome, TerminalModeState, TerminalReset, GRACEFUL_TERMINAL_MODE_RESET,
-    TERMINAL_MODE_RESET,
+    write_owned_with_policy, OwnedWriteOutcome, OwnedWritePolicy, RetainedCompletion,
+    TerminalModeState, TerminalReset, GRACEFUL_TERMINAL_MODE_RESET, TERMINAL_MODE_RESET,
 };
 use crate::client_terminal::{connection_ended, RemoteLines};
 use crate::error::ClientError;
 use crate::initial_connect::ReconnectOutcome;
+
+#[test]
+fn retained_completion_waits_for_terminal_and_forward_capacity() {
+    let terminal = Packet::new(
+        TerminalPacketType::TerminalBuffer as u8,
+        b"terminal".as_slice(),
+    );
+    let forwarding = Packet::new(91, b"forwarding".as_slice());
+    let mut completion = RetainedCompletion::new(Some(terminal), Some(forwarding));
+    let (terminal_attempt_tx, terminal_attempt_rx) = std::sync::mpsc::channel();
+    let (forward_attempt_tx, forward_attempt_rx) = std::sync::mpsc::channel();
+    let (terminal_release_tx, terminal_release_rx) = std::sync::mpsc::channel();
+    let (forward_release_tx, forward_release_rx) = std::sync::mpsc::channel();
+
+    assert!(!completion
+        .advance(
+            |packet| {
+                terminal_attempt_tx.send(packet.header()).unwrap();
+                Ok(match terminal_release_rx.try_recv() {
+                    Ok(()) => None,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => Some(packet),
+                    Err(error) => panic!("terminal release channel: {error}"),
+                })
+            },
+            |packet| {
+                forward_attempt_tx.send(packet.header()).unwrap();
+                Ok(match forward_release_rx.try_recv() {
+                    Ok(()) => None,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => Some(packet),
+                    Err(error) => panic!("forward release channel: {error}"),
+                })
+            },
+        )
+        .unwrap());
+    assert_eq!(
+        terminal_attempt_rx.recv().unwrap(),
+        TerminalPacketType::TerminalBuffer as u8
+    );
+    assert_eq!(forward_attempt_rx.recv().unwrap(), 91);
+
+    terminal_release_tx.send(()).unwrap();
+    forward_release_tx.send(()).unwrap();
+    assert!(completion
+        .advance(
+            |packet| {
+                terminal_attempt_tx.send(packet.header()).unwrap();
+                terminal_release_rx.recv().unwrap();
+                Ok(None)
+            },
+            |packet| {
+                forward_attempt_tx.send(packet.header()).unwrap();
+                forward_release_rx.recv().unwrap();
+                Ok(None)
+            },
+        )
+        .unwrap());
+    assert_eq!(
+        terminal_attempt_rx.recv().unwrap(),
+        TerminalPacketType::TerminalBuffer as u8
+    );
+    assert_eq!(forward_attempt_rx.recv().unwrap(), 91);
+}
+
+#[test]
+fn replaceable_terminal_size_never_retries_stale_payload_after_recovery() {
+    let (stream, _peer) = tcp_pair();
+    let mut connection = Connection::new_client(stream, &[7u8; KEY_LEN]);
+    let old = TerminalInfo {
+        row: Some(24),
+        column: Some(80),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let new = TerminalInfo {
+        row: Some(50),
+        column: Some(160),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let mut size_provider = [old.clone(), new.clone()].into_iter();
+    let initial = size_provider.next().unwrap();
+    let sent = std::cell::RefCell::new(Vec::new());
+    let outcome = write_owned_with_policy(
+        &mut connection,
+        TerminalPacketType::TerminalInfo as u8,
+        &initial,
+        OwnedWritePolicy::ReplaceableTerminalSize,
+        |_, _, payload| {
+            sent.borrow_mut().push(("initial", payload.to_vec()));
+            Err(WritePacketError::BeforeReplay(ConnError::Io(
+                std::io::ErrorKind::ConnectionReset.into(),
+            )))
+        },
+        |_, policy| {
+            assert!(matches!(policy, OwnedWritePolicy::ReplaceableTerminalSize));
+            sent.borrow_mut()
+                .push(("recovery", size_provider.next().unwrap()));
+            Ok(true)
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(outcome, OwnedWriteOutcome::Recovered));
+    assert_eq!(sent.into_inner(), vec![("initial", old), ("recovery", new)]);
+    assert!(size_provider.next().is_none());
+}
 
 #[test]
 fn command_exit_suffix_matches_no_exit_flag_and_remote_shell() {

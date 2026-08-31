@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# et.rs has no wake-time authentication, services, or repair work.

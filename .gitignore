@@ -5,3 +5,4 @@ Cargo.lock.bak
 *.profraw
 /coverage
 /.omo
+/.amp/portals/*

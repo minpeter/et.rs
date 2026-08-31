@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+started_at=$SECONDS
+
+step() {
+  printf '\n==> %s\n' "$1"
+}
+
+step "Installing system packages"
+packages=(build-essential protobuf-compiler)
+missing_packages=()
+for package in "${packages[@]}"; do
+  if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -Fqx 'install ok installed'; then
+    missing_packages+=("$package")
+  fi
+done
+if ((${#missing_packages[@]})); then
+  sudo apt-get update
+  sudo apt-get install -y --no-install-recommends "${missing_packages[@]}"
+else
+  echo "System packages are already installed."
+fi
+
+step "Installing the Rust toolchain"
+rust_toolchain="$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' Cargo.toml)"
+if [[ -z "$rust_toolchain" ]]; then
+  echo "Could not read workspace.package.rust-version from Cargo.toml." >&2
+  exit 1
+fi
+if [[ -d "$HOME/.cargo/bin" ]]; then
+  export PATH="$HOME/.cargo/bin:$PATH"
+fi
+if ! command -v rustup >/dev/null 2>&1; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain none
+  export PATH="$HOME/.cargo/bin:$PATH"
+fi
+if ! rustup run "$rust_toolchain" rustc --version >/dev/null 2>&1; then
+  rustup toolchain install "$rust_toolchain" \
+    --profile minimal \
+    --component clippy \
+    --component rustfmt
+else
+  for component in clippy rustfmt; do
+    if ! rustup component list --toolchain "$rust_toolchain" --installed \
+      | grep -q "^${component}-"; then
+      rustup component add --toolchain "$rust_toolchain" "$component"
+    fi
+  done
+fi
+rustup default "$rust_toolchain"
+
+profile_marker="# et.rs Rust toolchain"
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+  cat >>"$HOME/.bash_profile" <<'EOF'
+
+# et.rs Rust toolchain
+if [[ -f "$HOME/.cargo/env" ]]; then
+  . "$HOME/.cargo/env"
+fi
+EOF
+fi
+
+step "Installing locked dependencies"
+node_major="$(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || true)"
+if [[ -z "$node_major" || "$node_major" -lt 24 ]]; then
+  echo "Node.js 24 or newer is required; found: $(node --version 2>/dev/null || echo missing)" >&2
+  exit 1
+fi
+npm ci --prefer-offline --no-audit --no-fund
+cargo fetch --locked
+
+printf '\nOrb setup complete in %ss.\n' "$((SECONDS - started_at))"

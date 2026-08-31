@@ -7,6 +7,7 @@
 //! `unsafe`); it re-execs a helper, drops with [`nix`] in that
 //! single-threaded process, and uses the same fd-passing protocol.
 
+use std::error::Error;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, IoSlice, IoSliceMut};
@@ -218,6 +219,14 @@ fn drop_helper_privileges() -> io::Result<()> {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or_else(|| rustix::process::getgid().as_raw());
+    if !rustix::process::geteuid().is_root()
+        && (rustix::process::geteuid().as_raw() != uid
+            || rustix::process::getegid().as_raw() != gid)
+    {
+        return Err(io::Error::from_raw_os_error(
+            rustix::io::Errno::PERM.raw_os_error(),
+        ));
+    }
     let uid_text = uid.to_string();
     let gid_text = gid.to_string();
     privdrop::PrivDrop::default()
@@ -226,7 +235,7 @@ fn drop_helper_privileges() -> io::Result<()> {
         .group_list(&[&gid_text])
         .fallback_to_ids_if_names_are_numeric()
         .apply()
-        .map_err(io::Error::other)?;
+        .map_err(privdrop_io_error)?;
     let identity = HelperIdentity {
         euid: rustix::process::geteuid().as_raw(),
         egid: rustix::process::getegid().as_raw(),
@@ -236,12 +245,22 @@ fn drop_helper_privileges() -> io::Result<()> {
             .collect(),
     };
     if !helper_identity_matches((uid, gid), &[gid], &identity) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "user-socket helper retained unexpected credentials",
+        return Err(io::Error::from_raw_os_error(
+            rustix::io::Errno::PERM.raw_os_error(),
         ));
     }
     Ok(())
+}
+
+fn privdrop_io_error(error: privdrop::PrivDropError) -> io::Error {
+    let errno = error
+        .source()
+        .and_then(|source| source.downcast_ref::<privdrop::reexports::nix::errno::Errno>())
+        .copied();
+    match errno {
+        Some(errno) => io::Error::from_raw_os_error(errno as i32),
+        None => io::Error::other(error),
+    }
 }
 
 struct HelperIdentity {
@@ -400,6 +419,18 @@ mod tests {
 
     fn long_unix_path() -> PathBuf {
         PathBuf::from("x".repeat(UNIX_PATH_MAX + 8))
+    }
+
+    #[test]
+    fn privilege_drop_errno_preserves_io_error_kind() {
+        // Given
+        let denied = privdrop::PrivDropError::from(privdrop::reexports::nix::errno::Errno::EPERM);
+
+        // When
+        let error = privdrop_io_error(denied);
+
+        // Then
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]

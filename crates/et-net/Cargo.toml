@@ -18,7 +18,7 @@ rustix = { version = "1.1.4", features = ["event"] }
 socket2 = "0.6.1"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.3", default-features = false, features = ["user"] }
+privdrop = "0.5.6"
 rustix = { version = "1.1.4", features = ["event", "fs", "net", "process"] }
 
 [[bin]]

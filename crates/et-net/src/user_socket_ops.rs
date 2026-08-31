@@ -198,21 +198,48 @@ fn drop_helper_privileges() -> io::Result<()> {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or_else(|| rustix::process::getgid().as_raw());
-    let uid = nix::unistd::Uid::from_raw(uid);
-    let gid = nix::unistd::Gid::from_raw(gid);
-    // Match ET: setgroups/setgid/setuid while still root. nix `setgroups` is
-    // unavailable on Apple targets; Linux is the etserver-as-root case.
-    if nix::unistd::geteuid().as_raw() == 0 {
-        #[cfg(target_os = "linux")]
-        nix::unistd::setgroups(&[gid]).map_err(from_nix)?;
+    let uid_text = uid.to_string();
+    let gid_text = gid.to_string();
+    privdrop::PrivDrop::default()
+        .user(&uid_text)
+        .group(&gid_text)
+        .group_list(&[&gid_text])
+        .fallback_to_ids_if_names_are_numeric()
+        .apply()
+        .map_err(io::Error::other)?;
+    let identity = HelperIdentity {
+        euid: rustix::process::geteuid().as_raw(),
+        egid: rustix::process::getegid().as_raw(),
+        groups: rustix::process::getgroups()?
+            .into_iter()
+            .map(rustix::process::Gid::as_raw)
+            .collect(),
+    };
+    if !helper_identity_matches((uid, gid), &[gid], &identity) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "user-socket helper retained unexpected credentials",
+        ));
     }
-    nix::unistd::setgid(gid).map_err(from_nix)?;
-    nix::unistd::setuid(uid).map_err(from_nix)?;
     Ok(())
 }
 
-fn from_nix(error: nix::errno::Errno) -> io::Error {
-    io::Error::from_raw_os_error(error as i32)
+struct HelperIdentity {
+    euid: u32,
+    egid: u32,
+    groups: Vec<u32>,
+}
+
+fn helper_identity_matches(
+    target: (u32, u32),
+    expected_groups: &[u32],
+    identity: &HelperIdentity,
+) -> bool {
+    let mut expected = expected_groups.to_vec();
+    expected.sort_unstable();
+    let mut observed = identity.groups.clone();
+    observed.sort_unstable();
+    identity.euid == target.0 && identity.egid == target.1 && observed == expected
 }
 
 fn helper_exe() -> io::Result<PathBuf> {
@@ -353,6 +380,26 @@ mod tests {
 
     fn long_unix_path() -> PathBuf {
         PathBuf::from("x".repeat(UNIX_PATH_MAX + 8))
+    }
+
+    #[test]
+    fn helper_identity_rejects_inherited_privileged_supplementary_group() {
+        // Given
+        let target = (65_534, 65_534);
+        let inherited = HelperIdentity {
+            euid: 65_534,
+            egid: 65_534,
+            groups: vec![0, 65_534],
+        };
+        let dropped = HelperIdentity {
+            euid: 65_534,
+            egid: 65_534,
+            groups: vec![65_534],
+        };
+
+        // When / Then
+        assert!(!helper_identity_matches(target, &[65_534], &inherited));
+        assert!(helper_identity_matches(target, &[65_534], &dropped));
     }
 
     #[test]

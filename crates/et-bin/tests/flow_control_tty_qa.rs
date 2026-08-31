@@ -82,7 +82,7 @@ fn flow_control_keeps_ctrl_c_and_prompt_responsive_on_a_slow_link() {
              IFS= read -r flow_release; \
              i=0; while [ -z \"$interrupted\" ] && [ \"$i\" -lt 65536 ]; do \
              printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'; \
-             i=$((i + 1)); done; trap - INT"
+             i=$((i + 1)); done; trap - INT; printf 'FLOW-%s\\n' READY"
         )
         .unwrap();
         let startup_timeout = Duration::from_secs(10);
@@ -118,6 +118,10 @@ fn flow_control_keeps_ctrl_c_and_prompt_responsive_on_a_slow_link() {
             prompt_timeout,
         );
         let prompt = interrupt.and_then(|output| {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(mpsc::RecvTimeoutError::Timeout)?;
+            let output = receive_until(&receiver, output, b"FLOW-READY\r\n", remaining)?;
             writer
                 .write_all(b"printf 'FLOW-%s\\n' PROMPT\n")
                 .map_err(|_| mpsc::RecvTimeoutError::Disconnected)?;

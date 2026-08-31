@@ -479,6 +479,7 @@ fn spawn_client(
     process
         .env("PATH", &stack.directory)
         .env("ET_SSH_COUNT", &stack.ssh_count)
+        .env("ET_SHELL", "/bin/sh")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

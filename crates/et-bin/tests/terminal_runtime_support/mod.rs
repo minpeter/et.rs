@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -13,6 +14,7 @@ use prost::Message;
 const ID: &str = "abcdefghijklmnop";
 const KEY: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
 const TIMEOUT: Duration = Duration::from_secs(5);
+static FIXTURE_GENERATION: AtomicUsize = AtomicUsize::new(0);
 
 pub const LOGIN_COLOR_MARKER: &[u8] = b"\x1b[31mET-LOGIN-COLOR\x1b[0m";
 pub const NON_LOGIN_MARKER: &[u8] = b"ET-NON-LOGIN";
@@ -34,18 +36,19 @@ impl Fixture {
         Self::new_with_ack(label, false)
     }
 
-    fn new_with_ack(label: &str, registration_ack: bool) -> Self {
+    fn new_with_ack(_label: &str, registration_ack: bool) -> Self {
+        let generation = FIXTURE_GENERATION.fetch_add(1, Ordering::Relaxed);
         let directory =
-            std::env::temp_dir().join(format!("et-rs-terminal-{label}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("etr{:x}{generation:x}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
-        let socket = directory.join("router.sock");
+        let socket = directory.join("r");
         let listener = UnixListener::bind(&socket).unwrap();
         if registration_ack {
             et_net::local::write_registration_ack_capability(&socket).unwrap();
         }
-        let ready_socket = directory.join("ready.sock");
+        let ready_socket = directory.join("a");
         let ready_listener = UnixListener::bind(&ready_socket).unwrap();
         Self {
             directory,

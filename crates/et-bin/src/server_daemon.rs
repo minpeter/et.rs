@@ -3,8 +3,8 @@
 //! Upstream double-forks, calls `setsid`, writes the pid file, `chdir("/")`,
 //! and redirects stdio to `/dev/null`. Forking is not expressible in safe
 //! Rust, so the same end state is reached by re-executing this binary as a
-//! detached child: the parent returns after pid-file acknowledgement, and the
-//! child becomes a session leader before serving.
+//! detached child: the parent returns after runtime-startup acknowledgement,
+//! and the child becomes a session leader before serving.
 
 use crate::detach::{ChildStdout, Stdio};
 use std::fs;
@@ -21,7 +21,10 @@ pub const DEFAULT_PID_FILE: &str = "etserver.pid";
 
 const STATUS_ENV: &str = "ET_SERVER_DAEMON_STATUS";
 const STATUS_TOKEN: &str = "ready-v1";
-const STATUS_FRAME: &[u8; 4] = b"ETD1";
+const STATUS_MAGIC: &[u8; 4] = b"ETD1";
+const STATUS_READY: u8 = 1;
+const STATUS_FAILED: u8 = 2;
+const MAX_STATUS_MESSAGE: usize = 8 * 1024;
 #[cfg(unix)]
 const SHUTDOWN_STATUS_ENV: &str = "ET_RS_TEST_SERVER_SHUTDOWN_SOCKET";
 #[cfg(unix)]
@@ -31,7 +34,7 @@ const SHUTDOWN_STATUS_FRAME: &[u8; 4] = b"ETD2";
 const READY_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Re-exec this binary as a detached background server and return after the
-/// child acknowledges its pid file.
+/// child acknowledges runtime startup.
 ///
 /// The child receives the original arguments with `--daemon` replaced by the
 /// internal `--daemon-child` marker so it knows to finish detaching.
@@ -102,16 +105,35 @@ pub fn detach_child(pidfile: Option<&Path>) -> Result<(), String> {
     // The working directory is already `/`: the parent sets it on the child
     // via `Command::current_dir`, matching upstream's `chdir("/")`.
     let path = pidfile.unwrap_or_else(|| Path::new(DEFAULT_PID_FILE));
-    write_pid_file(path)?;
-    if std::env::var(STATUS_ENV).as_deref() == Ok(STATUS_TOKEN) {
-        let stdout = std::io::stdout();
-        let mut output = stdout.lock();
-        output
-            .write_all(STATUS_FRAME)
-            .and_then(|()| output.flush())
-            .map_err(|error| format!("could not signal daemon readiness: {error}"))?;
+    write_pid_file(path)
+}
+
+/// Acknowledge that signal handling and the server runtime are both ready.
+pub fn signal_startup_complete() -> Result<(), String> {
+    write_startup_status(STATUS_READY, "")
+}
+
+/// Report a bounded daemon startup failure to the spawning parent.
+pub fn fail_startup(message: &str) {
+    let _ = write_startup_status(STATUS_FAILED, message);
+}
+
+fn write_startup_status(code: u8, message: &str) -> Result<(), String> {
+    if std::env::var(STATUS_ENV).as_deref() != Ok(STATUS_TOKEN) {
+        return Ok(());
     }
-    Ok(())
+    let bytes = message.as_bytes();
+    let bytes = &bytes[..bytes.len().min(MAX_STATUS_MESSAGE)];
+    let length = u16::try_from(bytes.len()).expect("daemon status bound fits u16");
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    output
+        .write_all(STATUS_MAGIC)
+        .and_then(|()| output.write_all(&[code]))
+        .and_then(|()| output.write_all(&length.to_be_bytes()))
+        .and_then(|()| output.write_all(bytes))
+        .and_then(|()| output.flush())
+        .map_err(|error| format!("could not write daemon startup status: {error}"))
 }
 
 fn spawn_status_worker(
@@ -127,14 +149,26 @@ fn spawn_status_worker(
 }
 
 fn read_status(mut stdout: impl Read) -> Result<(), String> {
-    let mut frame = [0u8; STATUS_FRAME.len()];
+    let mut header = [0u8; 7];
     stdout
-        .read_exact(&mut frame)
+        .read_exact(&mut header)
         .map_err(|error| format!("daemon status channel closed: {error}"))?;
-    if &frame != STATUS_FRAME {
+    if &header[..4] != STATUS_MAGIC {
         return Err("malformed daemon startup status".to_owned());
     }
-    Ok(())
+    let length = usize::from(u16::from_be_bytes([header[5], header[6]]));
+    if length > MAX_STATUS_MESSAGE {
+        return Err("oversized daemon startup status".to_owned());
+    }
+    let mut message = vec![0u8; length];
+    stdout
+        .read_exact(&mut message)
+        .map_err(|error| format!("truncated daemon startup status: {error}"))?;
+    match header[4] {
+        STATUS_READY if message.is_empty() => Ok(()),
+        STATUS_FAILED => Err(String::from_utf8_lossy(&message).into_owned()),
+        _ => Err("malformed daemon startup status".to_owned()),
+    }
 }
 
 /// Signal an opt-in test observer after signal handling and runtime startup.

@@ -104,6 +104,23 @@ fn daemon_mode_detaches_and_writes_a_pid_file() {
         .unwrap();
     assert_eq!(invalid.status.code(), Some(2));
 
+    // Child failures cross the bounded startup pipe instead of being hidden by
+    // detached stderr or reported as an unclassified EOF.
+    let failed_pidfile = directory.join("missing/etserver.pid");
+    let failed = Command::new(env!("CARGO_BIN_EXE_et"))
+        .args(["server", "--daemon", "--port", "2022", "--pidfile"])
+        .arg(&failed_pidfile)
+        .output()
+        .unwrap();
+    assert_eq!(failed.status.code(), Some(2), "{failed:?}");
+    let failure = String::from_utf8(failed.stderr).unwrap();
+    assert!(
+        failure.contains("Error opening pidfile for writing"),
+        "{failure}"
+    );
+    assert!(failure.contains(&failed_pidfile.to_string_lossy().into_owned()));
+    assert!(!failure.contains("status channel closed"), "{failure}");
+
     // A real daemon run returns immediately and the child records its pid,
     // matching upstream `DaemonCreator::create`.
     for (index, program) in [env!("CARGO_BIN_EXE_et"), busybox.to_str().unwrap()]
@@ -159,7 +176,8 @@ fn daemon_mode_detaches_and_writes_a_pid_file() {
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         assert!(output.stdout.is_empty(), "{output:?}");
 
-        // The parent returns after the detached child flushes its pid file.
+        // The parent returns after the detached child starts its runtime; the
+        // pid file is therefore complete without filesystem polling.
         let pid = fs::read_to_string(&pidfile)
             .expect("daemon did not write a pid file")
             .trim()

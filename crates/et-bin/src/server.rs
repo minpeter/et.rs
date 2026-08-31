@@ -66,7 +66,8 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
     let mut runtime = Runtime::start(config.bind_ip, config.port, router_path)
         .map_err(|error| clap_io("could not start ET server", error))?;
     if parsed.daemon_child {
-        crate::server_daemon::signal_runtime_started()
+        crate::server_daemon::signal_startup_complete()
+            .and_then(|()| crate::server_daemon::signal_runtime_started())
             .map_err(|error| clap::Error::raw(ErrorKind::Io, error))?;
     }
     et_cli::logging::info(format!(

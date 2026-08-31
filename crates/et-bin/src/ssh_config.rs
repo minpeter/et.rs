@@ -97,6 +97,13 @@ fn parse_ssh_config(
     let mut user = None;
     let mut local_forwards = Vec::new();
     let mut remote_forwards = Vec::new();
+    if parse_local_forwards {
+        for _ in unsupported_dynamic_forwards(text) {
+            et_cli::logging::warn(
+                "SSH dynamicforward is unsupported by ET protocol v6; skipping forwarding row",
+            );
+        }
+    }
     for line in text.lines() {
         let mut fields = line.split_whitespace();
         match fields.next() {
@@ -106,11 +113,7 @@ fn parse_ssh_config(
             Some(key) if key.eq_ignore_ascii_case("user") => {
                 user = fields.next().map(str::to_string);
             }
-            Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("dynamicforward") => {
-                et_cli::logging::warn(
-                    "SSH dynamicforward is unsupported by ET protocol v6; skipping forwarding row",
-                );
-            }
+            Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("dynamicforward") => {}
             Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("localforward") => {
                 match parse_forward(fields, "localforward", policies)? {
                     ForwardRecord::Supported(forward) => local_forwards.push(forward),
@@ -139,6 +142,37 @@ fn parse_ssh_config(
         local_forwards,
         remote_forwards,
     })
+}
+
+fn unsupported_dynamic_forwards(text: &str) -> Vec<&str> {
+    let mut dynamic: Vec<&str> = text
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            fields
+                .next()
+                .is_some_and(|key| key.eq_ignore_ascii_case("dynamicforward"))
+                .then(|| fields.next())
+                .flatten()
+        })
+        .collect();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let is_local = fields
+            .next()
+            .is_some_and(|key| key.eq_ignore_ascii_case("localforward"));
+        let source = fields.next();
+        let destination = fields.next();
+        if is_local && destination.is_some_and(|value| value.starts_with('/')) {
+            if let Some(index) = dynamic
+                .iter()
+                .position(|candidate| Some(*candidate) == source)
+            {
+                dynamic.remove(index);
+            }
+        }
+    }
+    dynamic
 }
 
 fn warn_unsupported(directive: &str, reason: &str) {
@@ -634,6 +668,23 @@ mod tests {
                 [omitted, "localhost", "127.0.0.2", ""]
             );
         }
+    }
+
+    #[test]
+    fn dynamic_forward_classifier_consumes_unix_destination_pseudo_rows_as_a_multiset() {
+        // Given
+        let config = "hostname host\n\
+            dynamicforward 15002\n\
+            localforward 15002 /tmp/tcp-destination.sock\n\
+            dynamicforward /tmp/unix-source.sock\n\
+            localforward /tmp/unix-source.sock /tmp/unix-destination.sock\n\
+            dynamicforward 1080\n";
+
+        // When
+        let unsupported = unsupported_dynamic_forwards(config);
+
+        // Then
+        assert_eq!(unsupported, ["1080"]);
     }
 
     #[test]

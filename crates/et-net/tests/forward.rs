@@ -273,7 +273,7 @@ fn imported_local_wildcard_is_externally_reachable_while_loopback_is_not() {
 
 #[cfg(unix)]
 #[test]
-fn reverse_listener_limit_is_transactional() {
+fn local_forwarding_exceeds_reverse_cap_while_reverse_limit_is_transactional() {
     struct RemoveDir(std::path::PathBuf);
     impl Drop for RemoveDir {
         fn drop(&mut self) {
@@ -287,7 +287,7 @@ fn reverse_listener_limit_is_transactional() {
     let paths: Vec<_> = (0..33)
         .map(|index| directory.join(format!("source-{index}.sock")))
         .collect();
-    let requests = paths
+    let requests: Vec<PortForwardSourceRequest> = paths
         .iter()
         .map(|path| PortForwardSourceRequest {
             source: Some(SocketEndpoint {
@@ -302,14 +302,28 @@ fn reverse_listener_limit_is_transactional() {
         })
         .collect();
 
-    let error = match Forwarder::start(requests) {
-        Ok(forwarder) => {
+    // When: client-local forwarding owns more than the server reverse cap.
+    let local = Forwarder::start(requests.clone()).unwrap();
+
+    // Then: every local listener is usable and cleanup is deterministic.
+    assert!(paths.iter().all(|path| path.exists()));
+    local.shutdown().unwrap();
+    assert!(paths.iter().all(|path| !path.exists()));
+
+    // When: the same multiset is requested as authenticated server reverse forwarding.
+    let owner = (
+        rustix::process::geteuid().as_raw(),
+        rustix::process::getegid().as_raw(),
+    );
+    let error = match Forwarder::start_with_user(requests, Some(owner)) {
+        Ok((forwarder, _)) => {
             forwarder.shutdown().unwrap();
-            panic!("listener cap was not enforced");
+            panic!("reverse listener cap was not enforced");
         }
         Err(error) => error,
     };
 
+    // Then: the cap fails transactionally before any sibling bind.
     assert!(
         error.to_string().contains("listener limit"),
         "unexpected error: {error}"

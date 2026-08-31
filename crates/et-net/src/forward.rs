@@ -371,7 +371,7 @@ fn bind_sources(
         listener_count = listener_count
             .checked_add(additional_listeners)
             .ok_or(ForwardError::Protocol("reverse listener limit exceeded"))?;
-        if listener_count > MAX_SESSION_LISTENERS {
+        if owner.is_some() && listener_count > MAX_SESSION_LISTENERS {
             return Err(ForwardError::Protocol("reverse listener limit exceeded"));
         }
         plans.push(plan);

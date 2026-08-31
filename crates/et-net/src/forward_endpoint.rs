@@ -6,6 +6,8 @@ use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -218,86 +220,140 @@ impl ResolvedEndpoint {
             }
             (Self::Tcp(addresses), _) => bind_tcp_addresses(addresses.iter().copied()),
             #[cfg(unix)]
-            (Self::Unix(path), user) => bind_unix_source(path, user, || Ok(()), || Ok(())),
+            (Self::Unix(path), Some((uid, gid))) => {
+                let listener = crate::user_socket_ops::listen_unix_as_user(path, uid, gid)?;
+                finish_unix_listener_with(listener, path, None, |listener| {
+                    listener.set_nonblocking(true)
+                })
+                .map(|listener| vec![listener])
+            }
+            #[cfg(unix)]
+            (Self::Unix(path), None) => bind_unix_locally_with(path, |listener| {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+                listener.set_nonblocking(true)
+            })
+            .map(|listener| vec![listener]),
         }
     }
 }
 
 #[cfg(unix)]
-fn bind_unix_source(
-    path: &std::path::Path,
-    user: Option<(u32, u32)>,
-    after_directory: impl FnOnce() -> io::Result<()>,
-    after_bind: impl FnOnce() -> io::Result<()>,
-) -> io::Result<Vec<ForwardListener>> {
+fn bind_unix_locally_with(
+    path: &Path,
+    configure: impl FnOnce(&UnixListener) -> io::Result<()>,
+) -> io::Result<ForwardListener> {
     if path.exists() {
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             "Unix source socket already exists",
         ));
     }
-    let mut directory_guard = None;
-    if user.is_none() {
-        if let Some(parent) = path.parent().filter(|parent| !parent.exists()) {
-            fs::create_dir_all(parent)?;
-            directory_guard = Some(PathCleanup::directory(parent.to_path_buf()));
-            after_directory()?;
+    let mut parent_cleanup = None;
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            parent_cleanup = Some(create_missing_directories_with(parent, |directory| {
+                fs::create_dir(directory)
+            })?);
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
         }
     }
-    let listener = match user {
-        Some((uid, gid)) => crate::user_socket_ops::listen_unix_as_user(path, uid, gid)?,
-        None => UnixListener::bind(path)?,
-    };
-    let socket_guard = PathCleanup::socket(path.to_path_buf());
-    after_bind()?;
-    if user.is_none() {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    listener.set_nonblocking(true)?;
-    Ok(vec![ForwardListener {
+    let listener = UnixListener::bind(path)?;
+    finish_unix_listener_with(listener, path, parent_cleanup, configure)
+}
+
+#[cfg(unix)]
+fn finish_unix_listener_with(
+    listener: UnixListener,
+    path: &Path,
+    mut cleanup_dirs: Option<PendingDirectories>,
+    configure: impl FnOnce(&UnixListener) -> io::Result<()>,
+) -> io::Result<ForwardListener> {
+    let mut socket_cleanup = PendingPath::socket(path.to_path_buf());
+    configure(&listener)?;
+    Ok(ForwardListener {
         inner: ListenerKind::Unix(listener),
-        cleanup: socket_guard.disarm(),
-        cleanup_dir: directory_guard.and_then(PathCleanup::disarm),
-    }])
+        cleanup: socket_cleanup.disarm(),
+        cleanup_dirs: cleanup_dirs
+            .as_mut()
+            .and_then(PendingDirectories::disarm)
+            .unwrap_or_default(),
+    })
 }
 
 #[cfg(unix)]
-struct PathCleanup {
+struct PendingPath {
     path: Option<PathBuf>,
-    socket: bool,
 }
 
 #[cfg(unix)]
-impl PathCleanup {
+impl PendingPath {
     fn socket(path: PathBuf) -> Self {
-        Self {
-            path: Some(path),
-            socket: true,
-        }
+        Self { path: Some(path) }
     }
 
-    fn directory(path: PathBuf) -> Self {
-        Self {
-            path: Some(path),
-            socket: false,
-        }
-    }
-
-    fn disarm(mut self) -> Option<PathBuf> {
+    fn disarm(&mut self) -> Option<PathBuf> {
         self.path.take()
     }
 }
 
 #[cfg(unix)]
-impl Drop for PathCleanup {
+impl Drop for PendingPath {
     fn drop(&mut self) {
         if let Some(path) = self.path.as_ref() {
-            let _ = if self.socket {
-                fs::remove_file(path)
-            } else {
-                fs::remove_dir(path)
-            };
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn missing_directories(parent: &Path) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    let mut current = Some(parent);
+    while let Some(path) = current {
+        if path.exists() {
+            break;
+        }
+        directories.push(path.to_path_buf());
+        current = path.parent();
+    }
+    directories
+}
+
+#[cfg(unix)]
+fn create_missing_directories_with(
+    parent: &Path,
+    mut create: impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<PendingDirectories> {
+    let directories = missing_directories(parent);
+    let mut cleanup = PendingDirectories(Some(Vec::with_capacity(directories.len())));
+    for directory in directories.iter().rev() {
+        create(directory)?;
+        cleanup
+            .0
+            .as_mut()
+            .expect("pending directory cleanup")
+            .insert(0, directory.clone());
+    }
+    Ok(cleanup)
+}
+
+#[cfg(unix)]
+struct PendingDirectories(Option<Vec<PathBuf>>);
+
+#[cfg(unix)]
+impl PendingDirectories {
+    fn disarm(&mut self) -> Option<Vec<PathBuf>> {
+        self.0.take()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PendingDirectories {
+    fn drop(&mut self) {
+        if let Some(paths) = self.0.take() {
+            for path in paths {
+                let _ = fs::remove_dir(path);
+            }
         }
     }
 }
@@ -318,7 +374,7 @@ fn bind_tcp_addresses_with(
             listeners.push(ForwardListener {
                 inner: ListenerKind::Tcp(listener),
                 cleanup: None,
-                cleanup_dir: None,
+                cleanup_dirs: Vec::new(),
             });
         }
     }
@@ -455,7 +511,7 @@ enum ListenerKind {
 pub(crate) struct ForwardListener {
     inner: ListenerKind,
     cleanup: Option<PathBuf>,
-    cleanup_dir: Option<PathBuf>,
+    cleanup_dirs: Vec<PathBuf>,
 }
 
 impl ForwardListener {
@@ -463,7 +519,7 @@ impl ForwardListener {
     /// private named-pipe directories created for environment forwards).
     #[cfg(unix)]
     pub(crate) fn also_remove_dir(&mut self, directory: PathBuf) {
-        self.cleanup_dir = Some(directory);
+        self.cleanup_dirs.push(directory);
     }
 
     pub(crate) fn accept(&self) -> io::Result<ForwardStream> {
@@ -497,7 +553,7 @@ impl Drop for ForwardListener {
         if let Some(path) = self.cleanup.as_ref() {
             let _ = fs::remove_file(path);
         }
-        if let Some(path) = self.cleanup_dir.as_ref() {
+        for path in &self.cleanup_dirs {
             let _ = fs::remove_dir(path);
         }
     }
@@ -555,67 +611,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unix_source_failure_after_directory_creation_cleans_and_retries() {
-        // Given
-        let root = std::env::temp_dir().join(format!("et-fwd-dir-{}", std::process::id()));
-        let path = root.join("created").join("source.sock");
-        let created = path.parent().unwrap().to_path_buf();
-
-        // When
-        let error = match bind_unix_source(
-            &path,
-            None,
-            || Err(io::Error::other("injected after directory creation")),
-            || Ok(()),
-        ) {
-            Ok(_) => panic!("injected directory failure succeeded"),
-            Err(error) => error,
-        };
-
-        // Then
-        assert_eq!(error.kind(), io::ErrorKind::Other);
-        assert!(!created.exists());
-        let listeners = bind_unix_source(&path, None, || Ok(()), || Ok(())).unwrap();
-        assert!(path.exists());
-        drop(listeners);
-        assert!(!path.exists());
-        assert!(!created.exists());
-        let _ = fs::remove_dir(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unix_source_failure_after_bind_cleans_socket_and_directory_then_retries() {
-        // Given
-        let root = std::env::temp_dir().join(format!("et-fwd-bind-{}", std::process::id()));
-        let path = root.join("created").join("source.sock");
-        let created = path.parent().unwrap().to_path_buf();
-
-        // When
-        let error = match bind_unix_source(
-            &path,
-            None,
-            || Ok(()),
-            || Err(io::Error::other("injected before final configuration")),
-        ) {
-            Ok(_) => panic!("injected post-bind failure succeeded"),
-            Err(error) => error,
-        };
-
-        // Then
-        assert_eq!(error.kind(), io::ErrorKind::Other);
-        assert!(!path.exists());
-        assert!(!created.exists());
-        let listeners = bind_unix_source(&path, None, || Ok(()), || Ok(())).unwrap();
-        assert!(path.exists());
-        drop(listeners);
-        assert!(!path.exists());
-        assert!(!created.exists());
-        let _ = fs::remove_dir(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn unix_source_bind_uses_openssh_default_owner_only_mode() {
         // Given
         let path = std::env::temp_dir().join(format!("et-forward-mode-{}", std::process::id()));
@@ -630,6 +625,72 @@ mod tests {
             0o600
         );
         drop(listeners);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_unix_listener_setup_removes_socket_and_created_parent() {
+        let base = std::env::temp_dir().join(format!(
+            "et-forward-rollback-{}",
+            et_core::keys::gen_id_passkey().0
+        ));
+        fs::create_dir(&base).unwrap();
+        let created_parent = base.join("created");
+        let path = created_parent.join("source.sock");
+
+        let error = match bind_unix_locally_with(&path, |_| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected post-bind setup failure",
+            ))
+        }) {
+            Ok(_) => panic!("injected listener setup failure unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!path.exists());
+        assert!(!created_parent.exists());
+        fs::remove_dir(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_directory_creation_removes_created_ancestors() {
+        struct RemoveDirectory(PathBuf);
+
+        impl Drop for RemoveDirectory {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let base = std::env::temp_dir().join(format!(
+            "et-forward-directory-rollback-{}",
+            et_core::keys::gen_id_passkey().0
+        ));
+        fs::create_dir(&base).unwrap();
+        let _cleanup = RemoveDirectory(base.clone());
+        let created = base.join("created");
+        let parent = created.join("nested");
+        let mut calls = 0;
+
+        let error = match create_missing_directories_with(&parent, |directory| {
+            calls += 1;
+            if calls == 2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected directory creation failure",
+                ));
+            }
+            fs::create_dir(directory)
+        }) {
+            Ok(_) => panic!("injected directory creation failure unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!created.exists());
     }
 
     #[test]

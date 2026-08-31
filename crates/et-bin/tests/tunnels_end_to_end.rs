@@ -19,22 +19,21 @@ use wait_timeout::ChildExt;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 #[test]
-fn ssh_config_local_and_remote_tunnels_relay_real_tcp_payloads() {
+fn ssh_config_local_tunnel_relays_while_remote_forward_is_omitted() {
     let mut stack = Stack::start();
     let local_destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let local_destination_port = local_destination.local_addr().unwrap().port();
     let local_echo = spawn_tcp_echo_once(local_destination, b"config-local");
-    let local_source_port = reserve_port();
-    let reverse_destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let reverse_destination_port = reverse_destination.local_addr().unwrap().port();
-    let reverse_echo = spawn_tcp_echo_once(reverse_destination, b"config-reverse");
-    let reverse_source_port = reserve_port();
+    let local_source = stack.directory.join("ssh-config-local.sock");
+    let reverse_source = stack.directory.join("ssh-config-remote.sock");
     let gate = stack.directory.join("ssh-config-ready");
     mkfifo(&gate);
     let config = format!(
         "hostname 127.0.0.1\nuser tester\n\
-         localforward {local_source_port} [127.0.0.1]:{local_destination_port}\n\
-         remoteforward {reverse_source_port} [127.0.0.1]:{reverse_destination_port}\n"
+         localforward {} [127.0.0.1]:{local_destination_port}\n\
+         remoteforward {} [127.0.0.1]:{local_destination_port}\n",
+        local_source.display(),
+        reverse_source.display(),
     );
     let mut client = Command::new(env!("CARGO_BIN_EXE_et"));
     client
@@ -54,12 +53,56 @@ fn ssh_config_local_and_remote_tunnels_relay_real_tcp_payloads() {
     let mut client = client.spawn().unwrap();
 
     await_fifo(&gate, &mut client);
-    assert_ready_tcp_round_trip(local_source_port, b"config-local");
-    assert_ready_tcp_round_trip(reverse_source_port, b"config-reverse");
+    assert_unix_round_trip(&local_source, b"config-local");
+    assert!(!reverse_source.exists());
 
     stop(&mut client);
     local_echo.join().unwrap();
-    reverse_echo.join().unwrap();
+    stack.shutdown();
+}
+
+#[test]
+fn ssh_config_destination_host_reaches_target_not_localhost_decoy() {
+    let mut stack = Stack::start();
+    let target = TcpListener::bind((std::net::Ipv4Addr::new(127, 0, 0, 2), 0)).unwrap();
+    let target_port = target.local_addr().unwrap().port();
+    let decoy = TcpListener::bind((Ipv4Addr::LOCALHOST, target_port)).unwrap();
+    decoy.set_nonblocking(true).unwrap();
+    let target_echo = spawn_tcp_echo_once(target, b"configured-destination");
+    let source = stack.directory.join("configured-destination.sock");
+    let gate = stack.directory.join("configured-destination-ready");
+    mkfifo(&gate);
+    let config = format!(
+        "hostname 127.0.0.1\nuser tester\n\
+         localforward {} [127.0.0.2]:{target_port}\n",
+        source.display(),
+    );
+    let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env("PATH", &stack.directory)
+        .env("ET_SSH_COUNT", &stack.ssh_count)
+        .env("ET_SSH_CONFIG", config)
+        .env("ET_SSH_READY", &gate)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .args(["--terminal-path"])
+        .arg(&stack.terminal)
+        .args(["--serverfifo"])
+        .arg(&stack.router)
+        .arg("-N")
+        .arg(format!("tester@127.0.0.1:{}", stack.port))
+        .spawn()
+        .unwrap();
+
+    assert_eq!(await_fifo(&gate, &mut client), "ready");
+    assert_unix_round_trip(&source, b"configured-destination");
+    assert!(matches!(
+        decoy.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+
+    stop(&mut client);
+    target_echo.join().unwrap();
     stack.shutdown();
 }
 
@@ -71,7 +114,7 @@ fn ssh_config_hardening_imported_bind_failure_skips_only_that_row() {
     let destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let destination_port = destination.local_addr().unwrap().port();
     let echo = spawn_tcp_echo_once(destination, b"usable-import");
-    let usable_port = reserve_port();
+    let usable_source = stack.directory.join("best-effort-source.sock");
     let gate = stack.directory.join("imported-bind-ready");
     mkfifo(&gate);
     let config = format!(
@@ -79,8 +122,9 @@ fn ssh_config_hardening_imported_bind_failure_skips_only_that_row() {
 user tester
 gatewayports no
          localforward {occupied_port} [127.0.0.1]:{destination_port}
-         localforward {usable_port} [127.0.0.1]:{destination_port}
-"
+         localforward {} [127.0.0.1]:{destination_port}
+",
+        usable_source.display(),
     );
     let mut client = Command::new(env!("CARGO_BIN_EXE_et"));
     client
@@ -111,7 +155,7 @@ gatewayports no
             .unwrap()
     };
     assert_eq!(ready, "ready");
-    assert_ready_tcp_round_trip(usable_port, b"usable-import");
+    assert_unix_round_trip(&usable_source, b"usable-import");
 
     stop(&mut client);
     let mut output = String::new();
@@ -134,20 +178,68 @@ gatewayports no
 }
 
 #[test]
-fn imported_remote_bind_report_warns_and_keeps_usable_row_live() {
+fn exit_on_forward_failure_yes_aborts_imported_bind_conflict() {
+    let mut stack = Stack::start();
+    let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let occupied_port = occupied.local_addr().unwrap().port();
+    let config = format!(
+        "hostname 127.0.0.1\nuser tester\n\
+         exitonforwardfailure yes\n\
+         localforward {occupied_port} [127.0.0.1]:1\n"
+    );
+    let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env("PATH", &stack.directory)
+        .env("ET_SSH_COUNT", &stack.ssh_count)
+        .env("ET_SSH_CONFIG", config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .args(["--terminal-path"])
+        .arg(&stack.terminal)
+        .args(["--serverfifo"])
+        .arg(&stack.router)
+        .arg("-N")
+        .arg(format!("tester@127.0.0.1:{}", stack.port))
+        .spawn()
+        .unwrap();
+
+    let status = client
+        .wait_timeout(TIMEOUT)
+        .unwrap()
+        .expect("strict imported bind conflict did not terminate the client");
+    let mut error = String::new();
+    client
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut error)
+        .unwrap();
+    assert!(!status.success());
+    assert!(error.contains("Address already in use"), "{error}");
+
+    drop(occupied);
+    stack.shutdown();
+}
+
+#[test]
+fn imported_remote_rows_are_omitted_while_local_row_stays_live() {
     let mut stack = Stack::start();
     let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let occupied_port = occupied.local_addr().unwrap().port();
     let destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let destination_port = destination.local_addr().unwrap().port();
-    let echo = spawn_tcp_echo_once(destination, b"usable-remote-import");
-    let usable_port = reserve_port();
+    let echo = spawn_tcp_echo_once(destination, b"usable-local-import");
+    let local_source = stack.directory.join("imported-local.sock");
+    let usable_source = stack.directory.join("omitted-remote.sock");
     let gate = stack.directory.join("imported-remote-bind-ready");
     mkfifo(&gate);
     let config = format!(
         "hostname 127.0.0.1\nuser tester\n\
+         localforward {} [127.0.0.1]:{destination_port}\n\
          remoteforward {occupied_port} [127.0.0.1]:{destination_port}\n\
-         remoteforward {usable_port} [127.0.0.1]:{destination_port}\n"
+         remoteforward {} [127.0.0.1]:{destination_port}\n",
+        local_source.display(),
+        usable_source.display(),
     );
     let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
         .env("PATH", &stack.directory)
@@ -167,7 +259,8 @@ fn imported_remote_bind_report_warns_and_keeps_usable_row_live() {
         .unwrap();
 
     assert_eq!(await_fifo(&gate, &mut client), "ready");
-    assert_ready_tcp_round_trip(usable_port, b"usable-remote-import");
+    assert_unix_round_trip(&local_source, b"usable-local-import");
+    assert!(!usable_source.exists());
 
     stop(&mut client);
     let mut output = String::new();
@@ -182,7 +275,7 @@ fn imported_remote_bind_report_warns_and_keeps_usable_row_live() {
             .lines()
             .filter(|line| line.contains("WARNING"))
             .count(),
-        1
+        0
     );
     drop(occupied);
     echo.join().unwrap();
@@ -190,21 +283,25 @@ fn imported_remote_bind_report_warns_and_keeps_usable_row_live() {
 }
 
 #[test]
-fn native_jumphost_relays_imported_remote_skip_report_and_acknowledgement() {
+fn native_jumphost_omits_imported_remote_rows() {
     let mut destination = Stack::start();
     let mut jump = Stack::start();
     let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let occupied_port = occupied.local_addr().unwrap().port();
     let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let backend_port = backend.local_addr().unwrap().port();
-    let echo = spawn_tcp_echo_once(backend, b"native-jump-report");
-    let usable_port = reserve_port();
+    let echo = spawn_tcp_echo_once(backend, b"native-jump-local");
+    let local_source = destination.directory.join("native-jump-local.sock");
+    let usable_source = destination.directory.join("native-jump-remote.sock");
     let gate = destination.directory.join("native-jump-report-ready");
     mkfifo(&gate);
     let config = format!(
         "hostname 127.0.0.1\nuser tester\n\
+         localforward {} [127.0.0.1]:{backend_port}\n\
          remoteforward {occupied_port} [127.0.0.1]:{backend_port}\n\
-         remoteforward {usable_port} [127.0.0.1]:{backend_port}\n"
+         remoteforward {} [127.0.0.1]:{backend_port}\n",
+        local_source.display(),
+        usable_source.display(),
     );
     let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
         .env("PATH", &destination.directory)
@@ -228,7 +325,8 @@ fn native_jumphost_relays_imported_remote_skip_report_and_acknowledgement() {
         .unwrap();
 
     assert_eq!(await_fifo(&gate, &mut client), "ready");
-    assert_ready_tcp_round_trip(usable_port, b"native-jump-report");
+    assert_unix_round_trip(&local_source, b"native-jump-local");
+    assert!(!usable_source.exists());
 
     stop(&mut client);
     let mut output = String::new();
@@ -243,7 +341,7 @@ fn native_jumphost_relays_imported_remote_skip_report_and_acknowledgement() {
             .lines()
             .filter(|line| line.contains("WARNING"))
             .count(),
-        1
+        0
     );
     drop(occupied);
     echo.join().unwrap();
@@ -252,71 +350,13 @@ fn native_jumphost_relays_imported_remote_skip_report_and_acknowledgement() {
 }
 
 #[test]
-fn native_jumphost_strict_imported_remote_skip_withholds_ack_and_releases_sibling() {
-    // Given
+fn native_jumphost_explicit_remote_bind_failure_releases_final_sibling() {
     let mut destination = Stack::start();
     let mut jump = Stack::start();
     let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let occupied_port = occupied.local_addr().unwrap().port();
-    let sibling_port = reserve_port();
-    let config = format!(
-        "hostname 127.0.0.1\nuser tester\nexitonforwardfailure yes\n\
-         remoteforward {occupied_port} [127.0.0.1]:1\n\
-         remoteforward {sibling_port} [127.0.0.1]:1\n"
-    );
-    let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
-        .env("PATH", &destination.directory)
-        .env("ET_SSH_COUNT", &destination.ssh_count)
-        .env("ET_SSH_CONFIG", config)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .args(["--terminal-path"])
-        .arg(&destination.terminal)
-        .args(["--serverfifo"])
-        .arg(&destination.router)
-        .args(["--jumphost", "jump.example", "--jport"])
-        .arg(jump.port.to_string())
-        .args(["--jserverfifo"])
-        .arg(&jump.router)
-        .arg("-N")
-        .arg(format!("tester@127.0.0.1:{}", destination.port))
-        .spawn()
-        .unwrap();
-
-    // When
-    let status = client
-        .wait_timeout(TIMEOUT)
-        .unwrap()
-        .expect("strict imported native-jumphost skip did not terminate the client");
-    let mut error = String::new();
-    client
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut error)
-        .unwrap();
-
-    // Then
-    assert!(!status.success());
-    assert!(
-        error.contains("required reverse forwarding row could not bind"),
-        "{error}"
-    );
-    jump.shutdown();
-    destination.shutdown();
-    let rebound = TcpListener::bind((Ipv4Addr::LOCALHOST, sibling_port)).unwrap();
-    drop(rebound);
-    drop(occupied);
-}
-
-#[test]
-fn native_jumphost_explicit_remote_skip_aborts_and_releases_final_sibling() {
-    let mut destination = Stack::start();
-    let mut jump = Stack::start();
-    let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let occupied_port = occupied.local_addr().unwrap().port();
-    let sibling_port = reserve_port();
+    let sibling_source = destination.directory.join("jump-sibling-source.sock");
+    let sibling_destination = destination.directory.join("jump-sibling-destination.sock");
     let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
         .env("PATH", &destination.directory)
         .env("ET_SSH_COUNT", &destination.ssh_count)
@@ -332,9 +372,13 @@ fn native_jumphost_explicit_remote_skip_aborts_and_releases_final_sibling() {
         .args(["--jserverfifo"])
         .arg(&jump.router)
         .args(["-N", "-r"])
-        .arg(format!("{occupied_port}:1"))
+        .arg(format!(
+            "{}:{}",
+            sibling_source.display(),
+            sibling_destination.display()
+        ))
         .arg("-r")
-        .arg(format!("{sibling_port}:1"))
+        .arg(format!("{occupied_port}:1"))
         .arg(format!("tester@127.0.0.1:{}", destination.port))
         .spawn()
         .unwrap();
@@ -342,7 +386,7 @@ fn native_jumphost_explicit_remote_skip_aborts_and_releases_final_sibling() {
     let status = client
         .wait_timeout(TIMEOUT)
         .unwrap()
-        .expect("native jumphost explicit skip did not terminate the top-level client");
+        .expect("native jumphost reverse bind failure did not terminate the top-level client");
     let mut error = String::new();
     client
         .stderr
@@ -352,23 +396,22 @@ fn native_jumphost_explicit_remote_skip_aborts_and_releases_final_sibling() {
         .unwrap();
 
     assert!(!status.success());
-    assert!(
-        error.contains("required reverse forwarding row could not bind"),
-        "{error}"
-    );
+    assert!(error.contains("Address already in use"), "{error}");
+    assert!(!sibling_source.exists());
+    let rebound = UnixListener::bind(&sibling_source).unwrap();
+    drop(rebound);
     jump.shutdown();
     destination.shutdown();
-    let rebound = TcpListener::bind((Ipv4Addr::LOCALHOST, sibling_port)).unwrap();
-    drop(rebound);
     drop(occupied);
 }
 
 #[test]
-fn explicit_remote_bind_report_aborts_and_releases_sibling_listener() {
+fn explicit_remote_bind_failure_aborts_and_releases_sibling_listener() {
     let mut stack = Stack::start();
     let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let occupied_port = occupied.local_addr().unwrap().port();
-    let sibling_port = reserve_port();
+    let sibling_source = stack.directory.join("sibling-source.sock");
+    let sibling_destination = stack.directory.join("sibling-destination.sock");
     let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
         .env("PATH", &stack.directory)
         .env("ET_SSH_COUNT", &stack.ssh_count)
@@ -380,9 +423,13 @@ fn explicit_remote_bind_report_aborts_and_releases_sibling_listener() {
         .args(["--serverfifo"])
         .arg(&stack.router)
         .args(["-N", "-r"])
-        .arg(format!("{occupied_port}:1"))
+        .arg(format!(
+            "{}:{}",
+            sibling_source.display(),
+            sibling_destination.display()
+        ))
         .arg("-r")
-        .arg(format!("{sibling_port}:1"))
+        .arg(format!("{occupied_port}:1"))
         .arg(format!("tester@127.0.0.1:{}", stack.port))
         .spawn()
         .unwrap();
@@ -390,7 +437,7 @@ fn explicit_remote_bind_report_aborts_and_releases_sibling_listener() {
     let status = client
         .wait_timeout(TIMEOUT)
         .unwrap()
-        .expect("explicit reported bind failure did not terminate the client");
+        .expect("explicit reverse bind failure did not terminate the client");
     let mut error = String::new();
     client
         .stderr
@@ -400,13 +447,11 @@ fn explicit_remote_bind_report_aborts_and_releases_sibling_listener() {
         .unwrap();
 
     assert!(!status.success());
-    assert!(
-        error.contains("required reverse forwarding row could not bind"),
-        "{error}"
-    );
-    stack.shutdown();
-    let rebound = TcpListener::bind((Ipv4Addr::LOCALHOST, sibling_port)).unwrap();
+    assert!(error.contains("Address already in use"), "{error}");
+    assert!(!sibling_source.exists());
+    let rebound = UnixListener::bind(&sibling_source).unwrap();
     drop(rebound);
+    stack.shutdown();
     drop(occupied);
 }
 
@@ -502,7 +547,7 @@ fn ssh_config_hardening_explicit_bind_failure_remains_fatal() {
 }
 
 #[test]
-fn ssh_config_mixed_unix_tcp_tunnels_relay_on_both_axes() {
+fn ssh_config_unix_local_tunnels_relay_and_remote_rows_are_omitted() {
     let mut stack = Stack::start();
 
     let local_unix_source = stack.directory.join("local-unix-source.sock");
@@ -510,33 +555,24 @@ fn ssh_config_mixed_unix_tcp_tunnels_relay_on_both_axes() {
     let local_tcp_destination_port = local_tcp_destination.local_addr().unwrap().port();
     let local_tcp_echo = spawn_tcp_echo_once(local_tcp_destination, b"local-unix-source");
 
-    let local_tcp_source_port = reserve_port();
+    let second_local_unix_source = stack.directory.join("second-local-unix-source.sock");
     let local_unix_destination_path = stack.directory.join("local-unix-destination.sock");
     let local_unix_destination = UnixListener::bind(&local_unix_destination_path).unwrap();
     let local_unix_echo = spawn_unix_echo(local_unix_destination, b"local-unix-destination");
 
     let remote_unix_source = stack.directory.join("remote-unix-source.sock");
-    let remote_tcp_destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let remote_tcp_destination_port = remote_tcp_destination.local_addr().unwrap().port();
-    let remote_tcp_echo = spawn_tcp_echo_once(remote_tcp_destination, b"remote-unix-source");
-
-    let remote_tcp_source_port = reserve_port();
-    let remote_unix_destination_path = stack.directory.join("remote-unix-destination.sock");
-    let remote_unix_destination = UnixListener::bind(&remote_unix_destination_path).unwrap();
-    let remote_unix_echo = spawn_unix_echo(remote_unix_destination, b"remote-unix-destination");
 
     let gate = stack.directory.join("ssh-config-mixed-ready");
     mkfifo(&gate);
     let config = format!(
         "hostname 127.0.0.1\nuser tester\n\
          localforward {} [127.0.0.1]:{local_tcp_destination_port}\n\
-         localforward [127.0.0.1]:{local_tcp_source_port} {}\n\
-         remoteforward {} [127.0.0.1]:{remote_tcp_destination_port}\n\
-         remoteforward [127.0.0.1]:{remote_tcp_source_port} {}\n",
+         localforward {} {}\n\
+         remoteforward {} [127.0.0.1]:9\n",
         local_unix_source.display(),
+        second_local_unix_source.display(),
         local_unix_destination_path.display(),
         remote_unix_source.display(),
-        remote_unix_destination_path.display(),
     );
     let mut client = Command::new(env!("CARGO_BIN_EXE_et"));
     client
@@ -557,15 +593,12 @@ fn ssh_config_mixed_unix_tcp_tunnels_relay_on_both_axes() {
 
     await_fifo(&gate, &mut client);
     assert_unix_round_trip(&local_unix_source, b"local-unix-source");
-    assert_ready_tcp_round_trip(local_tcp_source_port, b"local-unix-destination");
-    assert_unix_round_trip(&remote_unix_source, b"remote-unix-source");
-    assert_ready_tcp_round_trip(remote_tcp_source_port, b"remote-unix-destination");
+    assert_unix_round_trip(&second_local_unix_source, b"local-unix-destination");
+    assert!(!remote_unix_source.exists());
 
     stop(&mut client);
     local_tcp_echo.join().unwrap();
     local_unix_echo.join().unwrap();
-    remote_tcp_echo.join().unwrap();
-    remote_unix_echo.join().unwrap();
     stack.shutdown();
 }
 

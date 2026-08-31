@@ -13,7 +13,6 @@ use et_core::proto::{PortForwardSourceRequest, TerminalPacketType};
 use crate::forward_endpoint::{Endpoint, ResolvedEndpoint};
 use crate::forward_io::BoundSource;
 use crate::forward_worker::{run, Command};
-use crate::reverse_report::SkipReason;
 
 const CHANNEL_CAPACITY: usize = 256;
 /// Maximum reverse listeners owned by one terminal session, after DNS fanout
@@ -53,7 +52,6 @@ pub(crate) type Outbound = Result<Packet, ForwardError>;
 pub enum ForwardOrigin {
     Explicit,
     SshConfig { strict: bool },
-    Reported(usize),
 }
 
 pub struct ForwardSource {
@@ -80,8 +78,6 @@ impl ForwardSource {
 pub struct SkippedForward {
     pub request: PortForwardSourceRequest,
     pub error: io::Error,
-    pub reason: SkipReason,
-    pub report_index: Option<usize>,
 }
 
 pub struct Forwarder {
@@ -119,21 +115,6 @@ impl Forwarder {
     ) -> Result<(Self, ForwardEnvironment), ForwardError> {
         let sources = sources.into_iter().map(ForwardSource::explicit).collect();
         start_forwarder(sources, owner).map(|(forwarder, environment, _)| (forwarder, environment))
-    }
-
-    pub fn start_with_user_report(
-        sources: Vec<PortForwardSourceRequest>,
-        owner: Option<(u32, u32)>,
-    ) -> Result<(Self, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
-        let sources = sources
-            .into_iter()
-            .enumerate()
-            .map(|(index, request)| ForwardSource {
-                request,
-                origin: ForwardOrigin::Reported(index),
-            })
-            .collect();
-        start_forwarder(sources, owner)
     }
 }
 
@@ -326,17 +307,6 @@ fn bind_sources(
                     skipped.push(SkippedForward {
                         request: original,
                         error,
-                        reason: SkipReason::Resolve,
-                        report_index: None,
-                    });
-                    continue;
-                }
-                (Err(error), ForwardOrigin::Reported(index)) => {
-                    skipped.push(SkippedForward {
-                        request: original,
-                        error,
-                        reason: SkipReason::Resolve,
-                        report_index: Some(index),
                     });
                     continue;
                 }
@@ -403,16 +373,6 @@ fn bind_sources(
                     skipped.push(SkippedForward {
                         request: original,
                         error,
-                        reason: SkipReason::Bind,
-                        report_index: None,
-                    });
-                }
-                (Err(error), ForwardOrigin::Reported(index)) => {
-                    skipped.push(SkippedForward {
-                        request: original,
-                        error,
-                        reason: SkipReason::Bind,
-                        report_index: Some(index),
                     });
                 }
                 (

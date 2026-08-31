@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
+use std::net::SocketAddr;
 #[cfg(unix)]
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,7 +13,11 @@ use et_core::packet::Packet;
 use et_core::proto::{
     PortForwardDestinationRequest, PortForwardSourceRequest, SocketEndpoint, TerminalPacketType,
 };
-use et_net::forward::{ForwardError, ForwardOrigin, ForwardSource, Forwarder};
+#[cfg(unix)]
+use et_net::forward::ForwardError;
+use et_net::forward::Forwarder;
+#[cfg(unix)]
+use et_net::forward::{ForwardOrigin, ForwardSource};
 use prost::Message;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
@@ -242,13 +248,13 @@ fn authenticated_reverse_tcp_wildcard_bind_exposes_session_to_external_network()
 
     let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = reservation.local_addr().unwrap().port();
-    let error = match Forwarder::start_with_user_report(
+    let error = match Forwarder::start_with_user(
         vec![request_on(&Ipv4Addr::UNSPECIFIED.to_string(), port, 1)],
         Some(owner),
     ) {
-        Ok((forwarder, _, _)) => {
+        Ok((forwarder, _)) => {
             forwarder.shutdown().unwrap();
-            panic!("authority failure was downgraded to a row report")
+            panic!("authority failure was not fatal")
         }
         Err(error) => error,
     };

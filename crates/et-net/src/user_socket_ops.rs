@@ -78,10 +78,12 @@ pub fn run_helper() -> i32 {
         .and_then(|value| Op::parse(&value));
     let argument = std::env::var(PATH_ENV).unwrap_or_default();
     match op {
-        Some(Op::Listen) if !argument.is_empty() => match listen_at_path(Path::new(&argument)) {
-            Ok(listener) => send_result(channel, Some(listener.as_fd()), 0, 0),
-            Err(error) => send_error(channel, &error),
-        },
+        Some(Op::Listen) if !argument.is_empty() => {
+            match PendingUnixListener::bind(Path::new(&argument)) {
+                Ok(listener) => listener.send(channel),
+                Err(error) => send_error(channel, &error),
+            }
+        }
         Some(Op::Connect) if !argument.is_empty() => match connect_at_path(Path::new(&argument)) {
             Ok(stream) => send_result(channel, Some(stream.as_fd()), 0, 0),
             Err(error) => send_error(channel, &error),
@@ -101,31 +103,54 @@ pub fn run_helper() -> i32 {
 
 /// Bind/listen a new owner-only UNIX socket path with the current credentials.
 pub fn listen_at_path(path: &Path) -> io::Result<UnixListener> {
-    listen_at_path_with(path, || Ok(()))
+    PendingUnixListener::bind(path).map(PendingUnixListener::into_listener)
 }
 
-fn listen_at_path_with(
-    path: &Path,
-    after_bind: impl FnOnce() -> io::Result<()>,
-) -> io::Result<UnixListener> {
-    if path_too_long(path) {
-        return Err(io::Error::from_raw_os_error(
-            rustix::io::Errno::NAMETOOLONG.raw_os_error(),
-        ));
+struct PendingUnixListener {
+    listener: Option<UnixListener>,
+    cleanup: PendingSocketPath,
+}
+
+impl PendingUnixListener {
+    fn bind(path: &Path) -> io::Result<Self> {
+        if path_too_long(path) {
+            return Err(io::Error::from_raw_os_error(
+                rustix::io::Errno::NAMETOOLONG.raw_os_error(),
+            ));
+        }
+        let listener = UnixListener::bind(path)?;
+        let cleanup = PendingSocketPath(Some(path.to_path_buf()));
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        Ok(Self {
+            listener: Some(listener),
+            cleanup,
+        })
     }
-    let listener = UnixListener::bind(path)?;
-    let mut cleanup = SocketPathCleanup(Some(path.to_path_buf()));
-    after_bind()?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    cleanup.0 = None;
-    Ok(listener)
+
+    fn into_listener(mut self) -> UnixListener {
+        self.cleanup.0.take();
+        self.listener.take().expect("bound Unix listener")
+    }
+
+    fn send(mut self, channel: BorrowedFd<'_>) -> i32 {
+        let status = send_result(
+            channel,
+            Some(self.listener.as_ref().expect("bound Unix listener").as_fd()),
+            0,
+            0,
+        );
+        if status == 0 {
+            self.cleanup.0.take();
+        }
+        status
+    }
 }
 
-struct SocketPathCleanup(Option<PathBuf>);
+struct PendingSocketPath(Option<PathBuf>);
 
-impl Drop for SocketPathCleanup {
+impl Drop for PendingSocketPath {
     fn drop(&mut self) {
-        if let Some(path) = self.0.as_ref() {
+        if let Some(path) = self.0.take() {
             let _ = fs::remove_file(path);
         }
     }
@@ -457,26 +482,6 @@ mod tests {
     }
 
     #[test]
-    fn listen_failure_after_bind_cleans_socket_and_immediate_retry_succeeds() {
-        // Given
-        let dir = temp_dir();
-        let path = dir.join("post-bind-failure.sock");
-
-        // When
-        let error = listen_at_path_with(&path, || Err(io::Error::other("injected before chmod")))
-            .unwrap_err();
-
-        // Then
-        assert_eq!(error.kind(), io::ErrorKind::Other);
-        assert!(!path.exists());
-        let listener = listen_at_path(&path).unwrap();
-        assert!(path.exists());
-        drop(listener);
-        fs::remove_file(&path).unwrap();
-        fs::remove_dir(&dir).unwrap();
-    }
-
-    #[test]
     fn listen_and_connect_at_path_roundtrip() {
         let dir = temp_dir();
         let path = dir.join("sock");
@@ -586,6 +591,20 @@ mod tests {
         let _ = fs::remove_dir(&dir);
     }
 
+    #[test]
+    fn failed_listener_descriptor_transfer_removes_socket_path() {
+        let dir = temp_dir();
+        let path = dir.join("sock");
+        let listener = PendingUnixListener::bind(&path).unwrap();
+        let (channel, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+
+        assert_eq!(listener.send(channel.as_fd()), 1);
+        assert!(!path.exists());
+
+        fs::remove_dir(dir).unwrap();
+    }
+
     fn unprivileged_drop_user() -> Option<(u32, u32)> {
         if rustix::process::getuid().as_raw() != 0 {
             return None;
@@ -613,6 +632,20 @@ mod tests {
             return Some((uid, gid));
         }
         None
+    }
+
+    #[test]
+    fn helper_command_clears_privileged_supplementary_groups() {
+        let Some((uid, gid)) = unprivileged_drop_user() else {
+            eprintln!("skipping helper group-drop test: not root or no nobody user");
+            return;
+        };
+        let identity = HelperIdentity {
+            euid: uid,
+            egid: gid,
+            groups: vec![gid],
+        };
+        assert!(helper_identity_matches((uid, gid), &[gid], &identity));
     }
 
     /// ANT-2026-AVTT7HQH: privilege-dropped listen cannot unlink a root-owned

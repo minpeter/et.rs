@@ -5,7 +5,13 @@ use crate::error::ClientError;
 const MARKER: &[u8] = b"IDPASSKEY:";
 const CREDENTIAL_LEN: usize = 16 + 1 + 32;
 pub const WINDOWS_SHELL_PROBE_SENTINEL: &str = "__ET_COMSPEC__";
-const CLEAR_ALL_FORWARDINGS: &str = "ClearAllForwardings=yes";
+const OPERATIONAL_SSH_OPTIONS: [&str; 5] = [
+    "ClearAllForwardings=yes",
+    "RemoteCommand=none",
+    "PermitLocalCommand=no",
+    "ControlMaster=no",
+    "ControlPath=none",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Credentials {
@@ -195,19 +201,30 @@ pub fn build_shell_probe(request: &BootstrapRequest) -> SshInvocation {
 }
 
 fn append_operational_options(args: &mut Vec<String>, options: &[String]) {
-    args.push(format!("-o{CLEAR_ALL_FORWARDINGS}"));
+    args.extend(
+        OPERATIONAL_SSH_OPTIONS
+            .iter()
+            .map(|option| format!("-o{option}")),
+    );
     args.extend(
         options
             .iter()
-            .filter(|option| {
-                !option
-                    .trim_start()
-                    .split(|character: char| character == '=' || character.is_ascii_whitespace())
-                    .next()
-                    .is_some_and(|key| key.eq_ignore_ascii_case("ClearAllForwardings"))
-            })
+            .filter(|option| !is_forced_operational_option(option))
             .map(|option| format!("-o{option}")),
     );
+}
+
+fn is_forced_operational_option(option: &str) -> bool {
+    let key = option
+        .trim_start()
+        .split(|character: char| character == '=' || character.is_ascii_whitespace())
+        .next()
+        .unwrap_or(option);
+    OPERATIONAL_SSH_OPTIONS.iter().any(|forced| {
+        forced
+            .split_once('=')
+            .is_some_and(|(forced_key, _)| key.eq_ignore_ascii_case(forced_key))
+    })
 }
 
 pub fn parse_shell_probe(stdout: &[u8]) -> Result<RemoteShell, ClientError> {
@@ -412,17 +429,25 @@ mod tests {
         }
     }
 
-    fn assert_clear_all_forwardings_once(invocation: &SshInvocation) {
-        assert_eq!(
-            invocation
-                .args
-                .iter()
-                .filter(|argument| argument.as_str() == "-oClearAllForwardings=yes")
-                .count(),
-            1,
-            "operational SSH argv must suppress configured forwarding exactly once: {:?}",
-            invocation.args
-        );
+    fn assert_operational_guards_once(invocation: &SshInvocation) {
+        for option in [
+            "ClearAllForwardings=yes",
+            "RemoteCommand=none",
+            "PermitLocalCommand=no",
+            "ControlMaster=no",
+            "ControlPath=none",
+        ] {
+            assert_eq!(
+                invocation
+                    .args
+                    .iter()
+                    .filter(|argument| argument.as_str() == format!("-o{option}"))
+                    .count(),
+                1,
+                "operational SSH argv must force {option} exactly once: {:?}",
+                invocation.args
+            );
+        }
     }
 
     #[test]
@@ -432,10 +457,14 @@ mod tests {
             "ClearAllForwardings=no".to_owned(),
             "clearallforwardings NO".to_owned(),
             "CLEARALLFORWARDINGS = no".to_owned(),
+            "RemoteCommand=hostname".to_owned(),
+            "permitlocalcommand yes".to_owned(),
+            "CONTROLMASTER=auto".to_owned(),
+            "controlpath ~/.ssh/et-master".to_owned(),
         ]);
         let invocation = build_invocation(&request, &provisional_credentials().unwrap());
 
-        assert_clear_all_forwardings_once(&invocation);
+        assert_operational_guards_once(&invocation);
         let suppression = invocation
             .args
             .iter()
@@ -516,7 +545,7 @@ mod tests {
     fn ssh_config_hardening_shell_probe_suppresses_forwardings() {
         let invocation = build_shell_probe(&request());
 
-        assert_clear_all_forwardings_once(&invocation);
+        assert_operational_guards_once(&invocation);
     }
 
     #[test]
@@ -534,7 +563,7 @@ mod tests {
         };
         let invocation = build_jump_invocation(&request, &provisional_credentials().unwrap());
 
-        assert_clear_all_forwardings_once(&invocation);
+        assert_operational_guards_once(&invocation);
     }
 
     #[test]
@@ -546,11 +575,19 @@ mod tests {
         let invocation = build_invocation(&request(), &credentials);
         assert_eq!(invocation.program, "ssh");
         assert_eq!(
-            invocation.args[0..3],
-            ["-oClearAllForwardings=yes", "-oPort=2222", "alice@server"]
+            invocation.args[0..7],
+            [
+                "-oClearAllForwardings=yes",
+                "-oRemoteCommand=none",
+                "-oPermitLocalCommand=no",
+                "-oControlMaster=no",
+                "-oControlPath=none",
+                "-oPort=2222",
+                "alice@server",
+            ]
         );
         assert_eq!(
-            invocation.args[3],
+            invocation.args[7],
             "printf '%s\\n' 'XXXdefghijklmnop/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef_xterm-256color' | 'etterminal' '--verbose=2'"
         );
     }
@@ -565,11 +602,15 @@ mod tests {
         req.jumphost = Some("jump.example,user@hop2".into());
         let invocation = build_invocation(&req, &credentials);
         assert_eq!(
-            invocation.args[0..5],
+            invocation.args[0..9],
             [
                 "-J",
                 "jump.example,user@hop2",
                 "-oClearAllForwardings=yes",
+                "-oRemoteCommand=none",
+                "-oPermitLocalCommand=no",
+                "-oControlMaster=no",
+                "-oControlPath=none",
                 "-oPort=2222",
                 "alice@server",
             ]
@@ -723,16 +764,20 @@ mod tests {
         };
         let invocation = build_jump_invocation(&request, &credentials);
         assert_eq!(
-            invocation.args[0..5],
+            invocation.args[0..9],
             [
                 "-p",
                 "2200",
                 "-oClearAllForwardings=yes",
+                "-oRemoteCommand=none",
+                "-oPermitLocalCommand=no",
+                "-oControlMaster=no",
+                "-oControlPath=none",
                 "-oStrictHostKeyChecking=no",
                 "user@jump.example"
             ]
         );
-        let command = &invocation.args[5];
+        let command = &invocation.args[9];
         assert!(command.contains("'--serverfifo=/tmp/jump.fifo'"));
         assert!(command.contains("'--jump'"));
         assert!(command.contains("'--dsthost=dst.internal'"));

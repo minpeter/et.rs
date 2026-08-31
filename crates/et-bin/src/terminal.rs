@@ -185,13 +185,7 @@ fn load_credentials(args: &TerminalArgs) -> Result<CredentialInput, String> {
 fn register(router: &mut LocalStream, input: &CredentialInput) -> Result<(), String> {
     // Upstream uses these to chown forwarded named pipes; Windows has no
     // POSIX ids, so the session reports zero there.
-    #[cfg(unix)]
-    let (uid, gid) = {
-        let (uid, gid) = effective_terminal_identity();
-        (i64::from(uid), i64::from(gid))
-    };
-    #[cfg(windows)]
-    let (uid, gid) = (0i64, 0i64);
+    let (uid, gid) = registration_identity();
     let user = TerminalUserInfo {
         id: Some(input.id.clone()),
         passkey: Some(input.passkey.clone()),
@@ -208,34 +202,35 @@ fn register(router: &mut LocalStream, input: &CredentialInput) -> Result<(), Str
 }
 
 #[cfg(unix)]
-fn effective_terminal_identity() -> (u32, u32) {
+fn registration_identity() -> (i64, i64) {
     (
-        rustix::process::geteuid().as_raw(),
-        rustix::process::getegid().as_raw(),
+        i64::from(rustix::process::geteuid().as_raw()),
+        i64::from(rustix::process::getegid().as_raw()),
     )
 }
 
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn terminal_registration_identity_matches_effective_peer_credentials() {
-        // Given: this host cannot create differing real/effective IDs without
-        // privilege, so assert the exact credential API used by registration.
-        let expected = (
-            rustix::process::geteuid().as_raw(),
-            rustix::process::getegid().as_raw(),
-        );
-
-        // When
-        let identity = effective_terminal_identity();
-
-        // Then
-        assert_eq!(identity, expected);
-    }
+#[cfg(windows)]
+fn registration_identity() -> (i64, i64) {
+    (0, 0)
 }
 
 fn clap_error(message: impl Into<String>) -> clap::Error {
     clap::Error::raw(ErrorKind::Io, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_registration_identity_matches_effective_peer_credentials() {
+        assert_eq!(
+            registration_identity(),
+            (
+                i64::from(rustix::process::geteuid().as_raw()),
+                i64::from(rustix::process::getegid().as_raw()),
+            )
+        );
+    }
 }

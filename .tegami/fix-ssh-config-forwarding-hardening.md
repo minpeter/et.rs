@@ -6,13 +6,14 @@ packages:
 
 ## Harden SSH configuration port forwarding
 
-Operational SSH commands now suppress OpenSSH forwarding before user options,
-while configuration queries still import supported forwarding rows. Imported
-TCP destinations are limited to localhost, and local binds preserve
-GatewayPorts loopback and wildcard behavior.
+Operational SSH commands now force isolated forwarding, command, and control
+socket settings after filtering conflicting user options, while configuration
+queries still read supported `LocalForward` rows.
 
 Reverse listeners bind with the authenticated session identity, reject wildcard
 or privileged authority escalation, and enforce a transactional per-session
-listener limit. Bind failures are reported by bounded row index: SSH-config-only
-rows warn and continue, while an unavailable explicit reverse row aborts the
-client and releases sibling listeners.
+listener limit without capping client-side local listeners. Unix forwarding
+helpers clear supplementary groups, authenticate router peers, and roll back
+socket paths and created directories on every failed setup or descriptor
+transfer. Any explicit reverse bind failure aborts the session and releases
+sibling listeners without adding a protocol extension.

@@ -307,16 +307,26 @@ fn jumphost_payload_is_relayed_to_the_registered_terminal() {
     };
     let (stream, response) = server.handshake(ID_A);
     assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let terminal_handshake = std::thread::spawn(move || {
+        let packet = et_net::local_packet::read_local_packet(&mut terminal).unwrap();
+        assert_eq!(
+            packet.header(),
+            et_core::proto::TerminalPacketType::JumphostInit as u8
+        );
+        let relayed = InitialPayload::decode(packet.payload()).unwrap();
+        et_net::local_packet::write_local_packet(
+            &mut terminal,
+            &et_core::packet::Packet::new(
+                et_core::proto::TerminalPacketType::JumphostInit as u8,
+                InitialResponse { error: None }.encode_to_vec(),
+            ),
+        )
+        .unwrap();
+        relayed
+    });
     let (_client, initial) = runtime_support::initialize(stream, &key, payload);
-    // Jumphost sessions succeed: upstream `runJumpHost` answers with an empty
-    // InitialResponse and forwards JUMPHOST_INIT to the jump terminal.
     assert!(initial.error.is_none(), "{:?}", initial.error);
-    let packet = et_net::local_packet::read_local_packet(&mut terminal).unwrap();
-    assert_eq!(
-        packet.header(),
-        et_core::proto::TerminalPacketType::JumphostInit as u8
-    );
-    let relayed = InitialPayload::decode(packet.payload()).unwrap();
+    let relayed = terminal_handshake.join().unwrap();
     assert_eq!(relayed.jumphost, Some(true));
     server.runtime.shutdown().unwrap();
 }

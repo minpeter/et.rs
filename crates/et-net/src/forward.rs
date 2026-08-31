@@ -988,11 +988,12 @@ mod tests {
     fn shutdown_and_drop_ignore_a_full_non_emitting_command_queue() {
         for drop_only in [false, true] {
             let directory = std::env::temp_dir().join(format!(
-                "et-forward-stale-close-shutdown-{}-{drop_only}",
-                std::process::id()
+                "ef{}{}",
+                std::process::id(),
+                u8::from(drop_only)
             ));
             std::fs::create_dir_all(&directory).unwrap();
-            let path = directory.join("listener.sock");
+            let path = directory.join("s");
             let request = PortForwardSourceRequest {
                 source: Some(SocketEndpoint {
                     name: Some(path.to_string_lossy().into_owned()),

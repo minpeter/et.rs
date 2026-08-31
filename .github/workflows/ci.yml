@@ -58,6 +58,12 @@ jobs:
       - if: runner.os == 'Linux'
         run: cargo test --workspace -- --test-threads=1
 
+      # Library unit tests exercise the real SCM_RIGHTS helper. Unlike the
+      # Linux workspace test command, `--lib --bins` does not produce Cargo's
+      # un-hashed executable, so build the shipped helper explicitly.
+      - if: runner.os == 'macOS'
+        run: cargo build -p et-net --bin et-user-socket-helper
+
       - if: runner.os == 'macOS'
         run: cargo test --workspace --lib --bins -- --test-threads=1
 

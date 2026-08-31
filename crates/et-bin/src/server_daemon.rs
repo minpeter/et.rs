@@ -3,13 +3,15 @@
 //! Upstream double-forks, calls `setsid`, writes the pid file, `chdir("/")`,
 //! and redirects stdio to `/dev/null`. Forking is not expressible in safe
 //! Rust, so the same end state is reached by re-executing this binary as a
-//! detached child: the parent returns immediately (exit 0), and the child
-//! becomes a session leader before serving.
+//! detached child: the parent returns after pid-file acknowledgement, and the
+//! child becomes a session leader before serving.
 
-use crate::detach::Stdio;
+use crate::detach::{ChildStdout, Stdio};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::Duration;
 
 #[cfg(unix)]
 pub const DEFAULT_PID_FILE: &str = "/var/run/etserver.pid";
@@ -17,7 +19,13 @@ pub const DEFAULT_PID_FILE: &str = "/var/run/etserver.pid";
 #[cfg(windows)]
 pub const DEFAULT_PID_FILE: &str = "etserver.pid";
 
-/// Re-exec this binary as a detached background server and return.
+const STATUS_ENV: &str = "ET_SERVER_DAEMON_STATUS";
+const STATUS_TOKEN: &str = "ready-v1";
+const STATUS_FRAME: &[u8; 4] = b"ETD1";
+const READY_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Re-exec this binary as a detached background server and return after the
+/// child acknowledges its pid file.
 ///
 /// The child receives the original arguments with `--daemon` replaced by the
 /// internal `--daemon-child` marker so it knows to finish detaching.
@@ -41,13 +49,38 @@ pub fn spawn_detached(args: &[std::ffi::OsString]) -> Result<(), String> {
     }
     child
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .env(STATUS_ENV, STATUS_TOKEN)
         .current_dir(root_directory());
     crate::detach::configure(&mut child);
-    crate::detach::spawn(&mut child)
-        .map(|_| ())
-        .map_err(|error| format!("could not start background etserver: {error}"))
+    let mut child = crate::detach::spawn(&mut child)
+        .map_err(|error| format!("could not start background etserver: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "background etserver status pipe was not created".to_owned())?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker = match spawn_status_worker(stdout, sender) {
+        Ok(worker) => worker,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let result = match receiver.recv_timeout(READY_TIMEOUT) {
+        Ok(result) => {
+            result.map_err(|error| format!("background etserver did not detach: {error}"))
+        }
+        Err(_) => Err("timed out waiting for background etserver to detach".to_owned()),
+    };
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let _ = worker.join();
+    result
 }
 
 /// Finish detaching inside the re-executed child: become a session leader,
@@ -63,7 +96,39 @@ pub fn detach_child(pidfile: Option<&Path>) -> Result<(), String> {
     // The working directory is already `/`: the parent sets it on the child
     // via `Command::current_dir`, matching upstream's `chdir("/")`.
     let path = pidfile.unwrap_or_else(|| Path::new(DEFAULT_PID_FILE));
-    write_pid_file(path)
+    write_pid_file(path)?;
+    if std::env::var(STATUS_ENV).as_deref() == Ok(STATUS_TOKEN) {
+        let stdout = std::io::stdout();
+        let mut output = stdout.lock();
+        output
+            .write_all(STATUS_FRAME)
+            .and_then(|()| output.flush())
+            .map_err(|error| format!("could not signal daemon readiness: {error}"))?;
+    }
+    Ok(())
+}
+
+fn spawn_status_worker(
+    stdout: ChildStdout,
+    sender: mpsc::SyncSender<Result<(), String>>,
+) -> Result<std::thread::JoinHandle<()>, String> {
+    std::thread::Builder::new()
+        .name("et-server-daemon-status".to_owned())
+        .spawn(move || {
+            let _ = sender.send(read_status(stdout));
+        })
+        .map_err(|error| format!("could not start daemon status worker: {error}"))
+}
+
+fn read_status(mut stdout: impl Read) -> Result<(), String> {
+    let mut frame = [0u8; STATUS_FRAME.len()];
+    stdout
+        .read_exact(&mut frame)
+        .map_err(|error| format!("daemon status channel closed: {error}"))?;
+    if &frame != STATUS_FRAME {
+        return Err("malformed daemon startup status".to_owned());
+    }
+    Ok(())
 }
 
 /// Working directory for the detached server.

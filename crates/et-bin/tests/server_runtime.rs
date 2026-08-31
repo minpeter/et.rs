@@ -137,18 +137,13 @@ fn daemon_mode_detaches_and_writes_a_pid_file() {
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         assert!(output.stdout.is_empty(), "{output:?}");
 
-        // The detached child writes the pid file shortly after starting.
-        let mut recorded = None;
-        for _ in 0..50 {
-            if let Ok(text) = fs::read_to_string(&pidfile) {
-                if let Ok(pid) = text.trim().parse::<i32>() {
-                    recorded = Some(pid);
-                    break;
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        let pid = recorded.expect("daemon did not write a pid file");
+        // The parent returns only after the detached child acknowledges its
+        // flushed pid file, so no timing-based filesystem polling is needed.
+        let pid = fs::read_to_string(&pidfile)
+            .expect("daemon did not write a pid file")
+            .trim()
+            .parse::<i32>()
+            .expect("daemon wrote an invalid pid file");
         assert!(pid > 0);
         // Owner-only permissions, like upstream's 0600 open().
         let mode = fs::metadata(&pidfile).unwrap().permissions().mode() & 0o777;

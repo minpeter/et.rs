@@ -34,8 +34,11 @@ const UID_ENV: &str = "ET_RS_USER_SOCKET_UID";
 const GID_ENV: &str = "ET_RS_USER_SOCKET_GID";
 const HELPER_ENV: &str = "ET_RS_USER_SOCKET_HELPER";
 const HELPER_NAME: &str = "et-user-socket-helper";
-/// `sockaddr_un.sun_path` on Linux, including the trailing NUL.
+/// `sockaddr_un.sun_path`, including the trailing NUL.
+#[cfg(not(target_os = "macos"))]
 const UNIX_PATH_MAX: usize = 108;
+#[cfg(target_os = "macos")]
+const UNIX_PATH_MAX: usize = 104;
 const HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 const ATOMIC_SCM_RIGHTS_CLOEXEC: bool = cfg!(any(target_os = "linux", target_os = "android"));
 static HELPER_SPAWN_LOCK: HelperSpawnLock = HelperSpawnLock {
@@ -246,6 +249,11 @@ pub(crate) fn listen_unix_as_user_until(
     deadline: Instant,
 ) -> io::Result<UserUnixListener> {
     let path = path.as_ref();
+    if path_too_long(path) {
+        return Err(io::Error::from_raw_os_error(
+            rustix::io::Errno::NAMETOOLONG.raw_os_error(),
+        ));
+    }
     run_listener_as_user(path, uid, gid, deadline)
 }
 
@@ -1088,6 +1096,8 @@ mod tests {
         let uid = rustix::process::getuid().as_raw();
         let gid = rustix::process::getgid().as_raw();
         let error = listen_unix_as_user(long_unix_path(), uid, gid).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidFilename);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         assert_eq!(
             error.raw_os_error(),
             Some(rustix::io::Errno::NAMETOOLONG.raw_os_error())

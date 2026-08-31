@@ -114,12 +114,11 @@ fn append_first_message(output: &mut Vec<u8>, paths: &[PathBuf]) {
     for path in paths {
         match try_read_message(path) {
             Err(()) => continue,
-            Ok(message) => {
-                if let Some(message) = message {
-                    append_terminal_bytes(output, &message);
-                }
+            Ok(Some(message)) => {
+                append_terminal_bytes(output, &message);
                 break;
             }
+            Ok(None) => continue,
         }
     }
 }
@@ -178,24 +177,30 @@ fn try_read_message(path: &Path) -> Result<Option<Vec<u8>>, ()> {
 
 /// Preserve existing CRLF and make lone LF render from column zero.
 fn append_terminal_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let body = if bytes.ends_with(b"\r\n") {
+        body.strip_suffix(b"\r").unwrap_or(body)
+    } else {
+        body
+    };
+    let content_limit = MAX_MOTD_TOTAL.saturating_sub(2);
     let mut previous = 0u8;
-    for byte in bytes {
-        if output.len() >= MAX_MOTD_TOTAL {
-            return;
-        }
+    for byte in body {
         if *byte == b'\n' && previous != b'\r' {
-            output.push(b'\r');
-            if output.len() >= MAX_MOTD_TOTAL {
-                return;
+            if output.len().saturating_add(2) > content_limit {
+                break;
             }
+            output.push(b'\r');
+        } else if output.len() >= content_limit {
+            break;
         }
         output.push(*byte);
         previous = *byte;
     }
-    if !bytes.is_empty()
-        && !bytes.ends_with(b"\n")
-        && output.len().saturating_add(2) <= MAX_MOTD_TOTAL
-    {
+    if output.len().saturating_add(2) <= MAX_MOTD_TOTAL {
         output.extend_from_slice(b"\r\n");
     }
 }

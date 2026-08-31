@@ -79,6 +79,23 @@ fn load_bounds_each_message_and_total_directory_output() {
     let output = load_from(&[], std::slice::from_ref(&directory), None, None).unwrap();
 
     assert_eq!(output.len(), MAX_MOTD_TOTAL);
+    assert!(output.ends_with(b"\r\n"));
+}
+
+#[test]
+fn load_preserves_framing_when_newline_messages_hit_total_bound() {
+    let sandbox = Sandbox::new("bounded-newline");
+    let directory = sandbox.directory("motd.d");
+    for index in 0..5 {
+        let mut message = vec![b'x'; MAX_MOTD_MESSAGE];
+        *message.last_mut().unwrap() = b'\n';
+        fs::write(directory.join(format!("{index:02}-message")), message).unwrap();
+    }
+
+    let output = load_from(&[], std::slice::from_ref(&directory), None, None).unwrap();
+
+    assert_eq!(output.len(), MAX_MOTD_TOTAL);
+    assert!(output.ends_with(b"\r\n"));
 }
 
 #[test]
@@ -94,6 +111,13 @@ fn load_shows_only_the_first_readable_default_file() {
     assert_eq!(
         load_from(&[sandbox.0.join("absent"), second], &[], None, None).unwrap(),
         b"second\r\n"
+    );
+
+    let nonregular = sandbox.directory("nonregular");
+    let fallback = sandbox.file("fallback", b"fallback\n");
+    assert_eq!(
+        load_from(&[nonregular, fallback], &[], None, None).unwrap(),
+        b"fallback\r\n"
     );
 }
 

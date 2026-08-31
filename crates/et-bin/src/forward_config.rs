@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use et_cli::client::ClientArgs;
 use et_cli::tunnel::parse_tunnels;
 use et_core::proto::{InitialPayload, PortForwardSourceRequest, SocketEndpoint};
+use et_net::forward::ForwardSource;
 
 use crate::ssh_config::ResolvedSshConfig;
 use crate::terminal_protocol::{valid_environment_name, MAX_ENVIRONMENT};
@@ -69,7 +70,7 @@ impl From<et_cli::tunnel::TunnelError> for ForwardConfigError {
 }
 
 pub struct ForwardConfig {
-    pub local_sources: Vec<PortForwardSourceRequest>,
+    pub local_sources: Vec<ForwardSource>,
     pub initial_payload: InitialPayload,
 }
 
@@ -80,7 +81,12 @@ impl ForwardConfig {
         resolved: &ResolvedSshConfig,
     ) -> Result<(), ForwardConfigError> {
         if args.tunnel.is_empty() {
-            self.local_sources.clone_from(&resolved.local_forwards);
+            self.local_sources = resolved
+                .local_forwards
+                .iter()
+                .cloned()
+                .map(ForwardSource::ssh_config)
+                .collect();
         }
         if args.reverse_tunnel.is_empty() {
             let mut configured = resolved.remote_forwards.clone();
@@ -95,7 +101,10 @@ pub fn build(
     args: &ClientArgs,
     environment_agent: Option<&str>,
 ) -> Result<ForwardConfig, ForwardConfigError> {
-    let local_sources = parse_tunnels(&args.tunnel)?;
+    let local_sources = parse_tunnels(&args.tunnel)?
+        .into_iter()
+        .map(ForwardSource::explicit)
+        .collect();
     let mut reverse_tunnels = parse_tunnels(&args.reverse_tunnel)?;
     if args.forward_ssh_agent {
         // Upstream sends a reverse tunnel with no source: the server creates

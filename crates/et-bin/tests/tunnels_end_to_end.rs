@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use reconnect_stack::{mkfifo, shell_quote, Stack};
 use tunnel_support::SingleCutProxy;
+use wait_timeout::ChildExt;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -59,6 +60,107 @@ fn ssh_config_local_and_remote_tunnels_relay_real_tcp_payloads() {
     stop(&mut client);
     local_echo.join().unwrap();
     reverse_echo.join().unwrap();
+    stack.shutdown();
+}
+
+#[test]
+fn ssh_config_hardening_imported_bind_failure_skips_only_that_row() {
+    let mut stack = Stack::start();
+    let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let occupied_port = occupied.local_addr().unwrap().port();
+    let destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let destination_port = destination.local_addr().unwrap().port();
+    let echo = spawn_tcp_echo_once(destination, b"usable-import");
+    let usable_port = reserve_port();
+    let gate = stack.directory.join("imported-bind-ready");
+    mkfifo(&gate);
+    let config = format!(
+        "hostname 127.0.0.1
+user tester
+gatewayports no
+         localforward {occupied_port} [127.0.0.1]:{destination_port}
+         localforward {usable_port} [127.0.0.1]:{destination_port}
+"
+    );
+    let mut client = Command::new(env!("CARGO_BIN_EXE_et"));
+    client
+        .env("PATH", &stack.directory)
+        .env("ET_SSH_COUNT", &stack.ssh_count)
+        .env("ET_SSH_CONFIG", config)
+        .env("ET_SSH_READY", &gate)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(["--logtostdout", "--terminal-path"])
+        .arg(&stack.terminal)
+        .args(["--serverfifo"])
+        .arg(&stack.router)
+        .arg("-N")
+        .arg(format!("tester@127.0.0.1:{}", stack.port));
+    let mut client = client.spawn().unwrap();
+
+    let ready = {
+        let gate = gate.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = sender.send(fs::read_to_string(gate));
+        });
+        receiver
+            .recv_timeout(TIMEOUT)
+            .expect("imported bind failure prevented client readiness")
+            .unwrap()
+    };
+    assert_eq!(ready, "ready");
+    assert_ready_tcp_round_trip(usable_port, b"usable-import");
+
+    stop(&mut client);
+    let mut output = String::new();
+    client
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert_eq!(
+        output
+            .lines()
+            .filter(|line| line.contains("WARNING"))
+            .count(),
+        1
+    );
+    drop(occupied);
+    echo.join().unwrap();
+    stack.shutdown();
+}
+
+#[test]
+fn ssh_config_hardening_explicit_bind_failure_remains_fatal() {
+    let mut stack = Stack::start();
+    let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let occupied_port = occupied.local_addr().unwrap().port();
+    let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env("PATH", &stack.directory)
+        .env("ET_SSH_COUNT", &stack.ssh_count)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .args(["--terminal-path"])
+        .arg(&stack.terminal)
+        .args(["--serverfifo"])
+        .arg(&stack.router)
+        .args(["-N", "--tunnel"])
+        .arg(format!("{occupied_port}:1"))
+        .arg(format!("tester@127.0.0.1:{}", stack.port))
+        .spawn()
+        .unwrap();
+
+    let status = client
+        .wait_timeout(TIMEOUT)
+        .unwrap()
+        .expect("explicit bind failure did not terminate the client");
+
+    assert!(!status.success());
+    drop(occupied);
     stack.shutdown();
 }
 

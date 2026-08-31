@@ -173,7 +173,6 @@ fn reverse_listener_limit_is_transactional() {
         .iter()
         .map(|listener| listener.local_addr().unwrap().port())
         .collect();
-    drop(reservations);
     let requests = ports.iter().map(|port| request(*port, 1)).collect();
 
     let error = match Forwarder::start(requests) {
@@ -185,6 +184,7 @@ fn reverse_listener_limit_is_transactional() {
     };
 
     assert!(error.to_string().contains("listener limit"));
+    drop(reservations);
     let rebound: Vec<TcpListener> = ports
         .iter()
         .map(|port| TcpListener::bind((Ipv4Addr::LOCALHOST, *port)).unwrap())

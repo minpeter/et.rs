@@ -6,6 +6,13 @@ use crate::error::ClientError;
 use crate::ssh_process::{run_checked, SshRunner};
 use et_core::proto::{PortForwardSourceRequest, SocketEndpoint};
 
+#[derive(Clone, Copy)]
+enum GatewayPorts {
+    No,
+    Yes,
+    ClientSpecified,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedSshConfig {
     pub hostname: String,
@@ -54,6 +61,19 @@ fn parse_ssh_config(
 ) -> Result<ResolvedSshConfig, ClientError> {
     let text =
         std::str::from_utf8(stdout).map_err(|_| ClientError::SshConfigMalformed("UTF-8 output"))?;
+    let gateway_ports = text
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            fields
+                .next()
+                .is_some_and(|key| key.eq_ignore_ascii_case("gatewayports"))
+                .then(|| fields.next())
+                .flatten()
+        })
+        .map(GatewayPorts::parse)
+        .transpose()?
+        .unwrap_or(GatewayPorts::No);
     let mut hostname = None;
     let mut user = None;
     let mut local_forwards = Vec::new();
@@ -68,12 +88,12 @@ fn parse_ssh_config(
                 user = fields.next().map(str::to_string);
             }
             Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("localforward") => {
-                if let Some(forward) = parse_forward(fields, "localforward")? {
+                if let Some(forward) = parse_forward(fields, "localforward", gateway_ports)? {
                     local_forwards.push(forward);
                 }
             }
             Some(key) if parse_remote_forwards && key.eq_ignore_ascii_case("remoteforward") => {
-                if let Some(forward) = parse_forward(fields, "remoteforward")? {
+                if let Some(forward) = parse_forward(fields, "remoteforward", gateway_ports)? {
                     remote_forwards.push(forward);
                 }
             }
@@ -96,6 +116,7 @@ fn parse_ssh_config(
 fn parse_forward<'a>(
     fields: impl Iterator<Item = &'a str>,
     directive: &'static str,
+    gateway_ports: GatewayPorts,
 ) -> Result<Option<PortForwardSourceRequest>, ClientError> {
     let fields: Vec<&str> = fields.collect();
     let [source, destination] = fields.as_slice() else {
@@ -104,7 +125,12 @@ fn parse_forward<'a>(
             reason: "expected exactly two fields",
         });
     };
-    let source = parse_source_endpoint(source).ok_or(ClientError::SshConfigMalformedForward {
+    let source = parse_source_endpoint(
+        source,
+        gateway_ports,
+        directive.eq_ignore_ascii_case("localforward"),
+    )
+    .ok_or(ClientError::SshConfigMalformedForward {
         directive,
         reason: "invalid source endpoint",
     })?;
@@ -138,21 +164,63 @@ fn is_representable_tcp_destination(host: &str) -> bool {
             .is_ok_and(|address| address == Ipv6Addr::LOCALHOST)
 }
 
-fn parse_source_endpoint(value: &str) -> Option<SocketEndpoint> {
+impl GatewayPorts {
+    fn parse(value: &str) -> Result<Self, ClientError> {
+        match value {
+            "no" => Ok(Self::No),
+            "yes" => Ok(Self::Yes),
+            "clientspecified" => Ok(Self::ClientSpecified),
+            _ => Err(ClientError::SshConfigMalformed("gatewayports")),
+        }
+    }
+}
+
+fn parse_source_endpoint(
+    value: &str,
+    gateway_ports: GatewayPorts,
+    is_local_forward: bool,
+) -> Option<SocketEndpoint> {
     if let Some(endpoint) = parse_unix_endpoint(value) {
         return Some(endpoint);
     }
     if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Some(SocketEndpoint {
-            name: Some("localhost".to_owned()),
-            port: Some(parse_port(value)?),
-        });
+        return Some(normalize_tcp_source(
+            SocketEndpoint {
+                name: Some("localhost".to_owned()),
+                port: Some(parse_port(value)?),
+            },
+            gateway_ports,
+            is_local_forward,
+        ));
     }
-    parse_tcp_endpoint(value)
+    parse_tcp_endpoint(value, true)
+        .map(|endpoint| normalize_tcp_source(endpoint, gateway_ports, is_local_forward))
+}
+
+fn normalize_tcp_source(
+    mut endpoint: SocketEndpoint,
+    gateway_ports: GatewayPorts,
+    is_local_forward: bool,
+) -> SocketEndpoint {
+    let requested = endpoint.name.take().unwrap_or_default();
+    let normalized = match (is_local_forward, gateway_ports) {
+        (false, _) if requested == "*" || requested == "[*]" => String::new(),
+        (false, _) if requested.is_empty() => "localhost".to_owned(),
+        (false, _) => requested,
+        (true, GatewayPorts::No) => "localhost".to_owned(),
+        (true, GatewayPorts::Yes) => String::new(),
+        (true, GatewayPorts::ClientSpecified) if requested == "*" || requested == "[*]" => {
+            String::new()
+        }
+        (true, GatewayPorts::ClientSpecified) if requested.is_empty() => "localhost".to_owned(),
+        (true, GatewayPorts::ClientSpecified) => requested,
+    };
+    endpoint.name = Some(normalized);
+    endpoint
 }
 
 fn parse_destination_endpoint(value: &str) -> Option<SocketEndpoint> {
-    parse_unix_endpoint(value).or_else(|| parse_tcp_endpoint(value))
+    parse_unix_endpoint(value).or_else(|| parse_tcp_endpoint(value, false))
 }
 
 fn parse_unix_endpoint(value: &str) -> Option<SocketEndpoint> {
@@ -165,10 +233,10 @@ fn parse_unix_endpoint(value: &str) -> Option<SocketEndpoint> {
     })
 }
 
-fn parse_tcp_endpoint(value: &str) -> Option<SocketEndpoint> {
+fn parse_tcp_endpoint(value: &str, allow_empty_host: bool) -> Option<SocketEndpoint> {
     let (host, port) = if let Some(bracketed) = value.strip_prefix('[') {
         let (host, port) = bracketed.split_once("]:")?;
-        if host.is_empty() || port.contains(':') {
+        if (!allow_empty_host && host.is_empty()) || port.contains(':') {
             return None;
         }
         (host, port)
@@ -277,16 +345,112 @@ mod tests {
             resolved.local_forwards,
             [
                 request("localhost", Some(10022), "127.0.0.1", Some(22)),
-                request("::1", Some(18080), "::1", Some(80)),
+                request("localhost", Some(18080), "::1", Some(80)),
                 request("/tmp/local.sock", None, "/tmp/remote.sock", None),
                 request("/tmp/mixed.sock", None, "127.0.0.1", Some(8080)),
-                request("127.0.0.1", Some(9090), "/tmp/destination.sock", None,),
+                request("localhost", Some(9090), "/tmp/destination.sock", None,),
             ]
         );
         assert_eq!(
             resolved.remote_forwards,
             [request("localhost", Some(1492), "127.0.0.1", Some(1492))]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_config_hardening_normalizes_real_openssh_bind_shapes() {
+        struct RemoveFile(std::path::PathBuf);
+        impl Drop for RemoveFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let path = std::env::temp_dir().join(format!(
+            "et-ssh-g-oracle-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("bind-policy")
+        ));
+        let _cleanup = RemoveFile(path.clone());
+        let config = |gatewayports: &str| {
+            format!(
+                "Host oracle\n HostName localhost\n GatewayPorts {gatewayports}\n\
+                 LocalForward *:15432 localhost:5432\n\
+                 LocalForward :15433 localhost:5432\n\
+                 LocalForward 127.0.0.2:15434 localhost:5432\n\
+                 RemoteForward *:25432 localhost:5432\n\
+                 RemoteForward :25433 localhost:5432\n\
+                 RemoteForward 127.0.0.2:25434 localhost:5432\n"
+            )
+        };
+        let query = |gatewayports: &str| {
+            std::fs::write(&path, config(gatewayports)).unwrap();
+            std::process::Command::new("ssh")
+                .args(["-G", "-F"])
+                .arg(&path)
+                .arg("oracle")
+                .output()
+                .unwrap()
+        };
+        let parse_oracle = |gatewayports: &str| {
+            let output = query(gatewayports);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            parse_ssh_config(&output.stdout, true, true).unwrap()
+        };
+
+        let no = parse_oracle("no");
+        assert_eq!(
+            no.local_forwards
+                .iter()
+                .map(|request| request.source.as_ref().unwrap().name.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["localhost", "localhost", "localhost"]
+        );
+        assert_eq!(
+            no.remote_forwards
+                .iter()
+                .map(|request| request.source.as_ref().unwrap().name.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["", "localhost", "127.0.0.2"]
+        );
+
+        let yes = parse_oracle("yes");
+        assert_eq!(
+            yes.local_forwards
+                .iter()
+                .map(|request| request.source.as_ref().unwrap().name.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["", "", ""]
+        );
+        assert_eq!(
+            yes.remote_forwards
+                .iter()
+                .map(|request| request.source.as_ref().unwrap().name.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["", "localhost", "127.0.0.2"]
+        );
+
+        let clientspecified = query("clientspecified");
+        if clientspecified.status.success() {
+            let resolved = parse_ssh_config(&clientspecified.stdout, true, true).unwrap();
+            assert_eq!(
+                resolved
+                    .local_forwards
+                    .iter()
+                    .map(|request| request.source.as_ref().unwrap().name.as_deref().unwrap())
+                    .collect::<Vec<_>>(),
+                ["", "localhost", "127.0.0.2"]
+            );
+        } else {
+            assert!(
+                String::from_utf8_lossy(&clientspecified.stderr).contains("unsupported option")
+                    && String::from_utf8_lossy(&clientspecified.stderr).contains("clientspecified")
+            );
+        }
     }
 
     #[test]

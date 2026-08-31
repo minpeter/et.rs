@@ -48,6 +48,38 @@ impl From<io::Error> for ForwardError {
 
 pub(crate) type Outbound = Result<Packet, ForwardError>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForwardOrigin {
+    Explicit,
+    SshConfig,
+}
+
+pub struct ForwardSource {
+    pub request: PortForwardSourceRequest,
+    pub origin: ForwardOrigin,
+}
+
+impl ForwardSource {
+    pub const fn explicit(request: PortForwardSourceRequest) -> Self {
+        Self {
+            request,
+            origin: ForwardOrigin::Explicit,
+        }
+    }
+
+    pub const fn ssh_config(request: PortForwardSourceRequest) -> Self {
+        Self {
+            request,
+            origin: ForwardOrigin::SshConfig,
+        }
+    }
+}
+
+pub struct SkippedForward {
+    pub request: PortForwardSourceRequest,
+    pub error: io::Error,
+}
+
 pub struct Forwarder {
     commands: mpsc::SyncSender<Command>,
     outbound: mpsc::Receiver<Outbound>,
@@ -62,7 +94,14 @@ pub struct Forwarder {
 
 impl Forwarder {
     pub fn start(sources: Vec<PortForwardSourceRequest>) -> Result<Self, ForwardError> {
-        Self::start_with_user(sources, None).map(|(forwarder, _)| forwarder)
+        let sources = sources.into_iter().map(ForwardSource::explicit).collect();
+        start_forwarder(sources, None).map(|(forwarder, _, _)| forwarder)
+    }
+
+    pub fn start_with_origins(
+        sources: Vec<ForwardSource>,
+    ) -> Result<(Self, Vec<SkippedForward>), ForwardError> {
+        start_forwarder(sources, None).map(|(forwarder, _, skipped)| (forwarder, skipped))
     }
 
     /// Bind all forwarding sources and return the forwarder together with the
@@ -74,54 +113,65 @@ impl Forwarder {
         sources: Vec<PortForwardSourceRequest>,
         owner: Option<(u32, u32)>,
     ) -> Result<(Self, ForwardEnvironment), ForwardError> {
-        let (sources, environment) = bind_sources(sources, owner)?;
-        let session_user = owner;
-        let (commands_tx, commands_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
-        let (outbound_tx, outbound_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
-        #[cfg(unix)]
-        let (wake, wake_writer) = {
-            let (reader, writer) = UnixStream::pair()?;
-            reader.set_nonblocking(true)?;
-            (reader, writer)
-        };
-        #[cfg(unix)]
-        let (listener_stop, listener_stop_reader) = UnixStream::pair()?;
-        #[cfg(windows)]
-        let listener_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        #[cfg(windows)]
-        let listener_stop_reader = listener_stop.clone();
-        let worker_commands = commands_tx.clone();
-        let worker = std::thread::Builder::new()
-            .name("et-forwarding".to_owned())
-            .spawn(move || {
-                run(
-                    sources,
-                    commands_rx,
-                    worker_commands,
-                    outbound_tx,
-                    #[cfg(unix)]
-                    wake_writer,
-                    listener_stop_reader,
-                    session_user,
-                );
-                #[cfg(unix)]
-                drop(listener_stop);
-                #[cfg(windows)]
-                listener_stop.store(true, std::sync::atomic::Ordering::Release);
-            })
-            .map_err(ForwardError::Io)?;
-        Ok((
-            Self {
-                commands: commands_tx,
-                outbound: outbound_rx,
-                #[cfg(unix)]
-                wake,
-                worker: Some(worker),
-            },
-            environment,
-        ))
+        let sources = sources.into_iter().map(ForwardSource::explicit).collect();
+        start_forwarder(sources, owner).map(|(forwarder, environment, _)| (forwarder, environment))
     }
+}
 
+fn start_forwarder(
+    sources: Vec<ForwardSource>,
+    owner: Option<(u32, u32)>,
+) -> Result<(Forwarder, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
+    let (sources, environment, skipped) = bind_sources(sources, owner)?;
+    let session_user = owner;
+    let (commands_tx, commands_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+    let (outbound_tx, outbound_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+    #[cfg(unix)]
+    let (wake, wake_writer) = {
+        let (reader, writer) = UnixStream::pair()?;
+        reader.set_nonblocking(true)?;
+        (reader, writer)
+    };
+    #[cfg(unix)]
+    let (listener_stop, listener_stop_reader) = UnixStream::pair()?;
+    #[cfg(windows)]
+    let listener_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(windows)]
+    let listener_stop_reader = listener_stop.clone();
+    let worker_commands = commands_tx.clone();
+    let worker = std::thread::Builder::new()
+        .name("et-forwarding".to_owned())
+        .spawn(move || {
+            run(
+                sources,
+                commands_rx,
+                worker_commands,
+                outbound_tx,
+                #[cfg(unix)]
+                wake_writer,
+                listener_stop_reader,
+                session_user,
+            );
+            #[cfg(unix)]
+            drop(listener_stop);
+            #[cfg(windows)]
+            listener_stop.store(true, std::sync::atomic::Ordering::Release);
+        })
+        .map_err(ForwardError::Io)?;
+    Ok((
+        Forwarder {
+            commands: commands_tx,
+            outbound: outbound_rx,
+            #[cfg(unix)]
+            wake,
+            worker: Some(worker),
+        },
+        environment,
+        skipped,
+    ))
+}
+
+impl Forwarder {
     /// Pollable readiness handle for outbound forwarding packets (Unix only).
     #[cfg(unix)]
     pub fn wake(&self) -> Result<&UnixStream, ForwardError> {
@@ -201,6 +251,8 @@ enum PlannedSource {
     Endpoint {
         source: ResolvedEndpoint,
         destination: et_core::proto::SocketEndpoint,
+        original: PortForwardSourceRequest,
+        origin: ForwardOrigin,
     },
     #[cfg(unix)]
     Environment {
@@ -210,12 +262,16 @@ enum PlannedSource {
 }
 
 fn bind_sources(
-    sources: Vec<PortForwardSourceRequest>,
+    sources: Vec<ForwardSource>,
     owner: Option<(u32, u32)>,
-) -> Result<(Vec<BoundSource>, ForwardEnvironment), ForwardError> {
+) -> Result<(Vec<BoundSource>, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
     let mut plans = Vec::with_capacity(sources.len());
+    let mut skipped = Vec::new();
     let mut listener_count = 0usize;
-    for request in sources {
+    for source in sources {
+        let origin = source.origin;
+        let original = source.request.clone();
+        let request = source.request;
         // The destination is passed through verbatim in the
         // PORT_FORWARD_DESTINATION_REQUEST and parsed by the remote side.
         let destination = request.destination.unwrap_or_default();
@@ -243,12 +299,26 @@ fn bind_sources(
                 ));
             }
         } else {
-            let source = Endpoint::parse(request.source)?.resolve_for_bind()?;
+            let resolved =
+                Endpoint::parse(request.source).and_then(|source| source.resolve_for_bind());
+            let source = match resolved {
+                Ok(source) => source,
+                Err(error) if origin == ForwardOrigin::SshConfig => {
+                    skipped.push(SkippedForward {
+                        request: original,
+                        error,
+                    });
+                    continue;
+                }
+                Err(error) => return Err(ForwardError::Io(error)),
+            };
             let listener_count = source.listener_count();
             (
                 PlannedSource::Endpoint {
                     source,
                     destination,
+                    original,
+                    origin,
                 },
                 listener_count,
             )
@@ -270,14 +340,25 @@ fn bind_sources(
             PlannedSource::Endpoint {
                 source,
                 destination,
-            } => {
-                for listener in source.bind_with_user(owner)? {
-                    bound.push(BoundSource {
-                        listener,
-                        destination: destination.clone(),
+                original,
+                origin,
+            } => match source.bind_with_user(owner) {
+                Ok(listeners) => {
+                    for listener in listeners {
+                        bound.push(BoundSource {
+                            listener,
+                            destination: destination.clone(),
+                        });
+                    }
+                }
+                Err(error) if origin == ForwardOrigin::SshConfig => {
+                    skipped.push(SkippedForward {
+                        request: original,
+                        error,
                     });
                 }
-            }
+                Err(error) => return Err(ForwardError::Io(error)),
+            },
             #[cfg(unix)]
             PlannedSource::Environment {
                 variable,
@@ -299,7 +380,7 @@ fn bind_sources(
             }
         }
     }
-    Ok((bound, environment))
+    Ok((bound, environment, skipped))
 }
 
 /// Create the private directory for a named-pipe forward and return the

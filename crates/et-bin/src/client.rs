@@ -282,8 +282,21 @@ fn run_client(
     if args.no_terminal && !has_forwarding {
         return Ok(());
     }
-    let forwarder = et_net::forward::Forwarder::start(local_sources)
+    let (forwarder, skipped) = et_net::forward::Forwarder::start_with_origins(local_sources)
         .map_err(|error| ClientError::Terminal(error.to_string()))?;
+    for skipped in skipped {
+        let source = skipped.request.source.unwrap_or_default();
+        let label = match (source.name.as_deref(), source.port) {
+            (Some(name), Some(port)) if !name.is_empty() => format!("{name}:{port}"),
+            (_, Some(port)) => port.to_string(),
+            (Some(name), None) => name.to_owned(),
+            (None, None) => "<missing>".to_owned(),
+        };
+        et_cli::logging::warn(format!(
+            "SSH localforward source '{label}' could not bind: {}; skipping forwarding row",
+            skipped.error
+        ));
+    }
     crate::client_terminal::run(
         connection,
         crate::client_terminal::TerminalOptions {

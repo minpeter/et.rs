@@ -412,18 +412,13 @@ fn disconnect_watched(
 fn accept_ready(
     listener: &OwnedRouterListener,
     pending: &mut Vec<PendingConnection>,
-    events: &SyncSender<RouterEvent>,
+    _events: &SyncSender<RouterEvent>,
 ) -> Result<(), RouterError> {
-    loop {
+    while pending.len() < MAX_PENDING_REGISTRATIONS {
         match listener.accept() {
             Ok((stream, _)) => {
                 let peer = PeerIdentity::from_stream(&stream).map_err(RouterError::Io)?;
                 stream.set_nonblocking(true).map_err(RouterError::Io)?;
-                if pending.len() >= MAX_PENDING_REGISTRATIONS {
-                    emit_capacity();
-                    emit(events, RouterEvent::Rejected(RouterReject::Capacity));
-                    continue;
-                }
                 pending.push(PendingConnection {
                     stream,
                     decoder: LocalPacketDecoder::new(),
@@ -444,6 +439,7 @@ fn accept_ready(
             Err(error) => return Err(RouterError::Io(error)),
         }
     }
+    Ok(())
 }
 
 fn read_ready(connection: &mut PendingConnection) -> Result<ReadOutcome, RouterError> {
@@ -539,17 +535,6 @@ fn expire_pending(pending: &mut Vec<PendingConnection>, events: &SyncSender<Rout
 
 fn emit(events: &SyncSender<RouterEvent>, event: RouterEvent) {
     let _ = events.try_send(event);
-}
-
-fn emit_capacity() {
-    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
-    if let Ok(mut last) = LAST.lock() {
-        let now = Instant::now();
-        if last.is_none_or(|previous| now.duration_since(previous) >= Duration::from_secs(1)) {
-            crate::diag::info("router registration capacity exhausted");
-            *last = Some(now);
-        }
-    }
 }
 
 fn emit_resource_error(error: &io::Error) {

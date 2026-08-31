@@ -212,7 +212,8 @@ mod state;
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::net::UnixStream;
-    use std::sync::mpsc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{mpsc, Arc};
     use std::time::Duration;
 
     use et_core::packet::Packet;
@@ -235,7 +236,13 @@ mod tests {
         let (outbound, outbound_receiver) = mpsc::sync_channel(MAX_ACTIVE_SOCKETS + 1);
         let (_wake_reader, wake_writer) = UnixStream::pair().unwrap();
         (
-            Worker::new(commands, outbound, Some(wake_writer)).unwrap(),
+            Worker::new(
+                commands,
+                outbound,
+                Some(wake_writer),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap(),
             command_receiver,
             outbound_receiver,
         )

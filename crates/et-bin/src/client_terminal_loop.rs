@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 #[cfg(unix)]
@@ -31,6 +31,45 @@ use crate::initial_connect::ReconnectOutcome;
 const INPUT_CHUNK: usize = 16 * 1024;
 #[cfg(unix)]
 const MISSED_KEEPALIVES: u32 = 3;
+
+#[cfg(unix)]
+struct PumpProbe {
+    stream: UnixStream,
+}
+
+#[cfg(unix)]
+impl PumpProbe {
+    fn connect() -> Result<Option<Self>, ClientError> {
+        let Some(path) = std::env::var_os("ET_PUMP_PROBE") else {
+            return Ok(None);
+        };
+        let mut stream = UnixStream::connect(path)
+            .map_err(|error| terminal_io("connecting terminal pump probe", error))?;
+        stream
+            .write_all(b"R")
+            .map_err(|error| terminal_io("reporting terminal pump readiness", error))?;
+        let mut gate = [0_u8; 1];
+        stream
+            .read_exact(&mut gate)
+            .map_err(|error| terminal_io("waiting for terminal pump probe gate", error))?;
+        if gate != *b"G" {
+            return Err(terminal_text("terminal pump probe sent an invalid gate"));
+        }
+        Ok(Some(Self { stream }))
+    }
+
+    fn arm(&mut self) -> Result<(), ClientError> {
+        self.stream
+            .write_all(b"A")
+            .map_err(|error| terminal_io("arming terminal pump probe", error))
+    }
+
+    fn progressed(&mut self) -> Result<(), ClientError> {
+        self.stream
+            .write_all(b"P")
+            .map_err(|error| terminal_io("reporting terminal pump progress", error))
+    }
+}
 
 /// Loop configuration resolved by [`crate::client_terminal::run`].
 pub(crate) struct PumpOptions<'a> {
@@ -77,7 +116,11 @@ where
     if let Ok(path) = std::env::var("ET_SSH_READY") {
         let _ = std::fs::write(path, b"ready");
     }
+    let mut pump_probe = PumpProbe::connect()?;
     loop {
+        if let Some(probe) = pump_probe.as_mut() {
+            probe.arm()?;
+        }
         // Retry a held forwarding packet first: draining the forwarder's
         // outbound queue below is what frees worker capacity, so this makes
         // progress every iteration instead of deadlocking on a blocking send.
@@ -142,6 +185,9 @@ where
                     .unwrap_or(PollFlags::empty()),
             )
         };
+        if let Some(probe) = pump_probe.as_mut() {
+            probe.progressed()?;
+        }
         let mut reconnect_needed = network.intersects(PollFlags::HUP | PollFlags::ERR);
         if resize.intersects(PollFlags::IN | PollFlags::HUP) {
             drain(wake)?;

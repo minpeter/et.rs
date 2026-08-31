@@ -15,12 +15,11 @@ use et_core::proto::{PortForwardSourceRequest, TerminalPacketType};
 use crate::forward_endpoint::{Endpoint, ResolvedEndpoint};
 use crate::forward_io::BoundSource;
 use crate::forward_worker::{run, Command};
-use crate::reverse_report::SkipReason;
 
 const CHANNEL_CAPACITY: usize = 256;
 /// Maximum reverse listeners owned by one terminal session, after DNS fanout
 /// and address deduplication.
-const MAX_SESSION_LISTENERS: usize = 32;
+pub const MAX_SESSION_LISTENERS: usize = 32;
 pub(crate) const RESOLVER_WORKERS: usize = 4;
 pub(crate) const RESOLVER_QUEUE_CAPACITY: usize = 16;
 pub const FORWARD_TIMEOUT_SENTINEL: &str = "\nET_ERR:FORWARD_TIMEOUT";
@@ -255,7 +254,6 @@ pub(crate) type Outbound = Result<Packet, ForwardError>;
 pub enum ForwardOrigin {
     Explicit,
     SshConfig { strict: bool },
-    Reported(usize),
 }
 
 pub struct ForwardSource {
@@ -282,8 +280,6 @@ impl ForwardSource {
 pub struct SkippedForward {
     pub request: PortForwardSourceRequest,
     pub error: io::Error,
-    pub reason: SkipReason,
-    pub report_index: Option<usize>,
 }
 
 pub struct Forwarder {
@@ -366,35 +362,6 @@ impl Forwarder {
         let sources = sources.into_iter().map(ForwardSource::explicit).collect();
         start_forwarder_hook(sources, owner, deadline, resolver, before_publish)
             .map(|(forwarder, environment, _)| (forwarder, environment))
-    }
-
-    pub fn start_with_user_report(
-        sources: Vec<PortForwardSourceRequest>,
-        owner: Option<(u32, u32)>,
-    ) -> Result<(Self, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
-        Self::start_with_user_report_deadline(
-            sources,
-            owner,
-            Instant::now() + Duration::from_secs(30),
-            Arc::new(SystemForwardResolver),
-        )
-    }
-
-    pub fn start_with_user_report_deadline(
-        sources: Vec<PortForwardSourceRequest>,
-        owner: Option<(u32, u32)>,
-        deadline: Instant,
-        resolver: Arc<dyn ForwardResolver>,
-    ) -> Result<(Self, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
-        let sources = sources
-            .into_iter()
-            .enumerate()
-            .map(|(index, request)| ForwardSource {
-                request,
-                origin: ForwardOrigin::Reported(index),
-            })
-            .collect();
-        start_forwarder(sources, owner, deadline, resolver)
     }
 }
 
@@ -605,17 +572,6 @@ fn bind_sources(
                     skipped.push(SkippedForward {
                         request: original,
                         error,
-                        reason: SkipReason::Resolve,
-                        report_index: None,
-                    });
-                    continue;
-                }
-                (Err(error), ForwardOrigin::Reported(index)) => {
-                    skipped.push(SkippedForward {
-                        request: original,
-                        error,
-                        reason: SkipReason::Resolve,
-                        report_index: Some(index),
                     });
                     continue;
                 }
@@ -624,20 +580,17 @@ fn bind_sources(
                     ForwardOrigin::Explicit | ForwardOrigin::SshConfig { strict: true },
                 ) => return Err(ForwardError::Io(error)),
             };
-            if owner.is_some() {
-                match &source {
+            if owner.is_some()
+                && matches!(
+                    &source,
                     ResolvedEndpoint::Tcp(addresses)
-                        if addresses.iter().any(|address| !address.ip().is_loopback()) =>
-                    {
-                        return Err(ForwardError::Io(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "authenticated reverse TCP bind must resolve only to loopback addresses",
-                        )));
-                    }
-                    ResolvedEndpoint::Tcp(_) => {}
-                    #[cfg(unix)]
-                    ResolvedEndpoint::Unix(_) => {}
-                }
+                        if addresses.iter().any(|address| address.ip().is_unspecified())
+                )
+            {
+                return Err(ForwardError::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "authenticated reverse TCP wildcard bind is not permitted",
+                )));
             }
             let listener_count = source.listener_count();
             (
@@ -685,16 +638,6 @@ fn bind_sources(
                     skipped.push(SkippedForward {
                         request: original,
                         error,
-                        reason: SkipReason::Bind,
-                        report_index: None,
-                    });
-                }
-                (Err(error), ForwardOrigin::Reported(index)) => {
-                    skipped.push(SkippedForward {
-                        request: original,
-                        error,
-                        reason: SkipReason::Bind,
-                        report_index: Some(index),
                     });
                 }
                 (

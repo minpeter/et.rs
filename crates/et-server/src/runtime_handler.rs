@@ -18,7 +18,6 @@ use crate::runtime_state::{PreAuthGuard, RawSocketGuard, RuntimeCore};
 use crate::session::ActiveSession;
 use crate::session_table::SessionClaim;
 
-const LEGACY_UNTRUSTED_ORIGIN_MARKER: &str = "ET_RS_SSH_CONFIG_REMOTE_FORWARD";
 // The client caps an individual initialization read at ten seconds. The server
 // owns one shorter absolute budget so authenticated failures arrive first.
 const INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(8);
@@ -318,23 +317,17 @@ fn handle_new(
         );
         return;
     }
-    if payload.reversetunnels.len() > et_net::reverse_report::MAX_REVERSE_ROWS {
-        send_initial_error(&mut connection, "too many reverse forwarding rows");
+    if payload.reversetunnels.len() > et_net::forward::MAX_SESSION_LISTENERS {
+        send_initial_error(&mut connection, "reverse listener limit exceeded");
         return;
     }
     let owner = {
         let registration = start.registration();
         (registration.uid, registration.gid)
     };
-    let mut reverse_tunnels = payload.reversetunnels.clone();
-    for request in &mut reverse_tunnels {
-        if request.environmentvariable.as_deref() == Some(LEGACY_UNTRUSTED_ORIGIN_MARKER) {
-            request.environmentvariable = None;
-        }
-    }
-    let (forwarder, forward_environment, skipped) =
-        match et_net::forward::Forwarder::start_with_user_report_deadline(
-            reverse_tunnels,
+    let (forwarder, forward_environment) =
+        match et_net::forward::Forwarder::start_with_user_deadline(
+            payload.reversetunnels.clone(),
             Some(owner),
             initialization_deadline - INITIALIZATION_RESPONSE_MARGIN,
             core.forward_resolver.clone(),
@@ -356,30 +349,6 @@ fn handle_new(
                 return;
             }
         };
-    let response_error = if skipped.is_empty() {
-        None
-    } else {
-        let mut rows: Vec<_> = skipped
-            .iter()
-            .filter_map(|skipped| {
-                skipped
-                    .report_index
-                    .map(|index| et_net::reverse_report::SkippedRow {
-                        index,
-                        reason: skipped.reason,
-                    })
-            })
-            .collect();
-        rows.sort_unstable_by_key(|row| row.index);
-        match et_net::reverse_report::encode_skipped_rows(&rows) {
-            Ok(report) => Some(report),
-            Err(_) => {
-                drop(forwarder);
-                send_initial_error(&mut connection, "too many skipped reverse forwarding rows");
-                return;
-            }
-        }
-    };
     if Instant::now() >= initialization_deadline {
         send_initial_error(
             &mut connection,
@@ -436,14 +405,10 @@ fn handle_new(
         );
         return;
     }
-    let requires_ack = response_error.is_some();
     if connection
         .write_packet_strict(
             EtPacketType::InitialResponse as u8,
-            &InitialResponse {
-                error: response_error,
-            }
-            .encode_to_vec(),
+            &InitialResponse { error: None }.encode_to_vec(),
         )
         .is_err()
     {
@@ -451,17 +416,6 @@ fn handle_new(
             "id={id}: failed writing INITIAL_RESPONSE to {peer}"
         ));
         return;
-    }
-    if requires_ack {
-        if connection.set_io_timeout(Some(HANDSHAKE_TIMEOUT)).is_err() {
-            return;
-        }
-        let acknowledged = connection.read_packet().is_ok_and(|packet| {
-            packet.header() == EtPacketType::Heartbeat as u8 && packet.payload().is_empty()
-        });
-        if !acknowledged || connection.set_io_timeout(None).is_err() {
-            return;
-        }
     }
     let active = match ActiveSession::new(connection, &terminal) {
         Ok(active) => active,

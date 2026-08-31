@@ -1,28 +1,35 @@
 //! Regression test: signals delivered while the client blocks in poll() must
-//! not kill the session.
-//!
-//! The client installs a process-wide SIGWINCH handler for terminal resizes.
-//! poll() is never auto-restarted by SA_RESTART, so any SIGWINCH landing on
-//! the thread blocked in poll() makes it fail with EINTR. The client used to
-//! treat that as fatal and died with:
-//!
-//!   et: polling terminal streams: Interrupted system call (os error 4)
+//! not kill or strand the session.
 #![forbid(unsafe_code)]
 #![cfg(unix)]
 
-use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::fs::{self, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::{symlink, PermissionsExt};
-use std::process::{Command, Stdio};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use wait_timeout::ChildExt;
 
-const TIMEOUT: Duration = Duration::from_secs(20);
+const WATCHDOG: Duration = Duration::from_secs(20);
+const SIGNAL_COUNT: usize = 128;
+const MARKER: &str = "SIGWINCH-SURVIVED";
+
+enum OutputEvent {
+    Line(String),
+    Done(io::Result<String>),
+}
+
+struct ClientObservation {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+}
 
 #[test]
 fn client_survives_sigwinch_storm_while_polling() {
@@ -33,7 +40,19 @@ fn client_survives_sigwinch_storm_while_polling() {
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
     let router = directory.join("router.sock");
     let config = directory.join("et.cfg");
-    let ready = directory.join("session-ready");
+    let pump_probe = directory.join("pump-probe.sock");
+    let release = directory.join("remote-release");
+    let remote_ready = directory.join("remote-ready");
+    let probe_listener = UnixListener::bind(&pump_probe).unwrap();
+    for fifo in [&release, &remote_ready] {
+        assert!(Command::new("mkfifo").arg(fifo).status().unwrap().success());
+    }
+    let remote_ready_control = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&remote_ready)
+        .unwrap();
+
     let reserved = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = reserved.local_addr().unwrap().port();
     drop(reserved);
@@ -71,84 +90,256 @@ fn client_survives_sigwinch_storm_while_polling() {
     symlink(env!("CARGO_BIN_EXE_et"), &terminal).unwrap();
     let existing_path = std::env::var("PATH").unwrap();
 
-    // Keep the session alive long enough for the storm, then print a marker.
-    let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
+    let client = Command::new(env!("CARGO_BIN_EXE_et"))
         .env("PATH", format!("{}:{existing_path}", directory.display()))
         .env("TERM", "xterm-256color")
-        .env("ET_SSH_READY", &ready)
+        .env("ET_PUMP_PROBE", &pump_probe)
         .args(["--terminal-path"])
         .arg(&terminal)
         .args(["--serverfifo"])
         .arg(&router)
         .arg("-p")
         .arg(port.to_string())
-        .args(["-c", "sleep 2; printf 'SIGWINCH-SURVIVED\\n'", "127.0.0.1"])
+        .arg("-c")
+        .arg(format!(
+            "printf x > '{}'; read _ < '{}'; printf 'SIGWINCH-%s\\n' SURVIVED",
+            remote_ready.display(),
+            release.display()
+        ))
+        .arg("127.0.0.1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
 
-    // Wait until the client's pump loop is live (it writes the gate file).
-    let gate_deadline = Instant::now() + TIMEOUT;
-    while !ready.exists() {
-        assert!(
-            Instant::now() < gate_deadline,
-            "client never reached the terminal loop"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let result = exercise_client(client, probe_listener, remote_ready_control, release);
+    terminate_server(&mut server);
+    fs::remove_dir_all(&directory).unwrap();
 
-    // Storm the client with SIGWINCH while it blocks in poll() waiting for
-    // server output. Any one of these interrupts poll() with EINTR.
-    let client_pid = Pid::from_raw(i32::try_from(client.id()).unwrap());
-    let storm_deadline = Instant::now() + Duration::from_millis(1_500);
-    while Instant::now() < storm_deadline {
-        if kill(client_pid, Signal::SIGWINCH).is_err() {
-            break; // client already exited; the assertions below explain why
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-
-    let status = match client.wait_timeout(TIMEOUT).unwrap() {
-        Some(status) => status,
-        None => {
-            let _ = client.kill();
-            let _ = client.wait();
-            panic!("client did not exit after the signal storm");
-        }
-    };
-    let mut stdout_text = String::new();
-    let mut stderr_text = String::new();
-    client
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut stdout_text)
-        .unwrap();
-    client
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr_text)
-        .unwrap();
+    let observation = result.unwrap_or_else(|error| panic!("{error}"));
     assert!(
-        !stderr_text.contains("Interrupted system call"),
-        "client died from EINTR: {stderr_text}"
+        !observation.stderr.contains("Interrupted system call"),
+        "client died from EINTR: {}",
+        observation.stderr
     );
-    assert!(status.success(), "{stderr_text}");
+    assert!(observation.status.success(), "{}", observation.stderr);
     assert!(
-        stdout_text.contains("SIGWINCH-SURVIVED"),
-        "{stdout_text:?} {stderr_text:?}"
+        observation.stdout.contains(MARKER),
+        "{:?} {:?}",
+        observation.stdout,
+        observation.stderr
     );
-
-    let server_pid = Pid::from_raw(i32::try_from(server.id()).unwrap());
-    kill(server_pid, Signal::SIGTERM).unwrap();
-    assert!(server.wait_timeout(TIMEOUT).unwrap().unwrap().success());
-    fs::remove_dir_all(directory).unwrap();
 }
 
-fn wait_ready(server: &mut std::process::Child, port: u16, router: &std::path::Path) {
+fn exercise_client(
+    mut client: Child,
+    probe_listener: UnixListener,
+    mut remote_ready: fs::File,
+    release_path: std::path::PathBuf,
+) -> Result<ClientObservation, String> {
+    let pid = Pid::from_raw(i32::try_from(client.id()).unwrap());
+    let stdout = client.stdout.take().unwrap();
+    let stderr = client.stderr.take().unwrap();
+    let (output_tx, output_rx) = mpsc::sync_channel(64);
+    std::thread::spawn(move || read_stdout(stdout, output_tx));
+    let (stderr_tx, stderr_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut text = String::new();
+        let result = stderr.read_to_string(&mut text).map(|_| text);
+        let _ = stderr_tx.send(result);
+    });
+    let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = exit_tx.send(client.wait());
+    });
+    let (accept_tx, accept_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = accept_tx.send(probe_listener.accept().map(|(stream, _)| stream));
+    });
+
+    let mut failure = None;
+    let mut probe = match accept_rx.recv_timeout(WATCHDOG) {
+        Ok(Ok(stream)) => Some(stream),
+        Ok(Err(error)) => {
+            failure = Some(format!("client pump probe accept failed: {error}"));
+            None
+        }
+        Err(error) => {
+            failure = Some(format!("client never connected its pump probe: {error}"));
+            None
+        }
+    };
+    if let Some(stream) = probe.as_mut() {
+        stream.set_read_timeout(Some(WATCHDOG)).unwrap();
+        stream.set_write_timeout(Some(WATCHDOG)).unwrap();
+        if let Err(error) = expect_probe(stream, b'R') {
+            failure = Some(format!("client never reported pump readiness: {error}"));
+        } else if let Err(error) = stream.write_all(b"G") {
+            failure = Some(format!("could not release the armed pump gate: {error}"));
+        }
+    }
+
+    let (remote_ready_tx, remote_ready_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut byte = [0_u8; 1];
+        let result = remote_ready.read_exact(&mut byte);
+        let _ = remote_ready_tx.send(result);
+    });
+    if let Err(error) = remote_ready_rx.recv_timeout(WATCHDOG) {
+        failure.get_or_insert_with(|| format!("remote command never armed its release: {error}"));
+    }
+
+    if failure.is_none() {
+        let stream = probe.as_mut().expect("probe established without failure");
+        for delivered in 0..SIGNAL_COUNT {
+            if let Err(error) = expect_probe(stream, b'A') {
+                failure = Some(format!(
+                    "client stopped arming poll after {delivered} signals: {error}"
+                ));
+                break;
+            }
+            if let Err(error) = kill(pid, Signal::SIGWINCH) {
+                failure = Some(format!(
+                    "client exited while delivering signal {delivered}: {error}"
+                ));
+                break;
+            }
+            if let Err(error) = expect_probe(stream, b'P') {
+                failure = Some(format!(
+                    "client made no pump progress after signal {delivered}: {error}"
+                ));
+                break;
+            }
+        }
+    }
+
+    // The remote command is released only after every acknowledged signal.
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = OpenOptions::new()
+            .write(true)
+            .open(release_path)
+            .and_then(|mut release| release.write_all(b"go\n"));
+        let _ = release_tx.send(result);
+    });
+    match release_rx.recv_timeout(WATCHDOG) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            failure.get_or_insert_with(|| format!("could not release remote command: {error}"));
+        }
+        Err(error) => {
+            failure.get_or_insert_with(|| format!("remote release writer stalled: {error}"));
+        }
+    }
+
+    let mut stdout_done = None;
+    let mut marker_seen = false;
+    while stdout_done.is_none() {
+        match output_rx.recv_timeout(WATCHDOG) {
+            Ok(OutputEvent::Line(line)) => marker_seen |= line.contains(MARKER),
+            Ok(OutputEvent::Done(result)) => stdout_done = Some(result),
+            Err(error) => {
+                failure.get_or_insert_with(|| format!("client output stalled: {error}"));
+                break;
+            }
+        }
+    }
+    if !marker_seen {
+        failure
+            .get_or_insert_with(|| "remote marker was not observed before client EOF".to_owned());
+    }
+
+    let status = match exit_rx.recv_timeout(WATCHDOG) {
+        Ok(Ok(status)) => Some(status),
+        Ok(Err(error)) => {
+            failure.get_or_insert_with(|| format!("waiting for client failed: {error}"));
+            None
+        }
+        Err(_) => {
+            let _ = kill(pid, Signal::SIGKILL);
+            let reaped = exit_rx.recv_timeout(WATCHDOG);
+            failure.get_or_insert_with(|| {
+                format!("client product hang after marker/exit trigger; cleanup={reaped:?}")
+            });
+            reaped.ok().and_then(Result::ok)
+        }
+    };
+    let stdout = stdout_done
+        .and_then(Result::ok)
+        .unwrap_or_else(|| "<stdout unavailable>".to_owned());
+    let stderr = stderr_rx
+        .recv_timeout(WATCHDOG)
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_else(|| "<stderr unavailable>".to_owned());
+
+    if let Some(error) = failure {
+        return Err(format!("{error}; stdout={stdout:?}; stderr={stderr:?}"));
+    }
+    Ok(ClientObservation {
+        status: status.expect("successful observation has an exit status"),
+        stdout,
+        stderr,
+    })
+}
+
+fn read_stdout(stdout: impl Read, sender: mpsc::SyncSender<OutputEvent>) {
+    let mut reader = BufReader::new(stdout);
+    let mut complete = String::new();
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                let _ = sender.send(OutputEvent::Done(Ok(complete)));
+                return;
+            }
+            Ok(_) => {
+                complete.push_str(&line);
+                if sender.send(OutputEvent::Line(line)).is_err() {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = sender.send(OutputEvent::Done(Err(error)));
+                return;
+            }
+        }
+    }
+}
+
+fn expect_probe(stream: &mut UnixStream, expected: u8) -> io::Result<()> {
+    let mut observed = [0_u8; 1];
+    stream.read_exact(&mut observed)?;
+    if observed[0] == expected {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "expected pump event {:?}, received {:?}",
+                char::from(expected),
+                char::from(observed[0])
+            ),
+        ))
+    }
+}
+
+fn terminate_server(server: &mut Child) {
+    let pid = Pid::from_raw(i32::try_from(server.id()).unwrap());
+    let _ = kill(pid, Signal::SIGTERM);
+    match server.wait_timeout(WATCHDOG).unwrap() {
+        Some(status) => assert!(status.success(), "server shutdown failed: {status}"),
+        None => {
+            let _ = kill(pid, Signal::SIGKILL);
+            let _ = server.wait();
+            panic!("server did not terminate after SIGTERM");
+        }
+    }
+}
+
+fn wait_ready(server: &mut Child, port: u16, router: &std::path::Path) {
     let stdout = server.stdout.take().unwrap();
     let (sender, receiver) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
@@ -157,7 +348,7 @@ fn wait_ready(server: &mut std::process::Child, port: u16, router: &std::path::P
         let _ = sender.send(result);
     });
     assert_eq!(
-        receiver.recv_timeout(TIMEOUT).unwrap().unwrap(),
+        receiver.recv_timeout(WATCHDOG).unwrap().unwrap(),
         format!(
             "ETSERVER_READY tcp=127.0.0.1:{port} router={}\n",
             router.display()

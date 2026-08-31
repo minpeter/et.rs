@@ -7,7 +7,6 @@ use et_core::proto::{
     ConnectResponse, ConnectStatus, EtPacketType, InitialPayload, InitialResponse,
 };
 use et_net::connection::Connection;
-use et_net::forward::ForwardOrigin;
 use et_net::framing_io::{read_proto_limited, write_proto};
 use et_net::handshake::{client_request, MAX_HANDSHAKE_PROTO_LEN};
 use prost::Message;
@@ -57,7 +56,6 @@ pub fn connect_initial(
     endpoint: &Endpoint,
     credentials: &Credentials,
     initial_payload: &InitialPayload,
-    remote_origins: &[ForwardOrigin],
     resolver: &dyn EndpointResolver,
     deadline: Deadline,
 ) -> Result<Connection, ClientError> {
@@ -79,7 +77,7 @@ pub fn connect_initial(
     ensure_deadline(deadline, "sending INITIAL_PAYLOAD")?;
     let mut connection = Connection::new_client(stream, &key);
     connection
-        .write_packet_strict(
+        .write_packet_live(
             EtPacketType::InitialPayload as u8,
             &initial_payload.encode_to_vec(),
         )
@@ -93,13 +91,7 @@ pub fn connect_initial(
     }
     let response =
         InitialResponse::decode(packet.payload()).map_err(ClientError::MalformedInitialResponse)?;
-    if accept_initial_response(response, remote_origins)? {
-        connection
-            .write_packet_strict(EtPacketType::Heartbeat as u8, &[])
-            .map_err(|error| {
-                transport_error(deadline, "acknowledging reverse forwarding skips", error)
-            })?;
-    }
+    accept_initial_response(response)?;
     connection
         .set_io_timeout(None)
         .map_err(ClientError::Transport)?;
@@ -206,41 +198,12 @@ fn transport_error(
     }
 }
 
-fn accept_initial_response(
-    response: InitialResponse,
-    remote_origins: &[ForwardOrigin],
-) -> Result<bool, ClientError> {
-    let Some(message) = response.error else {
-        return Ok(false);
-    };
-    let rows = match et_net::reverse_report::decode_skipped_rows(&message, remote_origins.len()) {
-        Ok(Some(rows)) => rows,
-        Ok(None) => return Err(classify_initial_response_error(message)),
-        Err(_) => {
-            return Err(ClientError::InitialResponseRejected(
-                "malformed reverse forwarding skip report".to_owned(),
-            ));
-        }
-    };
-    for row in &rows {
-        match remote_origins[row.index] {
-            ForwardOrigin::SshConfig { strict: false } => {}
-            ForwardOrigin::Explicit
-            | ForwardOrigin::SshConfig { strict: true }
-            | ForwardOrigin::Reported(_) => {
-                return Err(ClientError::InitialResponseRejected(
-                    "required reverse forwarding row could not bind".to_owned(),
-                ));
-            }
-        }
+fn accept_initial_response(response: InitialResponse) -> Result<(), ClientError> {
+    if let Some(message) = response.error {
+        Err(classify_initial_response_error(message))
+    } else {
+        Ok(())
     }
-    for row in rows {
-        et_cli::logging::warn(format!(
-            "SSH remoteforward row {} could not bind; skipping forwarding row",
-            row.index
-        ));
-    }
-    Ok(true)
 }
 
 fn accept_response(response: ConnectResponse) -> Result<(), ClientError> {

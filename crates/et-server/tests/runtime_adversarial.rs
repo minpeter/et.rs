@@ -52,6 +52,22 @@ fn bad_encrypted_initial_messages_reset_the_slot() {
     server.runtime.shutdown().unwrap();
 }
 
+#[test]
+fn incomplete_initial_payload_expires_and_resets_the_slot() {
+    let mut server = TestRuntime::start();
+    let _terminal = server.register(ID_A, KEY_A);
+    let (mut stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    stream.write_all(&[0_u8; 1]).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(9)))
+        .unwrap();
+    let mut byte = [0_u8; 1];
+    assert_eq!(std::io::Read::read(&mut stream, &mut byte).unwrap_or(0), 0);
+    assert_eq!(server.handle.session_state(ID_A).unwrap(), None);
+    server.runtime.shutdown().unwrap();
+}
+
 struct DelayedResolver {
     address: SocketAddr,
     entered: mpsc::SyncSender<()>,
@@ -233,11 +249,15 @@ fn stalled_privileged_tcp_helper_honors_initialization_deadline_and_resets_slot(
         .recv_timeout(Duration::from_secs(8))
         .expect("privileged TCP helper exceeded initialization deadline");
     assert!(started.elapsed() < Duration::from_secs(8));
-    assert!(initial
-        .error
-        .as_deref()
-        .and_then(et_net::forward::decode_forward_timeout)
-        .is_some());
+    assert!(
+        initial
+            .error
+            .as_deref()
+            .and_then(et_net::forward::decode_forward_timeout)
+            .is_some(),
+        "unexpected stalled-helper response: {:?}",
+        initial.error
+    );
     server
         .handle
         .wait_for_state(ID_A, SessionState::Registered, TIMEOUT)
@@ -283,7 +303,7 @@ fn unbindable_reverse_tunnel_reports_an_error_and_resets_the_slot() {
 }
 
 #[test]
-fn occupied_reverse_row_is_reported_while_usable_row_stays_live() {
+fn occupied_reverse_row_is_fatal_and_rolls_back_sibling() {
     let mut server = TestRuntime::start();
     let _terminal = server.register(ID_A, KEY_A);
     let key = passkey_to_key(KEY_A).unwrap();
@@ -308,27 +328,41 @@ fn occupied_reverse_row_is_reported_while_usable_row_stays_live() {
     };
 
     let (stream, _) = server.handshake(ID_A);
-    let (mut client, initial) = runtime_support::initialize(stream, &key, payload);
-    let report = et_net::reverse_report::decode_skipped_rows(initial.error.as_deref().unwrap(), 2)
-        .unwrap()
-        .unwrap();
-
-    assert_eq!(
-        report,
-        [et_net::reverse_report::SkippedRow {
-            index: 0,
-            reason: et_net::reverse_report::SkipReason::Bind,
-        }]
-    );
-    runtime_support::acknowledge_skip_report(&mut client);
-    let usable = std::os::unix::net::UnixStream::connect(&usable_path).unwrap();
-    drop(usable);
+    let (client, initial) = runtime_support::initialize(stream, &key, payload);
+    assert!(initial.error.is_some());
     drop(client);
+    server
+        .handle
+        .wait_for_state(ID_A, SessionState::Registered, TIMEOUT)
+        .unwrap();
+    assert!(!usable_path.exists());
     server.runtime.shutdown().unwrap();
 }
 
 #[test]
-fn unacknowledged_report_releases_sibling_before_activation() {
+fn client_close_before_initial_payload_rolls_back_the_session_claim() {
+    let mut server = TestRuntime::start();
+    let _terminal = server.register(ID_A, KEY_A);
+    let key = passkey_to_key(KEY_A).unwrap();
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    drop(stream);
+
+    assert_eq!(server.handle.session_state(ID_A).unwrap(), None);
+
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let (_client, initial) = runtime_support::initialize(stream, &key, default_payload());
+    assert_eq!(initial.error, None);
+    server
+        .handle
+        .wait_for_state(ID_A, SessionState::Active, TIMEOUT)
+        .unwrap();
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
+fn reverse_bind_failure_never_activates_the_session() {
     let mut server = TestRuntime::start();
     let _terminal = server.register(ID_A, KEY_A);
     let key = passkey_to_key(KEY_A).unwrap();
@@ -366,26 +400,22 @@ fn unacknowledged_report_releases_sibling_before_activation() {
 }
 
 #[test]
-fn reverse_row_and_report_bounds_are_global_fatal() {
+fn reverse_failures_are_plain_fatal_errors() {
     let cases = [
-        vec![Default::default(); et_net::reverse_report::MAX_REVERSE_ROWS + 1],
-        vec![
-            et_core::proto::PortForwardSourceRequest {
-                source: Some(et_core::proto::SocketEndpoint {
-                    name: Some("a".repeat(256)),
-                    port: Some(1),
-                }),
-                destination: Some(et_core::proto::SocketEndpoint {
-                    name: Some("127.0.0.1".to_owned()),
-                    port: Some(1),
-                }),
-                environmentvariable: None,
-            };
-            et_net::reverse_report::MAX_REVERSE_ROWS
-        ],
+        vec![Default::default()],
+        vec![et_core::proto::PortForwardSourceRequest {
+            source: Some(et_core::proto::SocketEndpoint {
+                name: Some("a".repeat(256)),
+                port: Some(1),
+            }),
+            destination: Some(et_core::proto::SocketEndpoint {
+                name: Some("127.0.0.1".to_owned()),
+                port: Some(1),
+            }),
+            environmentvariable: None,
+        }],
     ];
     for requests in cases {
-        let count = requests.len();
         let mut server = TestRuntime::start();
         let _terminal = server.register(ID_A, KEY_A);
         let key = passkey_to_key(KEY_A).unwrap();
@@ -399,10 +429,7 @@ fn reverse_row_and_report_bounds_are_global_fatal() {
         let (_, initial) = runtime_support::initialize(stream, &key, payload);
 
         let error = initial.error.unwrap();
-        assert_eq!(
-            et_net::reverse_report::decode_skipped_rows(&error, count).unwrap(),
-            None
-        );
+        assert!(!error.starts_with("ETRS-RF-SKIP"));
         server.runtime.shutdown().unwrap();
     }
 }
@@ -445,60 +472,39 @@ fn reverse_listener_cap_is_prebind_transactional_on_server() {
 }
 
 #[test]
-fn hostile_origin_marker_does_not_change_origin_independent_report() {
-    fn run(marker: Option<&str>) -> String {
-        let mut server = TestRuntime::start();
-        let _terminal = server.register(ID_A, KEY_A);
-        let key = passkey_to_key(KEY_A).unwrap();
-        let occupied_path = server.dir.path().join("hostile-origin.sock");
-        let usable_path = server.dir.path().join("hostile-usable.sock");
-        let _occupied = std::os::unix::net::UnixListener::bind(&occupied_path).unwrap();
-        let request = |path: &std::path::Path, environmentvariable: Option<String>| {
-            et_core::proto::PortForwardSourceRequest {
-                source: Some(et_core::proto::SocketEndpoint {
-                    name: Some(path.to_string_lossy().into_owned()),
-                    port: None,
-                }),
-                destination: Some(et_core::proto::SocketEndpoint {
-                    name: Some("/tmp/destination.sock".to_owned()),
-                    port: None,
-                }),
-                environmentvariable,
-            }
-        };
-        let payload = InitialPayload {
-            jumphost: Some(false),
-            reversetunnels: vec![
-                request(&occupied_path, marker.map(str::to_owned)),
-                request(&usable_path, None),
-            ],
-            environmentvariables: HashMap::new(),
-        };
+fn obsolete_origin_marker_has_no_privileged_meaning() {
+    let mut server = TestRuntime::start();
+    let _terminal = server.register(ID_A, KEY_A);
+    let key = passkey_to_key(KEY_A).unwrap();
+    let payload = InitialPayload {
+        jumphost: Some(false),
+        reversetunnels: vec![et_core::proto::PortForwardSourceRequest {
+            source: Some(et_core::proto::SocketEndpoint {
+                name: Some(
+                    server
+                        .dir
+                        .path()
+                        .join("hostile-origin.sock")
+                        .to_string_lossy()
+                        .into(),
+                ),
+                port: None,
+            }),
+            destination: Some(et_core::proto::SocketEndpoint {
+                name: Some("/tmp/destination.sock".to_owned()),
+                port: None,
+            }),
+            environmentvariable: Some("ET_RS_SSH_CONFIG_REMOTE_FORWARD".to_owned()),
+        }],
+        environmentvariables: HashMap::new(),
+    };
 
-        let (stream, _) = server.handshake(ID_A);
-        let (mut client, initial) = runtime_support::initialize(stream, &key, payload);
-        let report = initial.error.unwrap();
-        runtime_support::acknowledge_skip_report(&mut client);
-        let usable = std::os::unix::net::UnixStream::connect(&usable_path).unwrap();
-        drop(usable);
-        drop(client);
-        server.runtime.shutdown().unwrap();
-        report
-    }
-
-    let ordinary = run(None);
-    let hostile = run(Some("ET_RS_SSH_CONFIG_REMOTE_FORWARD"));
-
-    assert_eq!(hostile, ordinary);
-    assert_eq!(
-        et_net::reverse_report::decode_skipped_rows(&hostile, 2)
-            .unwrap()
-            .unwrap(),
-        [et_net::reverse_report::SkippedRow {
-            index: 0,
-            reason: et_net::reverse_report::SkipReason::Bind,
-        }]
-    );
+    let (stream, _) = server.handshake(ID_A);
+    let (_, initial) = runtime_support::initialize(stream, &key, payload);
+    assert!(initial
+        .error
+        .is_some_and(|error| error.contains("Do not set a source")));
+    server.runtime.shutdown().unwrap();
 }
 
 #[test]

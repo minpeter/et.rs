@@ -11,9 +11,7 @@ use et_core::packet::Packet;
 use et_core::proto::{TerminalPacketType, TerminalUserInfo};
 use et_net::local_packet::{read_local_packet, write_local_packet, MAX_LOCAL_PACKET_LEN};
 use et_server::path::select_router_path_for;
-use et_server::{
-    Registry, Router, RouterEvent, RouterReject, MAX_PENDING_REGISTRATIONS, REGISTRATION_TIMEOUT,
-};
+use et_server::{Registry, Router, RouterEvent, RouterReject, REGISTRATION_TIMEOUT};
 use prost::Message;
 use support::TestDir;
 
@@ -324,37 +322,6 @@ fn broken_registration_ack_rolls_back_and_router_keeps_serving() {
 }
 
 #[test]
-fn idle_registration_capacity_is_bounded_and_recovers() {
-    let dir = TestDir::new();
-    let path = dir.socket();
-    let registry = Registry::new();
-    let selected = select_router_path_for(1000, Some(&path), None, None).unwrap();
-    let mut router = Router::start(selected, registry.clone()).unwrap();
-    let idle: Vec<_> = (0..MAX_PENDING_REGISTRATIONS)
-        .map(|_| UnixStream::connect(&path).unwrap())
-        .collect();
-    let excess = UnixStream::connect(&path).unwrap();
-    expect_rejected(&router, RouterReject::Capacity);
-    drop(excess);
-    drop(idle);
-    for _ in 0..MAX_PENDING_REGISTRATIONS {
-        expect_rejected(&router, RouterReject::MalformedFrame);
-    }
-
-    let (uid, gid) = current_ids();
-    let packet = Packet::new(
-        TerminalPacketType::TerminalUserInfo as u8,
-        info(Some(ID), Some(KEY), Some(uid), Some(gid)).encode_to_vec(),
-    );
-    let _terminal = connect_packet(&path, &packet);
-    assert_eq!(
-        router.recv_event_timeout(Duration::from_secs(2)).unwrap(),
-        RouterEvent::Registered { id: ID.to_owned() }
-    );
-    router.shutdown().unwrap();
-}
-
-#[test]
 fn idle_registration_expires_on_monotonic_deadline() {
     let dir = TestDir::new();
     let path = dir.socket();
@@ -432,6 +399,7 @@ fn idle_pending_registration_expires_and_router_remains_live() {
     idle.set_read_timeout(Some(Duration::from_secs(7))).unwrap();
     let mut byte = [0_u8; 1];
     assert_eq!(std::io::Read::read(&mut idle, &mut byte).unwrap(), 0);
+    expect_rejected(&router, RouterReject::Timeout);
 
     let (uid, gid) = peer_identity();
     let packet = Packet::new(

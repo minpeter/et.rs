@@ -160,8 +160,8 @@ pub fn build_invocation(request: &BootstrapRequest, credentials: &Credentials) -
         Some(user) => format!("{user}@{}", request.host_alias),
         None => request.host_alias.clone(),
     };
-    args.push(destination);
     append_operational_options(&mut args, &request.ssh_options);
+    args.push(destination);
     args.push(remote_command(request, credentials));
 
     SshInvocation {
@@ -182,9 +182,9 @@ pub fn build_shell_probe(request: &BootstrapRequest) -> SshInvocation {
         Some(user) => format!("{user}@{}", request.host_alias),
         None => request.host_alias.clone(),
     };
-    args.push(destination);
     append_operational_options(&mut args, &request.ssh_options);
     args.push("-oLogLevel=ERROR".to_owned());
+    args.push(destination);
     args.push(format!("echo {WINDOWS_SHELL_PROBE_SENTINEL}%ComSpec%"));
     SshInvocation {
         program: "ssh".to_owned(),
@@ -195,13 +195,19 @@ pub fn build_shell_probe(request: &BootstrapRequest) -> SshInvocation {
 }
 
 fn append_operational_options(args: &mut Vec<String>, options: &[String]) {
+    args.push(format!("-o{CLEAR_ALL_FORWARDINGS}"));
     args.extend(
         options
             .iter()
-            .filter(|option| !option.eq_ignore_ascii_case(CLEAR_ALL_FORWARDINGS))
+            .filter(|option| {
+                !option
+                    .trim_start()
+                    .split(|character: char| character == '=' || character.is_ascii_whitespace())
+                    .next()
+                    .is_some_and(|key| key.eq_ignore_ascii_case("ClearAllForwardings"))
+            })
             .map(|option| format!("-o{option}")),
     );
-    args.push(format!("-o{CLEAR_ALL_FORWARDINGS}"));
 }
 
 pub fn parse_shell_probe(stdout: &[u8]) -> Result<RemoteShell, ClientError> {
@@ -422,12 +428,88 @@ mod tests {
     #[test]
     fn ssh_config_hardening_destination_bootstrap_suppresses_forwardings() {
         let mut request = request();
-        request
-            .ssh_options
-            .push("ClearAllForwardings=yes".to_owned());
+        request.ssh_options.extend([
+            "ClearAllForwardings=no".to_owned(),
+            "clearallforwardings NO".to_owned(),
+            "CLEARALLFORWARDINGS = no".to_owned(),
+        ]);
         let invocation = build_invocation(&request, &provisional_credentials().unwrap());
 
         assert_clear_all_forwardings_once(&invocation);
+        let suppression = invocation
+            .args
+            .iter()
+            .position(|argument| argument == "-oClearAllForwardings=yes")
+            .unwrap();
+        let destination = invocation
+            .args
+            .iter()
+            .position(|argument| argument == "alice@server")
+            .unwrap();
+        assert!(suppression < destination);
+        assert!(!invocation.args.iter().any(|argument| {
+            argument
+                .trim_start_matches("-o")
+                .split(['=', ' ', '\t'])
+                .next()
+                .is_some_and(|key| key.eq_ignore_ascii_case("ClearAllForwardings"))
+                && argument != "-oClearAllForwardings=yes"
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_config_hardening_real_openssh_observes_operational_precedence() {
+        struct RemoveFile(std::path::PathBuf);
+        impl Drop for RemoveFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "et-clear-forwarding-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("openssh")
+        ));
+        let _cleanup = RemoveFile(path.clone());
+        std::fs::write(
+            &path,
+            "Host oracle\n HostName localhost\n LocalForward 15432 localhost:5432\n",
+        )
+        .unwrap();
+        let mut request = request();
+        request.ssh_options.extend([
+            "clearallforwardings no".to_owned(),
+            "CLEARALLFORWARDINGS=no".to_owned(),
+        ]);
+        let invocation = build_invocation(&request, &provisional_credentials().unwrap());
+        let destination = invocation
+            .args
+            .iter()
+            .position(|argument| argument == "alice@server")
+            .unwrap();
+
+        let output = std::process::Command::new("ssh")
+            .args(["-G", "-F"])
+            .arg(&path)
+            .args(&invocation.args[..destination])
+            .arg("oracle")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let effective = String::from_utf8(output.stdout).unwrap();
+        assert!(effective
+            .lines()
+            .any(|line| line == "clearallforwardings yes"));
+        assert!(!effective
+            .lines()
+            .any(|line| line.starts_with("localforward ")));
     }
 
     #[test]
@@ -465,7 +547,7 @@ mod tests {
         assert_eq!(invocation.program, "ssh");
         assert_eq!(
             invocation.args[0..3],
-            ["alice@server", "-oPort=2222", "-oClearAllForwardings=yes"]
+            ["-oClearAllForwardings=yes", "-oPort=2222", "alice@server"]
         );
         assert_eq!(
             invocation.args[3],
@@ -644,8 +726,8 @@ mod tests {
             [
                 "-p",
                 "2200",
-                "-oStrictHostKeyChecking=no",
                 "-oClearAllForwardings=yes",
+                "-oStrictHostKeyChecking=no",
                 "user@jump.example"
             ]
         );

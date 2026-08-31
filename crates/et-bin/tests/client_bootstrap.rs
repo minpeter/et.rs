@@ -566,9 +566,9 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
     assert_eq!(
         &argv[..3],
         [
-            "test-user@server-alias",
-            "-oStrictHostKeyChecking=no",
             "-oClearAllForwardings=yes",
+            "-oStrictHostKeyChecking=no",
+            "test-user@server-alias",
         ]
     );
     let prefix = "printf '%s\\n' '";
@@ -883,8 +883,8 @@ fn explicit_posix_shell_skips_probe_and_uses_exact_posix_bootstrap() {
     assert_eq!(invocations.len(), 2, "{invocations:?}");
     assert_eq!(invocations[0], ["-G", "-T", "127.0.0.1"]);
     let bootstrap = &invocations[1];
-    assert_eq!(bootstrap[0], "config-user@127.0.0.1");
-    assert_eq!(bootstrap[1], "-oClearAllForwardings=yes");
+    assert_eq!(bootstrap[0], "-oClearAllForwardings=yes");
+    assert_eq!(bootstrap[1], "config-user@127.0.0.1");
     let input = bootstrap[2]
         .strip_prefix("printf '%s\\n' '")
         .unwrap()
@@ -1274,8 +1274,8 @@ fn jumphost_starts_a_jump_terminal_and_connects_to_the_jumphost() {
     let destination = &invocations[2];
     assert_eq!(destination[0], "-J");
     assert_eq!(destination[1], "jump.example");
-    assert_eq!(destination[2], "test-user@server-alias");
-    assert_eq!(destination[3], "-oClearAllForwardings=yes");
+    assert_eq!(destination[2], "-oClearAllForwardings=yes");
+    assert_eq!(destination[3], "test-user@server-alias");
     let destination_command = &destination[4];
     assert!(
         destination_command.starts_with("echo "),

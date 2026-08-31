@@ -6,12 +6,12 @@ use std::thread;
 use std::time::Duration;
 
 use et_core::proto::FlowControlMode;
-use et_net::connection::Connection;
+use et_net::connection::{ConnError, Connection, WritePacketError};
 use prost::Message;
 
 use super::{
     session_flow::{FlowControl, FlowWriteResult},
-    ActiveSession, SessionError,
+    ActiveSession, SessionError, SessionWriteError,
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
@@ -27,6 +27,43 @@ fn connection_pair() -> (Connection, Connection) {
         Connection::new_server(server, &key),
         Connection::new_client(client, &key),
     )
+}
+
+#[test]
+fn default_none_preserves_write_ownership_for_exact_once_retry() {
+    let (server, mut client) = connection_pair();
+    let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
+    let session = ActiveSession::new(server, &terminal, None).unwrap();
+    let mut writes = 0;
+
+    let error = session
+        .send_packet_owned_with(46, b"exactly-once", |_, _, _| {
+            writes += 1;
+            Err(WritePacketError::BeforeReplay(ConnError::Io(
+                std::io::Error::other("injected clone failure"),
+            )))
+        })
+        .unwrap_err();
+    assert!(matches!(error, SessionWriteError::BeforeReplay(_)));
+    assert_eq!(writes, 1);
+
+    session.send_packet_owned(46, b"exactly-once").unwrap();
+    let packet = client.read_packet().unwrap();
+    assert_eq!(
+        (packet.header(), packet.payload()),
+        (46, b"exactly-once".as_slice())
+    );
+
+    let error = session
+        .send_packet_owned_with(47, b"replay-owned", |_, _, _| {
+            writes += 1;
+            Err(WritePacketError::ReplayOwned(ConnError::Io(
+                std::io::Error::other("injected post-admission failure"),
+            )))
+        })
+        .unwrap_err();
+    assert!(matches!(error, SessionWriteError::ReplayOwned(_)));
+    assert_eq!(writes, 2);
 }
 
 #[test]
@@ -88,7 +125,7 @@ fn hard_shutdown_wakes_and_joins_a_deliberately_blocked_writer() {
 }
 
 #[test]
-fn flow_writer_clone_failure_restores_and_later_delivers_once() {
+fn before_replay_failure_waits_for_resume_then_delivers_once() {
     // Given: the flow writer owns one packet and socket cloning fails before replay admission.
     let (server, mut client) = connection_pair();
     client.set_io_timeout(Some(TEST_TIMEOUT)).unwrap();
@@ -117,7 +154,13 @@ fn flow_writer_clone_failure_restores_and_later_delivers_once() {
     );
     assert!(matches!(failed, FlowWriteResult::BeforeReplay(_)));
     assert!(flow.complete(packet, &failed, connected));
-    let restored = flow.next_packet().unwrap();
+    let (restored_tx, restored_rx) = mpsc::sync_channel(0);
+    let flow_waiter = Arc::clone(session.flow_control.as_ref().unwrap());
+    let waiting = thread::spawn(move || restored_tx.send(flow_waiter.next_packet()).unwrap());
+    assert!(restored_rx.try_recv().is_err());
+    flow.resume(true);
+    let restored = restored_rx.recv_timeout(TEST_TIMEOUT).unwrap().unwrap();
+    waiting.join().unwrap();
     let (delivered, connected) =
         super::session_flow::writer::write_packet(&session, flow, &restored);
     assert!(flow.complete(restored, &delivered, connected));

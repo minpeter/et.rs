@@ -12,7 +12,7 @@ use rustix::event::{poll, PollFd, PollFlags};
 #[cfg(unix)]
 use rustix::time::Timespec;
 
-use crate::session::{ActiveSession, SessionError};
+use crate::session::{ActiveSession, SessionError, SessionWriteError};
 
 const READ_BUFFER: usize = 16 * 1024;
 
@@ -396,10 +396,19 @@ fn send_or_hold(
     connected: &mut bool,
     connection_generation: &mut u64,
 ) -> Result<Option<Packet>, SessionError> {
-    match session.send_packet(packet.header(), packet.payload()) {
+    match session.send_packet_owned(packet.header(), packet.payload()) {
         Ok(()) => Ok(None),
-        Err(SessionError::Connection(ConnError::Backpressure)) => Ok(Some(packet)),
-        Err(error) => {
+        Err(SessionWriteError::BeforeReplay(SessionError::Connection(ConnError::Backpressure))) => {
+            Ok(Some(packet))
+        }
+        Err(SessionWriteError::BeforeReplay(error)) => {
+            if client_transport_error(&error, session, connected, connection_generation)? {
+                Ok(Some(packet))
+            } else {
+                Err(error)
+            }
+        }
+        Err(SessionWriteError::ReplayOwned(error)) => {
             if client_transport_error(&error, session, connected, connection_generation)? {
                 Ok(None)
             } else {

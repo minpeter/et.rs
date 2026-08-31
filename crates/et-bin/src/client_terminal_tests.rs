@@ -2,12 +2,13 @@ use std::net::{Ipv4Addr, TcpListener, TcpStream};
 
 use et_core::crypto::KEY_LEN;
 use et_core::proto::{TerminalBuffer, TerminalPacketType};
-use et_net::connection::{ConnError, Connection};
+use et_net::connection::{ConnError, Connection, WritePacketError};
 use prost::Message;
 
 use super::{
-    recover_initial_transport, recover_transport, send_command, TerminalModeState, TerminalReset,
-    GRACEFUL_TERMINAL_MODE_RESET, TERMINAL_MODE_RESET,
+    command_payload, recover_initial_transport, recover_transport, write_owned_recovering_with,
+    OwnedWriteOutcome, TerminalModeState, TerminalReset, GRACEFUL_TERMINAL_MODE_RESET,
+    TERMINAL_MODE_RESET,
 };
 use crate::client_terminal::{connection_ended, RemoteLines};
 use crate::error::ClientError;
@@ -22,24 +23,81 @@ fn command_exit_suffix_matches_no_exit_flag_and_remote_shell() {
         (RemoteLines::Cmd, false, b"printf ok & exit\r\n".as_slice()),
         (RemoteLines::Cmd, true, b"printf ok\r\n".as_slice()),
     ] {
-        let (client_stream, server_stream) = tcp_pair();
-        let key = [7u8; KEY_LEN];
-        let worker = std::thread::spawn(move || {
-            let mut server = Connection::new_server(server_stream, &key);
-            server.read_packet().unwrap()
-        });
-        let mut client = Connection::new_client(client_stream, &key);
-        send_command(&mut client, "printf ok", no_exit, lines).unwrap();
-        let packet = worker.join().unwrap();
-        assert_eq!(packet.header(), TerminalPacketType::TerminalBuffer as u8);
+        let payload = command_payload("printf ok", no_exit, lines).unwrap();
         assert_eq!(
-            TerminalBuffer::decode(packet.payload())
+            TerminalBuffer::decode(payload.as_slice())
                 .unwrap()
                 .buffer
                 .as_deref(),
             Some(expected)
         );
     }
+}
+
+#[test]
+fn before_replay_client_write_retries_plaintext_once_after_recovery() {
+    let (stream, _peer) = tcp_pair();
+    let mut connection = Connection::new_client(stream, &[7u8; KEY_LEN]);
+    let payload = command_payload("echo once", false, RemoteLines::Posix).unwrap();
+    let mut writes = 0;
+    let mut recoveries = 0;
+    let outcome = write_owned_recovering_with(
+        &mut connection,
+        TerminalPacketType::TerminalBuffer as u8,
+        &payload,
+        &mut |_| {
+            recoveries += 1;
+            Ok(ReconnectOutcome::Recovered)
+        },
+        false,
+        |_, _, actual| {
+            writes += 1;
+            assert_eq!(actual, payload);
+            if writes == 1 {
+                Err(WritePacketError::BeforeReplay(ConnError::Io(
+                    std::io::ErrorKind::ConnectionReset.into(),
+                )))
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(outcome, OwnedWriteOutcome::Recovered));
+    assert_eq!((writes, recoveries), (2, 1));
+}
+
+#[test]
+fn replay_owned_client_write_recovers_without_plaintext_retry() {
+    let (stream, _peer) = tcp_pair();
+    let mut connection = Connection::new_client(stream, &[7u8; KEY_LEN]);
+    let payload = TerminalBuffer {
+        buffer: Some(b"input-once".to_vec()),
+    }
+    .encode_to_vec();
+    let mut writes = 0;
+    let mut recoveries = 0;
+    let outcome = write_owned_recovering_with(
+        &mut connection,
+        TerminalPacketType::TerminalBuffer as u8,
+        &payload,
+        &mut |_| {
+            recoveries += 1;
+            Ok(ReconnectOutcome::Recovered)
+        },
+        false,
+        |_, _, _| {
+            writes += 1;
+            Err(WritePacketError::ReplayOwned(ConnError::Io(
+                std::io::ErrorKind::ConnectionReset.into(),
+            )))
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(outcome, OwnedWriteOutcome::Recovered));
+    assert_eq!((writes, recoveries), (1, 1));
 }
 
 #[test]

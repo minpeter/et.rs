@@ -106,7 +106,67 @@ fn evicted_alternate_leave_preserves_confirmed_enter_state() {
 }
 
 #[test]
-fn blocked_writer_shutdown_is_cancelled_before_join() {
+fn clean_remote_session_end_drains_admitted_output_before_returning() {
+    let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+    let (release_tx, release_rx) = mpsc::sync_channel(0);
+    let output = ConsoleOutput::new(
+        FlowControlMode::Backpressure,
+        Box::new(GatedWriter {
+            entered: entered_tx,
+            release: release_rx,
+        }),
+    )
+    .unwrap();
+    let modes = TerminalModeState::default();
+    assert!(output.try_write(b"first", &modes).unwrap());
+    assert_eq!(entered_rx.recv().unwrap(), 5);
+    assert!(output.try_write(b"second", &modes).unwrap());
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    std::thread::spawn(move || {
+        done_tx
+            .send(output.complete(ConsoleCompletion::RemoteSessionEnded))
+            .unwrap();
+    });
+
+    assert!(done_rx.try_recv().is_err());
+    release_tx.send(()).unwrap();
+    assert_eq!(entered_rx.recv().unwrap(), 6);
+    assert!(done_rx.try_recv().is_err());
+    release_tx.send(()).unwrap();
+    assert!(done_rx.recv().unwrap().is_ok());
+}
+
+#[test]
+fn graceful_finish_is_idempotent() {
+    let mut output =
+        ConsoleOutput::new(FlowControlMode::Backpressure, Box::new(Vec::<u8>::new())).unwrap();
+    assert!(output.finish_gracefully().is_ok());
+    assert!(output.finish_gracefully().is_ok());
+}
+
+#[test]
+fn graceful_finish_surfaces_last_write_error() {
+    struct Broken;
+    impl Write for Broken {
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut output = ConsoleOutput::new(FlowControlMode::Backpressure, Box::new(Broken)).unwrap();
+    let modes = TerminalModeState::default();
+    assert!(output.try_write(b"last", &modes).unwrap());
+
+    assert_eq!(
+        output.finish_gracefully().unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+}
+
+#[test]
+fn local_input_close_cancels_blocked_output_before_join() {
     enum Gate {
         Cancel,
     }
@@ -142,10 +202,10 @@ fn blocked_writer_shutdown_is_cancelled_before_join() {
 
     let (done_tx, done_rx) = mpsc::sync_channel(0);
     std::thread::spawn(move || {
-        drop(output);
-        done_tx.send(()).unwrap();
+        let result = output.complete(ConsoleCompletion::LocalInputClosed);
+        done_tx.send(result).unwrap();
     });
-    done_rx.recv().unwrap();
+    assert!(done_rx.recv().unwrap().is_ok());
 }
 
 #[test]

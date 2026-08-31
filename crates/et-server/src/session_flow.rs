@@ -205,7 +205,10 @@ impl FlowControl {
         state.connected = connected;
         match result {
             writer::FlowWriteResult::Delivered => state.queue.complete(&packet),
-            writer::FlowWriteResult::BeforeReplay(_error) => state.queue.restore_front(packet),
+            writer::FlowWriteResult::BeforeReplay(_error) => {
+                state.queue.restore_front(packet);
+                state.connected = false;
+            }
             writer::FlowWriteResult::ReplayOwned(_error) => {
                 state.queue.complete(&packet);
                 state.connected = false;

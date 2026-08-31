@@ -18,9 +18,11 @@ use et_core::proto::TerminalPacketType;
 use et_net::connection::Connection;
 use et_net::forward::{is_forward_packet, Forwarder};
 
+use crate::client_output::ConsoleCompletion;
 use crate::client_terminal::{
-    connection_ended, recover_transport, send_buffer, send_size, terminal_error, terminal_io,
-    terminal_text, DisplayOutcome, TerminalModeState,
+    connection_ended, encoded_buffer, recover_transport, terminal_error, terminal_io,
+    terminal_size_payload, terminal_text, write_owned_recovering, DisplayOutcome,
+    OwnedWriteOutcome, TerminalModeState,
 };
 use crate::error::ClientError;
 use crate::initial_connect::ReconnectOutcome;
@@ -68,7 +70,14 @@ where
                 .take_cursor_reports()
                 .map_err(|error| terminal_io("reading console confirmations", error))?
             {
-                let _ = send_buffer(connection, crate::client_terminal::CURSOR_REPORT_REPLY);
+                if matches!(
+                    write_cursor_report(connection, &mut reconnect, terminal_enabled)?,
+                    OwnedWriteOutcome::SessionEnded
+                ) {
+                    return console_output
+                        .complete(ConsoleCompletion::RemoteSessionEnded)
+                        .map_err(|error| terminal_io("draining terminal output", error));
+                }
             }
         }
         let mut reconnect_needed = false;
@@ -85,7 +94,14 @@ where
                 DisplayOutcome::Displayed { cursor_report }
                     if cursor_report && auto_cursor_report && !console_output.is_async() =>
                 {
-                    let _ = send_buffer(connection, crate::client_terminal::CURSOR_REPORT_REPLY);
+                    if matches!(
+                        write_cursor_report(connection, &mut reconnect, terminal_enabled)?,
+                        OwnedWriteOutcome::SessionEnded
+                    ) {
+                        return console_output
+                            .complete(ConsoleCompletion::RemoteSessionEnded)
+                            .map_err(|error| terminal_io("draining terminal output", error));
+                    }
                 }
                 DisplayOutcome::Displayed { .. } => {}
                 DisplayOutcome::Pending(packet) => pending_output = Some(packet),
@@ -105,19 +121,46 @@ where
                         if bytes.is_empty() {
                             continue;
                         }
-                        match send_buffer(connection, &bytes) {
-                            Ok(()) => {}
-                            Err(error) if connection_ended(&error) => reconnect_needed = true,
-                            Err(error) => return Err(terminal_error(error)),
+                        let payload = encoded_buffer(&bytes);
+                        match write_owned_recovering(
+                            connection,
+                            TerminalPacketType::TerminalBuffer as u8,
+                            &payload,
+                            &mut reconnect,
+                            terminal_enabled,
+                        )? {
+                            OwnedWriteOutcome::Written => {}
+                            OwnedWriteOutcome::Recovered => reconnect_needed = false,
+                            OwnedWriteOutcome::SessionEnded => {
+                                return console_output
+                                    .complete(ConsoleCompletion::RemoteSessionEnded)
+                                    .map_err(|error| {
+                                        terminal_io("draining terminal output", error)
+                                    });
+                            }
                         }
                     }
-                    Event::Resize(_, _) if terminal_enabled => match send_size(connection) {
-                        Ok(()) => {}
-                        Err(ClientError::Transport(error)) if connection_ended(&error) => {
-                            reconnect_needed = true;
+                    Event::Resize(_, _) if terminal_enabled => {
+                        if let Some(payload) = terminal_size_payload()? {
+                            match write_owned_recovering(
+                                connection,
+                                TerminalPacketType::TerminalInfo as u8,
+                                &payload,
+                                &mut reconnect,
+                                false,
+                            )? {
+                                OwnedWriteOutcome::Written => {}
+                                OwnedWriteOutcome::Recovered => reconnect_needed = false,
+                                OwnedWriteOutcome::SessionEnded => {
+                                    return console_output
+                                        .complete(ConsoleCompletion::RemoteSessionEnded)
+                                        .map_err(|error| {
+                                            terminal_io("draining terminal output", error)
+                                        });
+                                }
+                            }
                         }
-                        Err(error) => return Err(error),
-                    },
+                    }
                     // Upstream forwards neither mouse nor focus records.
                     Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {}
                     _ => {}
@@ -151,10 +194,20 @@ where
                                     && auto_cursor_report
                                     && !console_output.is_async() =>
                             {
-                                let _ = send_buffer(
-                                    connection,
-                                    crate::client_terminal::CURSOR_REPORT_REPLY,
-                                );
+                                if matches!(
+                                    write_cursor_report(
+                                        connection,
+                                        &mut reconnect,
+                                        terminal_enabled,
+                                    )?,
+                                    OwnedWriteOutcome::SessionEnded
+                                ) {
+                                    return console_output
+                                        .complete(ConsoleCompletion::RemoteSessionEnded)
+                                        .map_err(|error| {
+                                            terminal_io("draining terminal output", error)
+                                        });
+                                }
                             }
                             DisplayOutcome::Displayed { .. } => {}
                             DisplayOutcome::Pending(packet) => pending_output = Some(packet),
@@ -175,13 +228,20 @@ where
             .try_outbound()
             .map_err(|error| terminal_text(error.to_string()))?
         {
-            match connection.write_packet(packet.header(), packet.payload()) {
-                Ok(()) => {}
-                Err(error) if connection_ended(&error) => {
-                    reconnect_needed = true;
-                    break;
+            match write_owned_recovering(
+                connection,
+                packet.header(),
+                packet.payload(),
+                &mut reconnect,
+                terminal_enabled,
+            )? {
+                OwnedWriteOutcome::Written => {}
+                OwnedWriteOutcome::Recovered => reconnect_needed = false,
+                OwnedWriteOutcome::SessionEnded => {
+                    return console_output
+                        .complete(ConsoleCompletion::RemoteSessionEnded)
+                        .map_err(|error| terminal_io("draining terminal output", error));
                 }
-                Err(error) => return Err(terminal_error(error)),
             }
         }
 
@@ -191,7 +251,9 @@ where
         }
         if reconnect_needed {
             if !recover_transport(connection, &mut reconnect, terminal_enabled)? {
-                return Ok(());
+                return console_output
+                    .complete(ConsoleCompletion::RemoteSessionEnded)
+                    .map_err(|error| terminal_io("draining terminal output", error));
             }
             last_received = Instant::now();
             next_keepalive = last_received + interval;
@@ -201,12 +263,19 @@ where
             // The payload acknowledges everything read so far, so the server
             // can trim its replay backup; legacy servers ignore it.
             let ack = connection.keepalive_ack();
-            if connection
-                .write_packet(TerminalPacketType::KeepAlive as u8, &ack)
-                .is_err()
-                && !recover_transport(connection, &mut reconnect, terminal_enabled)?
-            {
-                return Ok(());
+            if matches!(
+                write_owned_recovering(
+                    connection,
+                    TerminalPacketType::KeepAlive as u8,
+                    &ack,
+                    &mut reconnect,
+                    terminal_enabled,
+                )?,
+                OwnedWriteOutcome::SessionEnded
+            ) {
+                return console_output
+                    .complete(ConsoleCompletion::RemoteSessionEnded)
+                    .map_err(|error| terminal_io("draining terminal output", error));
             }
             next_keepalive = Instant::now() + interval;
         }
@@ -219,6 +288,24 @@ where
             std::thread::sleep(POLL_INTERVAL);
         }
     }
+}
+
+fn write_cursor_report<F>(
+    connection: &mut Connection,
+    reconnect: &mut F,
+    send_terminal_size: bool,
+) -> Result<OwnedWriteOutcome, ClientError>
+where
+    F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
+{
+    let payload = encoded_buffer(crate::client_terminal::CURSOR_REPORT_REPLY);
+    write_owned_recovering(
+        connection,
+        TerminalPacketType::TerminalBuffer as u8,
+        &payload,
+        reconnect,
+        send_terminal_size,
+    )
 }
 
 /// Returns `true` when a cursor position report must be sent back.

@@ -79,6 +79,7 @@ fn flow_control_keeps_ctrl_c_and_prompt_responsive_on_a_slow_link() {
             "interrupted=; \
              trap 'interrupted=1; printf \"\\nFLOW-INTERRUPTED\\n\"' INT; \
              printf 'FLOW-%s\\n' START; \
+             IFS= read -r flow_release; \
              i=0; while [ -z \"$interrupted\" ] && [ \"$i\" -lt 65536 ]; do \
              printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'; \
              i=$((i + 1)); done; trap - INT"
@@ -96,6 +97,8 @@ fn flow_control_keeps_ctrl_c_and_prompt_responsive_on_a_slow_link() {
                 panic!("{mode}: waiting for FLOW-START: {error}");
             }
         };
+        writer.write_all(b"FLOW-RELEASE\n").unwrap();
+        writer.flush().unwrap();
         proxy
             .wait_saturated(Duration::from_secs(40))
             .unwrap_or_else(|error| panic!("{mode}: exact saturation event: {error}"));

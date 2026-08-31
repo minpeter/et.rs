@@ -39,6 +39,13 @@ struct Shared {
     wake: Condvar,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ConsoleCompletion {
+    RemoteSessionEnded,
+    #[cfg(any(unix, test))]
+    LocalInputClosed,
+}
+
 pub(crate) struct ConsoleOutput {
     mode: FlowControlMode,
     shared: Option<Arc<Shared>>,
@@ -49,13 +56,19 @@ pub(crate) struct ConsoleOutput {
     #[cfg(unix)]
     _idle_signals: Option<(LocalStream, LocalStream)>,
     cancel: Option<Box<dyn FnOnce() + Send>>,
+    graceful_finish: Option<Box<dyn FnOnce() -> io::Result<()> + Send>>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
 impl ConsoleOutput {
     pub(crate) fn stdout(mode: FlowControlMode) -> io::Result<Self> {
         if mode == FlowControlMode::None {
-            return Self::new_with_cancel(mode, Box::new(io::stdout()), Box::new(|| {}));
+            return Self::new_with_lifecycle(
+                mode,
+                Box::new(io::stdout()),
+                Box::new(|| {}),
+                Box::new(|| Ok(())),
+            );
         }
         #[cfg(unix)]
         {
@@ -64,13 +77,14 @@ impl ConsoleOutput {
             let cancel = Box::new(move || {
                 let _ = cancel_writer.write_all(&[1]);
             });
-            Self::new_with_cancel(
+            Self::new_with_lifecycle(
                 mode,
                 Box::new(CancellableStdout {
                     file,
                     cancel: cancel_reader,
                 }),
                 cancel,
+                Box::new(|| Ok(())),
             )
         }
         #[cfg(windows)]
@@ -91,23 +105,35 @@ impl ConsoleOutput {
                 .ok_or_else(|| io::Error::other("console helper acknowledgement unavailable"))?;
             let child = Arc::new(Mutex::new(child));
             let cancel_child = Arc::clone(&child);
-            Self::new_with_cancel(
+            let graceful_child = Arc::clone(&child);
+            Self::new_with_lifecycle(
                 mode,
                 Box::new(WindowsHelperWriter { input, ack }),
                 Box::new(move || cancel_windows_helper(&cancel_child)),
+                Box::new(move || wait_windows_helper(&graceful_child)),
             )
         }
     }
 
     #[cfg(test)]
     pub(crate) fn new(mode: FlowControlMode, writer: Box<dyn Write + Send>) -> io::Result<Self> {
-        Self::new_with_cancel(mode, writer, Box::new(|| {}))
+        Self::new_with_lifecycle(mode, writer, Box::new(|| {}), Box::new(|| Ok(())))
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_cancel(
+        mode: FlowControlMode,
+        writer: Box<dyn Write + Send>,
+        cancel: Box<dyn FnOnce() + Send>,
+    ) -> io::Result<Self> {
+        Self::new_with_lifecycle(mode, writer, cancel, Box::new(|| Ok(())))
+    }
+
+    pub(crate) fn new_with_lifecycle(
         mode: FlowControlMode,
         mut writer: Box<dyn Write + Send>,
         cancel: Box<dyn FnOnce() + Send>,
+        graceful_finish: Box<dyn FnOnce() -> io::Result<()> + Send>,
     ) -> io::Result<Self> {
         #[cfg(unix)]
         let (capacity_wake, mut capacity_signal) = {
@@ -135,6 +161,7 @@ impl ConsoleOutput {
                     #[cfg(unix)]
                     _idle_signals: Some((capacity_signal, status_signal)),
                     cancel: None,
+                    graceful_finish: None,
                     worker: None,
                 });
             }
@@ -174,6 +201,7 @@ impl ConsoleOutput {
             #[cfg(unix)]
             _idle_signals: None,
             cancel: Some(cancel),
+            graceful_finish: Some(graceful_finish),
             worker: Some(worker),
         })
     }
@@ -278,6 +306,40 @@ impl ConsoleOutput {
         );
     }
 
+    pub(crate) fn complete(mut self, completion: ConsoleCompletion) -> io::Result<()> {
+        match completion {
+            ConsoleCompletion::RemoteSessionEnded => self.finish_gracefully(),
+            #[cfg(any(unix, test))]
+            ConsoleCompletion::LocalInputClosed => Ok(()),
+        }
+    }
+
+    pub(crate) fn finish_gracefully(&mut self) -> io::Result<()> {
+        let Some(shared) = &self.shared else {
+            return Ok(());
+        };
+        {
+            let mut state = shared
+                .state
+                .lock()
+                .map_err(|_| io::Error::other("console output worker unavailable"))?;
+            state.stopping = true;
+            shared.wake.notify_all();
+        }
+        if let Some(worker) = self.worker.take() {
+            worker
+                .join()
+                .map_err(|_| io::Error::other("console output worker panicked"))?;
+        }
+        self.check_error()?;
+        if let Some(finish) = self.graceful_finish.take() {
+            finish()?;
+        }
+        self.cancel = None;
+        self.shared = None;
+        Ok(())
+    }
+
     pub(crate) fn check_error(&self) -> io::Result<()> {
         let Some(shared) = &self.shared else {
             return Ok(());
@@ -321,6 +383,7 @@ impl Drop for ConsoleOutput {
                 shared.wake.notify_all();
             }
         }
+        self.graceful_finish = None;
         if let Some(cancel) = self.cancel.take() {
             cancel();
         }
@@ -416,6 +479,21 @@ impl Write for WindowsHelperWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn wait_windows_helper(child: &Mutex<std::process::Child>) -> io::Result<()> {
+    let mut child = child
+        .lock()
+        .map_err(|_| io::Error::other("console helper unavailable"))?;
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "console helper exited with {status}"
+        )))
     }
 }
 

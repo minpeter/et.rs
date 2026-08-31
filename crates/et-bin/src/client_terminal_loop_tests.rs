@@ -6,6 +6,7 @@ use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::thread;
 
+use crate::client_terminal::send_buffer;
 use et_core::proto::TerminalBuffer;
 use prost::Message;
 

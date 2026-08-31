@@ -56,6 +56,20 @@ pub(crate) enum SessionConnection {
 }
 
 #[derive(Debug)]
+pub enum SessionWriteError {
+    BeforeReplay(SessionError),
+    ReplayOwned(SessionError),
+}
+
+impl SessionWriteError {
+    fn into_inner(self) -> SessionError {
+        match self {
+            Self::BeforeReplay(error) | Self::ReplayOwned(error) => error,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum SessionError {
     Connection(ConnError),
     Io(io::Error),
@@ -133,35 +147,81 @@ impl ActiveSession {
     }
 
     pub(crate) fn send_packet(&self, header: u8, payload: &[u8]) -> Result<(), SessionError> {
+        match self.send_packet_owned(header, payload) {
+            Ok(()) => Ok(()),
+            Err(SessionWriteError::BeforeReplay(SessionError::Connection(ConnError::Io(_)))) => {
+                self.connection
+                    .lock()
+                    .map_err(|_| SessionError::Unavailable)?
+                    .disconnect();
+                self.send_packet_owned(header, payload)
+                    .map_err(SessionWriteError::into_inner)
+            }
+            Err(error) => Err(error.into_inner()),
+        }
+    }
+
+    pub(crate) fn send_packet_owned(
+        &self,
+        header: u8,
+        payload: &[u8],
+    ) -> Result<(), SessionWriteError> {
+        self.send_packet_owned_with(header, payload, |connection, header, payload| {
+            connection.write_packet_owned(header, payload)
+        })
+    }
+
+    fn send_packet_owned_with<W>(
+        &self,
+        header: u8,
+        payload: &[u8],
+        mut write: W,
+    ) -> Result<(), SessionWriteError>
+    where
+        W: FnMut(&mut Connection, u8, &[u8]) -> Result<(), et_net::connection::WritePacketError>,
+    {
         if let Some(state) = &self.flow_control {
-            return state.enqueue(Packet::new(header, payload));
+            return state
+                .enqueue(Packet::new(header, payload))
+                .map_err(SessionWriteError::BeforeReplay);
         }
         // While a recover holds the single-flight permit, queue terminal
         // output instead of contending on the connection mutex for the
         // recovery network RTT. Flushed after the new stream is installed.
-        if self.queue_if_recovering(header, payload)? {
+        if self
+            .queue_if_recovering(header, payload)
+            .map_err(SessionWriteError::BeforeReplay)?
+        {
             return Ok(());
         }
         let mut connection = self
             .connection
             .lock()
-            .map_err(|_| SessionError::Unavailable)?;
+            .map_err(|_| SessionWriteError::BeforeReplay(SessionError::Unavailable))?;
         // Recover may have started after the fast path check. Drop the
         // connection lock before taking `recover_hold` (flush takes hold
         // then connection — reverse order deadlocks).
         if self.recovering.load(Ordering::Acquire) {
             drop(connection);
-            if self.queue_if_recovering(header, payload)? {
+            if self
+                .queue_if_recovering(header, payload)
+                .map_err(SessionWriteError::BeforeReplay)?
+            {
                 return Ok(());
             }
             connection = self
                 .connection
                 .lock()
-                .map_err(|_| SessionError::Unavailable)?;
+                .map_err(|_| SessionWriteError::BeforeReplay(SessionError::Unavailable))?;
         }
-        connection
-            .write_packet(header, payload)
-            .map_err(SessionError::Connection)
+        write(&mut connection, header, payload).map_err(|error| match error {
+            et_net::connection::WritePacketError::BeforeReplay(error) => {
+                SessionWriteError::BeforeReplay(SessionError::Connection(error))
+            }
+            et_net::connection::WritePacketError::ReplayOwned(error) => {
+                SessionWriteError::ReplayOwned(SessionError::Connection(error))
+            }
+        })
     }
 
     fn queue_if_recovering(&self, header: u8, payload: &[u8]) -> Result<bool, SessionError> {

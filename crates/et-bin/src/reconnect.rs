@@ -59,7 +59,7 @@ fn recover_connection(
     // trims its replay backup right after recovery; legacy servers ignore it.
     let ack = connection.keepalive_ack();
     connection
-        .write_packet(TerminalPacketType::KeepAlive as u8, &ack)
+        .write_packet_live(TerminalPacketType::KeepAlive as u8, &ack)
         .map_err(|error| transport_error(deadline, "authenticating recovery", error))?;
     // Any packet that decrypts with the session key authenticates the server;
     // it is requeued and handled by the session loop. Upstream C++ servers

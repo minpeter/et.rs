@@ -91,12 +91,6 @@ pub fn default_payload() -> InitialPayload {
     }
 }
 
-pub fn acknowledge_skip_report(connection: &mut Connection) {
-    connection
-        .write_packet(et_core::proto::EtPacketType::Heartbeat as u8, &[])
-        .unwrap();
-}
-
 pub fn initialize(
     stream: TcpStream,
     key: &[u8; 32],

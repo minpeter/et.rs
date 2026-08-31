@@ -5,7 +5,7 @@ use std::io::{self};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use et_core::packet::Packet;
 use et_core::proto::{PortForwardSourceRequest, TerminalPacketType};
@@ -13,12 +13,11 @@ use et_core::proto::{PortForwardSourceRequest, TerminalPacketType};
 use crate::forward_endpoint::{Endpoint, ResolvedEndpoint};
 use crate::forward_io::BoundSource;
 use crate::forward_worker::{run, Command};
-use crate::reverse_report::SkipReason;
 
 const CHANNEL_CAPACITY: usize = 256;
 /// Maximum reverse listeners owned by one terminal session, after DNS fanout
 /// and address deduplication.
-const MAX_SESSION_LISTENERS: usize = 32;
+pub const MAX_SESSION_LISTENERS: usize = 32;
 
 #[derive(Debug)]
 pub enum ForwardError {
@@ -53,7 +52,6 @@ pub(crate) type Outbound = Result<Packet, ForwardError>;
 pub enum ForwardOrigin {
     Explicit,
     SshConfig { strict: bool },
-    Reported(usize),
 }
 
 pub struct ForwardSource {
@@ -80,8 +78,6 @@ impl ForwardSource {
 pub struct SkippedForward {
     pub request: PortForwardSourceRequest,
     pub error: io::Error,
-    pub reason: SkipReason,
-    pub report_index: Option<usize>,
 }
 
 pub struct Forwarder {
@@ -99,13 +95,13 @@ pub struct Forwarder {
 impl Forwarder {
     pub fn start(sources: Vec<PortForwardSourceRequest>) -> Result<Self, ForwardError> {
         let sources = sources.into_iter().map(ForwardSource::explicit).collect();
-        start_forwarder(sources, None).map(|(forwarder, _, _)| forwarder)
+        start_forwarder(sources, None, None).map(|(forwarder, _, _)| forwarder)
     }
 
     pub fn start_with_origins(
         sources: Vec<ForwardSource>,
     ) -> Result<(Self, Vec<SkippedForward>), ForwardError> {
-        start_forwarder(sources, None).map(|(forwarder, _, skipped)| (forwarder, skipped))
+        start_forwarder(sources, None, None).map(|(forwarder, _, skipped)| (forwarder, skipped))
     }
 
     /// Bind all forwarding sources and return the forwarder together with the
@@ -118,30 +114,27 @@ impl Forwarder {
         owner: Option<(u32, u32)>,
     ) -> Result<(Self, ForwardEnvironment), ForwardError> {
         let sources = sources.into_iter().map(ForwardSource::explicit).collect();
-        start_forwarder(sources, owner).map(|(forwarder, environment, _)| (forwarder, environment))
+        start_forwarder(sources, owner, None)
+            .map(|(forwarder, environment, _)| (forwarder, environment))
     }
 
-    pub fn start_with_user_report(
+    pub fn start_with_user_until(
         sources: Vec<PortForwardSourceRequest>,
-        owner: Option<(u32, u32)>,
-    ) -> Result<(Self, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
-        let sources = sources
-            .into_iter()
-            .enumerate()
-            .map(|(index, request)| ForwardSource {
-                request,
-                origin: ForwardOrigin::Reported(index),
-            })
-            .collect();
-        start_forwarder(sources, owner)
+        owner: (u32, u32),
+        deadline: Instant,
+    ) -> Result<(Self, ForwardEnvironment), ForwardError> {
+        let sources = sources.into_iter().map(ForwardSource::explicit).collect();
+        start_forwarder(sources, Some(owner), Some(deadline))
+            .map(|(forwarder, environment, _)| (forwarder, environment))
     }
 }
 
 fn start_forwarder(
     sources: Vec<ForwardSource>,
     owner: Option<(u32, u32)>,
+    deadline: Option<Instant>,
 ) -> Result<(Forwarder, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
-    let (sources, environment, skipped) = bind_sources(sources, owner)?;
+    let (sources, environment, skipped) = bind_sources(sources, owner, deadline)?;
     let session_user = owner;
     let (commands_tx, commands_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
     let (outbound_tx, outbound_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
@@ -283,6 +276,7 @@ enum PlannedSource {
 fn bind_sources(
     sources: Vec<ForwardSource>,
     owner: Option<(u32, u32)>,
+    deadline: Option<Instant>,
 ) -> Result<(Vec<BoundSource>, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
     let mut plans = Vec::with_capacity(sources.len());
     let mut skipped = Vec::new();
@@ -319,24 +313,19 @@ fn bind_sources(
             }
         } else {
             let endpoint = Endpoint::parse(request.source).map_err(ForwardError::Io)?;
-            let resolved = endpoint.resolve_for_bind();
+            let resolved = match (owner, deadline) {
+                (Some(_), Some(deadline)) => endpoint.resolve_for_bind_until(
+                    deadline,
+                    MAX_SESSION_LISTENERS.saturating_sub(listener_count),
+                ),
+                _ => endpoint.resolve_for_bind(),
+            };
             let source = match (resolved, origin) {
                 (Ok(source), _) => source,
                 (Err(error), ForwardOrigin::SshConfig { strict: false }) => {
                     skipped.push(SkippedForward {
                         request: original,
                         error,
-                        reason: SkipReason::Resolve,
-                        report_index: None,
-                    });
-                    continue;
-                }
-                (Err(error), ForwardOrigin::Reported(index)) => {
-                    skipped.push(SkippedForward {
-                        request: original,
-                        error,
-                        reason: SkipReason::Resolve,
-                        report_index: Some(index),
                     });
                     continue;
                 }
@@ -348,11 +337,13 @@ fn bind_sources(
             if owner.is_some() {
                 match &source {
                     ResolvedEndpoint::Tcp(addresses)
-                        if addresses.iter().any(|address| !address.ip().is_loopback()) =>
+                        if addresses
+                            .iter()
+                            .any(|address| address.ip().is_unspecified()) =>
                     {
                         return Err(ForwardError::Io(io::Error::new(
                             io::ErrorKind::PermissionDenied,
-                            "authenticated reverse TCP bind must resolve only to loopback addresses",
+                            "authenticated reverse TCP wildcard bind is not permitted",
                         )));
                     }
                     ResolvedEndpoint::Tcp(_) => {}
@@ -390,7 +381,13 @@ fn bind_sources(
                 destination,
                 original,
                 origin,
-            } => match (source.bind_with_user(owner), origin) {
+            } => match (
+                match deadline {
+                    Some(deadline) => source.bind_with_user_until(owner, deadline),
+                    None => source.bind_with_user(owner),
+                },
+                origin,
+            ) {
                 (Ok(listeners), _) => {
                     for listener in listeners {
                         bound.push(BoundSource {
@@ -403,16 +400,6 @@ fn bind_sources(
                     skipped.push(SkippedForward {
                         request: original,
                         error,
-                        reason: SkipReason::Bind,
-                        report_index: None,
-                    });
-                }
-                (Err(error), ForwardOrigin::Reported(index)) => {
-                    skipped.push(SkippedForward {
-                        request: original,
-                        error,
-                        reason: SkipReason::Bind,
-                        report_index: Some(index),
                     });
                 }
                 (
@@ -427,7 +414,10 @@ fn bind_sources(
             } => {
                 let mut pipe = create_forward_pipe(owner)?;
                 let source = Endpoint::Unix(pipe.path.clone()).resolve_for_bind()?;
-                let mut listeners = source.bind_with_user(owner)?;
+                let mut listeners = match deadline {
+                    Some(deadline) => source.bind_with_user_until(owner, deadline)?,
+                    None => source.bind_with_user(owner)?,
+                };
                 environment.push((variable, pipe.path.to_string_lossy().into_owned()));
                 let directory = pipe.disarm()?;
                 for mut listener in listeners.drain(..) {

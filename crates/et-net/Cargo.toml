@@ -20,6 +20,7 @@ socket2 = "0.6.1"
 [target.'cfg(unix)'.dependencies]
 privdrop = "0.5.6"
 rustix = { version = "1.1.4", features = ["event", "fs", "net", "process"] }
+wait-timeout = "0.2.1"
 
 [[bin]]
 name = "et-user-socket-helper"

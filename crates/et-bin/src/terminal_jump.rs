@@ -64,7 +64,7 @@ pub fn run(
         }
         destination
             .connection
-            .write_packet_strict(EtPacketType::Heartbeat as u8, &[])
+            .write_packet_live(EtPacketType::Heartbeat as u8, &[])
             .map_err(|error| format!("could not acknowledge destination response: {error}"))?;
     }
     destination
@@ -165,7 +165,7 @@ fn try_connect_once(
     }
     let mut connection = Connection::new_client(stream, key);
     connection
-        .write_packet_strict(EtPacketType::InitialPayload as u8, &payload.encode_to_vec())
+        .write_packet_live(EtPacketType::InitialPayload as u8, &payload.encode_to_vec())
         .map_err(|error| format!("could not send INITIAL_PAYLOAD: {error}"))?;
     let packet = connection
         .read_packet()
@@ -202,19 +202,16 @@ fn relay(mut router: LocalStream, destination: &mut Connection) -> Result<i32, S
     #[cfg(windows)]
     loop {
         let mut progress = false;
-        match read_router_packet(&mut router, &mut decoder)? {
-            Some(packet) => {
-                progress = true;
-                decoder = LocalPacketDecoder::new();
-                let packet = destination_packet(destination, packet);
-                if destination
-                    .write_packet(packet.header(), packet.payload())
-                    .is_err()
-                {
-                    return Ok(0);
-                }
+        if let Some(packet) = read_router_packet(&mut router, &mut decoder)? {
+            progress = true;
+            decoder = LocalPacketDecoder::new();
+            let packet = destination_packet(destination, packet);
+            if destination
+                .write_packet(packet.header(), packet.payload())
+                .is_err()
+            {
+                return Ok(0);
             }
-            None => {}
         }
         loop {
             match destination.try_read_packet() {

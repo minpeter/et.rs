@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use super::*;
 use std::io::Write;
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -41,9 +43,10 @@ fn pending_console_output_does_not_block_terminal_input() {
         }),
     )
     .unwrap();
-    assert!(output.try_write(&vec![1; 64 * 1024]).unwrap());
+    let modes = TerminalModeState::default();
+    assert!(output.try_write(&vec![1; 64 * 1024], &modes).unwrap());
     assert_eq!(entered_rx.recv().unwrap(), 64 * 1024);
-    assert!(output.try_write(&vec![2; 64 * 1024]).unwrap());
+    assert!(output.try_write(&vec![2; 64 * 1024], &modes).unwrap());
     let packet = et_core::packet::Packet::new(
         TerminalPacketType::TerminalBuffer as u8,
         TerminalBuffer {

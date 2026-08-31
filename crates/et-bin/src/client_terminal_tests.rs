@@ -144,15 +144,15 @@ fn observed_alternate_screen_selects_graceful_or_abrupt_reset() {
 
 #[test]
 fn alternate_screen_tracking_handles_split_enter_and_leave_sequences() {
-    let mut modes = TerminalModeState::default();
+    let modes = TerminalModeState::default();
     modes.observe(b"before\x1b[?10");
-    assert!(!modes.alternate_screen);
+    assert!(!modes.alternate_screen());
     modes.observe(b"49hinside");
-    assert!(modes.alternate_screen);
+    assert!(modes.alternate_screen());
     modes.observe(b"\x1b[?104");
-    assert!(modes.alternate_screen);
+    assert!(modes.alternate_screen());
     modes.observe(b"9lafter");
-    assert!(!modes.alternate_screen);
+    assert!(!modes.alternate_screen());
 }
 
 fn tcp_pair() -> (TcpStream, TcpStream) {

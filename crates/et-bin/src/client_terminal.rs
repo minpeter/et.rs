@@ -91,7 +91,7 @@ where
             terminal_enabled,
             initial_size,
         )? {
-            return raw_mode.finish(Ok(()), close_message, terminal_modes.alternate_screen);
+            return raw_mode.finish(Ok(()), close_message, terminal_modes.alternate_screen());
         }
     }
     if terminal_enabled {
@@ -103,7 +103,7 @@ where
                 terminal_enabled,
                 initial_command,
             )? {
-                return raw_mode.finish(Ok(()), close_message, terminal_modes.alternate_screen);
+                return raw_mode.finish(Ok(()), close_message, terminal_modes.alternate_screen());
             }
         }
     }
@@ -174,7 +174,7 @@ where
         &forwarder,
         reconnect,
     );
-    raw_mode.finish(result, close_message, terminal_modes.alternate_screen)
+    raw_mode.finish(result, close_message, terminal_modes.alternate_screen())
 }
 
 /// Device Status Report request (`ESC [ 6 n`).
@@ -195,7 +195,6 @@ pub(crate) enum DisplayOutcome {
 
 pub(crate) fn display_packet_with<F>(
     packet: et_core::packet::Packet,
-    terminal_modes: &mut TerminalModeState,
     mut output: F,
 ) -> Result<DisplayOutcome, ClientError>
 where
@@ -211,7 +210,6 @@ where
             if !output(&bytes)? {
                 return Ok(DisplayOutcome::Pending(packet));
             }
-            terminal_modes.observe(&bytes);
             Ok(DisplayOutcome::Displayed {
                 cursor_report: contains_cursor_report_request(&bytes),
             })
@@ -223,7 +221,7 @@ where
     }
 }
 
-fn contains_cursor_report_request(bytes: &[u8]) -> bool {
+pub(crate) fn contains_cursor_report_request(bytes: &[u8]) -> bool {
     bytes
         .windows(CURSOR_REPORT_REQUEST.len())
         .any(|window| window == CURSOR_REPORT_REQUEST)
@@ -365,28 +363,38 @@ const GRACEFUL_TERMINAL_MODE_RESET: &[u8] = b"\x1b[<64u\x1b[=0;1u\
 \x1b[>4;0m\x1b[?2004l\x1b[?1004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h";
 
 #[derive(Default)]
-pub(crate) struct TerminalModeState {
+struct TerminalModeInner {
     alternate_prefix_len: usize,
     alternate_screen: bool,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct TerminalModeState(std::sync::Arc<std::sync::Mutex<TerminalModeInner>>);
+
 impl TerminalModeState {
-    fn observe(&mut self, bytes: &[u8]) {
+    pub(crate) fn observe(&self, bytes: &[u8]) {
         const PREFIX: &[u8] = b"\x1b[?1049";
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
         for &byte in bytes {
-            if self.alternate_prefix_len == PREFIX.len() {
+            if state.alternate_prefix_len == PREFIX.len() {
                 match byte {
-                    b'h' => self.alternate_screen = true,
-                    b'l' => self.alternate_screen = false,
+                    b'h' => state.alternate_screen = true,
+                    b'l' => state.alternate_screen = false,
                     _ => {}
                 }
-                self.alternate_prefix_len = usize::from(byte == PREFIX[0]);
-            } else if byte == PREFIX[self.alternate_prefix_len] {
-                self.alternate_prefix_len += 1;
+                state.alternate_prefix_len = usize::from(byte == PREFIX[0]);
+            } else if byte == PREFIX[state.alternate_prefix_len] {
+                state.alternate_prefix_len += 1;
             } else {
-                self.alternate_prefix_len = usize::from(byte == PREFIX[0]);
+                state.alternate_prefix_len = usize::from(byte == PREFIX[0]);
             }
         }
+    }
+
+    pub(crate) fn alternate_screen(&self) -> bool {
+        self.0.lock().is_ok_and(|state| state.alternate_screen)
     }
 }
 

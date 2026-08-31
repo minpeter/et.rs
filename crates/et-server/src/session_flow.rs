@@ -1,13 +1,15 @@
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
-use et_core::flow_control::{is_terminal_output, FlowControlMode, OutputQueue};
+use et_core::flow_control::{FlowControlMode, OutputQueue, QueuePushError};
 use et_core::packet::Packet;
 use et_net::connection::ConnError;
 
 use super::{ActiveSession, SessionError, FLOW_CONTROL_BUFFER_BYTES};
 
 #[path = "session_flow_write.rs"]
-mod writer;
+pub(super) mod writer;
+#[cfg(test)]
+pub(super) use writer::FlowWriteResult;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StopMode {
@@ -46,30 +48,21 @@ impl FlowControl {
     }
 
     pub(super) fn enqueue(&self, packet: Packet) -> Result<(), SessionError> {
-        let terminal = is_terminal_output(&packet);
-        let mut pending = Some(packet);
         let mut state = self.state.lock().map_err(|_| SessionError::Unavailable)?;
-        loop {
-            if state.stop != StopMode::Running {
-                return Err(SessionError::Unavailable);
+        if state.stop != StopMode::Running {
+            return Err(SessionError::Unavailable);
+        }
+        match state.queue.push(packet) {
+            Ok(()) => {
+                drop(state);
+                self.wake.notify_one();
+                Ok(())
             }
-            let packet = pending.take().ok_or(SessionError::Unavailable)?;
-            match state.queue.push(packet) {
-                Ok(()) => {
-                    drop(state);
-                    self.wake.notify_one();
-                    return Ok(());
-                }
-                Err(_packet) if terminal => {
-                    return Err(SessionError::Connection(ConnError::Backpressure));
-                }
-                Err(packet) => {
-                    pending = Some(packet);
-                    state = self
-                        .wake
-                        .wait(state)
-                        .map_err(|_| SessionError::Unavailable)?;
-                }
+            Err(QueuePushError::Full(_packet)) => {
+                Err(SessionError::Connection(ConnError::Backpressure))
+            }
+            Err(QueuePushError::Oversized(_packet)) => {
+                Err(SessionError::Connection(ConnError::PacketTooLarge))
             }
         }
     }
@@ -202,7 +195,7 @@ impl FlowControl {
     pub(super) fn complete(
         &self,
         packet: Packet,
-        result: &Result<(), SessionError>,
+        result: &writer::FlowWriteResult,
         connected: bool,
     ) -> bool {
         let Ok(mut state) = self.state.lock() else {
@@ -211,18 +204,13 @@ impl FlowControl {
         state.in_flight = false;
         state.connected = connected;
         match result {
-            Ok(()) => state.queue.complete(&packet),
-            Err(SessionError::Connection(ConnError::Backpressure)) => {
-                state.queue.restore_front(packet);
-            }
-            Err(SessionError::Connection(ConnError::Io(_))) => {
-                // The replay writer already owns this packet. A live transport
-                // failure therefore disconnects and waits for recovery without
-                // enqueueing a duplicate or turning graceful state into hard.
+            writer::FlowWriteResult::Delivered => state.queue.complete(&packet),
+            writer::FlowWriteResult::BeforeReplay(_error) => state.queue.restore_front(packet),
+            writer::FlowWriteResult::ReplayOwned(_error) => {
                 state.queue.complete(&packet);
                 state.connected = false;
             }
-            Err(error) => {
+            writer::FlowWriteResult::Fatal(error) => {
                 state.queue.complete(&packet);
                 crate::diag::info(format!("flow-control writer stopped: {error}"));
                 state.stop = StopMode::Hard;

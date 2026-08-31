@@ -7,8 +7,12 @@ use std::time::Duration;
 
 use et_core::proto::FlowControlMode;
 use et_net::connection::Connection;
+use prost::Message;
 
-use super::{session_flow::FlowControl, ActiveSession, SessionError};
+use super::{
+    session_flow::{FlowControl, FlowWriteResult},
+    ActiveSession, SessionError,
+};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -84,6 +88,53 @@ fn hard_shutdown_wakes_and_joins_a_deliberately_blocked_writer() {
 }
 
 #[test]
+fn flow_writer_clone_failure_restores_and_later_delivers_once() {
+    // Given: the flow writer owns one packet and socket cloning fails before replay admission.
+    let (server, mut client) = connection_pair();
+    client.set_io_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
+    let session = ActiveSession::new(
+        server,
+        &terminal,
+        Some(FlowControlMode::Backpressure as i32),
+    )
+    .unwrap();
+    let flow = session.flow_control.as_ref().unwrap();
+    flow.enqueue(et_core::packet::Packet::new(40, b"clone-retry".as_slice()))
+        .unwrap();
+    let packet = flow.next_packet().unwrap();
+
+    // When: preparation injects a clone failure, then normal preparation retries it.
+    let (failed, connected) = super::session_flow::writer::write_packet_with(
+        &session,
+        flow,
+        &packet,
+        |connection, packet| {
+            connection.prepare_write_packet_with(packet.header(), packet.payload(), |_| {
+                Err(std::io::Error::other("injected clone failure"))
+            })
+        },
+    );
+    assert!(matches!(failed, FlowWriteResult::BeforeReplay(_)));
+    assert!(flow.complete(packet, &failed, connected));
+    let restored = flow.next_packet().unwrap();
+    let (delivered, connected) =
+        super::session_flow::writer::write_packet(&session, flow, &restored);
+    assert!(flow.complete(restored, &delivered, connected));
+
+    // Then: the restored plaintext is encrypted under one sequence and delivered once.
+    let received = client.read_packet().unwrap();
+    assert_eq!(
+        (received.header(), received.payload()),
+        (40, b"clone-retry".as_slice())
+    );
+    client
+        .set_io_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    assert!(client.read_packet().is_err());
+}
+
+#[test]
 fn live_send_reset_disconnects_without_requeueing_replay_owned_packet() {
     // Given: one in-flight packet followed by queued output.
     let flow = FlowControl::new(et_core::flow_control::FlowControlMode::Backpressure);
@@ -94,9 +145,9 @@ fn live_send_reset_disconnects_without_requeueing_replay_owned_packet() {
     let in_flight = flow.next_packet().unwrap();
 
     // When: the live socket resets after replay accepted the packet.
-    let error = Err(SessionError::Connection(et_net::connection::ConnError::Io(
-        std::io::ErrorKind::ConnectionReset.into(),
-    )));
+    let error = FlowWriteResult::ReplayOwned(SessionError::Connection(
+        et_net::connection::ConnError::Io(std::io::ErrorKind::ConnectionReset.into()),
+    ));
     assert!(flow.complete(in_flight, &error, false));
     flow.resume(true);
 
@@ -124,9 +175,9 @@ fn live_send_reset_recovers_replay_then_sends_queued_and_subsequent_once() {
         .unwrap();
     drop(prepared);
     sender.disconnect();
-    let reset = Err(SessionError::Connection(et_net::connection::ConnError::Io(
-        std::io::ErrorKind::ConnectionReset.into(),
-    )));
+    let reset = FlowWriteResult::ReplayOwned(SessionError::Connection(
+        et_net::connection::ConnError::Io(std::io::ErrorKind::ConnectionReset.into()),
+    ));
     assert!(flow.complete(replay, &reset, false));
 
     // When: both peers recover on a replacement socket.
@@ -153,11 +204,10 @@ fn live_send_reset_recovers_replay_then_sends_queued_and_subsequent_once() {
                 .unwrap();
         }
         let packet = flow.next_packet().unwrap();
-        let result = sender
+        sender
             .write_packet(packet.header(), packet.payload())
-            .map_err(SessionError::Connection);
-        assert!(flow.complete(packet, &result, sender.connected()));
-        assert!(result.is_ok());
+            .unwrap();
+        assert!(flow.complete(packet, &FlowWriteResult::Delivered, sender.connected()));
     }
     for expected in [
         (51, b"replay".as_slice()),
@@ -174,6 +224,106 @@ fn live_send_reset_recovers_replay_then_sends_queued_and_subsequent_once() {
         receiver.read_packet().is_err(),
         "recovered output was duplicated"
     );
+}
+
+#[test]
+fn recover_hold_post_admission_failure_replays_without_plaintext_duplicate() {
+    // Given: post-install held plaintext is accepted by replay, then live send fails.
+    let (server, mut client) = connection_pair();
+    let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
+    let session = ActiveSession::new(server, &terminal, None).unwrap();
+    session
+        .recover_hold
+        .lock()
+        .unwrap()
+        .push((54, b"held-once".to_vec()));
+    let result = session.flush_recover_hold_with(|connection, header, payload| {
+        let prepared = connection.prepare_write_packet(header, payload)?;
+        drop(prepared);
+        connection.disconnect();
+        Err(et_net::connection::WritePacketError::ReplayOwned(
+            et_net::connection::ConnError::Io(std::io::ErrorKind::ConnectionReset.into()),
+        ))
+    });
+    assert!(result.is_err());
+    assert!(session.recover_hold.lock().unwrap().is_empty());
+
+    // When: the installed connection recovers again.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let connector = thread::spawn(move || TcpStream::connect(address).unwrap());
+    let (new_server, _) = listener.accept().unwrap();
+    let new_client = connector.join().unwrap();
+    let (client_tx, client_rx) = mpsc::sync_channel(0);
+    let recovering_client = thread::spawn(move || {
+        client.recover(new_client).unwrap();
+        client_tx.send(client).unwrap();
+    });
+    session
+        .connection
+        .lock()
+        .unwrap()
+        .recover(new_server)
+        .unwrap();
+    let mut client = client_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+    recovering_client.join().unwrap();
+
+    // Then: replay supplies the packet exactly once; no plaintext duplicate was retained.
+    let packet = client.read_packet().unwrap();
+    assert_eq!(
+        (packet.header(), packet.payload()),
+        (54, b"held-once".as_slice())
+    );
+    client
+        .set_io_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    assert!(client.read_packet().is_err());
+}
+
+#[test]
+fn full_control_lane_rejects_nonblocking_while_discard_terminal_and_recovery_progress() {
+    // Given: discard mode's lossless control lane is full.
+    let flow = FlowControl::new(et_core::flow_control::FlowControlMode::Discard);
+    let control = et_core::packet::Packet::new(61, vec![1; 1024]);
+    loop {
+        match flow.enqueue(control.clone()) {
+            Ok(()) => {}
+            Err(SessionError::Connection(et_net::connection::ConnError::Backpressure)) => break,
+            Err(error) => panic!("unexpected control admission: {error}"),
+        }
+    }
+
+    // When: terminal output arrives and a recovery pause/resume completes.
+    let terminal = et_core::packet::Packet::new(
+        et_core::proto::TerminalPacketType::TerminalBuffer as u8,
+        et_core::proto::TerminalBuffer {
+            buffer: Some(b"newest".to_vec()),
+        }
+        .encode_to_vec(),
+    );
+    flow.enqueue(terminal).unwrap();
+    flow.pause().unwrap();
+    flow.resume(true);
+
+    // Then: the bridge-facing full result was immediate and terminal remains serviceable.
+    let next = flow.next_packet().unwrap();
+    assert_eq!(
+        next.header(),
+        et_core::proto::TerminalPacketType::TerminalBuffer as u8
+    );
+}
+
+#[test]
+fn oversized_control_fails_permanently_without_waiting() {
+    let flow = FlowControl::new(et_core::flow_control::FlowControlMode::Backpressure);
+    let oversized = et_core::packet::Packet::new(62, vec![0; 64 * 1024]);
+
+    assert!(matches!(
+        flow.enqueue(oversized),
+        Err(SessionError::Connection(
+            et_net::connection::ConnError::PacketTooLarge
+        ))
+    ));
 }
 
 #[test]

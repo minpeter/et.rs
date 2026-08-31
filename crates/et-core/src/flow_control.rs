@@ -10,16 +10,18 @@ use crate::proto::{TerminalBuffer, TerminalPacketType};
 const FRAME_BYTES: usize = std::mem::size_of::<u32>();
 pub(crate) const MAX_PACKETS_PER_LANE: usize = 4096;
 
-/// Behavior when terminal output reaches the configured queue limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlowControlMode {
-    /// Stop accepting output until queued bytes are drained.
     Backpressure,
-    /// Remove the oldest terminal output while retaining control packets.
     Discard,
 }
 
-/// Packet queue with separately bounded terminal and lossless-control lanes.
+#[derive(Debug, PartialEq, Eq)]
+pub enum QueuePushError {
+    Full(Packet),
+    Oversized(Packet),
+}
+
 pub struct OutputQueue {
     mode: FlowControlMode,
     limit: usize,
@@ -47,7 +49,7 @@ impl OutputQueue {
         }
     }
 
-    pub fn push(&mut self, packet: Packet) -> Result<(), Packet> {
+    pub fn push(&mut self, packet: Packet) -> Result<(), QueuePushError> {
         if is_terminal_output(&packet) {
             self.push_terminal(packet)
         } else {
@@ -55,25 +57,25 @@ impl OutputQueue {
         }
     }
 
-    fn push_terminal(&mut self, mut packet: Packet) -> Result<(), Packet> {
+    fn push_terminal(&mut self, mut packet: Packet) -> Result<(), QueuePushError> {
         if packet_cost(&packet) > self.limit {
             if self.mode == FlowControlMode::Backpressure {
-                return Err(packet);
+                return Err(QueuePushError::Oversized(packet));
             }
-            packet = truncate_terminal(packet, self.limit)?;
+            packet = truncate_terminal(packet, self.limit).map_err(QueuePushError::Oversized)?;
         }
         let wanted = packet_cost(&packet);
         if self.mode == FlowControlMode::Backpressure
             && (self.terminal_bytes.saturating_add(wanted) > self.limit
                 || self.terminal_packets >= MAX_PACKETS_PER_LANE)
         {
-            return Err(packet);
+            return Err(QueuePushError::Full(packet));
         }
         while self.terminal_bytes.saturating_add(wanted) > self.limit
             || self.terminal_packets >= MAX_PACKETS_PER_LANE
         {
             let Some(removed) = self.terminal.pop_front() else {
-                return Err(packet);
+                return Err(QueuePushError::Full(packet));
             };
             self.terminal_bytes -= packet_cost(&removed);
             self.terminal_packets -= 1;
@@ -84,13 +86,15 @@ impl OutputQueue {
         Ok(())
     }
 
-    fn push_control(&mut self, packet: Packet) -> Result<(), Packet> {
+    fn push_control(&mut self, packet: Packet) -> Result<(), QueuePushError> {
         let wanted = packet_cost(&packet);
-        if wanted > self.limit
-            || self.control_bytes.saturating_add(wanted) > self.limit
+        if wanted > self.limit {
+            return Err(QueuePushError::Oversized(packet));
+        }
+        if self.control_bytes.saturating_add(wanted) > self.limit
             || self.control_packets >= MAX_PACKETS_PER_LANE
         {
-            return Err(packet);
+            return Err(QueuePushError::Full(packet));
         }
         self.control_bytes += wanted;
         self.control_packets += 1;
@@ -98,7 +102,6 @@ impl OutputQueue {
         Ok(())
     }
 
-    /// Remove the next packet while retaining its capacity reservation.
     pub fn take(&mut self) -> Option<Packet> {
         let packet = if self.prefer_terminal {
             self.terminal
@@ -113,7 +116,6 @@ impl OutputQueue {
         Some(packet)
     }
 
-    /// Release the reservation for a packet successfully handed to replay.
     pub fn complete(&mut self, packet: &Packet) {
         if is_terminal_output(packet) {
             self.terminal_bytes -= packet_cost(packet);
@@ -124,7 +126,6 @@ impl OutputQueue {
         }
     }
 
-    /// Restore a packet whose replay writer refused admission.
     pub fn restore_front(&mut self, packet: Packet) {
         if is_terminal_output(&packet) {
             self.terminal.push_front(packet);

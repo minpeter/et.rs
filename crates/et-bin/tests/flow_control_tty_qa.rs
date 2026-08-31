@@ -76,10 +76,12 @@ fn flow_control_keeps_ctrl_c_and_prompt_responsive_on_a_slow_link() {
 
         writeln!(
             writer,
-            "printf 'FLOW-%s\\n' START; \
-             i=0; while [ \"$i\" -lt 65536 ]; do \
+            "interrupted=; \
+             trap 'interrupted=1; printf \"\\nFLOW-INTERRUPTED\\n\"' INT; \
+             printf 'FLOW-%s\\n' START; \
+             i=0; while [ -z \"$interrupted\" ] && [ \"$i\" -lt 65536 ]; do \
              printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'; \
-             i=$((i + 1)); done"
+             i=$((i + 1)); done; trap - INT"
         )
         .unwrap();
         let startup_timeout = Duration::from_secs(10);
@@ -102,16 +104,24 @@ fn flow_control_keeps_ctrl_c_and_prompt_responsive_on_a_slow_link() {
             output.extend(chunk);
         }
         let interrupted = Instant::now();
-        writer
-            .write_all(b"\x03printf 'FLOW-%s\\n' PROMPT\n")
-            .unwrap();
         let prompt_timeout = MAX_PROMPT_LATENCY;
-        let prompt = receive_until(
+        let deadline = interrupted + prompt_timeout;
+        writer.write_all(b"\x03").unwrap();
+        let interrupt = receive_until(
             &receiver,
             output.clone(),
-            b"FLOW-PROMPT\r\n",
+            b"FLOW-INTERRUPTED\r\n",
             prompt_timeout,
         );
+        let prompt = interrupt.and_then(|output| {
+            writer
+                .write_all(b"printf 'FLOW-%s\\n' PROMPT\n")
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)?;
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(mpsc::RecvTimeoutError::Timeout)?;
+            receive_until(&receiver, output, b"FLOW-PROMPT\r\n", remaining)
+        });
         let latency = interrupted.elapsed();
         let latency_failed = prompt.is_err();
         if mode == "none" {

@@ -1,6 +1,6 @@
 use prost::Message;
 
-use crate::flow_control::{FlowControlMode, OutputQueue, MAX_PACKETS_PER_LANE};
+use crate::flow_control::{FlowControlMode, OutputQueue, QueuePushError, MAX_PACKETS_PER_LANE};
 use crate::packet::Packet;
 use crate::proto::{TerminalBuffer, TerminalPacketType};
 
@@ -31,7 +31,10 @@ fn backpressure_is_lossless_and_refuses_capacity_overflow() {
     let second = terminal(&[2; 40]);
 
     assert!(queue.push(first.clone()).is_ok());
-    assert_eq!(queue.push(second.clone()), Err(second));
+    assert_eq!(
+        queue.push(second.clone()),
+        Err(QueuePushError::Full(second))
+    );
     assert_eq!(queue.pop(), Some(first));
     assert_eq!(queue.pop(), None);
 }
@@ -74,11 +77,25 @@ fn oversized_terminal_packet_truncates_decoded_bytes_and_reencodes() {
 }
 
 #[test]
+fn oversized_control_is_permanent_not_temporary_full() {
+    let packet = control(&[0; LIMIT]);
+    let mut queue = OutputQueue::new(FlowControlMode::Backpressure, LIMIT);
+
+    assert_eq!(
+        queue.push(packet.clone()),
+        Err(QueuePushError::Oversized(packet))
+    );
+}
+
+#[test]
 fn framing_bytes_are_included_in_capacity() {
     let packet = control(&[0; LIMIT - crate::packet::HEADER_LEN]);
     let mut queue = OutputQueue::new(FlowControlMode::Backpressure, LIMIT);
 
-    assert_eq!(queue.push(packet.clone()), Err(packet));
+    assert_eq!(
+        queue.push(packet.clone()),
+        Err(QueuePushError::Oversized(packet))
+    );
 }
 
 #[test]
@@ -90,6 +107,23 @@ fn header_only_packets_are_packet_aware_and_never_look_empty() {
     assert!(!queue.is_empty());
     assert_eq!(queue.pop(), Some(packet));
     assert!(queue.is_empty());
+}
+
+#[test]
+fn full_control_lane_does_not_prevent_discard_terminal_progress() {
+    let mut queue = OutputQueue::new(FlowControlMode::Discard, 64);
+    let held = control(&[1; 58]);
+    queue.push(held.clone()).unwrap();
+    let rejected = control(&[]);
+    assert_eq!(
+        queue.push(rejected.clone()),
+        Err(QueuePushError::Full(rejected))
+    );
+    let output = terminal(&[2; 40]);
+    queue.push(output.clone()).unwrap();
+
+    assert_eq!(queue.pop(), Some(output));
+    assert_eq!(queue.pop(), Some(held));
 }
 
 #[test]
@@ -121,7 +155,10 @@ fn in_flight_packet_retains_exact_packet_count_capacity() {
     }
     let in_flight = queue.take().unwrap();
 
-    assert_eq!(queue.push(packet.clone()), Err(packet));
+    assert_eq!(
+        queue.push(packet.clone()),
+        Err(QueuePushError::Full(packet))
+    );
     queue.complete(&in_flight);
     assert!(queue.push(control(&[])).is_ok());
 }
@@ -134,7 +171,10 @@ fn failed_send_restoration_retains_its_capacity_reservation() {
     queue.push(first.clone()).unwrap();
     let in_flight = queue.take().unwrap();
 
-    assert_eq!(queue.push(second.clone()), Err(second));
+    assert_eq!(
+        queue.push(second.clone()),
+        Err(QueuePushError::Full(second))
+    );
     queue.restore_front(in_flight);
     assert!(queue.bytes() <= LIMIT);
     assert_eq!(queue.pop(), Some(first));

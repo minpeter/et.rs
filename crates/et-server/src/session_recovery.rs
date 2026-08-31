@@ -4,7 +4,7 @@ use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use et_core::proto::TerminalPacketType;
-use et_net::connection::DEFAULT_RECOVERY_TIMEOUT;
+use et_net::connection::{WritePacketError, DEFAULT_RECOVERY_TIMEOUT};
 
 use super::{ActiveSession, SessionError, RECOVERY_LOCK_TIMEOUT};
 
@@ -84,6 +84,15 @@ impl ActiveSession {
     }
 
     fn flush_recover_hold(&self) -> Result<(), SessionError> {
+        self.flush_recover_hold_with(|connection, header, payload| {
+            connection.write_packet_owned(header, payload)
+        })
+    }
+
+    pub(super) fn flush_recover_hold_with<F>(&self, mut write: F) -> Result<(), SessionError>
+    where
+        F: FnMut(&mut et_net::connection::Connection, u8, &[u8]) -> Result<(), WritePacketError>,
+    {
         loop {
             let batch = {
                 let mut hold = self
@@ -98,21 +107,28 @@ impl ActiveSession {
             let mut connection = lock_timeout(&self.connection, RECOVERY_LOCK_TIMEOUT)?;
             let mut remaining = batch.into_iter();
             while let Some((header, payload)) = remaining.next() {
-                if let Err(error) = connection.write_packet(header, &payload) {
-                    // Release the connection lock before taking `recover_hold`
-                    // (send_packet may hold hold → connection; reverse deadlocks).
+                if let Err(error) = write(&mut connection, header, &payload) {
                     drop(connection);
-                    // Put the failed packet and unwritten tail back ahead of
-                    // anything concurrent senders queued after we took `batch`.
                     let mut hold = self
                         .recover_hold
                         .lock()
                         .map_err(|_| SessionError::Unavailable)?;
                     let concurrent = std::mem::take(&mut *hold);
-                    hold.push((header, payload));
-                    hold.extend(remaining);
-                    hold.extend(concurrent);
-                    return Err(SessionError::Connection(error));
+                    match error {
+                        WritePacketError::BeforeReplay(error) => {
+                            hold.push((header, payload));
+                            hold.extend(remaining);
+                            hold.extend(concurrent);
+                            return Err(SessionError::Connection(error));
+                        }
+                        WritePacketError::ReplayOwned(error) => {
+                            // Replay owns the failed packet; retain only the
+                            // unwritten tail and concurrent plaintext.
+                            hold.extend(remaining);
+                            hold.extend(concurrent);
+                            return Err(SessionError::Connection(error));
+                        }
+                    }
                 }
             }
         }

@@ -33,6 +33,7 @@ pub enum ConnError {
     Recover(RecoverError),
     Encrypt(EncryptError),
     Backpressure,
+    PacketTooLarge,
     SequenceOutOfRange(i64),
     InvalidRecoverySequence(Option<i32>),
 }
@@ -48,12 +49,28 @@ pub struct PreparedWrite {
     live: Option<(TcpStream, Vec<u8>, Duration)>,
 }
 
+#[derive(Debug)]
+pub enum WritePacketError {
+    BeforeReplay(ConnError),
+    ReplayOwned(ConnError),
+}
+
+impl WritePacketError {
+    pub fn into_inner(self) -> ConnError {
+        match self {
+            Self::BeforeReplay(error) | Self::ReplayOwned(error) => error,
+        }
+    }
+}
+
 impl PreparedWrite {
-    pub fn send(self) -> Result<(), ConnError> {
+    pub fn send(self) -> Result<(), WritePacketError> {
         let Some((mut stream, frame, timeout)) = self.live else {
             return Ok(());
         };
-        write_live_frame(&mut stream, &frame, timeout).map_err(ConnError::Io)
+        write_live_frame(&mut stream, &frame, timeout)
+            .map_err(ConnError::Io)
+            .map_err(WritePacketError::ReplayOwned)
     }
 }
 
@@ -76,6 +93,15 @@ impl Connection {
     }
 
     pub fn write_packet(&mut self, header: u8, payload: &[u8]) -> Result<(), ConnError> {
+        self.write_packet_owned(header, payload)
+            .map_err(WritePacketError::into_inner)
+    }
+
+    pub fn write_packet_owned(
+        &mut self,
+        header: u8,
+        payload: &[u8],
+    ) -> Result<(), WritePacketError> {
         let prepared = self.prepare_write_packet(header, payload)?;
         if let Err(error) = prepared.send() {
             self.disconnect();
@@ -88,16 +114,16 @@ impl Connection {
         &mut self,
         header: u8,
         payload: &[u8],
-    ) -> Result<PreparedWrite, ConnError> {
+    ) -> Result<PreparedWrite, WritePacketError> {
         self.prepare_write_packet_with(header, payload, TcpStream::try_clone)
     }
 
-    fn prepare_write_packet_with<F>(
+    pub fn prepare_write_packet_with<F>(
         &mut self,
         header: u8,
         payload: &[u8],
         clone_stream: F,
-    ) -> Result<PreparedWrite, ConnError>
+    ) -> Result<PreparedWrite, WritePacketError>
     where
         F: FnOnce(&TcpStream) -> io::Result<TcpStream>,
     {
@@ -112,14 +138,23 @@ impl Connection {
         let live_stream = self
             .writer
             .connected()
-            .then(|| clone_stream(&self.stream).map_err(ConnError::Io))
+            .then(|| {
+                clone_stream(&self.stream)
+                    .map_err(ConnError::Io)
+                    .map_err(WritePacketError::BeforeReplay)
+            })
             .transpose()?;
-        match self.writer.write_packet(header, payload)? {
+        match self
+            .writer
+            .write_packet(header, payload)
+            .map_err(ConnError::Encrypt)
+            .map_err(WritePacketError::BeforeReplay)?
+        {
             WriterOutcome::Send(frame) => Ok(PreparedWrite {
                 live: live_stream.map(|stream| (stream, frame, self.live_write_timeout)),
             }),
             WriterOutcome::BufferedOnly => Ok(PreparedWrite { live: None }),
-            WriterOutcome::Skipped => Err(ConnError::Backpressure),
+            WriterOutcome::Skipped => Err(WritePacketError::BeforeReplay(ConnError::Backpressure)),
         }
     }
 
@@ -344,7 +379,10 @@ mod tests {
         let failure = sender.prepare_write_packet_with(7, b"once", |_| {
             Err(io::Error::other("injected clone failure"))
         });
-        assert!(matches!(failure, Err(ConnError::Io(_))));
+        assert!(matches!(
+            failure,
+            Err(WritePacketError::BeforeReplay(ConnError::Io(_)))
+        ));
         assert_eq!(sender.writer_sequence(), 0);
         sender.write_packet(7, b"once").unwrap();
 

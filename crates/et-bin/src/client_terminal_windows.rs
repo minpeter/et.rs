@@ -60,6 +60,17 @@ where
     let mut pending_forward: Option<et_core::packet::Packet> = None;
     let mut pending_output: Option<et_core::packet::Packet> = None;
     loop {
+        console_output
+            .check_error()
+            .map_err(|error| terminal_io("writing terminal output", error))?;
+        if auto_cursor_report {
+            for _ in 0..console_output
+                .take_cursor_reports()
+                .map_err(|error| terminal_io("reading console confirmations", error))?
+            {
+                let _ = send_buffer(connection, crate::client_terminal::CURSOR_REPORT_REPLY);
+            }
+        }
         let mut reconnect_needed = false;
         // Retry the held packet first: draining the forwarder's outbound
         // queue below is what frees worker capacity, so this makes progress
@@ -72,7 +83,7 @@ where
         if let Some(packet) = pending_output.take() {
             match route_server_packet(packet, terminal_enabled, terminal_modes, &console_output)? {
                 DisplayOutcome::Displayed { cursor_report }
-                    if cursor_report && auto_cursor_report =>
+                    if cursor_report && auto_cursor_report && !console_output.is_async() =>
                 {
                     let _ = send_buffer(connection, crate::client_terminal::CURSOR_REPORT_REPLY);
                 }
@@ -136,7 +147,9 @@ where
                             &console_output,
                         )? {
                             DisplayOutcome::Displayed { cursor_report }
-                                if cursor_report && auto_cursor_report =>
+                                if cursor_report
+                                    && auto_cursor_report
+                                    && !console_output.is_async() =>
                             {
                                 let _ = send_buffer(
                                     connection,
@@ -216,9 +229,9 @@ fn route_server_packet(
     output: &crate::client_output::ConsoleOutput,
 ) -> Result<DisplayOutcome, ClientError> {
     if terminal_enabled || packet.header() == TerminalPacketType::KeepAlive as u8 {
-        return crate::client_terminal::display_packet_with(packet, terminal_modes, |bytes| {
+        return crate::client_terminal::display_packet_with(packet, |bytes| {
             output
-                .try_write(bytes)
+                .try_write(bytes, terminal_modes)
                 .map_err(|error| terminal_io("writing terminal output", error))
         });
     }

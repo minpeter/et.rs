@@ -76,6 +76,8 @@ fn run_mode_poll(
     // A complete terminal packet already read from the local stream. Retain
     // ownership across backpressure instead of dropping it or reading ahead.
     let mut pending_terminal: Option<Packet> = None;
+    let mut terminal_closing = false;
+    let mut terminal_eof = false;
     loop {
         let mut resume_outbound_drain = false;
         if session.is_shutting_down() {
@@ -138,41 +140,34 @@ fn run_mode_poll(
             }
             (connected, connection_generation) = session.connection_state()?;
         }
-        let terminal_closed = terminal_events.intersects(PollFlags::HUP | PollFlags::ERR);
-        if terminal_closed || terminal_events.contains(PollFlags::IN) {
-            loop {
-                match read_terminal_packet(&mut terminal, &mut decoder) {
-                    Ok(Some(packet)) => {
-                        let packet = if mode == BridgeMode::Terminal {
-                            validate_terminal_output(&packet)?;
-                            packet
-                        } else {
-                            jumphost_terminal_packet(&session, packet)?
-                        };
-                        decoder = LocalPacketDecoder::new();
-                        pending_terminal = send_or_hold(
-                            &session,
-                            packet,
-                            &mut connected,
-                            &mut connection_generation,
-                        )?;
-                    }
-                    Ok(None) if terminal_closed => continue,
-                    Ok(None) => break,
-                    Err(SessionError::Io(error))
-                        if terminal_closed && error.kind() == io::ErrorKind::UnexpectedEof =>
-                    {
-                        break;
-                    }
-                    Err(error) => return Err(error),
+        terminal_closing |= terminal_events.intersects(PollFlags::HUP | PollFlags::ERR);
+        if pending_terminal.is_none()
+            && !terminal_eof
+            && (terminal_closing || terminal_events.contains(PollFlags::IN))
+        {
+            match read_terminal_packet(&mut terminal, &mut decoder) {
+                Ok(Some(packet)) => {
+                    let packet = if mode == BridgeMode::Terminal {
+                        validate_terminal_output(&packet)?;
+                        packet
+                    } else {
+                        jumphost_terminal_packet(&session, packet)?
+                    };
+                    decoder = LocalPacketDecoder::new();
+                    pending_terminal =
+                        send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
                 }
-                if !terminal_closed {
-                    break;
+                Ok(None) => {}
+                Err(SessionError::Io(error))
+                    if terminal_closing && error.kind() == io::ErrorKind::UnexpectedEof =>
+                {
+                    terminal_eof = true;
                 }
+                Err(error) => return Err(error),
             }
-            if terminal_closed {
-                return Ok(());
-            }
+        }
+        if terminal_eof && pending_terminal.is_none() {
+            return Ok(());
         }
         // Recovery authentication may read more than its proof packet into
         // BackedReader. Drain it after the wake even when the new socket no
@@ -180,7 +175,7 @@ fn run_mode_poll(
         let client_data_ready =
             connected && (client_events_are_stale || client_events.contains(PollFlags::IN));
         if client_data_ready {
-            while pending_forward.is_none() {
+            while pending_forward.is_none() && pending_outbound.is_none() {
                 match session.try_read_packet() {
                     // Jumphost relays every packet verbatim to the jump
                     // terminal, which owns the destination connection.
@@ -191,7 +186,18 @@ fn run_mode_poll(
                     Ok(Some(packet)) if is_forward_packet(packet.header()) => {
                         pending_forward = forwarder.try_receive(packet).map_err(forward_error)?;
                     }
-                    Ok(Some(packet)) => forward_client_packet(&session, &mut terminal, packet)?,
+                    Ok(Some(packet)) => {
+                        if let Some(control) =
+                            forward_client_packet(&session, &mut terminal, packet)?
+                        {
+                            pending_outbound = send_or_hold(
+                                &session,
+                                control,
+                                &mut connected,
+                                &mut connection_generation,
+                            )?;
+                        }
+                    }
                     Ok(None) => break,
                     Err(error) => {
                         if client_transport_error(
@@ -312,7 +318,7 @@ fn run_mode_windows(
 
         // Client -> terminal / forwarder.
         if connected {
-            while pending_forward.is_none() {
+            while pending_forward.is_none() && pending_outbound.is_none() {
                 match session.try_read_packet() {
                     Ok(Some(packet)) => {
                         progress = true;
@@ -322,8 +328,15 @@ fn run_mode_windows(
                         } else if is_forward_packet(packet.header()) {
                             pending_forward =
                                 forwarder.try_receive(packet).map_err(forward_error)?;
-                        } else {
-                            forward_client_packet(&session, &mut terminal, packet)?;
+                        } else if let Some(control) =
+                            forward_client_packet(&session, &mut terminal, packet)?
+                        {
+                            pending_outbound = send_or_hold(
+                                &session,
+                                control,
+                                &mut connected,
+                                &mut connection_generation,
+                            )?;
                         }
                     }
                     Ok(None) => break,
@@ -591,13 +604,15 @@ fn forward_client_packet(
     session: &ActiveSession,
     terminal: &mut LocalStream,
     packet: Packet,
-) -> Result<(), SessionError> {
+) -> Result<Option<Packet>, SessionError> {
     match packet.header() {
         value
             if value == TerminalPacketType::TerminalBuffer as u8
                 || value == TerminalPacketType::TerminalInfo as u8 =>
         {
-            write_local_packet(terminal, &packet).map_err(SessionError::Io)
+            write_local_packet(terminal, &packet)
+                .map_err(SessionError::Io)
+                .map(|()| None)
         }
         header if header == TerminalPacketType::KeepAlive as u8 => {
             if let Some(ack) = et_core::keepalive::decode_ack(packet.payload()) {
@@ -606,10 +621,10 @@ fn forward_client_packet(
             // The echo acknowledges everything read from the client, letting
             // an et.rs client trim its own replay backup. Legacy peers
             // (upstream C++, released et.rs) ignore the payload.
-            session.send_packet(
+            Ok(Some(Packet::new(
                 TerminalPacketType::KeepAlive as u8,
-                &session.keepalive_ack()?,
-            )
+                session.keepalive_ack()?.to_vec(),
+            )))
         }
         _ => Err(SessionError::Io(io::Error::new(
             io::ErrorKind::InvalidData,

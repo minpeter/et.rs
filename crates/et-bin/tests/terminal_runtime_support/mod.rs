@@ -50,7 +50,18 @@ impl Fixture {
     }
 
     pub fn spawn_with_shell(&self, shell: &str) -> std::process::Child {
-        Command::new(env!("CARGO_BIN_EXE_et"))
+        self.spawn_session(shell, &[])
+    }
+
+    /// Spawn the session child with extra environment entries applied before
+    /// exec, so a test can seed server-side state the session reads at startup.
+    pub fn spawn_session(
+        &self,
+        shell: &str,
+        environment: &[(&str, &std::ffi::OsStr)],
+    ) -> std::process::Child {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_et"));
+        command
             .args([
                 "terminal",
                 "--session-child",
@@ -60,12 +71,23 @@ impl Fixture {
             ])
             .arg(&self.socket)
             .env("SHELL", shell)
-            .env_remove("COLORTERM")
+            .env_remove("COLORTERM");
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap()
+    }
+
+    /// Write a server-side file inside the fixture directory and return its path.
+    pub fn file(&self, name: &str, contents: &[u8]) -> std::path::PathBuf {
+        let path = self.directory.join(name);
+        fs::write(&path, contents).unwrap();
+        path
     }
 
     /// Wrapper that emits an ANSI palette color marker only when argv[1] is `-l`.

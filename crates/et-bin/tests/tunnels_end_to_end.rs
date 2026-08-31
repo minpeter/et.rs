@@ -190,6 +190,121 @@ fn imported_remote_bind_report_warns_and_keeps_usable_row_live() {
 }
 
 #[test]
+fn native_jumphost_relays_imported_remote_skip_report_and_acknowledgement() {
+    let mut destination = Stack::start();
+    let mut jump = Stack::start();
+    let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let occupied_port = occupied.local_addr().unwrap().port();
+    let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let backend_port = backend.local_addr().unwrap().port();
+    let echo = spawn_tcp_echo_once(backend, b"native-jump-report");
+    let usable_port = reserve_port();
+    let gate = destination.directory.join("native-jump-report-ready");
+    mkfifo(&gate);
+    let config = format!(
+        "hostname 127.0.0.1\nuser tester\n\
+         remoteforward {occupied_port} [127.0.0.1]:{backend_port}\n\
+         remoteforward {usable_port} [127.0.0.1]:{backend_port}\n"
+    );
+    let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env("PATH", &destination.directory)
+        .env("ET_SSH_COUNT", &destination.ssh_count)
+        .env("ET_SSH_CONFIG", config)
+        .env("ET_SSH_READY", &gate)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(["--logtostdout", "--terminal-path"])
+        .arg(&destination.terminal)
+        .args(["--serverfifo"])
+        .arg(&destination.router)
+        .args(["--jumphost", "jump.example", "--jport"])
+        .arg(jump.port.to_string())
+        .args(["--jserverfifo"])
+        .arg(&jump.router)
+        .arg("-N")
+        .arg(format!("tester@127.0.0.1:{}", destination.port))
+        .spawn()
+        .unwrap();
+
+    assert_eq!(await_fifo(&gate, &mut client), "ready");
+    assert_ready_tcp_round_trip(usable_port, b"native-jump-report");
+
+    stop(&mut client);
+    let mut output = String::new();
+    client
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert_eq!(
+        output
+            .lines()
+            .filter(|line| line.contains("WARNING"))
+            .count(),
+        1
+    );
+    drop(occupied);
+    echo.join().unwrap();
+    jump.shutdown();
+    destination.shutdown();
+}
+
+#[test]
+fn native_jumphost_explicit_remote_skip_aborts_and_releases_final_sibling() {
+    let mut destination = Stack::start();
+    let mut jump = Stack::start();
+    let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let occupied_port = occupied.local_addr().unwrap().port();
+    let sibling_port = reserve_port();
+    let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env("PATH", &destination.directory)
+        .env("ET_SSH_COUNT", &destination.ssh_count)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .args(["--terminal-path"])
+        .arg(&destination.terminal)
+        .args(["--serverfifo"])
+        .arg(&destination.router)
+        .args(["--jumphost", "jump.example", "--jport"])
+        .arg(jump.port.to_string())
+        .args(["--jserverfifo"])
+        .arg(&jump.router)
+        .args(["-N", "-r"])
+        .arg(format!("{occupied_port}:1"))
+        .arg("-r")
+        .arg(format!("{sibling_port}:1"))
+        .arg(format!("tester@127.0.0.1:{}", destination.port))
+        .spawn()
+        .unwrap();
+
+    let status = client
+        .wait_timeout(TIMEOUT)
+        .unwrap()
+        .expect("native jumphost explicit skip did not terminate the top-level client");
+    let mut error = String::new();
+    client
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut error)
+        .unwrap();
+
+    assert!(!status.success());
+    assert!(
+        error.contains("explicit reverse forwarding row could not bind"),
+        "{error}"
+    );
+    jump.shutdown();
+    destination.shutdown();
+    let rebound = TcpListener::bind((Ipv4Addr::LOCALHOST, sibling_port)).unwrap();
+    drop(rebound);
+    drop(occupied);
+}
+
+#[test]
 fn explicit_remote_bind_report_aborts_and_releases_sibling_listener() {
     let mut stack = Stack::start();
     let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();

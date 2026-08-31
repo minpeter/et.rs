@@ -48,7 +48,30 @@ pub fn run(
     payload.jumphost = Some(false);
 
     let mut destination = connect_destination(input, destination_host, destination_port, &payload)?;
-    relay(router, &mut destination)
+    write_local_packet(
+        &mut router,
+        &Packet::new(
+            TerminalPacketType::JumphostInit as u8,
+            destination.response_payload.clone(),
+        ),
+    )
+    .map_err(|error| format!("could not relay destination INITIAL_RESPONSE: {error}"))?;
+    if downstream_requires_ack(&destination.response_payload)? {
+        let acknowledgement = et_net::local_packet::read_local_packet(&mut router)
+            .map_err(|error| format!("could not read jumphost acknowledgement: {error}"))?;
+        if !is_acknowledgement(&acknowledgement) {
+            return Err("jumphost acknowledgement is malformed".to_owned());
+        }
+        destination
+            .connection
+            .write_packet(EtPacketType::Heartbeat as u8, &[])
+            .map_err(|error| format!("could not acknowledge destination response: {error}"))?;
+    }
+    destination
+        .connection
+        .set_io_timeout(None)
+        .map_err(|error| format!("could not clear the destination timeout: {error}"))?;
+    relay(router, &mut destination.connection)
 }
 
 fn read_jumphost_init(router: &mut LocalStream) -> Result<InitialPayload, String> {
@@ -64,12 +87,17 @@ fn read_jumphost_init(router: &mut LocalStream) -> Result<InitialPayload, String
         .map_err(|_| "JUMPHOST_INIT protobuf is malformed".to_owned())
 }
 
+struct DestinationHandshake {
+    connection: Connection,
+    response_payload: Vec<u8>,
+}
+
 fn connect_destination(
     input: &CredentialInput,
     host: &str,
     port: u16,
     payload: &InitialPayload,
-) -> Result<Connection, String> {
+) -> Result<DestinationHandshake, String> {
     let key = passkey_to_key(&input.passkey).ok_or_else(|| "invalid passkey".to_owned())?;
     let mut last_error = String::from("Connect Timeout");
     for _ in 0..CONNECT_ATTEMPTS {
@@ -90,7 +118,7 @@ fn try_connect_once(
     host: &str,
     port: u16,
     payload: &InitialPayload,
-) -> Result<Connection, String> {
+) -> Result<DestinationHandshake, String> {
     let addresses = (host, port)
         .to_socket_addrs()
         .map_err(|error| format!("could not resolve {host}: {error}"))?;
@@ -145,15 +173,22 @@ fn try_connect_once(
     if packet.header() != EtPacketType::InitialResponse as u8 {
         return Err("Missing initial response!".to_owned());
     }
-    let response = InitialResponse::decode(packet.payload())
-        .map_err(|_| "malformed INITIAL_RESPONSE".to_owned())?;
-    if let Some(error) = response.error {
-        return Err(format!("Error initializing connection: {error}"));
-    }
-    connection
-        .set_io_timeout(None)
-        .map_err(|error| format!("could not clear the destination timeout: {error}"))?;
-    Ok(connection)
+    Ok(DestinationHandshake {
+        connection,
+        response_payload: packet.payload().to_vec(),
+    })
+}
+
+fn downstream_requires_ack(payload: &[u8]) -> Result<bool, String> {
+    InitialResponse::decode(payload)
+        .map(|response| response.error.is_some())
+        .map_err(|_| "destination sent a malformed INITIAL_RESPONSE".to_owned())
+}
+
+fn is_acknowledgement(packet: &Packet) -> bool {
+    !packet.is_encrypted()
+        && packet.header() == EtPacketType::Heartbeat as u8
+        && packet.payload().is_empty()
 }
 
 /// Relay packets verbatim between the local router and the destination.
@@ -306,5 +341,29 @@ fn read_router_packet(
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(format!("could not read the router: {error}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::downstream_requires_ack;
+    use et_core::proto::InitialResponse;
+    use prost::Message;
+
+    #[test]
+    fn malformed_downstream_initial_response_fails_closed() {
+        assert_eq!(
+            downstream_requires_ack(&[0xff]),
+            Err("destination sent a malformed INITIAL_RESPONSE".to_owned())
+        );
+        assert_eq!(
+            downstream_requires_ack(
+                &InitialResponse {
+                    error: Some("ordinary fatal".to_owned()),
+                }
+                .encode_to_vec()
+            ),
+            Ok(true)
+        );
     }
 }

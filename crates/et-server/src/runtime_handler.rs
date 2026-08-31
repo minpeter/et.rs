@@ -17,6 +17,7 @@ use crate::session::ActiveSession;
 use crate::session_table::SessionClaim;
 
 const LEGACY_UNTRUSTED_ORIGIN_MARKER: &str = "ET_RS_SSH_CONFIG_REMOTE_FORWARD";
+const JUMPHOST_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 pub(crate) fn handle(
     stream: TcpStream,
@@ -341,18 +342,6 @@ fn run_jumphost(
     id: &str,
     peer: &str,
 ) {
-    if connection
-        .write_packet(
-            EtPacketType::InitialResponse as u8,
-            &InitialResponse { error: None }.encode_to_vec(),
-        )
-        .is_err()
-    {
-        crate::diag::info(format!(
-            "id={id}: jumphost failed writing INITIAL_RESPONSE to {peer}"
-        ));
-        return;
-    }
     let mut terminal = match core.registry.clone_stream(start.registration()) {
         Ok(terminal) => terminal,
         Err(error) => {
@@ -366,8 +355,70 @@ fn run_jumphost(
         TerminalPacketType::JumphostInit as u8,
         payload.encode_to_vec(),
     );
-    if write_local_packet(&mut terminal, &init_packet).is_err() {
+    if terminal
+        .set_nonblocking(false)
+        .and_then(|()| terminal.set_read_timeout(Some(JUMPHOST_RESPONSE_TIMEOUT)))
+        .and_then(|()| terminal.set_write_timeout(Some(JUMPHOST_RESPONSE_TIMEOUT)))
+        .is_err()
+        || write_local_packet(&mut terminal, &init_packet).is_err()
+    {
         crate::diag::info(format!("id={id}: jumphost failed sending JUMPHOST_INIT"));
+        return;
+    }
+    let response_packet = match et_net::local_packet::read_local_packet(&mut terminal) {
+        Ok(packet)
+            if !packet.is_encrypted()
+                && packet.header() == TerminalPacketType::JumphostInit as u8 =>
+        {
+            packet
+        }
+        Ok(_) | Err(_) => {
+            crate::diag::info(format!(
+                "id={id}: jumphost received invalid destination response"
+            ));
+            return;
+        }
+    };
+    let response = InitialResponse::decode(response_packet.payload()).ok();
+    if connection
+        .write_packet(
+            EtPacketType::InitialResponse as u8,
+            response_packet.payload(),
+        )
+        .is_err()
+    {
+        crate::diag::info(format!(
+            "id={id}: jumphost failed writing destination INITIAL_RESPONSE to {peer}"
+        ));
+        return;
+    }
+    let Some(response) = response else {
+        let _ = terminal.shutdown(std::net::Shutdown::Both);
+        return;
+    };
+    if response.error.is_some() {
+        if connection.set_io_timeout(Some(HANDSHAKE_TIMEOUT)).is_err() {
+            return;
+        }
+        let acknowledged = connection.read_packet().is_ok_and(|packet| {
+            packet.header() == EtPacketType::Heartbeat as u8 && packet.payload().is_empty()
+        });
+        if !acknowledged
+            || write_local_packet(
+                &mut terminal,
+                &et_core::packet::Packet::new(EtPacketType::Heartbeat as u8, Vec::new()),
+            )
+            .is_err()
+            || connection.set_io_timeout(None).is_err()
+        {
+            let _ = terminal.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+    }
+    if terminal.set_read_timeout(None).is_err()
+        || terminal.set_write_timeout(None).is_err()
+        || terminal.set_nonblocking(true).is_err()
+    {
         return;
     }
     let active = match ActiveSession::new(connection, &terminal) {

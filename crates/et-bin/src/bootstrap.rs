@@ -565,12 +565,13 @@ mod tests {
         req.jumphost = Some("jump.example,user@hop2".into());
         let invocation = build_invocation(&req, &credentials);
         assert_eq!(
-            invocation.args[0..4],
+            invocation.args[0..5],
             [
                 "-J",
                 "jump.example,user@hop2",
+                "-oClearAllForwardings=yes",
+                "-oPort=2222",
                 "alice@server",
-                "-oPort=2222"
             ]
         );
     }

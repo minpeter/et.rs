@@ -4,7 +4,7 @@ use et_core::proto::{ConnectResponse, ConnectStatus, InitialResponse};
 
 use super::{
     accept_initial_response, accept_reconnect_response, accept_response,
-    initialization_admission_deadline, ReconnectStatus,
+    ensure_initialization_budget, initialization_admission_deadline, ReconnectStatus,
 };
 use crate::deadline::Deadline;
 use crate::error::ClientError;
@@ -20,6 +20,12 @@ fn short_outer_budget_is_rejected_before_connection_admission() {
     let outer = Deadline::after(Duration::from_secs(10));
     let admission = initialization_admission_deadline(outer).unwrap();
     assert!(admission.expires_at() < outer.expires_at());
+    assert!(matches!(
+        ensure_initialization_budget(Deadline::after(Duration::from_secs(9))),
+        Err(ClientError::BootstrapTimeout(
+            "reserving the ET initialization budget"
+        ))
+    ));
 }
 
 #[test]

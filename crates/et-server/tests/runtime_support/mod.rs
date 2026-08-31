@@ -36,11 +36,25 @@ pub struct TestRuntime {
 
 impl TestRuntime {
     pub fn start() -> Self {
+        Self::start_with_forward_resolver(std::sync::Arc::new(
+            et_net::forward::SystemForwardResolver,
+        ))
+    }
+
+    pub fn start_with_forward_resolver(
+        resolver: std::sync::Arc<dyn et_net::forward::ForwardResolver>,
+    ) -> Self {
         let dir = TestDir::new();
         let path = dir.socket();
         let uid = rustix::process::getuid().as_raw();
         let selected = select_router_path_for(uid, Some(&path), None, None).unwrap();
-        let runtime = Runtime::start(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, selected).unwrap();
+        let runtime = Runtime::start_with_forward_resolver(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            0,
+            selected,
+            resolver,
+        )
+        .unwrap();
         let handle = runtime.handle();
         let address = runtime.tcp_addresses()[0];
         Self {

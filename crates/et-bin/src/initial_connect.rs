@@ -64,7 +64,9 @@ pub fn connect_initial(
     let mut stream = connect_endpoint(endpoint, resolver, admission_deadline)?;
     set_stream_timeout(&stream, deadline)?;
 
-    ensure_deadline(deadline, "sending ConnectRequest")?;
+    // Resolution/connect may consume their entire admission slice. Revalidate
+    // the reserved server-response margin at the actual admission boundary.
+    ensure_initialization_budget(deadline)?;
     write_proto(&mut stream, &client_request(&credentials.id))
         .map_err(|source| connect_error(deadline, "sending ConnectRequest", source))?;
     set_stream_timeout(&stream, deadline)?;
@@ -141,6 +143,15 @@ fn set_stream_timeout(stream: &TcpStream, deadline: Deadline) -> Result<(), Clie
             operation: "setting the write timeout",
             source,
         })
+}
+
+fn ensure_initialization_budget(deadline: Deadline) -> Result<(), ClientError> {
+    match deadline.remaining() {
+        Some(remaining) if remaining >= MIN_INITIALIZATION_BUDGET => Ok(()),
+        _ => Err(ClientError::BootstrapTimeout(
+            "reserving the ET initialization budget",
+        )),
+    }
 }
 
 fn initialization_admission_deadline(deadline: Deadline) -> Result<Deadline, ClientError> {

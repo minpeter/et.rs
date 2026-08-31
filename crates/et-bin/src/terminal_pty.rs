@@ -22,6 +22,7 @@ use sysinfo::{Pid as SystemPid, ProcessesToUpdate, Signal as SystemSignal, Syste
 
 const MAX_OUTPUT_CHUNK: usize = 16 * 1024;
 const OUTPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const FINAL_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 use crate::terminal_protocol::{handle_packet, read_initial_environment, read_ready_packet};
 
@@ -30,7 +31,27 @@ enum WorkerEvent {
     Child(Result<u32, String>),
 }
 
-pub fn run_with_startup<F>(mut router: LocalStream, term: &str, started: F) -> Result<i32, String>
+pub fn run_with_startup<F>(router: LocalStream, term: &str, started: F) -> Result<i32, String>
+where
+    F: FnOnce(&mut LocalStream) -> Result<(), String>,
+{
+    let command = CommandBuilder::new(default_shell());
+    #[cfg(unix)]
+    let command = {
+        let mut command = command;
+        command.arg("-l");
+        command
+    };
+    run_with_command(router, term, command, Duration::ZERO, started)
+}
+
+fn run_with_command<F>(
+    mut router: LocalStream,
+    term: &str,
+    mut command: CommandBuilder,
+    output_delay: Duration,
+    started: F,
+) -> Result<i32, String>
 where
     F: FnOnce(&mut LocalStream) -> Result<(), String>,
 {
@@ -47,9 +68,6 @@ where
             pixel_height: 0,
         })
         .map_err(|error| format!("could not open PTY: {error}"))?;
-    let mut command = CommandBuilder::new(default_shell());
-    #[cfg(unix)]
-    command.arg("-l");
     command.env("TERM", term);
     for (name, value) in environment {
         command.env(name, value);
@@ -91,8 +109,12 @@ where
     let output_worker = match thread::Builder::new()
         .name("et-pty-output".to_owned())
         .spawn(move || {
-            let result = wait_for_output_gate(&worker_gate, &worker_cancelled)
-                .and_then(|()| forward_output(&mut pty_reader, &worker_writer, &worker_cancelled));
+            let result = wait_for_output_gate(&worker_gate, &worker_cancelled).and_then(|()| {
+                if !output_delay.is_zero() {
+                    thread::sleep(output_delay);
+                }
+                forward_output(&mut pty_reader, &worker_writer, &worker_cancelled)
+            });
             let _ = output_tx.send(WorkerEvent::Output(result));
             signal(output_wake);
         }) {
@@ -178,14 +200,17 @@ where
             &events_rx,
         )
     });
+    let graceful_drain = result.as_ref().is_ok_and(|completion| completion.drained);
     kill_process_group(child_pid);
-    cancelled.store(true, Ordering::Release);
+    // Preserve normal output through PTY EOF. If the bounded fallback elapsed,
+    // cancel and close the writer even though the shell itself exited normally.
+    cancelled.store(!graceful_drain, Ordering::Release);
     let (ready, changed) = &*output_gate;
     if let Ok(mut ready) = ready.lock() {
         *ready = true;
         changed.notify_all();
     }
-    if output_started {
+    if output_started && !graceful_drain {
         let _ = router.shutdown(Shutdown::Both);
         if let Ok(writer) = router_writer.lock() {
             let _ = writer.shutdown(Shutdown::Both);
@@ -201,10 +226,11 @@ where
     let child_join = child_worker
         .join()
         .map_err(|_| "PTY child worker panicked".to_owned());
-    let status = result?;
+    let completion = result?;
     output_join?;
     child_join?;
-    i32::try_from(status).map_err(|_| "terminal shell exit status is out of range".to_owned())
+    i32::try_from(completion.status)
+        .map_err(|_| "terminal shell exit status is out of range".to_owned())
 }
 
 /// Shell the session hosts.
@@ -289,13 +315,60 @@ fn forward_output(
     }
 }
 
+struct PumpCompletion {
+    status: u32,
+    drained: bool,
+}
+
+#[derive(Default)]
+struct CompletionState {
+    child_status: Option<u32>,
+    output_done: bool,
+    drain_deadline: Option<Instant>,
+}
+
+impl CompletionState {
+    fn observe(&mut self, event: WorkerEvent) -> Result<Option<PumpCompletion>, String> {
+        match event {
+            WorkerEvent::Output(Err(error)) | WorkerEvent::Child(Err(error)) => Err(error),
+            WorkerEvent::Child(Ok(status)) => {
+                self.child_status = Some(status);
+                self.drain_deadline = Some(Instant::now() + FINAL_OUTPUT_DRAIN_TIMEOUT);
+                Ok(self.output_done.then_some(PumpCompletion {
+                    status,
+                    drained: true,
+                }))
+            }
+            WorkerEvent::Output(Ok(())) => {
+                self.output_done = true;
+                Ok(self.child_status.map(|status| PumpCompletion {
+                    status,
+                    drained: true,
+                }))
+            }
+        }
+    }
+
+    fn expired_status(&self) -> Option<PumpCompletion> {
+        self.child_status
+            .filter(|_| {
+                self.drain_deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+            })
+            .map(|status| PumpCompletion {
+                status,
+                drained: false,
+            })
+    }
+}
+
 fn pump(
     router: &mut LocalStream,
     wake_reader: LocalStream,
     master: &dyn portable_pty::MasterPty,
     pty_writer: &mut dyn Write,
     events: &mpsc::Receiver<WorkerEvent>,
-) -> Result<u32, String> {
+) -> Result<PumpCompletion, String> {
     #[cfg(unix)]
     return pump_poll(router, wake_reader, master, pty_writer, events);
     #[cfg(windows)]
@@ -309,8 +382,9 @@ fn pump_poll(
     master: &dyn portable_pty::MasterPty,
     pty_writer: &mut dyn Write,
     events: &mpsc::Receiver<WorkerEvent>,
-) -> Result<u32, String> {
+) -> Result<PumpCompletion, String> {
     let mut decoder = LocalPacketDecoder::new();
+    let mut completion = CompletionState::default();
     loop {
         let (router_events, wake_events) = {
             let mut descriptors = [
@@ -320,7 +394,13 @@ fn pump_poll(
             // poll() is never restarted by SA_RESTART; retry on EINTR so a
             // stray signal cannot kill the terminal session.
             loop {
-                match poll(&mut descriptors, None) {
+                let timeout = completion.drain_deadline.map(|deadline| {
+                    rustix::time::Timespec::try_from(
+                        deadline.saturating_duration_since(Instant::now()),
+                    )
+                    .expect("two-second PTY drain timeout fits timespec")
+                });
+                match poll(&mut descriptors, timeout.as_ref()) {
                     Ok(_) => break,
                     Err(error) if error == rustix::io::Errno::INTR => {}
                     Err(error) => {
@@ -332,15 +412,14 @@ fn pump_poll(
         };
         if wake_events.intersects(PollFlags::IN | PollFlags::HUP) {
             while let Ok(event) = events.try_recv() {
-                match event {
-                    WorkerEvent::Output(Err(error)) | WorkerEvent::Child(Err(error)) => {
-                        return Err(error);
-                    }
-                    WorkerEvent::Child(Ok(status)) => return Ok(status),
-                    WorkerEvent::Output(Ok(())) => {}
+                if let Some(status) = completion.observe(event)? {
+                    return Ok(status);
                 }
             }
             drain_wakeup(&mut wake_reader)?;
+        }
+        if let Some(status) = completion.expired_status() {
+            return Ok(status);
         }
         if router_events.intersects(PollFlags::HUP | PollFlags::ERR) {
             return Err("terminal router disconnected".to_owned());
@@ -364,20 +443,20 @@ fn pump_windows(
     master: &dyn portable_pty::MasterPty,
     pty_writer: &mut dyn Write,
     events: &mpsc::Receiver<WorkerEvent>,
-) -> Result<u32, String> {
+) -> Result<PumpCompletion, String> {
     const IDLE: std::time::Duration = std::time::Duration::from_millis(10);
     let mut decoder = LocalPacketDecoder::new();
+    let mut completion = CompletionState::default();
     loop {
         let mut progress = false;
         while let Ok(event) = events.try_recv() {
             progress = true;
-            match event {
-                WorkerEvent::Output(Err(error)) | WorkerEvent::Child(Err(error)) => {
-                    return Err(error);
-                }
-                WorkerEvent::Child(Ok(status)) => return Ok(status),
-                WorkerEvent::Output(Ok(())) => {}
+            if let Some(status) = completion.observe(event)? {
+                return Ok(status);
             }
+        }
+        if let Some(status) = completion.expired_status() {
+            return Ok(status);
         }
         drain_wakeup(&mut wake_reader)?;
         match read_ready_packet(router, &mut decoder) {
@@ -480,6 +559,65 @@ mod tests {
     };
     use prost::Message;
     use std::io::Cursor;
+
+    #[cfg(unix)]
+    #[test]
+    fn normal_immediate_exit_drains_delayed_output_before_eof() {
+        let (router, mut peer) = et_net::local::wake_pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        write_local_packet(
+            &mut peer,
+            &Packet::new(
+                TerminalPacketType::TerminalInit as u8,
+                TermInit::default().encode_to_vec(),
+            ),
+        )
+        .unwrap();
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "printf FINAL-OUTPUT-MARKER"]);
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = run_with_command(
+                router,
+                "xterm",
+                command,
+                Duration::from_millis(250),
+                |writer| {
+                    write_local_packet(writer, &status_packet(STARTUP_STATUS, Ok(())))
+                        .map_err(|error| error.to_string())
+                },
+            );
+            let _ = done_tx.send(result);
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        let status = read_local_packet(&mut peer).unwrap();
+        assert_eq!(status.header(), STARTUP_STATUS);
+        let mut output = Vec::new();
+        while let Ok(packet) = read_local_packet(&mut peer) {
+            assert_eq!(packet.header(), TerminalPacketType::TerminalBuffer as u8);
+            output.extend(
+                TerminalBuffer::decode(packet.payload())
+                    .unwrap()
+                    .buffer
+                    .unwrap(),
+            );
+        }
+        assert!(
+            output
+                .windows(b"FINAL-OUTPUT-MARKER".len())
+                .any(|window| window == b"FINAL-OUTPUT-MARKER"),
+            "final PTY output was lost: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn injected_setup_failure_reaps_shell_while_peer_stays_open_and_unread() {

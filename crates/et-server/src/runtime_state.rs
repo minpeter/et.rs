@@ -15,6 +15,7 @@ pub(crate) struct RuntimeCore {
     pub(crate) handlers: HandlerThreads,
     pub(crate) pre_auth_slots: Arc<PreAuthSlots>,
     pub(crate) shutdown: AtomicBool,
+    pub(crate) forward_resolver: Arc<dyn et_net::forward::ForwardResolver>,
 }
 
 pub(crate) const MAX_PRE_AUTH_CONNECTIONS: usize = 128;

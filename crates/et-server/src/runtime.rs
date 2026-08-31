@@ -38,6 +38,21 @@ impl Runtime {
         port: u16,
         router_path: RouterPath,
     ) -> Result<Self, RuntimeError> {
+        Self::start_with_forward_resolver(
+            bind_ip,
+            port,
+            router_path,
+            Arc::new(et_net::forward::SystemForwardResolver),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn start_with_forward_resolver(
+        bind_ip: IpAddr,
+        port: u16,
+        router_path: RouterPath,
+        forward_resolver: Arc<dyn et_net::forward::ForwardResolver>,
+    ) -> Result<Self, RuntimeError> {
         let bound = bind_tcp(bind_ip, port)?;
         let mut tcp_addresses = Vec::new();
         for listener in bound.iter() {
@@ -54,6 +69,7 @@ impl Runtime {
             handlers: HandlerThreads::new(),
             pre_auth_slots: Arc::new(PreAuthSlots::new(MAX_PRE_AUTH_CONNECTIONS)),
             shutdown: AtomicBool::new(false),
+            forward_resolver,
         });
         let router_name = router_path.path().to_path_buf();
         let (lifecycle_sender, lifecycle_events) = mpsc::channel();

@@ -621,18 +621,20 @@ mod tests {
 
     fn collect_forwarded(segments: &[&[u8]], prefix: Option<&[u8]>) -> (Vec<Vec<u8>>, Vec<u8>) {
         let (writer, mut peer) = et_net::local::wake_pair().unwrap();
-        peer.set_read_timeout(Some(Duration::from_millis(100)))
-            .unwrap();
         let (packets_tx, packets_rx) = mpsc::sync_channel(1);
         thread::spawn(move || {
             let mut packets = Vec::new();
-            while let Ok(packet) = read_local_packet(&mut peer) {
-                packets.push(
-                    TerminalBuffer::decode(packet.payload())
-                        .unwrap()
-                        .buffer
-                        .unwrap(),
-                );
+            loop {
+                match read_local_packet(&mut peer) {
+                    Ok(packet) => packets.push(
+                        TerminalBuffer::decode(packet.payload())
+                            .unwrap()
+                            .buffer
+                            .unwrap(),
+                    ),
+                    Err(et_net::local_packet::LocalPacketError::TruncatedPrefix) => break,
+                    Err(error) => panic!("reading forwarded output packet: {error}"),
+                }
             }
             let _ = packets_tx.send(packets);
         });

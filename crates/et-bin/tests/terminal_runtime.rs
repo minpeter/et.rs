@@ -603,8 +603,7 @@ fn real_terminal_does_not_stack_motd_newline_with_shell_startup_newline() {
         &[("ET_MOTD_PATH", motd.as_os_str())],
     );
     write_credentials(&mut child);
-    let (mut router, _) = fixture.listener.accept().unwrap();
-    router.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let mut router = fixture.accept();
     let _ = read_local_packet(&mut router).unwrap();
     acknowledge_registration(&mut router);
     fixture.wait_ready();
@@ -658,8 +657,7 @@ fn real_terminal_suppresses_motd_when_home_has_hushlogin() {
         ],
     );
     write_credentials(&mut child);
-    let (mut router, _) = fixture.listener.accept().unwrap();
-    router.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let mut router = fixture.accept();
     let _ = read_local_packet(&mut router).unwrap();
     acknowledge_registration(&mut router);
     fixture.wait_ready();

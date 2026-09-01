@@ -22,8 +22,6 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use reconnect_stack::Stack;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
-/// Long enough for several reconnect attempts (retry delay is one second).
-const OUTAGE: Duration = Duration::from_secs(4);
 
 #[test]
 fn client_retries_reconnect_through_network_outage() {
@@ -85,7 +83,7 @@ fn client_retries_reconnect_through_network_outage() {
     // Drop the link and refuse every reconnect attempt for a while, like a
     // laptop that wakes from sleep before its network is back.
     proxy.outage();
-    thread::sleep(OUTAGE);
+    proxy.wait_for_refused(2);
     proxy.restore();
 
     // The client announces the retry loop on the first failed attempt.
@@ -150,6 +148,7 @@ struct OutageProxy {
     port: u16,
     outage: mpsc::SyncSender<()>,
     restore: mpsc::SyncSender<()>,
+    refused: mpsc::Receiver<usize>,
     worker: Option<thread::JoinHandle<io::Result<usize>>>,
 }
 
@@ -159,6 +158,7 @@ impl OutageProxy {
         let port = listener.local_addr().unwrap().port();
         let (outage_tx, outage_rx) = mpsc::sync_channel(1);
         let (restore_tx, restore_rx) = mpsc::sync_channel::<()>(1);
+        let (refused_tx, refused_rx) = mpsc::sync_channel(2);
         let worker = thread::spawn(move || {
             let (first, _) = listener.accept()?;
             let backend = TcpStream::connect((Ipv4Addr::LOCALHOST, backend_port))?;
@@ -178,6 +178,7 @@ impl OutageProxy {
                 }
                 let _ = attempt.shutdown(Shutdown::Both);
                 refused += 1;
+                let _ = refused_tx.try_send(refused);
             };
             let backend = TcpStream::connect((Ipv4Addr::LOCALHOST, backend_port))?;
             let relays = relay(&recovered, &backend)?;
@@ -194,6 +195,7 @@ impl OutageProxy {
             port,
             outage: outage_tx,
             restore: restore_tx,
+            refused: refused_rx,
             worker: Some(worker),
         }
     }
@@ -204,6 +206,15 @@ impl OutageProxy {
 
     fn restore(&self) {
         self.restore.send(()).unwrap();
+    }
+
+    fn wait_for_refused(&self, minimum: usize) {
+        loop {
+            let refused = self.refused.recv_timeout(TIMEOUT).unwrap();
+            if refused >= minimum {
+                return;
+            }
+        }
     }
 
     fn join(mut self) -> usize {

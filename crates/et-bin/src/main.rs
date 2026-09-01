@@ -16,6 +16,10 @@
 use std::ffi::OsString;
 
 fn main() {
+    #[cfg(windows)]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__et-console-writer")) {
+        std::process::exit(crate::client_output::run_windows_helper());
+    }
     #[cfg(unix)]
     if let Some(code) = et_net::user_socket_ops::maybe_run_helper() {
         std::process::exit(code);
@@ -83,6 +87,7 @@ fn role(name: &str, args: &[OsString]) -> Result<i32, clap::Error> {
 mod bootstrap;
 mod client;
 mod client_environment;
+mod client_output;
 mod client_terminal;
 mod client_terminal_loop;
 #[cfg(windows)]

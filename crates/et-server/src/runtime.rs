@@ -21,6 +21,10 @@ use crate::runtime_state::{
 };
 use crate::session_table::SessionTable;
 
+#[cfg(all(test, unix))]
+#[path = "runtime_recovery_test.rs"]
+mod recovery_tests;
+
 pub struct Runtime {
     core: Arc<RuntimeCore>,
     router: Option<Router>,
@@ -294,7 +298,8 @@ mod tests {
         let (assignment_tx, assignment_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
         let (scan_tx, scan_rx) = mpsc::sync_channel(1);
-        crate::runtime_handler::install_raw_assignment_hook(ID, assignment_tx, release_rx);
+        let identity = runtime.core.registry.get(ID).unwrap().unwrap().identity();
+        crate::runtime_handler::install_raw_assignment_hook(identity, assignment_tx, release_rx);
         crate::runtime_lifecycle::install_raw_scan_hook(ID, scan_tx);
 
         let mut client = connect_request(address);

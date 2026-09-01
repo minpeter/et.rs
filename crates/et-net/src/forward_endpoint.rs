@@ -613,6 +613,20 @@ impl ForwardStream {
             Self::Unix(stream) => stream.shutdown(Shutdown::Read),
         };
     }
+
+    #[cfg(windows)]
+    pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.set_read_timeout(timeout),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.set_write_timeout(timeout),
+        }
+    }
 }
 
 impl Read for ForwardStream {

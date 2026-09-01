@@ -5,14 +5,18 @@ use std::io::{self};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+#[cfg(all(test, unix))]
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+
+use crossbeam_channel as channel;
 
 use crate::forward::{ForwardError, Outbound};
 use crate::forward_endpoint::ForwardStream;
 use crate::forward_io::{
-    spawn_connector, spawn_io, spawn_listener, stop_io, ActiveIo, BoundSource, ListenerStop,
-    WriteCommand,
+    abort_io, spawn_connector, spawn_io, spawn_listener, stop_io, ActiveIo, BoundSource,
+    ListenerStop, WriteCommand,
 };
 use et_core::packet::Packet;
 use et_core::proto::SocketEndpoint;
@@ -152,7 +156,14 @@ impl CommandSender {
         self.queue.changed.notify_all();
     }
 
-    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.queue
+            .state
+            .lock()
+            .map_or(true, |state| state.commands.is_empty())
+    }
+
+    #[cfg(all(test, unix))]
     pub(crate) fn wait_shutdown_timeout(&self, timeout: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         let mut state = self.queue.state.lock().unwrap();
@@ -188,7 +199,7 @@ impl CommandReceiver {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn recv_timeout(
         &self,
         timeout: std::time::Duration,
@@ -223,29 +234,46 @@ impl Drop for CommandReceiver {
     }
 }
 
+pub(crate) struct WorkerChannels {
+    pub(crate) receiver: CommandReceiver,
+    pub(crate) sender: CommandSender,
+    pub(crate) outbound: channel::Sender<Outbound>,
+    pub(crate) cancel: channel::Receiver<()>,
+    pub(crate) abandoned: Arc<AtomicBool>,
+}
+
 pub(crate) fn run(
     sources: Vec<BoundSource>,
-    commands: CommandReceiver,
-    command_sender: CommandSender,
-    outbound: mpsc::SyncSender<Outbound>,
+    channels: WorkerChannels,
     #[cfg(unix)] mut outbound_wake: UnixStream,
     control: (ListenerStop, Option<(u32, u32)>, Arc<AtomicBool>),
 ) {
+    let WorkerChannels {
+        receiver: commands,
+        sender: command_sender,
+        outbound,
+        cancel,
+        abandoned,
+    } = channels;
     let (listener_stop, session_user, shutdown) = control;
     #[cfg(unix)]
     let result = Worker::new(
         command_sender,
         outbound.clone(),
         outbound_wake.try_clone().ok(),
-        shutdown.clone(),
+        cancel.clone(),
+        abandoned,
     )
     .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user));
     #[cfg(windows)]
-    let result = Worker::new(command_sender, outbound.clone(), shutdown.clone())
+    let result = Worker::new(command_sender, outbound.clone(), cancel.clone(), abandoned)
         .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user));
     if let Err(error) = result {
         if !shutdown.load(Ordering::Acquire) {
-            let _ = outbound.try_send(Err(error));
+            channel::select! {
+                send(outbound, Err(error)) -> _ => {}
+                recv(cancel) -> _ => {}
+            }
         }
         #[cfg(unix)]
         let _ = outbound_wake.write(&[1]);
@@ -254,7 +282,9 @@ pub(crate) fn run(
 
 struct Worker {
     commands: CommandSender,
-    outbound: mpsc::SyncSender<Outbound>,
+    outbound: channel::Sender<Outbound>,
+    cancel: channel::Receiver<()>,
+    abandoned: Arc<AtomicBool>,
     #[cfg(unix)]
     outbound_wake: UnixStream,
     pending: HashMap<i32, ForwardStream>,
@@ -264,15 +294,15 @@ struct Worker {
     threads: Vec<JoinHandle<()>>,
     next_socket_id: i32,
     session_user: Option<(u32, u32)>,
-    shutdown: Arc<AtomicBool>,
 }
 
 impl Worker {
     fn new(
         commands: CommandSender,
-        outbound: mpsc::SyncSender<Outbound>,
+        outbound: channel::Sender<Outbound>,
         #[cfg(unix)] outbound_wake: Option<UnixStream>,
-        shutdown: Arc<AtomicBool>,
+        cancel: channel::Receiver<()>,
+        abandoned: Arc<AtomicBool>,
     ) -> Result<Self, ForwardError> {
         #[cfg(unix)]
         let outbound_wake = {
@@ -283,6 +313,8 @@ impl Worker {
         Ok(Self {
             commands,
             outbound,
+            cancel,
+            abandoned,
             #[cfg(unix)]
             outbound_wake,
             pending: HashMap::new(),
@@ -292,7 +324,6 @@ impl Worker {
             threads: Vec::new(),
             next_socket_id: 1,
             session_user: None,
-            shutdown,
         })
     }
 
@@ -313,14 +344,14 @@ impl Worker {
             self.threads.push(spawn_listener(
                 source,
                 self.commands.clone(),
+                self.cancel.clone(),
                 stop,
                 next_client_fd.clone(),
             ));
         }
         let result = loop {
-            let command = match commands.recv() {
-                Some(command) => command,
-                None => break Ok(()),
+            let Some(command) = commands.recv() else {
+                break Ok(());
             };
             let step = match command {
                 Command::Packet(packet) => self.handle_packet(packet),
@@ -364,8 +395,13 @@ impl Worker {
         for (_, stream) in self.pending.drain() {
             stream.shutdown();
         }
+        let hard_cancelled = !matches!(self.cancel.try_recv(), Err(channel::TryRecvError::Empty));
         for (_, io) in self.sources.drain().chain(self.destinations.drain()) {
-            stop_io(io);
+            if hard_cancelled {
+                abort_io(io);
+            } else {
+                stop_io(io);
+            }
         }
         for thread in self.threads.drain(..) {
             let _ = thread.join();
@@ -380,9 +416,10 @@ mod state;
 mod tests {
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::AtomicBool;
-    use std::sync::{mpsc, Arc};
+    use std::sync::Arc;
     use std::time::Duration;
 
+    use crossbeam_channel as channel;
     use et_core::packet::Packet;
     use et_core::proto::{
         PortForwardDestinationRequest, PortForwardDestinationResponse, SocketEndpoint,
@@ -397,21 +434,25 @@ mod tests {
     fn worker() -> (
         Worker,
         CommandReceiver,
-        mpsc::Receiver<crate::forward::Outbound>,
+        channel::Receiver<crate::forward::Outbound>,
+        channel::Sender<()>,
     ) {
         let (commands, command_receiver) = command_channel(MAX_ACTIVE_SOCKETS + 1);
-        let (outbound, outbound_receiver) = mpsc::sync_channel(MAX_ACTIVE_SOCKETS + 1);
+        let (outbound, outbound_receiver) = channel::bounded(MAX_ACTIVE_SOCKETS + 1);
+        let (cancel, cancel_receiver) = channel::bounded(1);
         let (_wake_reader, wake_writer) = UnixStream::pair().unwrap();
         (
             Worker::new(
                 commands,
                 outbound,
                 Some(wake_writer),
+                cancel_receiver,
                 Arc::new(AtomicBool::new(false)),
             )
             .unwrap(),
             command_receiver,
             outbound_receiver,
+            cancel,
         )
     }
 
@@ -457,7 +498,7 @@ mod tests {
     fn in_flight_connectors_count_toward_socket_limit_and_failure_releases_slot() {
         let (directory, _cleanup) = test_directory("connector-failure-test");
         let missing_socket = directory.join("missing.sock");
-        let (mut worker, commands, outbound) = worker();
+        let (mut worker, commands, outbound, _cancel) = worker();
 
         for fd in 1..=MAX_ACTIVE_SOCKETS as i32 {
             worker
@@ -505,7 +546,7 @@ mod tests {
         let (directory, _cleanup) = test_directory("connector-success-test");
         let path = directory.join("destination.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        let (mut worker, commands, _outbound) = worker();
+        let (mut worker, commands, _outbound, _cancel) = worker();
         let request = Packet::new(
             TerminalPacketType::PortForwardDestinationRequest as u8,
             PortForwardDestinationRequest {

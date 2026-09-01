@@ -10,12 +10,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use et_core::keys::passkey_to_key;
-use et_core::proto::{ConnectResponse, ConnectStatus, TerminalPacketType};
+use et_core::packet::Packet;
+use et_core::proto::{
+    ConnectResponse, ConnectStatus, FlowControlMode, TermInit, TerminalBuffer, TerminalPacketType,
+};
 use et_net::connection::DEFAULT_LIVE_WRITE_TIMEOUT;
 use et_net::framing_io::{read_proto_limited, write_proto};
 use et_net::handshake::client_request;
-use et_net::local_packet::read_local_packet;
+use et_net::local_packet::{read_local_packet, write_local_packet};
 use et_server::SessionState;
+use prost::Message;
 use runtime_support::{default_payload, initialize, TestRuntime, ID_A, KEY_A, TIMEOUT};
 
 // Deadlock watchdog only. Success is driven by exact bridge-generation and
@@ -189,6 +193,62 @@ fn returning_client_receives_exact_buffered_server_catchup() {
 }
 
 #[test]
+fn discard_flow_control_resumes_queued_terminal_output_after_recovery() {
+    let mut server = TestRuntime::start();
+    let mut terminal = server.register(ID_A, KEY_A);
+    terminal.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let key = passkey_to_key(KEY_A).unwrap();
+    let mut payload = default_payload();
+    payload.flowcontrol = Some(FlowControlMode::Discard as i32);
+    let (mut client, initial) = initialize(stream, &key, payload);
+    assert_eq!(initial.error, None);
+    server
+        .handle
+        .wait_for_state(ID_A, SessionState::Active, TIMEOUT)
+        .unwrap();
+    let init = read_local_packet(&mut terminal).unwrap();
+    let term_init = TermInit::decode(init.payload()).unwrap();
+    assert_eq!(term_init.flowcontrol, Some(FlowControlMode::Discard as i32));
+
+    client.shutdown().unwrap();
+    let output = TerminalBuffer {
+        buffer: Some(b"newest-while-disconnected".to_vec()),
+    };
+    write_local_packet(
+        &mut terminal,
+        &Packet::new(
+            TerminalPacketType::TerminalBuffer as u8,
+            output.encode_to_vec(),
+        ),
+    )
+    .unwrap();
+
+    let (returning, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::ReturningClient as i32));
+    client.recover(returning).unwrap();
+    client
+        .write_packet(TerminalPacketType::KeepAlive as u8, &[])
+        .unwrap();
+    let mut recovered_output = None;
+    for _ in 0..2 {
+        let recovered = client.read_packet().unwrap();
+        match recovered.header() {
+            header if header == TerminalPacketType::KeepAlive as u8 => {}
+            header if header == TerminalPacketType::TerminalBuffer as u8 => {
+                recovered_output = Some(TerminalBuffer::decode(recovered.payload()).unwrap());
+                break;
+            }
+            header => panic!("unexpected recovered packet type {header}"),
+        }
+    }
+    assert_eq!(recovered_output, Some(output));
+
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
 fn hard_client_drop_keeps_session_for_returning_recover() {
     // Regression: laptop sleep / Wi-Fi drop aborts the TCP socket. The server
     // used to tear the terminal down (bridge exit → session removed →
@@ -335,19 +395,29 @@ fn recover_succeeds_while_old_peer_blackholes_writes() {
     let mut timed_out_live_write = false;
     for round in 0..1_024u32 {
         let send_started = Instant::now();
-        server
-            .handle
-            .send_packet(ID_A, 40, &payload)
-            .unwrap_or_else(|error| panic!("flood round {round}: {error}"));
+        let result = server.handle.send_packet(ID_A, 40, &payload);
         let elapsed = send_started.elapsed();
         assert!(
             elapsed < std::time::Duration::from_secs(8),
             "send_packet round {round} blocked for {:?} — live write timeout not applied",
             elapsed
         );
-        if elapsed >= DEFAULT_LIVE_WRITE_TIMEOUT / 2 {
-            timed_out_live_write = true;
-            break;
+        match result {
+            Ok(()) if elapsed >= DEFAULT_LIVE_WRITE_TIMEOUT / 2 => {
+                timed_out_live_write = true;
+                break;
+            }
+            Ok(()) => {}
+            Err(error) => {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("io: live write deadline elapsed"),
+                    "flood round {round} failed unexpectedly: {error}"
+                );
+                timed_out_live_write = true;
+                break;
+            }
         }
     }
     assert!(

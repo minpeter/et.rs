@@ -108,3 +108,29 @@ fn socket_endpoint() {
     };
     assert_eq!(enc(&se), *f.get("proto_socketendpoint_unix").unwrap());
 }
+
+#[test]
+fn flow_control_defaults_are_absent_and_wire_compatible() {
+    let initial = et::InitialPayload::default();
+    let term = et::TermInit::default();
+
+    assert_eq!(initial.flowcontrol, None);
+    assert_eq!(term.flowcontrol, None);
+    assert!(enc(&initial).is_empty());
+    assert!(enc(&term).is_empty());
+}
+
+#[test]
+fn flow_control_opt_in_modes_use_additive_proto_fields() {
+    let initial = et::InitialPayload {
+        flowcontrol: Some(et::FlowControlMode::Backpressure as i32),
+        ..Default::default()
+    };
+    let term = et::TermInit {
+        flowcontrol: Some(et::FlowControlMode::Discard as i32),
+        ..Default::default()
+    };
+
+    assert_eq!(enc(&initial), [0x20, 0x01]);
+    assert_eq!(enc(&term), [0x18, 0x02]);
+}

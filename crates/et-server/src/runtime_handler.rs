@@ -101,9 +101,9 @@ pub(crate) fn handle(
             return;
         }
     };
-    #[cfg(test)]
-    run_before_raw_assignment_hook(&id);
     let registration_identity = registration.identity();
+    #[cfg(test)]
+    run_before_raw_assignment_hook(&registration_identity);
     if guard.assign(registration_identity.clone()).is_err() {
         crate::diag::info(format!(
             "drop {peer} id={id}: could not track raw socket for registration"
@@ -180,12 +180,20 @@ pub(crate) fn handle(
                     return;
                 }
             };
+            if guard.own_session().is_err() {
+                crate::diag::info(format!(
+                    "id={id}: drop recover from {peer}: could not protect returning socket"
+                ));
+                return;
+            }
             if send_status(&mut stream, ConnectStatus::ReturningClient).is_err() {
                 crate::diag::info(format!(
                     "id={id}: failed to send ReturningClient status to {peer}"
                 ));
                 return;
             }
+            #[cfg(test)]
+            run_after_returning_status_hook(&id);
             match permit.complete(stream) {
                 Ok(()) => {
                     crate::diag::info(format!("id={id}: session recover accepted from {peer}"))
@@ -374,6 +382,7 @@ fn handle_new(
     let term_init = TermInit {
         environmentnames: environment.keys().cloned().collect(),
         environmentvalues: environment.values().cloned().collect(),
+        flowcontrol: payload.flowcontrol,
     };
     let init_packet = et_core::packet::Packet::new(
         TerminalPacketType::TerminalInit as u8,
@@ -417,7 +426,7 @@ fn handle_new(
         ));
         return;
     }
-    let active = match ActiveSession::new(connection, &terminal) {
+    let active = match ActiveSession::new(connection, &terminal, payload.flowcontrol) {
         Ok(active) => active,
         Err(error) => {
             crate::diag::info(format!(
@@ -427,6 +436,7 @@ fn handle_new(
         }
     };
     let active = Arc::new(active);
+    active.start_flow_writer();
     if start.activate(active.clone()).is_err() {
         crate::diag::info(format!("id={id}: could not activate session for {peer}"));
         return;
@@ -567,7 +577,7 @@ fn run_jumphost(
     {
         return;
     }
-    let active = match ActiveSession::new(connection, &terminal) {
+    let active = match ActiveSession::new(connection, &terminal, payload.flowcontrol) {
         Ok(active) => active,
         Err(error) => {
             crate::diag::info(format!(
@@ -577,6 +587,7 @@ fn run_jumphost(
         }
     };
     let active = Arc::new(active);
+    active.start_flow_writer();
     if start.activate(active.clone()).is_err() {
         crate::diag::info(format!("id={id}: jumphost could not activate session"));
         return;
@@ -669,7 +680,7 @@ fn valid_id(id: &str) -> bool {
 
 #[cfg(test)]
 struct RawAssignmentHook {
-    id: String,
+    identity: crate::registry::RegistrationIdentity,
     reached: std::sync::mpsc::SyncSender<()>,
     release: std::sync::mpsc::Receiver<()>,
 }
@@ -683,11 +694,57 @@ fn raw_assignment_hook() -> &'static std::sync::Mutex<Option<RawAssignmentHook>>
 
 #[cfg(test)]
 pub(crate) fn install_raw_assignment_hook(
-    id: &str,
+    identity: crate::registry::RegistrationIdentity,
     reached: std::sync::mpsc::SyncSender<()>,
     release: std::sync::mpsc::Receiver<()>,
 ) {
     *raw_assignment_hook().lock().unwrap() = Some(RawAssignmentHook {
+        identity,
+        reached,
+        release,
+    });
+}
+
+#[cfg(test)]
+fn run_before_raw_assignment_hook(identity: &crate::registry::RegistrationIdentity) {
+    let hook = {
+        let mut installed = raw_assignment_hook().lock().unwrap();
+        if installed
+            .as_ref()
+            .is_some_and(|hook| hook.identity.same_generation(identity))
+        {
+            installed.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        hook.reached.send(()).unwrap();
+        hook.release.recv().unwrap();
+    }
+}
+
+#[cfg(test)]
+struct ReturningStatusHook {
+    id: String,
+    reached: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+fn returning_status_hook() -> &'static std::sync::Mutex<Option<ReturningStatusHook>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<ReturningStatusHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn install_returning_status_hook(
+    id: &str,
+    reached: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+) {
+    *returning_status_hook().lock().unwrap() = Some(ReturningStatusHook {
         id: id.to_owned(),
         reached,
         release,
@@ -695,9 +752,9 @@ pub(crate) fn install_raw_assignment_hook(
 }
 
 #[cfg(test)]
-fn run_before_raw_assignment_hook(id: &str) {
+fn run_after_returning_status_hook(id: &str) {
     let hook = {
-        let mut installed = raw_assignment_hook().lock().unwrap();
+        let mut installed = returning_status_hook().lock().unwrap();
         if installed.as_ref().is_some_and(|hook| hook.id == id) {
             installed.take()
         } else {

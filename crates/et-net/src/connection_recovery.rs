@@ -42,6 +42,7 @@ impl Connection {
             stream: new_stream,
             writer: self.writer.clone(),
             reader: self.reader.clone(),
+            live_write_timeout: self.live_write_timeout,
         };
         candidate.disconnect();
         candidate

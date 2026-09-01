@@ -16,11 +16,16 @@ use rustix::event::{poll, PollFd, PollFlags};
 #[cfg(unix)]
 use rustix::time::Timespec;
 
+#[cfg(unix)]
+use crate::client_output::ConsoleCompletion;
+#[cfg(unix)]
+use crate::client_terminal::DisplayOutcome;
 use crate::client_terminal::TerminalModeState;
 #[cfg(unix)]
 use crate::client_terminal::{
-    connection_ended, display_packet, recover_transport, send_buffer, send_size, terminal_error,
-    terminal_io, terminal_text,
+    classify_forward_completion, connection_ended, encoded_buffer, recover_transport,
+    terminal_error, terminal_io, terminal_size_payload, terminal_text, write_owned_recovering,
+    write_terminal_size_recovering, OwnedWriteOutcome, RetainedCompletion,
 };
 #[cfg(unix)]
 use crate::error::ClientError;
@@ -75,6 +80,7 @@ impl PumpProbe {
 pub(crate) struct PumpOptions<'a> {
     pub(crate) read_stdin: bool,
     pub(crate) keepalive_seconds: u32,
+    pub(crate) flow_control: et_cli::client::FlowControlMode,
     pub(crate) terminal_enabled: bool,
     pub(crate) auto_cursor_report: bool,
     pub(crate) terminal_modes: &'a mut TerminalModeState,
@@ -85,7 +91,7 @@ pub fn pump<F>(
     connection: &mut Connection,
     wake: &mut UnixStream,
     options: PumpOptions<'_>,
-    forwarder: &Forwarder,
+    forwarder: &mut Forwarder,
     mut reconnect: F,
 ) -> Result<(), ClientError>
 where
@@ -94,11 +100,14 @@ where
     let PumpOptions {
         read_stdin,
         keepalive_seconds,
+        flow_control,
         terminal_enabled,
         auto_cursor_report,
         terminal_modes,
     } = options;
     let stdin = io::stdin();
+    let mut console_output = crate::client_output::ConsoleOutput::stdout(flow_control)
+        .map_err(|error| terminal_io("starting console output worker", error))?;
     let interval = Duration::from_secs(u64::from(keepalive_seconds.max(1)));
     let silence = interval.saturating_mul(MISSED_KEEPALIVES);
     let mut last_received = Instant::now();
@@ -108,6 +117,10 @@ where
     // further session packets are read (ordering) and the network fd is not
     // watched for readability (a readable socket would busy-loop the poll).
     let mut pending_forward: Option<et_core::packet::Packet> = None;
+    // A server terminal packet that could not enter the bounded local output
+    // queue. Keep exact ownership and stop reading the ordered server stream,
+    // while stdin, outbound forwarding, keepalive, and recovery stay live.
+    let mut pending_output: Option<et_core::packet::Packet> = None;
     let forward_wake = forwarder
         .wake()
         .map_err(|error| terminal_text(error.to_string()))?;
@@ -129,17 +142,52 @@ where
                 .try_receive(packet)
                 .map_err(|error| terminal_text(error.to_string()))?;
         }
-        let network_flags = if pending_forward.is_none() {
+        if let Some(packet) = pending_output.take() {
+            match route_server_packet(packet, terminal_enabled, terminal_modes, &console_output)? {
+                DisplayOutcome::Displayed { cursor_report }
+                    if cursor_report && auto_cursor_report && !console_output.is_async() =>
+                {
+                    if matches!(
+                        write_cursor_report(
+                            connection,
+                            &mut reconnect,
+                            &mut stream,
+                            terminal_enabled,
+                        )?,
+                        OwnedWriteOutcome::SessionEnded
+                    ) {
+                        return finish_remote_completion(
+                            console_output,
+                            pending_output,
+                            pending_forward,
+                            terminal_enabled,
+                            terminal_modes,
+                            forwarder,
+                            None,
+                        );
+                    }
+                }
+                DisplayOutcome::Displayed { .. } => {}
+                DisplayOutcome::Pending(packet) => pending_output = Some(packet),
+            }
+        }
+        let network_flags = if pending_forward.is_none() && pending_output.is_none() {
             PollFlags::IN | PollFlags::HUP | PollFlags::ERR
         } else {
             PollFlags::HUP | PollFlags::ERR
         };
-        let deadline = next_keepalive.min(last_received + silence);
-        let (network, resize, forwarding, input) = {
+        let deadline = if pending_output.is_some() {
+            next_keepalive
+        } else {
+            next_keepalive.min(last_received + silence)
+        };
+        let (network, resize, forwarding, output_ready, output_status, input) = {
             let mut descriptors = vec![
                 PollFd::new(&stream, network_flags),
                 PollFd::new(&*wake, PollFlags::IN | PollFlags::HUP),
                 PollFd::new(forward_wake, PollFlags::IN | PollFlags::HUP),
+                PollFd::new(console_output.wake(), PollFlags::IN | PollFlags::HUP),
+                PollFd::new(console_output.status_wake(), PollFlags::IN | PollFlags::HUP),
             ];
             if read_stdin {
                 descriptors.push(PollFd::new(
@@ -179,8 +227,10 @@ where
                 descriptors[0].revents(),
                 descriptors[1].revents(),
                 descriptors[2].revents(),
+                descriptors[3].revents(),
+                descriptors[4].revents(),
                 descriptors
-                    .get(3)
+                    .get(5)
                     .map(PollFd::revents)
                     .unwrap_or(PollFlags::empty()),
             )
@@ -189,21 +239,70 @@ where
             probe.progressed()?;
         }
         let mut reconnect_needed = network.intersects(PollFlags::HUP | PollFlags::ERR);
-        if resize.intersects(PollFlags::IN | PollFlags::HUP) {
-            drain(wake)?;
-            match if terminal_enabled {
-                send_size(connection)
-            } else {
-                Ok(())
-            } {
-                Ok(()) => {}
-                Err(ClientError::Transport(error)) if connection_ended(&error) => {
-                    reconnect_needed = true;
+        if output_ready.intersects(PollFlags::IN | PollFlags::HUP) {
+            console_output
+                .drain_wake()
+                .map_err(|error| terminal_io("draining console output wakeup", error))?;
+            console_output
+                .check_error()
+                .map_err(|error| terminal_io("writing terminal output", error))?;
+            if auto_cursor_report {
+                for _ in 0..console_output
+                    .take_cursor_reports()
+                    .map_err(|error| terminal_io("reading console confirmations", error))?
+                {
+                    if matches!(
+                        write_cursor_report(
+                            connection,
+                            &mut reconnect,
+                            &mut stream,
+                            terminal_enabled,
+                        )?,
+                        OwnedWriteOutcome::SessionEnded
+                    ) {
+                        return finish_remote_completion(
+                            console_output,
+                            pending_output,
+                            pending_forward,
+                            terminal_enabled,
+                            terminal_modes,
+                            forwarder,
+                            None,
+                        );
+                    }
                 }
-                Err(error) => return Err(error),
             }
         }
-        while pending_forward.is_none() {
+        if output_status.intersects(PollFlags::IN | PollFlags::HUP) {
+            console_output
+                .drain_status_wake()
+                .map_err(|error| terminal_io("draining console status wakeup", error))?;
+            console_output
+                .check_error()
+                .map_err(|error| terminal_io("writing terminal output", error))?;
+        }
+        if resize.intersects(PollFlags::IN | PollFlags::HUP) {
+            drain(wake)?;
+            if terminal_enabled {
+                if let Some(payload) = terminal_size_payload()? {
+                    if matches!(
+                        write_terminal_size(connection, &payload, &mut reconnect, &mut stream)?,
+                        OwnedWriteOutcome::SessionEnded
+                    ) {
+                        return finish_remote_completion(
+                            console_output,
+                            pending_output,
+                            pending_forward,
+                            terminal_enabled,
+                            terminal_modes,
+                            forwarder,
+                            None,
+                        );
+                    }
+                }
+            }
+        }
+        while pending_forward.is_none() && pending_output.is_none() {
             match connection.try_read_packet() {
                 Ok(Some(packet)) => {
                     last_received = Instant::now();
@@ -216,11 +315,41 @@ where
                         pending_forward = forwarder
                             .try_receive(packet)
                             .map_err(|error| terminal_text(error.to_string()))?;
-                    } else if route_server_packet(packet, terminal_enabled, terminal_modes)?
-                        && auto_cursor_report
-                    {
-                        let _ =
-                            send_buffer(connection, crate::client_terminal::CURSOR_REPORT_REPLY);
+                    } else {
+                        match route_server_packet(
+                            packet,
+                            terminal_enabled,
+                            terminal_modes,
+                            &console_output,
+                        )? {
+                            DisplayOutcome::Displayed { cursor_report }
+                                if cursor_report
+                                    && auto_cursor_report
+                                    && !console_output.is_async() =>
+                            {
+                                if matches!(
+                                    write_cursor_report(
+                                        connection,
+                                        &mut reconnect,
+                                        &mut stream,
+                                        terminal_enabled,
+                                    )?,
+                                    OwnedWriteOutcome::SessionEnded
+                                ) {
+                                    return finish_remote_completion(
+                                        console_output,
+                                        pending_output,
+                                        pending_forward,
+                                        terminal_enabled,
+                                        terminal_modes,
+                                        forwarder,
+                                        None,
+                                    );
+                                }
+                            }
+                            DisplayOutcome::Displayed { .. } => {}
+                            DisplayOutcome::Pending(packet) => pending_output = Some(packet),
+                        }
                     }
                 }
                 Ok(None) => break,
@@ -236,23 +365,48 @@ where
                 .try_outbound()
                 .map_err(|error| terminal_text(error.to_string()))?
             {
-                match connection.write_packet(packet.header(), packet.payload()) {
-                    Ok(()) => {}
-                    Err(error) if connection_ended(&error) => {
-                        reconnect_needed = true;
-                        break;
+                match write_owned(
+                    connection,
+                    packet.header(),
+                    packet.payload(),
+                    &mut reconnect,
+                    &mut stream,
+                    terminal_enabled,
+                )? {
+                    OwnedWriteOutcome::Written => {}
+                    OwnedWriteOutcome::Recovered => {
+                        last_received = Instant::now();
+                        next_keepalive = last_received + interval;
                     }
-                    Err(error) => return Err(terminal_error(error)),
+                    OwnedWriteOutcome::SessionEnded => {
+                        return finish_remote_completion(
+                            console_output,
+                            pending_output,
+                            pending_forward,
+                            terminal_enabled,
+                            terminal_modes,
+                            forwarder,
+                            Some(packet),
+                        );
+                    }
                 }
             }
         }
         let now = Instant::now();
-        if now.saturating_duration_since(last_received) >= silence {
+        if pending_output.is_none() && now.saturating_duration_since(last_received) >= silence {
             reconnect_needed = true;
         }
         if reconnect_needed {
             if !recover(connection, &mut reconnect, &mut stream, terminal_enabled)? {
-                return Ok(());
+                return finish_remote_completion(
+                    console_output,
+                    pending_output,
+                    pending_forward,
+                    terminal_enabled,
+                    terminal_modes,
+                    forwarder,
+                    None,
+                );
             }
             last_received = Instant::now();
             next_keepalive = last_received + interval;
@@ -265,34 +419,67 @@ where
                 .read(&mut bytes)
                 .map_err(|error| terminal_io("reading terminal input", error))?;
             if count == 0 {
-                return Ok(());
+                return console_output
+                    .complete(ConsoleCompletion::LocalInputClosed)
+                    .map_err(|error| terminal_io("stopping terminal output", error));
             }
-            match send_buffer(connection, &bytes[..count]) {
-                Ok(()) => {}
-                Err(error) if connection_ended(&error) => {
-                    if !recover(connection, &mut reconnect, &mut stream, terminal_enabled)? {
-                        return Ok(());
-                    }
+            let payload = encoded_buffer(&bytes[..count]);
+            match write_owned(
+                connection,
+                TerminalPacketType::TerminalBuffer as u8,
+                &payload,
+                &mut reconnect,
+                &mut stream,
+                terminal_enabled,
+            )? {
+                OwnedWriteOutcome::Written => {}
+                OwnedWriteOutcome::Recovered => {
                     last_received = Instant::now();
                     next_keepalive = last_received + interval;
                 }
-                Err(error) => return Err(terminal_error(error)),
+                OwnedWriteOutcome::SessionEnded => {
+                    return finish_remote_completion(
+                        console_output,
+                        pending_output,
+                        pending_forward,
+                        terminal_enabled,
+                        terminal_modes,
+                        forwarder,
+                        None,
+                    );
+                }
             }
         }
         if input.intersects(PollFlags::HUP | PollFlags::ERR) {
-            return Ok(());
+            return console_output
+                .complete(ConsoleCompletion::LocalInputClosed)
+                .map_err(|error| terminal_io("stopping terminal output", error));
         }
         let now = Instant::now();
         if now >= next_keepalive {
             // The payload acknowledges everything read so far, so the server
             // can trim its replay backup; legacy servers ignore it.
             let ack = connection.keepalive_ack();
-            if connection
-                .write_packet(TerminalPacketType::KeepAlive as u8, &ack)
-                .is_err()
-                && !recover(connection, &mut reconnect, &mut stream, terminal_enabled)?
-            {
-                return Ok(());
+            if matches!(
+                write_owned(
+                    connection,
+                    TerminalPacketType::KeepAlive as u8,
+                    &ack,
+                    &mut reconnect,
+                    &mut stream,
+                    terminal_enabled,
+                )?,
+                OwnedWriteOutcome::SessionEnded
+            ) {
+                return finish_remote_completion(
+                    console_output,
+                    pending_output,
+                    pending_forward,
+                    terminal_enabled,
+                    terminal_modes,
+                    forwarder,
+                    None,
+                );
             }
             next_keepalive = Instant::now() + interval;
         }
@@ -305,16 +492,163 @@ fn route_server_packet(
     packet: et_core::packet::Packet,
     terminal_enabled: bool,
     terminal_modes: &mut TerminalModeState,
-) -> Result<bool, ClientError> {
+    output: &crate::client_output::ConsoleOutput,
+) -> Result<DisplayOutcome, ClientError> {
     if terminal_enabled || packet.header() == TerminalPacketType::KeepAlive as u8 {
-        return display_packet(packet, terminal_modes);
+        return crate::client_terminal::display_packet_with(packet, |bytes| {
+            output
+                .try_write(bytes, terminal_modes)
+                .map_err(|error| terminal_io("writing terminal output", error))
+        });
     }
     if packet.header() == TerminalPacketType::TerminalBuffer as u8 {
-        return Ok(false);
+        return Ok(DisplayOutcome::Displayed {
+            cursor_report: false,
+        });
     }
     Err(terminal_text(
         "server sent an unsupported no-terminal packet",
     ))
+}
+
+#[cfg(unix)]
+fn finish_remote_completion(
+    mut output: crate::client_output::ConsoleOutput,
+    pending_output: Option<et_core::packet::Packet>,
+    pending_forward: Option<et_core::packet::Packet>,
+    terminal_enabled: bool,
+    terminal_modes: &mut TerminalModeState,
+    forwarder: &mut Forwarder,
+    current_outbound: Option<et_core::packet::Packet>,
+) -> Result<(), ClientError> {
+    let mut retained = RetainedCompletion::new(pending_output, pending_forward);
+    loop {
+        output
+            .check_error()
+            .map_err(|error| terminal_io("writing retained terminal output", error))?;
+        if retained.advance(
+            |packet| match route_server_packet(packet, terminal_enabled, terminal_modes, &output)? {
+                DisplayOutcome::Displayed { .. } => Ok(None),
+                DisplayOutcome::Pending(packet) => Ok(Some(packet)),
+            },
+            |packet| {
+                forwarder
+                    .try_receive(packet)
+                    .map_err(|error| terminal_text(error.to_string()))
+            },
+        )? {
+            let abandoned = forwarder
+                .shutdown_hard()
+                .map_err(|error| terminal_text(error.to_string()))?;
+            classify_forward_completion(current_outbound, abandoned)?;
+            return output
+                .complete(ConsoleCompletion::RemoteSessionEnded)
+                .map_err(|error| terminal_io("draining terminal output", error));
+        }
+        if let Some(packet) = forwarder
+            .try_outbound()
+            .map_err(|error| terminal_text(error.to_string()))?
+        {
+            let abandoned = forwarder
+                .shutdown_hard()
+                .map_err(|error| terminal_text(error.to_string()))?;
+            classify_forward_completion(Some(packet), abandoned)?;
+        }
+
+        let (output_ready, output_status) = {
+            let mut descriptors = [
+                PollFd::new(
+                    forwarder
+                        .wake()
+                        .map_err(|error| terminal_text(error.to_string()))?,
+                    PollFlags::IN | PollFlags::HUP,
+                ),
+                PollFd::new(output.wake(), PollFlags::IN | PollFlags::HUP),
+                PollFd::new(output.status_wake(), PollFlags::IN | PollFlags::HUP),
+            ];
+            let timeout = Timespec::try_from(Duration::from_millis(100))
+                .map_err(|_| terminal_text("completion wait exceeds poll range"))?;
+            match poll(&mut descriptors, Some(&timeout)) {
+                Ok(_) => {}
+                Err(error) if error == rustix::io::Errno::INTR => continue,
+                Err(error) => {
+                    return Err(terminal_io(
+                        "waiting to drain retained session packets",
+                        io::Error::from(error),
+                    ));
+                }
+            }
+            (descriptors[1].revents(), descriptors[2].revents())
+        };
+        if output_ready.intersects(PollFlags::IN | PollFlags::HUP) {
+            output
+                .drain_wake()
+                .map_err(|error| terminal_io("draining console output wakeup", error))?;
+        }
+        if output_status.intersects(PollFlags::IN | PollFlags::HUP) {
+            output
+                .drain_status_wake()
+                .map_err(|error| terminal_io("draining console status wakeup", error))?;
+        }
+    }
+}
+
+#[cfg(unix)]
+fn write_cursor_report<F>(
+    connection: &mut Connection,
+    reconnect: &mut F,
+    stream: &mut std::net::TcpStream,
+    send_terminal_size: bool,
+) -> Result<OwnedWriteOutcome, ClientError>
+where
+    F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
+{
+    let payload = encoded_buffer(crate::client_terminal::CURSOR_REPORT_REPLY);
+    write_owned(
+        connection,
+        TerminalPacketType::TerminalBuffer as u8,
+        &payload,
+        reconnect,
+        stream,
+        send_terminal_size,
+    )
+}
+
+#[cfg(unix)]
+fn write_terminal_size<F>(
+    connection: &mut Connection,
+    payload: &[u8],
+    reconnect: &mut F,
+    stream: &mut std::net::TcpStream,
+) -> Result<OwnedWriteOutcome, ClientError>
+where
+    F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
+{
+    let outcome = write_terminal_size_recovering(connection, payload, reconnect)?;
+    if matches!(outcome, OwnedWriteOutcome::Recovered) {
+        *stream = connection.try_clone_stream().map_err(terminal_error)?;
+    }
+    Ok(outcome)
+}
+
+#[cfg(unix)]
+fn write_owned<F>(
+    connection: &mut Connection,
+    header: u8,
+    payload: &[u8],
+    reconnect: &mut F,
+    stream: &mut std::net::TcpStream,
+    send_terminal_size: bool,
+) -> Result<OwnedWriteOutcome, ClientError>
+where
+    F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
+{
+    let outcome =
+        write_owned_recovering(connection, header, payload, reconnect, send_terminal_size)?;
+    if matches!(outcome, OwnedWriteOutcome::Recovered) {
+        *stream = connection.try_clone_stream().map_err(terminal_error)?;
+    }
+    Ok(outcome)
 }
 
 #[cfg(unix)]
@@ -347,3 +681,7 @@ fn drain(wake: &mut UnixStream) -> Result<(), ClientError> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "client_terminal_loop_tests.rs"]
+mod tests;

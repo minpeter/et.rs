@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[cfg(target_os = "linux")]
+use std::io::Write;
 use std::io::{Cursor, ErrorKind, Read};
 
 use et_core::packet::Packet;
@@ -114,4 +116,35 @@ fn writer_survives_wouldblock_backpressure_on_a_nonblocking_stream() {
         assert_eq!(packet.header(), index as u8);
         assert_eq!(packet.payload(), vec![index as u8; PAYLOAD]);
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn opted_in_terminal_sender_hits_backpressure_near_the_configured_bound() {
+    let (_server, mut terminal) = et_net::local::wake_pair().unwrap();
+    et_net::local::minimize_terminal_output_buffering(&terminal).unwrap();
+    terminal.set_nonblocking(true).unwrap();
+
+    let chunk = [0u8; 16 * 1024];
+    let mut queued = 0usize;
+    loop {
+        match terminal.write(&chunk) {
+            Ok(0) => panic!("local stream stopped accepting output before backpressure"),
+            Ok(count) => queued += count,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+            Err(error) => panic!("unexpected terminal output error: {error}"),
+        }
+    }
+
+    // Linux reports SO_SNDBUF at twice the requested value for bookkeeping.
+    // One write may straddle the threshold, so allow one chunk of headroom.
+    let configured = et_net::local::FLOW_CONTROL_SEND_BUFFER_BYTES;
+    assert!(
+        queued >= configured,
+        "backpressure arrived too early: {queued}"
+    );
+    assert!(
+        queued <= configured * 2 + chunk.len(),
+        "sender queued {queued} bytes past the configured {configured}-byte bound"
+    );
 }

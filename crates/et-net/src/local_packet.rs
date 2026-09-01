@@ -65,6 +65,22 @@ pub fn read_local_packet<R: Read>(reader: &mut R) -> Result<Packet, LocalPacketE
     Packet::from_serialized(&serialized).map_err(LocalPacketError::MalformedPacket)
 }
 
+pub fn encode_local_packet(packet: &Packet) -> io::Result<Vec<u8>> {
+    let serialized = packet.serialize();
+    if serialized.len() > MAX_LOCAL_PACKET_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "local packet exceeds 64 KiB",
+        ));
+    }
+    let length = i64::try_from(serialized.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "local packet too large"))?;
+    let mut frame = Vec::with_capacity(PREFIX_LEN + serialized.len());
+    frame.extend_from_slice(&length.to_ne_bytes());
+    frame.extend_from_slice(&serialized);
+    Ok(frame)
+}
+
 pub fn status_packet(header: u8, result: Result<(), &str>) -> Packet {
     let mut payload = Vec::new();
     match result {
@@ -100,9 +116,6 @@ pub fn write_local_packet<W: Write>(writer: &mut W, packet: &Packet) -> io::Resu
     write_local_packet_with(writer, packet, || false)
 }
 
-/// Write one frame while allowing an owner to cancel blocked backpressure.
-/// Once cancellation begins the caller must close the channel because a
-/// partially written frame is intentionally abandoned during teardown.
 pub fn write_local_packet_cancelled<W: Write>(
     writer: &mut W,
     packet: &Packet,
@@ -114,8 +127,6 @@ pub fn write_local_packet_cancelled<W: Write>(
     })
 }
 
-/// Write one complete local frame under ordinary backpressure, stopping only
-/// when teardown explicitly requests cancellation.
 pub fn write_local_packet_until_cancelled<W: Write>(
     writer: &mut W,
     packet: &Packet,
@@ -129,17 +140,8 @@ fn write_local_packet_with<W: Write>(
     packet: &Packet,
     cancelled: impl Fn() -> bool,
 ) -> io::Result<()> {
-    let serialized = packet.serialize();
-    if serialized.len() > MAX_LOCAL_PACKET_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "local packet exceeds 64 KiB",
-        ));
-    }
-    let length = i64::try_from(serialized.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "local packet too large"))?;
-    write_all_blocking(writer, &length.to_ne_bytes(), &cancelled)?;
-    write_all_blocking(writer, &serialized, &cancelled)?;
+    let frame = encode_local_packet(packet)?;
+    write_all_blocking(writer, &frame, &cancelled)?;
     flush_blocking(writer, &cancelled)
 }
 

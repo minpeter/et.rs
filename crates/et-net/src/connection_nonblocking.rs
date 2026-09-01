@@ -1,4 +1,6 @@
-use std::io::{self, Read};
+use std::io;
+#[cfg(windows)]
+use std::io::Read;
 use std::net::TcpStream;
 
 use et_core::backed_reader::{BackedReader, ReadItem};
@@ -14,10 +16,18 @@ pub(crate) fn try_read(
         ReadItem::Packet(packet) => return Ok(Some(packet)),
         ReadItem::NeedMore => {}
     }
-    stream.set_nonblocking(true)?;
     let mut buffer = [0u8; 8192];
-    let read = stream.read(&mut buffer);
-    stream.set_nonblocking(false)?;
+    #[cfg(unix)]
+    let read = rustix::net::recv(stream, &mut buffer, rustix::net::RecvFlags::DONTWAIT)
+        .map(|(count, _)| count)
+        .map_err(io::Error::from);
+    #[cfg(windows)]
+    let read = {
+        stream.set_nonblocking(true)?;
+        let read = stream.read(&mut buffer);
+        stream.set_nonblocking(false)?;
+        read
+    };
     match read {
         Ok(0) => Err(ConnError::Io(io::ErrorKind::UnexpectedEof.into())),
         Ok(count) => {

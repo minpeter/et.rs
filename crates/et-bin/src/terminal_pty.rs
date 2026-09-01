@@ -55,6 +55,8 @@ where
     F: FnOnce(&mut LocalStream) -> Result<(), String>,
 {
     let environment = read_initial_environment(&mut router)?;
+    #[cfg(unix)]
+    let motd = crate::terminal_motd::load();
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -108,7 +110,16 @@ where
                 if !output_delay.is_zero() {
                     thread::sleep(output_delay);
                 }
-                forward_output(&mut pty_reader, &worker_writer, &worker_cancelled)
+                #[cfg(unix)]
+                let prefix = motd.as_deref();
+                #[cfg(not(unix))]
+                let prefix = None;
+                forward_output(
+                    &mut pty_reader,
+                    &worker_writer,
+                    &worker_cancelled,
+                    prefix,
+                )
             });
             let _ = output_tx.send(WorkerEvent::Output(result));
             signal(output_wake);
@@ -177,10 +188,6 @@ where
                 .lock()
                 .map_err(|_| "terminal router writer is unavailable".to_owned())?;
             started(&mut writer)?;
-            // Keep startup status ahead of every user-visible byte while
-            // preserving current-main's MOTD-before-shell ordering.
-            #[cfg(unix)]
-            crate::terminal_motd::emit(&mut writer)?;
             Ok(())
         });
     let output_started = setup.is_ok();
@@ -286,8 +293,15 @@ fn forward_output(
     reader: &mut dyn Read,
     router: &Mutex<LocalStream>,
     cancelled: &AtomicBool,
+    prefix: Option<&[u8]>,
 ) -> Result<(), String> {
+    if let Some(prefix) = prefix {
+        for chunk in prefix.chunks(MAX_OUTPUT_CHUNK) {
+            write_output(router, cancelled, chunk)?;
+        }
+    }
     let mut buffer = [0u8; MAX_OUTPUT_CHUNK];
+    let mut first = true;
     loop {
         let count = reader
             .read(&mut buffer)
@@ -295,19 +309,39 @@ fn forward_output(
         if count == 0 {
             return Ok(());
         }
-        let message = TerminalBuffer {
-            buffer: Some(buffer[..count].to_vec()),
-        };
-        let packet = Packet::new(
-            TerminalPacketType::TerminalBuffer as u8,
-            message.encode_to_vec(),
-        );
-        let mut router = router
-            .lock()
-            .map_err(|_| "terminal router writer is unavailable".to_owned())?;
-        write_local_packet_until_cancelled(&mut *router, &packet, cancelled)
-            .map_err(|error| format!("could not forward PTY output: {error}"))?;
+        let mut output = &buffer[..count];
+        if first && prefix.is_some() {
+            output = output
+                .strip_prefix(b"\r\r\n")
+                .or_else(|| output.strip_prefix(b"\r\n"))
+                .or_else(|| output.strip_prefix(b"\n"))
+                .unwrap_or(output);
+        }
+        first = false;
+        write_output(router, cancelled, output)?;
     }
+}
+
+fn write_output(
+    router: &Mutex<LocalStream>,
+    cancelled: &AtomicBool,
+    output: &[u8],
+) -> Result<(), String> {
+    if output.is_empty() {
+        return Ok(());
+    }
+    let message = TerminalBuffer {
+        buffer: Some(output.to_vec()),
+    };
+    let packet = Packet::new(
+        TerminalPacketType::TerminalBuffer as u8,
+        message.encode_to_vec(),
+    );
+    let mut router = router
+        .lock()
+        .map_err(|_| "terminal router writer is unavailable".to_owned())?;
+    write_local_packet_until_cancelled(&mut *router, &packet, cancelled)
+        .map_err(|error| format!("could not forward PTY output: {error}"))
 }
 
 struct PumpCompletion {
@@ -665,6 +699,7 @@ mod tests {
                 &mut Cursor::new(b"immediate output"),
                 &worker_writer,
                 &worker_cancelled,
+                None,
             )
         });
 

@@ -194,10 +194,3 @@ fn load_preserves_raw_bytes_and_normalizes_only_lone_line_feeds() {
         b"a\r\nb\r\n\x1b[31mc\x07\xff\xfe\r\n"
     );
 }
-
-#[test]
-fn maximum_output_packet_fits_the_local_frame_bound() {
-    let packet = output_packet(&vec![b'x'; MAX_OUTPUT_CHUNK]);
-
-    assert!(packet.wire_len() <= et_net::local_packet::MAX_LOCAL_PACKET_LEN);
-}

@@ -138,6 +138,42 @@ impl Fixture {
         path
     }
 
+    /// Wrapper that emits a prompt marker immediately when invoked as a login shell.
+    pub fn prompt_probe_shell(&self) -> std::path::PathBuf {
+        let path = self.directory.join("prompt-probe-shell");
+        fs::write(
+            &path,
+            "#!/bin/sh\n\
+             if [ \"${1-}\" = \"-l\" ]; then\n\
+             printf 'ET-PROMPT> '\n\
+             shift\n\
+             exec /bin/sh \"$@\"\n\
+             fi\n\
+             exec /bin/sh \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    /// Login-shell wrapper matching profiles that begin by moving to a fresh line.
+    pub fn leading_newline_prompt_shell(&self) -> std::path::PathBuf {
+        let path = self.directory.join("leading-newline-prompt-shell");
+        fs::write(
+            &path,
+            "#!/bin/sh\n\
+             if [ \"${1-}\" = \"-l\" ]; then\n\
+             printf '\\r\\nET-PROMPT> '\n\
+             shift\n\
+             exec /bin/sh \"$@\"\n\
+             fi\n\
+             exec /bin/sh \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
     pub fn spawn_parent(&self) -> std::process::Child {
         Command::new(env!("CARGO_BIN_EXE_et"))
             .args(["terminal", "--serverfifo"])

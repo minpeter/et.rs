@@ -11,15 +11,8 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use et_core::packet::Packet;
-use et_core::proto::{TerminalBuffer, TerminalPacketType};
-use et_net::local::LocalStream;
-use et_net::local_packet::write_local_packet;
-use prost::Message;
 use rustix::fs::{Mode, OFlags};
 
-/// Largest output chunk per packet, matching the PTY output worker.
-const MAX_OUTPUT_CHUNK: usize = 16 * 1024;
 /// `pam_motd(8)` limits each message to 64 KiB.
 const MAX_MOTD_MESSAGE: usize = 64 * 1024;
 /// Bound aggregate startup output when many directory messages exist.
@@ -35,11 +28,10 @@ const DEFAULT_FILES: [&str; 3] = ["/etc/motd", "/run/motd", "/usr/lib/motd"];
 /// `pam_motd(8)`'s default directories, highest priority first.
 const DEFAULT_DIRS: [&str; 3] = ["/etc/motd.d", "/run/motd.d", "/usr/lib/motd.d"];
 
-/// Emit the message of the day to the router, if there is one to show.
+/// Load the message of the day, if there is one to show.
 ///
-/// File-level failures are advisory and never fail the session. A router write
-/// failure follows the same error path as any other terminal output failure.
-pub fn emit(router: &mut LocalStream) -> Result<(), String> {
+/// File-level failures are advisory and never fail the session.
+pub fn load() -> Option<Vec<u8>> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let override_path = std::env::var_os(OVERRIDE_VARIABLE)
         .filter(|path| !path.is_empty())
@@ -57,10 +49,7 @@ pub fn emit(router: &mut LocalStream) -> Result<(), String> {
     } else {
         load_defaults_from(&dynamic_files, &files, &directories, home.as_deref())
     };
-    let Some(text) = text else {
-        return Ok(());
-    };
-    write_output(router, &text)
+    text
 }
 
 fn load_from(
@@ -203,24 +192,6 @@ fn append_terminal_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
     if output.len().saturating_add(2) <= MAX_MOTD_TOTAL {
         output.extend_from_slice(b"\r\n");
     }
-}
-
-fn output_packet(chunk: &[u8]) -> Packet {
-    let message = TerminalBuffer {
-        buffer: Some(chunk.to_vec()),
-    };
-    Packet::new(
-        TerminalPacketType::TerminalBuffer as u8,
-        message.encode_to_vec(),
-    )
-}
-
-fn write_output(router: &mut LocalStream, text: &[u8]) -> Result<(), String> {
-    for chunk in text.chunks(MAX_OUTPUT_CHUNK) {
-        write_local_packet(router, &output_packet(chunk))
-            .map_err(|error| format!("could not forward message of the day: {error}"))?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

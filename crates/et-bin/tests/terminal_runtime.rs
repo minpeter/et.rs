@@ -26,6 +26,7 @@ const KEY: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
 const TIMEOUT: Duration = Duration::from_secs(5);
 const LOGIN_TERM_COMPLETION: &[u8] = b"__ET_LOGIN_TERM_COMPLETE__\r\n";
 const MOTD_MARKER: &[u8] = b"ET-MOTD-MARKER";
+const PROMPT_MARKER: &[u8] = b"ET-PROMPT> ";
 
 #[test]
 fn bootstrap_parent_reports_marker_and_leaves_registered_session_running() {
@@ -541,6 +542,102 @@ fn real_terminal_emits_motd_before_login_shell_output() {
         "expected MOTD exactly once; got {:?}",
         String::from_utf8_lossy(&output),
     );
+}
+
+#[test]
+fn real_terminal_places_prompt_on_line_after_motd() {
+    // Given: a one-line MOTD and a login shell that emits its prompt immediately.
+    let fixture = Fixture::new("motd-prompt-spacing");
+    let motd = fixture.file("motd", b"ET-MOTD-MARKER\n");
+    let shell = fixture.prompt_probe_shell();
+    let mut child = fixture.spawn_session(
+        shell.to_str().unwrap(),
+        &[("ET_MOTD_PATH", motd.as_os_str())],
+    );
+    write_credentials(&mut child);
+    let (mut router, _) = fixture.listener.accept().unwrap();
+    router.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let _ = read_local_packet(&mut router).unwrap();
+    fixture.wait_ready();
+
+    // When: the terminal session starts the login shell.
+    send(
+        &mut router,
+        TerminalPacketType::TerminalInit,
+        &TermInit {
+            environmentnames: Vec::new(),
+            environmentvalues: Vec::new(),
+        },
+    );
+    let output = collect_until(&mut router, |output| contains(output, PROMPT_MARKER));
+
+    // Then: exactly one terminal line transition separates MOTD and prompt.
+    let motd_at = find(&output, MOTD_MARKER).unwrap();
+    let prompt_at = find(&output, PROMPT_MARKER).unwrap();
+    assert_eq!(
+        &output[motd_at + MOTD_MARKER.len()..prompt_at],
+        b"\r\n",
+        "expected prompt directly below MOTD; got {:?}",
+        String::from_utf8_lossy(&output),
+    );
+
+    send(
+        &mut router,
+        TerminalPacketType::TerminalBuffer,
+        &TerminalBuffer {
+            buffer: Some(b"exit\n".to_vec()),
+        },
+    );
+    let status = child.wait_timeout(TIMEOUT).unwrap().unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn real_terminal_does_not_stack_motd_newline_with_shell_startup_newline() {
+    // Given: a MOTD plus a login shell whose startup moves to a fresh line.
+    let fixture = Fixture::new("motd-leading-shell-newline");
+    let motd = fixture.file("motd", b"ET-MOTD-MARKER\n");
+    let shell = fixture.leading_newline_prompt_shell();
+    let mut child = fixture.spawn_session(
+        shell.to_str().unwrap(),
+        &[("ET_MOTD_PATH", motd.as_os_str())],
+    );
+    write_credentials(&mut child);
+    let (mut router, _) = fixture.listener.accept().unwrap();
+    router.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let _ = read_local_packet(&mut router).unwrap();
+    fixture.wait_ready();
+
+    // When: the terminal starts the login shell after emitting MOTD.
+    send(
+        &mut router,
+        TerminalPacketType::TerminalInit,
+        &TermInit {
+            environmentnames: Vec::new(),
+            environmentvalues: Vec::new(),
+        },
+    );
+    let output = collect_until(&mut router, |output| contains(output, PROMPT_MARKER));
+
+    // Then: MOTD and shell startup do not create a blank line together.
+    let motd_at = find(&output, MOTD_MARKER).unwrap();
+    let prompt_at = find(&output, PROMPT_MARKER).unwrap();
+    assert_eq!(
+        &output[motd_at + MOTD_MARKER.len()..prompt_at],
+        b"\r\n",
+        "expected prompt directly below MOTD; got {:?}",
+        String::from_utf8_lossy(&output),
+    );
+
+    send(
+        &mut router,
+        TerminalPacketType::TerminalBuffer,
+        &TerminalBuffer {
+            buffer: Some(b"exit\n".to_vec()),
+        },
+    );
+    let status = child.wait_timeout(TIMEOUT).unwrap().unwrap();
+    assert!(status.success());
 }
 
 #[test]

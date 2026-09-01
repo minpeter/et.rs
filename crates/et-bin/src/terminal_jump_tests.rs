@@ -243,6 +243,75 @@ fn jumphost_resumes_coalesced_destination_packets_after_router_backpressure() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn closed_destination_poll_mask_ignores_readable_router_input() {
+    // Given: destination closure is latched while output remains pending.
+    // When: the router poll subscription is constructed.
+    let flags = router_poll_flags(true, true);
+
+    // Then: readable input cannot wake a loop that deliberately ignores it,
+    // while output progress and local closure remain observable.
+    assert!(!flags.contains(PollFlags::IN));
+    assert!(flags.contains(PollFlags::OUT));
+    assert!(flags.contains(PollFlags::HUP));
+    assert!(flags.contains(PollFlags::ERR));
+}
+
+#[cfg(unix)]
+#[test]
+fn jumphost_drains_buffered_destination_packets_after_hup() {
+    // Given: destination frames are coalesced before the peer closes, while
+    // the first local frame is held by real router backpressure.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let connector = thread::spawn(move || std::net::TcpStream::connect(address).unwrap());
+    let (server_stream, _) = listener.accept().unwrap();
+    let client_stream = connector.join().unwrap();
+    let key = [41u8; 32];
+    let mut destination_client = Connection::new_client(client_stream, &key);
+    let mut destination_server = Connection::new_server(server_stream, &key);
+    for header in 111..116 {
+        destination_server.write_packet(header, &[header]).unwrap();
+    }
+    let reset = destination_server.try_clone_stream().unwrap();
+    SockRef::from(&reset)
+        .set_linger(Some(Duration::ZERO))
+        .unwrap();
+    drop(reset);
+    drop(destination_server);
+    let (relay_router, mut router_peer) = et_net::local::wake_pair().unwrap();
+    let filler_bytes = saturate_router_output(&relay_router, &router_peer);
+    router_peer.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let (pending_tx, pending_rx) = mpsc::sync_channel(0);
+    let relay = thread::spawn(move || {
+        relay_with_output_observer(relay_router, &mut destination_client, || {
+            pending_tx.send(()).unwrap();
+        })
+    });
+    pending_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+
+    // When: the router resumes after destination HUP has already been observed.
+    router_peer
+        .read_exact(&mut vec![0u8; filler_bytes])
+        .unwrap();
+    let mut relayed = Vec::new();
+    for _ in 0..5 {
+        let packet = et_net::local_packet::read_local_packet(&mut router_peer).unwrap();
+        relayed.push((packet.header(), packet.payload().to_vec()));
+    }
+
+    // Then: the pending frame and every packet already buffered in the
+    // destination BackedReader leave in order before the relay exits.
+    assert_eq!(relay.join().unwrap().unwrap(), 0);
+    assert_eq!(
+        relayed,
+        (111..116)
+            .map(|header| (header, vec![header]))
+            .collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn jumphost_run_bounds_router_sender_before_destination_output() {
     // Given: the real jump relay is paused after the destination receives its

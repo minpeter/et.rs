@@ -185,6 +185,85 @@ fn hard_shutdown_cancels_active_destination_write_after_socket_backpressure() {
 }
 
 #[test]
+fn hard_shutdown_reports_admitted_socket_bytes_abandoned() {
+    // Given: a destination writer is blocked by a peer that never drains, but
+    // every forwarding command has crossed the worker boundary. The trailing
+    // response is a FIFO barrier proving the outer command queue is empty.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let destination_port = listener.local_addr().unwrap().port();
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+    let peer = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        socket2::SockRef::from(&stream)
+            .set_recv_buffer_size(4096)
+            .unwrap();
+        accepted_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    let source_port = reserve_port();
+    let mut source = Forwarder::start(vec![request(source_port, destination_port)]).unwrap();
+    let mut destination = Forwarder::start(Vec::new()).unwrap();
+    let application = TcpStream::connect((Ipv4Addr::LOCALHOST, source_port)).unwrap();
+    destination
+        .receive(source.wait_outbound(TIMEOUT).unwrap())
+        .unwrap();
+    let response_packet = destination.wait_outbound(TIMEOUT).unwrap();
+    let response =
+        et_core::proto::PortForwardDestinationResponse::decode(response_packet.payload()).unwrap();
+    let socket_id = response.socketid.unwrap();
+    source.receive(response_packet).unwrap();
+    accepted_rx.recv_timeout(TIMEOUT).unwrap();
+    let data_packet = || {
+        Packet::new(
+            TerminalPacketType::PortForwardData as u8,
+            et_core::proto::PortForwardData {
+                sourcetodestination: Some(true),
+                socketid: Some(socket_id),
+                buffer: Some(vec![9u8; 64 * 1024]),
+                error: None,
+                closed: None,
+            }
+            .encode_to_vec(),
+        )
+    };
+    for _ in 0..65 {
+        destination.receive(data_packet()).unwrap();
+    }
+    destination
+        .receive(Packet::new(
+            TerminalPacketType::PortForwardDestinationRequest as u8,
+            PortForwardDestinationRequest {
+                destination: Some(SocketEndpoint {
+                    name: None,
+                    port: Some(0),
+                }),
+                fd: Some(777),
+            }
+            .encode_to_vec(),
+        ))
+        .unwrap();
+    let barrier = destination.wait_outbound(TIMEOUT).unwrap();
+    let barrier =
+        et_core::proto::PortForwardDestinationResponse::decode(barrier.payload()).unwrap();
+    assert_eq!(barrier.clientfd, Some(777));
+    assert!(barrier.error.is_some());
+
+    // When: hard shutdown aborts the admitted writer queue and in-flight write.
+    let abandoned = destination.shutdown_hard().unwrap();
+
+    // Then: payload ownership loss is reported even though outer lanes drained.
+    release_tx.send(()).unwrap();
+    peer.join().unwrap();
+    drop(application);
+    source.shutdown_hard().unwrap();
+    assert!(
+        abandoned,
+        "hard shutdown discarded admitted socket bytes without reporting abandonment"
+    );
+}
+
+#[test]
 fn try_receive_reports_backpressure_and_outbound_drain_recovers() {
     let forwarder = Forwarder::start(Vec::new()).unwrap();
     // Every destination request with an unparseable destination (port 0)

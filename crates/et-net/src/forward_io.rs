@@ -1,7 +1,5 @@
 use std::io::{self, Read, Write};
-#[cfg(windows)]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -27,6 +25,9 @@ pub(crate) struct BoundSource {
 pub(crate) struct ActiveIo {
     pub(crate) writer: channel::Sender<WriteCommand>,
     pub(crate) control: ForwardStream,
+    pub(crate) cancel: channel::Receiver<()>,
+    pub(crate) pending_bytes: Arc<AtomicUsize>,
+    pub(crate) abandoned: Arc<AtomicBool>,
 }
 
 pub(crate) enum WriteCommand {
@@ -149,6 +150,7 @@ pub(crate) fn spawn_io(
     stream: ForwardStream,
     commands: channel::Sender<Command>,
     cancel: channel::Receiver<()>,
+    abandoned: Arc<AtomicBool>,
 ) -> io::Result<(ActiveIo, [JoinHandle<()>; 2])> {
     #[cfg(windows)]
     {
@@ -206,16 +208,19 @@ pub(crate) fn spawn_io(
         }
     });
     let writer_commands = commands;
-    let writer_cancel = cancel;
+    let writer_cancel = cancel.clone();
+    let pending_bytes = Arc::new(AtomicUsize::new(0));
+    let writer_pending_bytes = pending_bytes.clone();
+    let writer_abandoned = abandoned.clone();
     let writer_handle = thread::spawn(move || {
         let mut writer = stream;
         loop {
             let command = channel::select! {
                 recv(writer_rx) -> command => match command {
                     Ok(command) => command,
-                    Err(_) => return,
+                    Err(_) => break,
                 },
-                recv(writer_cancel) -> _ => return,
+                recv(writer_cancel) -> _ => break,
             };
             match command {
                 WriteCommand::Data(buffer) => {
@@ -230,26 +235,33 @@ pub(crate) fn spawn_io(
                                 send(writer_commands, Command::IoFailed { role, socket_id, error }) -> _ => {},
                                 recv(writer_cancel) -> _ => {},
                             }
-                            return;
+                            break;
                         }
                     };
                     if !delivered {
-                        return;
+                        break;
                     }
+                    writer_pending_bytes.fetch_sub(buffer.len(), Ordering::AcqRel);
                 }
                 WriteCommand::Stop => {
                     // Perform the final shutdown here so every Data command
                     // queued before Stop is flushed to the socket first.
                     writer.shutdown();
-                    return;
+                    break;
                 }
             }
+        }
+        if writer_pending_bytes.load(Ordering::Acquire) != 0 {
+            writer_abandoned.store(true, Ordering::Release);
         }
     });
     Ok((
         ActiveIo {
             writer: writer_tx,
             control,
+            cancel,
+            pending_bytes,
+            abandoned,
         },
         [reader_handle, writer_handle],
     ))
@@ -286,16 +298,112 @@ fn cancellation_requested(cancel: &channel::Receiver<()>) -> bool {
 }
 
 pub(crate) fn stop_io(io: ActiveIo) {
-    // Queue Stop before touching the socket: the writer thread drains any
-    // pending Data commands in FIFO order and then closes the socket. Only
-    // shut down the read half here to wake the reader thread; a full
-    // shutdown would discard writes that are still queued.
-    let _ = io.writer.send(WriteCommand::Stop);
-    io.control.shutdown_read();
+    // Keep the control socket alive while Stop waits for queue capacity so
+    // hard cancellation can still abort an in-flight write and release it.
+    let stop_admitted = channel::select! {
+        send(io.writer, WriteCommand::Stop) -> result => result.is_ok(),
+        recv(io.cancel) -> _ => false,
+    };
+    if stop_admitted {
+        io.control.shutdown_read();
+    } else {
+        if io.pending_bytes.load(Ordering::Acquire) != 0 {
+            io.abandoned.store(true, Ordering::Release);
+        }
+        io.control.shutdown();
+    }
 }
 
 pub(crate) fn abort_io(io: ActiveIo) {
     // Hard cancellation abandons queued output and closes both socket halves
     // before joining, waking a writer blocked inside write_all.
     io.control.shutdown();
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::io::{self, Write};
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    use crossbeam_channel as channel;
+
+    use super::{spawn_io, stop_io, ForwardStream, Role, WriteCommand};
+
+    const EVENT_TIMEOUT: Duration = Duration::from_secs(3);
+
+    #[test]
+    fn stop_io_cancellation_bypasses_a_full_writer_queue() {
+        // Given: the writer owns one command in a blocked socket write and its
+        // bounded queue is full. Admission of the final command proves this
+        // state without scheduler timing assumptions.
+        let (stream, peer) = UnixStream::pair().unwrap();
+        socket2::SockRef::from(&stream)
+            .set_send_buffer_size(2 * 1024)
+            .unwrap();
+        socket2::SockRef::from(&peer)
+            .set_recv_buffer_size(2 * 1024)
+            .unwrap();
+        let mut saturator = stream.try_clone().unwrap();
+        saturator.set_nonblocking(true).unwrap();
+        loop {
+            match saturator.write(&[0u8; 16 * 1024]) {
+                Ok(0) => panic!("forward socket closed before reaching backpressure"),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("could not saturate forward socket: {error}"),
+            }
+        }
+        saturator.set_nonblocking(false).unwrap();
+        let control = stream.try_clone().unwrap();
+        let (commands, _command_receiver) = channel::bounded(1);
+        let (cancel, cancel_receiver) = channel::bounded(1);
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let (active, handles) = spawn_io(
+            Role::Destination,
+            1,
+            ForwardStream::Unix(stream),
+            commands,
+            cancel_receiver,
+            abandoned,
+        )
+        .unwrap();
+        for _ in 0..64 {
+            active.writer.send(WriteCommand::Data(vec![1])).unwrap();
+        }
+        let writer = active.writer.clone();
+        let (admitted_tx, admitted_rx) = mpsc::sync_channel(0);
+        let admission = std::thread::spawn(move || {
+            writer.send(WriteCommand::Data(vec![1])).unwrap();
+            admitted_tx.send(()).unwrap();
+        });
+        admitted_rx.recv_timeout(EVENT_TIMEOUT).unwrap();
+        admission.join().unwrap();
+
+        // When: hard cancellation races graceful Stop admission.
+        let (done_tx, done_rx) = mpsc::sync_channel(0);
+        let stopping = std::thread::spawn(move || {
+            stop_io(active);
+            done_tx.send(()).unwrap();
+        });
+        drop(cancel);
+        let completed_before_abort = done_rx.recv_timeout(EVENT_TIMEOUT).is_ok();
+
+        // Then: cancellation itself must complete removal; the retained clone
+        // is used only to guarantee cleanup after observing a regression.
+        let _ = control.shutdown(std::net::Shutdown::Both);
+        let _ = done_rx.recv_timeout(EVENT_TIMEOUT);
+        stopping.join().unwrap();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        drop(peer);
+        assert!(
+            completed_before_abort,
+            "stop_io remained blocked behind the full writer queue after cancellation"
+        );
+    }
 }

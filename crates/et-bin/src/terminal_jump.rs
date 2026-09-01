@@ -291,40 +291,53 @@ fn relay_with_output_observer(
     #[cfg(unix)]
     let mut resume_destination_drain = false;
     #[cfg(unix)]
+    let mut destination_closed = false;
+    #[cfg(unix)]
+    let mut destination_drained = false;
+    #[cfg(unix)]
     loop {
-        let client = destination
-            .try_clone_stream()
-            .map_err(|error| format!("could not poll the destination: {error}"))?;
-        let router_flags = PollFlags::IN
-            | PollFlags::HUP
-            | PollFlags::ERR
-            | if pending_output.is_some() {
-                PollFlags::OUT
-            } else {
-                PollFlags::empty()
-            };
-        let client_flags = if pending_output.is_none() {
-            PollFlags::IN | PollFlags::HUP | PollFlags::ERR
-        } else {
-            PollFlags::HUP | PollFlags::ERR
-        };
-        let mut descriptors = [
-            PollFd::new(&router, router_flags),
-            PollFd::new(&client, client_flags),
-        ];
-        // poll() is never restarted by SA_RESTART; retry on EINTR so a stray
-        // signal cannot kill the jump-host bridge.
-        loop {
-            match poll(&mut descriptors, None) {
-                Ok(_) => break,
-                Err(error) if error == rustix::io::Errno::INTR => {}
-                Err(error) => return Err(format!("poll failed: {error}")),
-            }
+        if destination_drained && pending_output.is_none() {
+            return Ok(0);
         }
-        let router_events = descriptors[0].revents();
-        let client_events = descriptors[1].revents();
-        drop(client);
+        let router_flags = router_poll_flags(destination_closed, pending_output.is_some());
+        let (router_events, client_events) = if destination_closed {
+            let mut descriptors = [PollFd::new(&router, router_flags)];
+            loop {
+                match poll(&mut descriptors, None) {
+                    Ok(_) => break,
+                    Err(error) if error == rustix::io::Errno::INTR => {}
+                    Err(error) => return Err(format!("poll failed: {error}")),
+                }
+            }
+            (descriptors[0].revents(), PollFlags::empty())
+        } else {
+            let client = destination
+                .try_clone_stream()
+                .map_err(|error| format!("could not poll the destination: {error}"))?;
+            let client_flags = if pending_output.is_none() {
+                PollFlags::IN | PollFlags::HUP | PollFlags::ERR
+            } else {
+                PollFlags::HUP | PollFlags::ERR
+            };
+            let mut descriptors = [
+                PollFd::new(&router, router_flags),
+                PollFd::new(&client, client_flags),
+            ];
+            // poll() is never restarted by SA_RESTART; retry on EINTR so a
+            // stray signal cannot kill the jump-host bridge.
+            loop {
+                match poll(&mut descriptors, None) {
+                    Ok(_) => break,
+                    Err(error) if error == rustix::io::Errno::INTR => {}
+                    Err(error) => return Err(format!("poll failed: {error}")),
+                }
+            }
+            (descriptors[0].revents(), descriptors[1].revents())
+        };
 
+        if client_events.intersects(PollFlags::HUP | PollFlags::ERR) {
+            destination_closed = true;
+        }
         if router_events.intersects(PollFlags::HUP | PollFlags::ERR) {
             return Ok(0);
         }
@@ -333,7 +346,7 @@ fn relay_with_output_observer(
         {
             return Ok(0);
         }
-        if router_events.contains(PollFlags::IN) {
+        if !destination_closed && router_events.contains(PollFlags::IN) {
             if let Some(packet) = read_router_packet(&mut router, &mut decoder)? {
                 decoder = LocalPacketDecoder::new();
                 let packet = destination_packet(destination, packet);
@@ -346,7 +359,10 @@ fn relay_with_output_observer(
             }
         }
         if pending_output.is_none()
-            && (client_events.contains(PollFlags::IN) || resume_destination_drain)
+            && !destination_drained
+            && (client_events.contains(PollFlags::IN)
+                || resume_destination_drain
+                || destination_closed)
         {
             while pending_output.is_none() {
                 match destination.try_read_packet() {
@@ -368,16 +384,35 @@ fn relay_with_output_observer(
                     }
                     Ok(None) => {
                         resume_destination_drain = false;
+                        destination_drained = destination_closed;
                         break;
                     }
-                    Err(_) => return Ok(0),
+                    Err(_) => {
+                        destination_closed = true;
+                        destination_drained = true;
+                        break;
+                    }
                 }
             }
         }
-        if client_events.intersects(PollFlags::HUP | PollFlags::ERR) {
-            return Ok(0);
-        }
     }
+}
+
+#[cfg(unix)]
+fn router_poll_flags(destination_closed: bool, output_pending: bool) -> PollFlags {
+    let input = if destination_closed {
+        PollFlags::empty()
+    } else {
+        PollFlags::IN
+    };
+    input
+        | PollFlags::HUP
+        | PollFlags::ERR
+        | if output_pending {
+            PollFlags::OUT
+        } else {
+            PollFlags::empty()
+        }
 }
 
 fn write_pending_local(

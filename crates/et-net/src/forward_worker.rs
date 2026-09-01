@@ -4,7 +4,7 @@ use std::io::Write;
 use std::io::{self};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -62,6 +62,7 @@ pub(crate) struct WorkerChannels {
     pub(crate) sender: channel::Sender<Command>,
     pub(crate) outbound: channel::Sender<Outbound>,
     pub(crate) cancel: channel::Receiver<()>,
+    pub(crate) abandoned: Arc<AtomicBool>,
 }
 
 pub(crate) fn run(
@@ -76,6 +77,7 @@ pub(crate) fn run(
         sender: command_sender,
         outbound,
         cancel,
+        abandoned,
     } = channels;
     #[cfg(unix)]
     let result = Worker::new(
@@ -83,10 +85,11 @@ pub(crate) fn run(
         outbound.clone(),
         outbound_wake.try_clone().ok(),
         cancel.clone(),
+        abandoned,
     )
     .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user));
     #[cfg(windows)]
-    let result = Worker::new(command_sender, outbound.clone(), cancel.clone())
+    let result = Worker::new(command_sender, outbound.clone(), cancel.clone(), abandoned)
         .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user));
     if let Err(error) = result {
         channel::select! {
@@ -102,6 +105,7 @@ struct Worker {
     commands: channel::Sender<Command>,
     outbound: channel::Sender<Outbound>,
     cancel: channel::Receiver<()>,
+    abandoned: Arc<AtomicBool>,
     #[cfg(unix)]
     outbound_wake: UnixStream,
     pending: HashMap<i32, ForwardStream>,
@@ -119,6 +123,7 @@ impl Worker {
         outbound: channel::Sender<Outbound>,
         #[cfg(unix)] outbound_wake: Option<UnixStream>,
         cancel: channel::Receiver<()>,
+        abandoned: Arc<AtomicBool>,
     ) -> Result<Self, ForwardError> {
         #[cfg(unix)]
         let outbound_wake = {
@@ -130,6 +135,7 @@ impl Worker {
             commands,
             outbound,
             cancel,
+            abandoned,
             #[cfg(unix)]
             outbound_wake,
             pending: HashMap::new(),
@@ -239,6 +245,8 @@ mod state;
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::net::UnixStream;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use crossbeam_channel as channel;
@@ -264,7 +272,14 @@ mod tests {
         let (cancel, cancel_receiver) = channel::bounded(1);
         let (_wake_reader, wake_writer) = UnixStream::pair().unwrap();
         (
-            Worker::new(commands, outbound, Some(wake_writer), cancel_receiver).unwrap(),
+            Worker::new(
+                commands,
+                outbound,
+                Some(wake_writer),
+                cancel_receiver,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap(),
             command_receiver,
             outbound_receiver,
             cancel,

@@ -3,6 +3,8 @@ use std::io::Read;
 use std::io::{self};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crossbeam_channel as channel;
@@ -92,6 +94,7 @@ pub struct Forwarder {
     #[cfg(unix)]
     wake: UnixStream,
     worker: Option<JoinHandle<()>>,
+    abandoned: Arc<AtomicBool>,
 }
 
 impl Forwarder {
@@ -141,6 +144,8 @@ fn start_forwarder(
     let (commands_tx, commands_rx) = channel::bounded(CHANNEL_CAPACITY);
     let (outbound_tx, outbound_rx) = channel::bounded(CHANNEL_CAPACITY);
     let (cancel_tx, cancel_rx) = channel::bounded(1);
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let worker_abandoned = abandoned.clone();
     #[cfg(unix)]
     let (wake, wake_writer) = {
         let (reader, writer) = UnixStream::pair()?;
@@ -164,6 +169,7 @@ fn start_forwarder(
                     sender: worker_commands,
                     outbound: outbound_tx,
                     cancel: cancel_rx,
+                    abandoned: worker_abandoned,
                 },
                 #[cfg(unix)]
                 wake_writer,
@@ -184,6 +190,7 @@ fn start_forwarder(
             #[cfg(unix)]
             wake,
             worker: Some(worker),
+            abandoned,
         },
         environment,
         skipped,
@@ -263,6 +270,7 @@ impl Forwarder {
         if !self.commands.is_empty() {
             abandoned = true;
         }
+        abandoned |= self.abandoned.load(Ordering::Acquire);
         Ok(abandoned)
     }
 

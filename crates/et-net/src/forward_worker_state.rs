@@ -170,11 +170,21 @@ impl Worker {
         let Some(active) = self.map_ref(role).get(&socket_id) else {
             return Ok(());
         };
-        channel::select! {
-            send(active.writer, WriteCommand::Data(buffer)) -> result => {
-                result.map_err(|_| ForwardError::Unavailable)
-            }
-            recv(self.cancel) -> _ => Err(ForwardError::Unavailable),
+        let byte_count = buffer.len();
+        active
+            .pending_bytes
+            .fetch_add(byte_count, std::sync::atomic::Ordering::AcqRel);
+        let admitted = channel::select! {
+            send(active.writer, WriteCommand::Data(buffer)) -> result => result.is_ok(),
+            recv(self.cancel) -> _ => false,
+        };
+        if admitted {
+            Ok(())
+        } else {
+            active
+                .pending_bytes
+                .fetch_sub(byte_count, std::sync::atomic::Ordering::AcqRel);
+            Err(ForwardError::Unavailable)
         }
     }
 
@@ -221,6 +231,7 @@ impl Worker {
             stream,
             self.commands.clone(),
             self.cancel.clone(),
+            self.abandoned.clone(),
         )
         .map_err(ForwardError::Io)?;
         self.map(role).insert(socket_id, active);

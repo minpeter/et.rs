@@ -558,6 +558,7 @@ fn real_terminal_places_prompt_on_line_after_motd() {
     let (mut router, _) = fixture.listener.accept().unwrap();
     router.set_read_timeout(Some(TIMEOUT)).unwrap();
     let _ = read_local_packet(&mut router).unwrap();
+    acknowledge_registration(&mut router);
     fixture.wait_ready();
 
     // When: the terminal session starts the login shell.
@@ -569,6 +570,7 @@ fn real_terminal_places_prompt_on_line_after_motd() {
             environmentvalues: Vec::new(),
         },
     );
+    expect_startup(&mut router);
     let output = collect_until(&mut router, |output| contains(output, PROMPT_MARKER));
 
     // Then: exactly one terminal line transition separates MOTD and prompt.
@@ -606,6 +608,7 @@ fn real_terminal_does_not_stack_motd_newline_with_shell_startup_newline() {
     let (mut router, _) = fixture.listener.accept().unwrap();
     router.set_read_timeout(Some(TIMEOUT)).unwrap();
     let _ = read_local_packet(&mut router).unwrap();
+    acknowledge_registration(&mut router);
     fixture.wait_ready();
 
     // When: the terminal starts the login shell after emitting MOTD.
@@ -617,6 +620,7 @@ fn real_terminal_does_not_stack_motd_newline_with_shell_startup_newline() {
             environmentvalues: Vec::new(),
         },
     );
+    expect_startup(&mut router);
     let output = collect_until(&mut router, |output| contains(output, PROMPT_MARKER));
 
     // Then: MOTD and shell startup do not create a blank line together.

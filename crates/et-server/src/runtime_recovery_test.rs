@@ -108,7 +108,8 @@ fn terminal_hup_after_returning_status_delivers_final_output_only_to_recovered_c
     });
 
     // When: the terminal queues its final output while permit completion
-    // remains blocked at that exact barrier.
+    // remains blocked at that exact barrier, then the real terminal socket
+    // reaches HUP and lifecycle scans the returning raw socket.
     let (queued_tx, queued_rx) = mpsc::sync_channel(1);
     runtime
         .core
@@ -131,23 +132,37 @@ fn terminal_hup_after_returning_status_delivers_final_output_only_to_recovered_c
     queued_rx
         .recv_timeout(TIMEOUT)
         .expect("terminal output was not admitted to the flow queue");
+    let (scan_tx, scan_rx) = mpsc::sync_channel(1);
+    crate::runtime_lifecycle::install_raw_scan_hook(ID, scan_tx);
+    drop(terminal);
+    scan_rx
+        .recv_timeout(TIMEOUT)
+        .expect("terminal lifecycle did not complete its raw-socket scan");
 
-    // Then: the established recovery pause keeps the packet off the old
-    // stream, and releasing recovery delivers it exactly once on the new one.
-    let mut byte = [0u8; 1];
-    let old_read = old_stream.read(&mut byte);
-    assert!(
-        old_read.as_ref().is_err_and(|error| matches!(
-            error.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-        )),
-        "final output reached the old connection after ReturningClient: {old_read:?}"
-    );
+    // Then: releasing recovery installs the protected candidate, delivers the
+    // packet exactly once there, and retires the old stream without bytes.
     release_tx.send(()).unwrap();
     let mut client = client_rx
         .recv_timeout(TIMEOUT)
-        .expect("client recovery did not complete after barrier release");
+        .expect("client recovery did not complete after terminal HUP");
     recovering.join().unwrap();
+    let mut byte = [0u8; 1];
+    let old_read = old_stream.read(&mut byte);
+    assert!(
+        match &old_read {
+            Ok(0) => true,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                true
+            }
+            Ok(_) | Err(_) => false,
+        },
+        "final output reached the old connection after terminal HUP: {old_read:?}"
+    );
     assert_eq!(
         client.read_packet().unwrap().header(),
         TerminalPacketType::KeepAlive as u8
@@ -158,7 +173,6 @@ fn terminal_hup_after_returning_status_delivers_final_output_only_to_recovered_c
         TerminalBuffer::decode(delivered.payload()).unwrap(),
         final_output
     );
-    drop(terminal);
     if let Ok(packet) = client.read_packet() {
         assert_eq!(
             packet.header(),

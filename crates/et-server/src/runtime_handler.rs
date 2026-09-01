@@ -101,9 +101,9 @@ pub(crate) fn handle(
             return;
         }
     };
-    #[cfg(test)]
-    run_before_raw_assignment_hook(&id);
     let registration_identity = registration.identity();
+    #[cfg(test)]
+    run_before_raw_assignment_hook(&registration_identity);
     if guard.assign(registration_identity.clone()).is_err() {
         crate::diag::info(format!(
             "drop {peer} id={id}: could not track raw socket for registration"
@@ -180,6 +180,12 @@ pub(crate) fn handle(
                     return;
                 }
             };
+            if guard.own_session().is_err() {
+                crate::diag::info(format!(
+                    "id={id}: drop recover from {peer}: could not protect returning socket"
+                ));
+                return;
+            }
             if send_status(&mut stream, ConnectStatus::ReturningClient).is_err() {
                 crate::diag::info(format!(
                     "id={id}: failed to send ReturningClient status to {peer}"
@@ -674,7 +680,7 @@ fn valid_id(id: &str) -> bool {
 
 #[cfg(test)]
 struct RawAssignmentHook {
-    id: String,
+    identity: crate::registry::RegistrationIdentity,
     reached: std::sync::mpsc::SyncSender<()>,
     release: std::sync::mpsc::Receiver<()>,
 }
@@ -688,22 +694,25 @@ fn raw_assignment_hook() -> &'static std::sync::Mutex<Option<RawAssignmentHook>>
 
 #[cfg(test)]
 pub(crate) fn install_raw_assignment_hook(
-    id: &str,
+    identity: crate::registry::RegistrationIdentity,
     reached: std::sync::mpsc::SyncSender<()>,
     release: std::sync::mpsc::Receiver<()>,
 ) {
     *raw_assignment_hook().lock().unwrap() = Some(RawAssignmentHook {
-        id: id.to_owned(),
+        identity,
         reached,
         release,
     });
 }
 
 #[cfg(test)]
-fn run_before_raw_assignment_hook(id: &str) {
+fn run_before_raw_assignment_hook(identity: &crate::registry::RegistrationIdentity) {
     let hook = {
         let mut installed = raw_assignment_hook().lock().unwrap();
-        if installed.as_ref().is_some_and(|hook| hook.id == id) {
+        if installed
+            .as_ref()
+            .is_some_and(|hook| hook.identity.same_generation(identity))
+        {
             installed.take()
         } else {
             None

@@ -11,7 +11,7 @@ use rustix::event::{poll, PollFd, PollFlags};
 use crate::forward_endpoint::{Endpoint, ForwardListener, ForwardStream};
 use et_core::proto::SocketEndpoint;
 
-use super::forward_worker::{Command, Role};
+use super::forward_worker::{Command, CommandSender, Role};
 
 const READ_CHUNK: usize = 16 * 1024;
 #[cfg(windows)]
@@ -54,7 +54,7 @@ const ACCEPT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10
 
 pub(crate) fn spawn_listener(
     source: BoundSource,
-    commands: channel::Sender<Command>,
+    commands: CommandSender,
     cancel: channel::Receiver<()>,
     stop: ListenerStop,
     next_client_fd: Arc<AtomicI32>,
@@ -103,13 +103,16 @@ pub(crate) fn spawn_listener(
                         if client_fd <= 0 {
                             return;
                         }
-                        channel::select! {
-                            send(commands, Command::Accepted {
-                                client_fd,
-                                destination: destination.clone(),
-                                stream,
-                            }) -> result => if result.is_err() { return },
-                            recv(cancel) -> _ => return,
+                        if cancellation_requested(&cancel)
+                            || commands
+                                .send(Command::Accepted {
+                                    client_fd,
+                                    destination: destination.clone(),
+                                    stream,
+                                })
+                                .is_err()
+                        {
+                            return;
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
@@ -131,15 +134,18 @@ pub(crate) fn spawn_connector(
     client_fd: i32,
     socket_id: i32,
     destination: Endpoint,
-    commands: channel::Sender<Command>,
+    commands: CommandSender,
     cancel: channel::Receiver<()>,
     session_user: Option<(u32, u32)>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let result = destination.connect_with_user(session_user);
-        channel::select! {
-            send(commands, Command::Connected { client_fd, socket_id, result }) -> _ => {},
-            recv(cancel) -> _ => {},
+        if !cancellation_requested(&cancel) {
+            let _ = commands.send(Command::Connected {
+                client_fd,
+                socket_id,
+                result,
+            });
         }
     })
 }
@@ -148,7 +154,7 @@ pub(crate) fn spawn_io(
     role: Role,
     socket_id: i32,
     stream: ForwardStream,
-    commands: channel::Sender<Command>,
+    commands: CommandSender,
     cancel: channel::Receiver<()>,
     abandoned: Arc<AtomicBool>,
 ) -> io::Result<(ActiveIo, [JoinHandle<()>; 2])> {
@@ -174,20 +180,22 @@ pub(crate) fn spawn_io(
             }
             match reader.read(&mut buffer) {
                 Ok(0) => {
-                    channel::select! {
-                        send(reader_commands, Command::Closed { role, socket_id }) -> _ => {},
-                        recv(reader_cancel) -> _ => {},
+                    if !cancellation_requested(&reader_cancel) {
+                        let _ = reader_commands.send(Command::Closed { role, socket_id });
                     }
                     return;
                 }
                 Ok(count) => {
-                    channel::select! {
-                        send(reader_commands, Command::Read {
-                            role,
-                            socket_id,
-                            buffer: buffer[..count].to_vec(),
-                        }) -> result => if result.is_err() { return },
-                        recv(reader_cancel) -> _ => return,
+                    if cancellation_requested(&reader_cancel)
+                        || reader_commands
+                            .send(Command::Read {
+                                role,
+                                socket_id,
+                                buffer: buffer[..count].to_vec(),
+                            })
+                            .is_err()
+                    {
+                        return;
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -198,9 +206,12 @@ pub(crate) fn spawn_io(
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                     ) => {}
                 Err(error) => {
-                    channel::select! {
-                        send(reader_commands, Command::IoFailed { role, socket_id, error }) -> _ => {},
-                        recv(reader_cancel) -> _ => {},
+                    if !cancellation_requested(&reader_cancel) {
+                        let _ = reader_commands.send(Command::IoFailed {
+                            role,
+                            socket_id,
+                            error,
+                        });
                     }
                     return;
                 }
@@ -231,9 +242,12 @@ pub(crate) fn spawn_io(
                     let delivered = match result {
                         Ok(delivered) => delivered,
                         Err(error) => {
-                            channel::select! {
-                                send(writer_commands, Command::IoFailed { role, socket_id, error }) -> _ => {},
-                                recv(writer_cancel) -> _ => {},
+                            if !cancellation_requested(&writer_cancel) {
+                                let _ = writer_commands.send(Command::IoFailed {
+                                    role,
+                                    socket_id,
+                                    error,
+                                });
                             }
                             break;
                         }
@@ -292,7 +306,6 @@ fn write_all_cancellable(
     Ok(true)
 }
 
-#[cfg(windows)]
 fn cancellation_requested(cancel: &channel::Receiver<()>) -> bool {
     !matches!(cancel.try_recv(), Err(channel::TryRecvError::Empty))
 }
@@ -331,6 +344,7 @@ mod tests {
     use crossbeam_channel as channel;
 
     use super::{spawn_io, stop_io, ForwardStream, Role, WriteCommand};
+    use crate::forward_worker::command_channel;
 
     const EVENT_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -359,7 +373,7 @@ mod tests {
         }
         saturator.set_nonblocking(false).unwrap();
         let control = stream.try_clone().unwrap();
-        let (commands, _command_receiver) = channel::bounded(1);
+        let (commands, _command_receiver) = command_channel(1);
         let (cancel, cancel_receiver) = channel::bounded(1);
         let abandoned = Arc::new(AtomicBool::new(false));
         let (active, handles) = spawn_io(

@@ -2,9 +2,12 @@ use et_net::local::LocalStream;
 use std::io;
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use et_core::backed_writer::{
+    MAX_BACKUP_PACKETS, MAX_DISCONNECT_PACKETS, MAX_RECOVERY_BACKUP_BYTES,
+};
 use et_core::flow_control::FlowControlMode as QueueMode;
 use et_core::packet::Packet;
 use et_net::connection::{ConnError, Connection};
@@ -41,6 +44,7 @@ pub(crate) struct ActiveSession {
     /// new stream after install so the connection mutex is not held for the
     /// recovery network RTT.
     recover_hold: Mutex<Vec<(u8, Vec<u8>)>>,
+    recover_hold_bytes: AtomicU64,
     shutdown: AtomicBool,
     /// Only one recover may run at a time. Concurrent returning clients used
     /// to queue on the connection mutex for minutes after a blackhole write.
@@ -48,6 +52,8 @@ pub(crate) struct ActiveSession {
     connection_generation: AtomicU64,
     flow_control: Option<Arc<FlowControl>>,
     flow_writer: Mutex<Option<std::thread::JoinHandle<()>>>,
+    bridge_generation: Mutex<u64>,
+    bridge_changed: Condvar,
 }
 
 pub(crate) enum SessionConnection {
@@ -127,11 +133,14 @@ impl ActiveSession {
             wake_writer: Mutex::new(wake_writer),
             wake_reader: Mutex::new(Some(wake_reader)),
             recover_hold: Mutex::new(Vec::new()),
+            recover_hold_bytes: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             recovering: AtomicBool::new(false),
             connection_generation: AtomicU64::new(0),
             flow_control: queue_mode.map(|mode| Arc::new(FlowControl::new(mode))),
             flow_writer: Mutex::new(None),
+            bridge_generation: Mutex::new(0),
+            bridge_changed: Condvar::new(),
         })
     }
 
@@ -144,6 +153,14 @@ impl ActiveSession {
         if let Ok(mut writer) = self.flow_writer.lock() {
             *writer = Some(handle);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_flow_enqueue_hook(&self, reached: std::sync::mpsc::SyncSender<()>) {
+        self.flow_control
+            .as_ref()
+            .expect("test session must enable flow control")
+            .install_enqueue_hook(reached);
     }
 
     pub(crate) fn send_packet(&self, header: u8, payload: &[u8]) -> Result<(), SessionError> {
@@ -237,7 +254,24 @@ impl ActiveSession {
         if !self.recovering.load(Ordering::Acquire) {
             return Ok(false);
         }
+        let held_bytes = self.recover_hold_bytes.load(Ordering::Acquire);
+        let payload_bytes = u64::try_from(payload.len()).map_err(|_| SessionError::Unavailable)?;
+        if hold.len() >= MAX_BACKUP_PACKETS + MAX_DISCONNECT_PACKETS {
+            return Err(SessionError::Unavailable);
+        }
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| SessionError::Unavailable)?;
+        let requested = i64::try_from(held_bytes.saturating_add(payload_bytes))
+            .map_err(|_| SessionError::Unavailable)?;
+        if requested > MAX_RECOVERY_BACKUP_BYTES || !connection.can_buffer_write(requested) {
+            return Err(SessionError::Unavailable);
+        }
+        drop(connection);
         hold.push((header, payload.to_vec()));
+        self.recover_hold_bytes
+            .fetch_add(payload_bytes, Ordering::AcqRel);
         Ok(true)
     }
 
@@ -359,5 +393,45 @@ impl SessionConnection {
             },
             Self::Active(session) => session.shutdown(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stalled_recovery_hold_is_capacity_bounded_and_fifo() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || TcpStream::connect(address).unwrap());
+        let (stream, _) = listener.accept().unwrap();
+        let _peer = peer.join().unwrap();
+        let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
+        let session =
+            ActiveSession::new(Connection::new_server(stream, &[7; 32]), &terminal, None).unwrap();
+        let permit = session.try_begin_recover().unwrap();
+
+        for index in 0..4u8 {
+            assert!(session.queue_if_recovering(index, &[index; 8]).unwrap());
+        }
+        let payload = vec![b'x'; 64 * 1024];
+        let mut accepted = 4usize;
+        while session.queue_if_recovering(9, &payload).is_ok() {
+            accepted += 1;
+            assert!(accepted <= MAX_BACKUP_PACKETS + MAX_DISCONNECT_PACKETS);
+        }
+        assert!(!session.can_buffer_write(payload.len() as i64).unwrap());
+
+        let mut hold = session.recover_hold.lock().unwrap();
+        assert_eq!(hold.len(), accepted);
+        for index in 0..4u8 {
+            assert_eq!(hold[index as usize], (index, vec![index; 8]));
+        }
+        hold.clear();
+        session.recover_hold_bytes.store(0, Ordering::Release);
+        drop(hold);
+        session.recovering.store(false, Ordering::Release);
+        drop(permit);
     }
 }

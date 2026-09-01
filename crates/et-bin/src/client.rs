@@ -283,8 +283,12 @@ fn run_client(
     if args.no_terminal && !has_forwarding {
         return Ok(());
     }
-    let (forwarder, skipped) = et_net::forward::Forwarder::start_with_origins(local_sources)
-        .map_err(|error| ClientError::Terminal(error.to_string()))?;
+    let (forwarder, skipped) = et_net::forward::Forwarder::start_with_origins_deadline(
+        local_sources,
+        deadline.expires_at(),
+        std::sync::Arc::new(et_net::forward::SystemForwardResolver),
+    )
+    .map_err(|error| ClientError::Terminal(error.to_string()))?;
     for skipped in skipped {
         let source = skipped.request.source.unwrap_or_default();
         let label = match (source.name.as_deref(), source.port) {

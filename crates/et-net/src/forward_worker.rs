@@ -1,11 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(unix)]
 use std::io::Write;
 use std::io::{self};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicI32};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+#[cfg(all(test, unix))]
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use crossbeam_channel as channel;
@@ -54,12 +56,187 @@ pub(crate) enum Command {
         socket_id: i32,
         error: io::Error,
     },
-    Stop,
+}
+
+struct CommandQueueState {
+    commands: VecDeque<Command>,
+    senders: usize,
+    receiver_alive: bool,
+    shutdown: bool,
+}
+
+struct CommandQueue {
+    capacity: usize,
+    state: Mutex<CommandQueueState>,
+    changed: Condvar,
+}
+
+pub(crate) struct CommandSender {
+    queue: Arc<CommandQueue>,
+}
+
+pub(crate) struct CommandReceiver {
+    queue: Arc<CommandQueue>,
+}
+
+pub(crate) enum TryCommandError {
+    Full(Command),
+    Closed,
+}
+
+pub(crate) fn command_channel(capacity: usize) -> (CommandSender, CommandReceiver) {
+    let queue = Arc::new(CommandQueue {
+        capacity,
+        state: Mutex::new(CommandQueueState {
+            commands: VecDeque::with_capacity(capacity),
+            senders: 1,
+            receiver_alive: true,
+            shutdown: false,
+        }),
+        changed: Condvar::new(),
+    });
+    (
+        CommandSender {
+            queue: queue.clone(),
+        },
+        CommandReceiver { queue },
+    )
+}
+
+impl Clone for CommandSender {
+    fn clone(&self) -> Self {
+        let mut state = self.queue.state.lock().unwrap();
+        state.senders += 1;
+        drop(state);
+        Self {
+            queue: self.queue.clone(),
+        }
+    }
+}
+
+impl Drop for CommandSender {
+    fn drop(&mut self) {
+        let mut state = self.queue.state.lock().unwrap();
+        state.senders -= 1;
+        self.queue.changed.notify_all();
+    }
+}
+
+impl CommandSender {
+    pub(crate) fn send(&self, command: Command) -> Result<(), Command> {
+        let mut state = self.queue.state.lock().unwrap();
+        while state.commands.len() >= self.queue.capacity && !state.shutdown && state.receiver_alive
+        {
+            state = self.queue.changed.wait(state).unwrap();
+        }
+        if state.shutdown || !state.receiver_alive {
+            return Err(command);
+        }
+        state.commands.push_back(command);
+        self.queue.changed.notify_all();
+        Ok(())
+    }
+
+    pub(crate) fn try_send(&self, command: Command) -> Result<(), TryCommandError> {
+        let mut state = self.queue.state.lock().unwrap();
+        if state.shutdown || !state.receiver_alive {
+            return Err(TryCommandError::Closed);
+        }
+        if state.commands.len() >= self.queue.capacity {
+            return Err(TryCommandError::Full(command));
+        }
+        state.commands.push_back(command);
+        self.queue.changed.notify_all();
+        Ok(())
+    }
+
+    pub(crate) fn shutdown(&self) {
+        let mut state = self.queue.state.lock().unwrap();
+        state.shutdown = true;
+        self.queue.changed.notify_all();
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.queue
+            .state
+            .lock()
+            .map_or(true, |state| state.commands.is_empty())
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn wait_shutdown_timeout(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = self.queue.state.lock().unwrap();
+        while !state.shutdown {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return false;
+            };
+            let (next, wait) = self.queue.changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if wait.timed_out() && !state.shutdown {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl CommandReceiver {
+    fn recv(&self) -> Option<Command> {
+        let mut state = self.queue.state.lock().unwrap();
+        loop {
+            if state.shutdown {
+                return None;
+            }
+            if let Some(command) = state.commands.pop_front() {
+                self.queue.changed.notify_all();
+                return Some(command);
+            }
+            if state.senders == 0 {
+                return None;
+            }
+            state = self.queue.changed.wait(state).unwrap();
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<Command, mpsc::RecvTimeoutError> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = self.queue.state.lock().unwrap();
+        loop {
+            if state.shutdown || state.senders == 0 {
+                return Err(mpsc::RecvTimeoutError::Disconnected);
+            }
+            if let Some(command) = state.commands.pop_front() {
+                self.queue.changed.notify_all();
+                return Ok(command);
+            }
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return Err(mpsc::RecvTimeoutError::Timeout);
+            };
+            let (next, wait) = self.queue.changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if wait.timed_out() && state.commands.is_empty() {
+                return Err(mpsc::RecvTimeoutError::Timeout);
+            }
+        }
+    }
+}
+
+impl Drop for CommandReceiver {
+    fn drop(&mut self) {
+        let mut state = self.queue.state.lock().unwrap();
+        state.receiver_alive = false;
+        self.queue.changed.notify_all();
+    }
 }
 
 pub(crate) struct WorkerChannels {
-    pub(crate) receiver: channel::Receiver<Command>,
-    pub(crate) sender: channel::Sender<Command>,
+    pub(crate) receiver: CommandReceiver,
+    pub(crate) sender: CommandSender,
     pub(crate) outbound: channel::Sender<Outbound>,
     pub(crate) cancel: channel::Receiver<()>,
     pub(crate) abandoned: Arc<AtomicBool>,
@@ -69,8 +246,7 @@ pub(crate) fn run(
     sources: Vec<BoundSource>,
     channels: WorkerChannels,
     #[cfg(unix)] mut outbound_wake: UnixStream,
-    listener_stop: ListenerStop,
-    session_user: Option<(u32, u32)>,
+    control: (ListenerStop, Option<(u32, u32)>, Arc<AtomicBool>),
 ) {
     let WorkerChannels {
         receiver: commands,
@@ -79,6 +255,7 @@ pub(crate) fn run(
         cancel,
         abandoned,
     } = channels;
+    let (listener_stop, session_user, shutdown) = control;
     #[cfg(unix)]
     let result = Worker::new(
         command_sender,
@@ -92,9 +269,11 @@ pub(crate) fn run(
     let result = Worker::new(command_sender, outbound.clone(), cancel.clone(), abandoned)
         .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user));
     if let Err(error) = result {
-        channel::select! {
-            send(outbound, Err(error)) -> _ => {}
-            recv(cancel) -> _ => {}
+        if !shutdown.load(Ordering::Acquire) {
+            channel::select! {
+                send(outbound, Err(error)) -> _ => {}
+                recv(cancel) -> _ => {}
+            }
         }
         #[cfg(unix)]
         let _ = outbound_wake.write(&[1]);
@@ -102,7 +281,7 @@ pub(crate) fn run(
 }
 
 struct Worker {
-    commands: channel::Sender<Command>,
+    commands: CommandSender,
     outbound: channel::Sender<Outbound>,
     cancel: channel::Receiver<()>,
     abandoned: Arc<AtomicBool>,
@@ -119,7 +298,7 @@ struct Worker {
 
 impl Worker {
     fn new(
-        commands: channel::Sender<Command>,
+        commands: CommandSender,
         outbound: channel::Sender<Outbound>,
         #[cfg(unix)] outbound_wake: Option<UnixStream>,
         cancel: channel::Receiver<()>,
@@ -151,7 +330,7 @@ impl Worker {
     fn run(
         &mut self,
         sources: Vec<BoundSource>,
-        commands: channel::Receiver<Command>,
+        commands: CommandReceiver,
         listener_stop: ListenerStop,
         session_user: Option<(u32, u32)>,
     ) -> Result<(), ForwardError> {
@@ -170,17 +349,9 @@ impl Worker {
                 next_client_fd.clone(),
             ));
         }
-        let mut hard_cancelled = false;
         let result = loop {
-            let command = channel::select! {
-                recv(self.cancel) -> _ => {
-                    hard_cancelled = true;
-                    break Ok(())
-                },
-                recv(commands) -> command => match command {
-                    Ok(command) => command,
-                    Err(_) => break Ok(()),
-                },
+            let Some(command) = commands.recv() else {
+                break Ok(());
             };
             let step = match command {
                 Command::Packet(packet) => self.handle_packet(packet),
@@ -211,7 +382,6 @@ impl Worker {
                     self.remove(role, socket_id);
                     self.send_data(role, socket_id, Vec::new(), true, Some(error.to_string()))
                 }
-                Command::Stop => break Ok(()),
             };
             if let Err(error) = step {
                 break Err(error);
@@ -225,7 +395,7 @@ impl Worker {
         for (_, stream) in self.pending.drain() {
             stream.shutdown();
         }
-        hard_cancelled |= !matches!(self.cancel.try_recv(), Err(channel::TryRecvError::Empty));
+        let hard_cancelled = !matches!(self.cancel.try_recv(), Err(channel::TryRecvError::Empty));
         for (_, io) in self.sources.drain().chain(self.destinations.drain()) {
             if hard_cancelled {
                 abort_io(io);
@@ -257,17 +427,17 @@ mod tests {
     };
     use prost::Message;
 
-    use super::{Command, Worker, MAX_ACTIVE_SOCKETS};
+    use super::{command_channel, Command, CommandReceiver, Worker, MAX_ACTIVE_SOCKETS};
 
     const EVENT_TIMEOUT: Duration = Duration::from_secs(3);
 
     fn worker() -> (
         Worker,
-        channel::Receiver<Command>,
+        CommandReceiver,
         channel::Receiver<crate::forward::Outbound>,
         channel::Sender<()>,
     ) {
-        let (commands, command_receiver) = channel::bounded(MAX_ACTIVE_SOCKETS + 1);
+        let (commands, command_receiver) = command_channel(MAX_ACTIVE_SOCKETS + 1);
         let (outbound, outbound_receiver) = channel::bounded(MAX_ACTIVE_SOCKETS + 1);
         let (cancel, cancel_receiver) = channel::bounded(1);
         let (_wake_reader, wake_writer) = UnixStream::pair().unwrap();

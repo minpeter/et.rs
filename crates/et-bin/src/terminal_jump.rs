@@ -32,12 +32,32 @@ const READ_BUFFER: usize = 16 * 1024;
 /// Upstream retries the destination connection three times before failing.
 const CONNECT_ATTEMPTS: usize = 3;
 
-pub fn run(
-    mut router: LocalStream,
+#[cfg(test)]
+fn run(
+    router: LocalStream,
     input: &CredentialInput,
     destination_host: &str,
     destination_port: u16,
 ) -> Result<i32, String> {
+    run_with_startup(
+        router,
+        input,
+        destination_host,
+        destination_port,
+        |_| Ok(()),
+    )
+}
+
+pub fn run_with_startup<F>(
+    mut router: LocalStream,
+    input: &CredentialInput,
+    destination_host: &str,
+    destination_port: u16,
+    started: F,
+) -> Result<i32, String>
+where
+    F: FnOnce(&mut LocalStream) -> Result<(), String>,
+{
     let payload = read_jumphost_init(&mut router)?;
     if !payload.jumphost.unwrap_or(false) {
         return Err("Jumphost should be set by the initial client".to_owned());
@@ -62,6 +82,7 @@ pub fn run(
     payload.jumphost = Some(false);
 
     let mut destination = connect_destination(input, destination_host, destination_port, &payload)?;
+    started(&mut router)?;
     write_local_packet(
         &mut router,
         &Packet::new(

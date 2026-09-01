@@ -6,6 +6,9 @@ use et_net::connection::ConnError;
 
 use super::{ActiveSession, SessionError, FLOW_CONTROL_BUFFER_BYTES};
 
+#[cfg(test)]
+#[path = "session_flow_hook.rs"]
+mod test_hook;
 #[path = "session_flow_write.rs"]
 pub(super) mod writer;
 #[cfg(test)]
@@ -31,6 +34,8 @@ struct WriterState {
 pub(super) struct FlowControl {
     state: Mutex<WriterState>,
     wake: Condvar,
+    #[cfg(test)]
+    enqueue_hook: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
 }
 
 impl FlowControl {
@@ -46,6 +51,8 @@ impl FlowControl {
                 unrecoverable: false,
             }),
             wake: Condvar::new(),
+            #[cfg(test)]
+            enqueue_hook: Mutex::new(None),
         }
     }
 
@@ -56,6 +63,8 @@ impl FlowControl {
         }
         match state.queue.push(packet) {
             Ok(()) => {
+                #[cfg(test)]
+                self.run_enqueue_hook();
                 drop(state);
                 self.wake.notify_one();
                 Ok(())
@@ -77,10 +86,14 @@ impl FlowControl {
     pub(super) fn pause(&self) -> Result<(), SessionError> {
         let mut state = self.state.lock().map_err(|_| SessionError::Unavailable)?;
         state.paused = true;
-        state = self
-            .wake
-            .wait_while(state, |state| state.in_flight)
-            .map_err(|_| SessionError::Unavailable)?;
+        let state = match self.wake.wait_while(state, |state| state.in_flight) {
+            Ok(state) => state,
+            Err(error) => {
+                error.into_inner().paused = false;
+                self.wake.notify_all();
+                return Err(SessionError::Unavailable);
+            }
+        };
         drop(state);
         Ok(())
     }

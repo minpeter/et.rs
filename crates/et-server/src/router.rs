@@ -1,10 +1,13 @@
 use et_net::local::LocalStream;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+pub const MAX_PENDING_REGISTRATIONS: usize = 64;
+pub const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 use crate::path::{PathError, RouterPath};
 use crate::registry::Registry;
@@ -31,6 +34,9 @@ pub enum RouterReject {
     InvalidRegistration,
     Duplicate,
     RegistryUnavailable,
+    IdentityMismatch,
+    Capacity,
+    Timeout,
 }
 
 #[derive(Debug)]
@@ -83,14 +89,16 @@ impl Router {
     pub(crate) fn start_with_lifecycle(
         path: RouterPath,
         registry: Registry,
-        lifecycle: Option<Sender<LifecycleEvent>>,
+        lifecycle: Option<std::sync::mpsc::Sender<LifecycleEvent>>,
     ) -> Result<Self, RouterError> {
         let listener = OwnedRouterListener::bind(&path)?;
         let (wake_reader, wake_writer) = et_net::local::wake_pair().map_err(RouterError::Io)?;
         wake_reader.set_nonblocking(true).map_err(RouterError::Io)?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = shutdown.clone();
-        let (event_sender, events) = mpsc::channel();
+        // Runtime does not consume diagnostic events; keep test/diagnostic
+        // observability without allowing malformed peers to grow memory.
+        let (event_sender, events) = mpsc::sync_channel(1024);
         let worker = thread::Builder::new()
             .name("et-router".to_owned())
             .spawn(move || {

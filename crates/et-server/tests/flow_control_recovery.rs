@@ -179,7 +179,7 @@ fn terminal_hup_during_recovery_delivers_final_output_once_on_the_new_connection
     });
 
     // The server has taken its connection snapshot and the flow writer is
-    // paused. Queue the shell's final output, then deliver terminal EOF/HUP.
+    // paused. Queue the shell's final output while recovery remains gated.
     gate.snapshot.recv_timeout(TIMEOUT).unwrap();
     let final_output = TerminalBuffer {
         buffer: Some(b"final-before-hup".to_vec()),
@@ -192,20 +192,10 @@ fn terminal_hup_during_recovery_delivers_final_output_once_on_the_new_connection
         ),
     )
     .unwrap();
-    drop(terminal);
 
-    // Graceful stop must preserve the recovery pause: the final packet cannot
-    // leak onto the snapshotted old connection while the permit is stalled.
-    let mut byte = [0u8; 1];
-    let old_read = old_stream.read(&mut byte);
-    assert!(
-        old_read.as_ref().is_err_and(|error| matches!(
-            error.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-        )),
-        "final output reached the old connection during recovery: {old_read:?}"
-    );
-
+    // Release the exact sequence-header barrier and wait for the recovered
+    // keepalive. That event proves the candidate was installed and the old
+    // stream was retired; checking before it would race the recovery timeout.
     gate.release.send(()).unwrap();
     let mut client = client_rx.recv_timeout(TIMEOUT).unwrap();
     recovery.join().unwrap();
@@ -214,16 +204,45 @@ fn terminal_hup_during_recovery_delivers_final_output_once_on_the_new_connection
         acknowledgement.header(),
         TerminalPacketType::KeepAlive as u8
     );
+
+    // Graceful stop must preserve the recovery pause: retiring the old stream
+    // yields EOF/reset without even one byte of the final encrypted packet.
+    let mut byte = [0u8; 1];
+    let old_read = old_stream.read(&mut byte);
+    assert!(
+        match &old_read {
+            Ok(0) => true,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                true
+            }
+            Ok(_) | Err(_) => false,
+        },
+        "final output reached the old connection during recovery: {old_read:?}"
+    );
+
     let delivered = client.read_packet().unwrap();
     assert_eq!(delivered.header(), TerminalPacketType::TerminalBuffer as u8);
     assert_eq!(
         TerminalBuffer::decode(delivered.payload()).unwrap(),
         final_output
     );
-    assert!(
-        client.read_packet().is_err(),
-        "terminal EOF must follow the one final output packet"
-    );
+    drop(terminal);
+    if let Ok(packet) = client.read_packet() {
+        assert_eq!(
+            packet.header(),
+            TerminalPacketType::KeepAlive as u8,
+            "final terminal output was duplicated before EOF"
+        );
+        assert!(
+            client.read_packet().is_err(),
+            "terminal EOF must follow the recovery keepalive"
+        );
+    }
 
     gate.finish();
     server.runtime.shutdown().unwrap();

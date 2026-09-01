@@ -23,19 +23,19 @@ pub(crate) fn run(
                     "terminal disconnected for registration id={}",
                     identity.id()
                 ));
-                let removed = core
-                    .sessions
-                    .remove_registration_with(&identity, |shutdown_raw| {
-                        if shutdown_raw {
-                            if let Err(error) = core.raw_sockets.shutdown_registration(&identity) {
-                                crate::diag::info(format!(
-                                    "id={}: error shutting down raw sockets: {error}",
-                                    identity.id()
-                                ));
-                                first_error.get_or_insert(error);
-                            }
-                        }
-                    });
+                // Keep the active transport open long enough for the bridge to
+                // drain terminal bytes already buffered at HUP, but cancel every
+                // pre-slot, starting, and returning raw socket in this generation.
+                if let Err(error) = core.raw_sockets.shutdown_inactive_registration(&identity) {
+                    crate::diag::info(format!(
+                        "id={}: error shutting down inactive raw sockets: {error}",
+                        identity.id()
+                    ));
+                    first_error.get_or_insert(error);
+                }
+                #[cfg(test)]
+                notify_raw_scan_complete(identity.id());
+                let removed = core.sessions.remove_registration_with(&identity, |_| {});
                 match removed {
                     Ok(Some(removed)) => {
                         crate::diag::info(format!(
@@ -80,4 +80,40 @@ pub(crate) fn run(
         }
     }
     first_error.map_or(Ok(()), Err)
+}
+
+#[cfg(test)]
+struct RawScanHook {
+    id: String,
+    complete: std::sync::mpsc::SyncSender<()>,
+}
+
+#[cfg(test)]
+fn raw_scan_hook() -> &'static std::sync::Mutex<Option<RawScanHook>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<RawScanHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn install_raw_scan_hook(id: &str, complete: std::sync::mpsc::SyncSender<()>) {
+    *raw_scan_hook().lock().unwrap() = Some(RawScanHook {
+        id: id.to_owned(),
+        complete,
+    });
+}
+
+#[cfg(test)]
+fn notify_raw_scan_complete(id: &str) {
+    let complete = {
+        let mut installed = raw_scan_hook().lock().unwrap();
+        if installed.as_ref().is_some_and(|hook| hook.id == id) {
+            installed.take().map(|hook| hook.complete)
+        } else {
+            None
+        }
+    };
+    if let Some(complete) = complete {
+        let _ = complete.send(());
+    }
 }

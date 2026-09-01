@@ -19,6 +19,9 @@ use crate::resolver::EndpointResolver;
 const MAX_ENDPOINT_ADDRESSES: usize = 16;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Server owns an eight-second absolute initialization budget. Do not admit a
+/// connection unless the outer budget leaves an additional propagation margin.
+const MIN_INITIALIZATION_BUDGET: Duration = Duration::from_secs(9);
 
 #[path = "reconnect.rs"]
 mod reconnect_impl;
@@ -56,11 +59,14 @@ pub fn connect_initial(
     resolver: &dyn EndpointResolver,
     deadline: Deadline,
 ) -> Result<Connection, ClientError> {
+    let admission_deadline = initialization_admission_deadline(deadline)?;
     let key = passkey_to_key(&credentials.passkey).ok_or(ClientError::InvalidPasskey)?;
-    let mut stream = connect_endpoint(endpoint, resolver, deadline)?;
+    let mut stream = connect_endpoint(endpoint, resolver, admission_deadline)?;
     set_stream_timeout(&stream, deadline)?;
 
-    ensure_deadline(deadline, "sending ConnectRequest")?;
+    // Resolution/connect may consume their entire admission slice. Revalidate
+    // the reserved server-response margin at the actual admission boundary.
+    ensure_initialization_budget(deadline)?;
     write_proto(&mut stream, &client_request(&credentials.id))
         .map_err(|source| connect_error(deadline, "sending ConnectRequest", source))?;
     set_stream_timeout(&stream, deadline)?;
@@ -139,6 +145,34 @@ fn set_stream_timeout(stream: &TcpStream, deadline: Deadline) -> Result<(), Clie
         })
 }
 
+fn classify_initial_response_error(message: String) -> ClientError {
+    if et_net::forward::decode_forward_timeout(&message).is_some() {
+        ClientError::BootstrapTimeout("setting up forwarding")
+    } else {
+        ClientError::InitialResponseRejected(message)
+    }
+}
+
+fn ensure_initialization_budget(deadline: Deadline) -> Result<(), ClientError> {
+    match deadline.remaining() {
+        Some(remaining) if remaining >= MIN_INITIALIZATION_BUDGET => Ok(()),
+        _ => Err(ClientError::BootstrapTimeout(
+            "reserving the ET initialization budget",
+        )),
+    }
+}
+
+fn initialization_admission_deadline(deadline: Deadline) -> Result<Deadline, ClientError> {
+    match deadline.remaining() {
+        Some(remaining) if remaining > MIN_INITIALIZATION_BUDGET => {
+            Ok(Deadline::after(remaining - MIN_INITIALIZATION_BUDGET))
+        }
+        _ => Err(ClientError::BootstrapTimeout(
+            "reserving the ET initialization budget",
+        )),
+    }
+}
+
 fn ensure_deadline(deadline: Deadline, operation: &'static str) -> Result<(), ClientError> {
     match deadline.remaining() {
         Some(_) => Ok(()),
@@ -166,7 +200,7 @@ fn transport_error(
 
 fn accept_initial_response(response: InitialResponse) -> Result<(), ClientError> {
     if let Some(message) = response.error {
-        Err(ClientError::InitialResponseRejected(message))
+        Err(classify_initial_response_error(message))
     } else {
         Ok(())
     }

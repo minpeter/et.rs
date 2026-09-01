@@ -1,7 +1,11 @@
 use std::io::Write;
 use std::net::TcpStream;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
+use et_core::backed_writer::{
+    MAX_BACKUP_PACKETS, MAX_DISCONNECT_PACKETS, MAX_RECOVERY_BACKUP_BYTES,
+};
 use et_net::local::LocalStream;
 
 use super::{ActiveSession, SessionError};
@@ -43,6 +47,46 @@ impl ActiveSession {
             flow.set_reader_waiting(false);
         }
         result
+    }
+
+    pub(crate) fn note_bridge_generation(&self, generation: u64) -> Result<(), SessionError> {
+        let mut observed = self
+            .bridge_generation
+            .lock()
+            .map_err(|_| SessionError::Unavailable)?;
+        if generation > *observed {
+            *observed = generation;
+            self.bridge_changed.notify_all();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn wait_for_bridge_generation(
+        &self,
+        expected: u64,
+        timeout: Duration,
+    ) -> Result<(), SessionError> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(SessionError::Unavailable)?;
+        let mut observed = self
+            .bridge_generation
+            .lock()
+            .map_err(|_| SessionError::Unavailable)?;
+        while *observed < expected {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(SessionError::RecoverBusy)?;
+            let (next, result) = self
+                .bridge_changed
+                .wait_timeout(observed, remaining)
+                .map_err(|_| SessionError::Unavailable)?;
+            observed = next;
+            if result.timed_out() && *observed < expected {
+                return Err(SessionError::RecoverBusy);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn connection_state(&self) -> Result<(bool, u64), SessionError> {
@@ -104,11 +148,24 @@ impl ActiveSession {
             let bytes = usize::try_from(bytes).map_err(|_| SessionError::Unavailable)?;
             return state.can_accept_terminal(bytes);
         }
+        let hold = self
+            .recover_hold
+            .lock()
+            .map_err(|_| SessionError::Unavailable)?;
+        if hold.len() >= MAX_BACKUP_PACKETS + MAX_DISCONNECT_PACKETS {
+            return Ok(false);
+        }
+        let held =
+            i64::try_from(self.recover_hold_bytes.load(Ordering::Acquire)).unwrap_or(i64::MAX);
+        let requested = held.checked_add(bytes).unwrap_or(i64::MAX);
+        if requested > MAX_RECOVERY_BACKUP_BYTES {
+            return Ok(false);
+        }
         Ok(self
             .connection
             .lock()
             .map_err(|_| SessionError::Unavailable)?
-            .can_buffer_write(bytes))
+            .can_buffer_write(requested))
     }
 
     pub(crate) fn is_shutting_down(&self) -> bool {

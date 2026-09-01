@@ -3,7 +3,7 @@
 #[path = "terminal_runtime_support/mod.rs"]
 mod terminal_runtime_support;
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -11,11 +11,13 @@ use et_core::packet::Packet;
 use et_core::proto::{
     TermInit, TerminalBuffer, TerminalInfo, TerminalPacketType, TerminalUserInfo,
 };
-use et_net::local_packet::{read_local_packet, write_local_packet};
+use et_net::local_packet::{
+    parse_status, read_local_packet, status_packet, write_local_packet, REGISTRATION_STATUS,
+    STARTUP_STATUS,
+};
 use prost::Message;
 use terminal_runtime_support::{
-    collect_until, contains, read_line_timeout, write_credentials, Fixture, LOGIN_COLOR_MARKER,
-    NON_LOGIN_MARKER,
+    collect_until, contains, write_credentials, Fixture, LOGIN_COLOR_MARKER, NON_LOGIN_MARKER,
 };
 use wait_timeout::ChildExt;
 
@@ -30,15 +32,27 @@ fn bootstrap_parent_reports_marker_and_leaves_registered_session_running() {
     let fixture = Fixture::new("bootstrap-parent");
     let mut parent = fixture.spawn_parent();
     write_credentials(&mut parent);
-    let (mut router, _) = fixture.listener.accept().unwrap();
+    let mut router = fixture.accept();
     router.set_read_timeout(Some(TIMEOUT)).unwrap();
     let registration = read_local_packet(&mut router).unwrap();
     assert_eq!(
         registration.header(),
         TerminalPacketType::TerminalUserInfo as u8
     );
+    let (marker_tx, marker_rx) = std::sync::mpsc::sync_channel(1);
+    let stdout = parent.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
+        let _ = marker_tx.send(result);
+    });
+    assert!(matches!(
+        marker_rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    acknowledge_registration(&mut router);
     assert_eq!(
-        read_line_timeout(parent.stdout.take().unwrap()),
+        marker_rx.recv_timeout(TIMEOUT).unwrap().unwrap(),
         format!("IDPASSKEY:{ID}/{KEY}\n")
     );
     assert!(parent.wait_timeout(TIMEOUT).unwrap().unwrap().success());
@@ -51,6 +65,7 @@ fn bootstrap_parent_reports_marker_and_leaves_registered_session_running() {
             flowcontrol: None,
         },
     );
+    expect_startup(&mut router);
     send(
         &mut router,
         TerminalPacketType::TerminalBuffer,
@@ -74,13 +89,117 @@ fn bootstrap_parent_reports_marker_and_leaves_registered_session_running() {
 }
 
 #[test]
+fn registration_delayed_beyond_ten_seconds_still_completes_before_absolute_deadline() {
+    let fixture = Fixture::new("delayed-registration");
+    let mut parent = fixture.spawn_parent();
+    write_credentials(&mut parent);
+    let mut router = fixture.accept();
+    let _registration = read_local_packet(&mut router).unwrap();
+    let (marker_tx, marker_rx) = std::sync::mpsc::sync_channel(1);
+    let stdout = parent.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
+        let _ = marker_tx.send(result);
+    });
+    assert!(matches!(
+        marker_rx.recv_timeout(Duration::from_secs(11)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    acknowledge_registration(&mut router);
+    assert_eq!(
+        marker_rx.recv_timeout(TIMEOUT).unwrap().unwrap(),
+        format!("IDPASSKEY:{ID}/{KEY}\n")
+    );
+    assert!(parent.wait_timeout(TIMEOUT).unwrap().unwrap().success());
+    drop(router);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn detached_terminal_is_session_leader_and_closes_inherited_descriptors() {
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+
+    let sentinel_path = std::env::temp_dir().join(format!(
+        "et-rs-inherited-fd-sentinel-{}",
+        std::process::id()
+    ));
+    let sentinel = std::fs::File::create(&sentinel_path).unwrap();
+    fcntl(&sentinel, FcntlArg::F_SETFD(FdFlag::empty())).unwrap();
+
+    let fixture = Fixture::new("session-leader");
+    let mut parent = fixture.spawn_parent();
+    write_credentials(&mut parent);
+    let mut router = fixture.accept();
+    let credentials = getsockopt(&router, PeerCredentials).unwrap();
+    let pid = credentials.pid();
+    let _registration = read_local_packet(&mut router).unwrap();
+    acknowledge_registration(&mut router);
+    assert!(parent.wait_timeout(TIMEOUT).unwrap().unwrap().success());
+
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let fields: Vec<_> = stat[stat.rfind(')').unwrap() + 2..]
+        .split_whitespace()
+        .collect();
+    let session: i32 = fields[3].parse().unwrap();
+    assert_eq!(session, pid, "detached terminal must satisfy sid == pid");
+    let inherited = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+        .any(|target| target == sentinel_path);
+    assert!(
+        !inherited,
+        "detached terminal inherited sentinel descriptor"
+    );
+
+    drop(router);
+    drop(sentinel);
+    let _ = std::fs::remove_file(sentinel_path);
+}
+
+#[test]
+fn new_terminal_uses_legacy_sequence_with_old_router() {
+    let fixture = Fixture::new_legacy("old-router-new-terminal");
+    let mut child = fixture.spawn();
+    write_credentials(&mut child);
+    let mut router = fixture.accept();
+    router.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let registration = read_local_packet(&mut router).unwrap();
+    let user = TerminalUserInfo::decode(registration.payload()).unwrap();
+    assert_eq!(user.fd, None);
+    fixture.wait_ready();
+    send(
+        &mut router,
+        TerminalPacketType::TerminalInit,
+        &TermInit {
+            environmentnames: Vec::new(),
+            environmentvalues: Vec::new(),
+            flowcontrol: None,
+        },
+    );
+    send(
+        &mut router,
+        TerminalPacketType::TerminalBuffer,
+        &TerminalBuffer {
+            buffer: Some(b"printf 'MIXED-OLD-ROUTER\\n'; exit\n".to_vec()),
+        },
+    );
+    let output = collect_until(&mut router, |output| contains(output, b"MIXED-OLD-ROUTER"));
+    assert!(contains(&output, b"MIXED-OLD-ROUTER"));
+    assert!(child.wait_timeout(TIMEOUT).unwrap().unwrap().success());
+}
+
+#[test]
 fn real_terminal_registers_runs_shell_and_resizes_pty() {
     let fixture = Fixture::new("shell");
     let mut child = fixture.spawn();
     write_credentials(&mut child);
-    let (mut router, _) = fixture.listener.accept().unwrap();
+    let mut router = fixture.accept();
     router.set_read_timeout(Some(TIMEOUT)).unwrap();
     let registration = read_local_packet(&mut router).unwrap();
+    acknowledge_registration(&mut router);
     assert_eq!(
         registration.header(),
         TerminalPacketType::TerminalUserInfo as u8
@@ -99,6 +218,7 @@ fn real_terminal_registers_runs_shell_and_resizes_pty() {
             flowcontrol: None,
         },
     );
+    expect_startup(&mut router);
     send(
         &mut router,
         TerminalPacketType::TerminalInfo,
@@ -138,6 +258,61 @@ fn real_terminal_registers_runs_shell_and_resizes_pty() {
 }
 
 #[test]
+fn pty_output_backpressure_longer_than_two_seconds_preserves_session_and_order() {
+    let fixture = Fixture::new("pty-backpressure");
+    let mut child = fixture.spawn();
+    write_credentials(&mut child);
+    let mut router = fixture.accept();
+    router.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let _registration = read_local_packet(&mut router).unwrap();
+    acknowledge_registration(&mut router);
+    fixture.wait_ready();
+    send(
+        &mut router,
+        TerminalPacketType::TerminalInit,
+        &TermInit {
+            environmentnames: Vec::new(),
+            environmentvalues: Vec::new(),
+            flowcontrol: None,
+        },
+    );
+    expect_startup(&mut router);
+    send(
+        &mut router,
+        TerminalPacketType::TerminalBuffer,
+        &TerminalBuffer {
+            buffer: Some(b"stty -echo; printf 'PTY-BACKPRESSURE-%s\\n' READY\n".to_vec()),
+        },
+    );
+    let _ = collect_until(&mut router, |output| {
+        contains(output, b"PTY-BACKPRESSURE-READY")
+    });
+    send(
+        &mut router,
+        TerminalPacketType::TerminalBuffer,
+        &TerminalBuffer {
+            buffer: Some(
+                b"head -c 1048576 /dev/zero | tr '\\000' x; printf 'PTY-BACKPRESSURE-%s\\n' MARKER; exit\n"
+                    .to_vec(),
+            ),
+        },
+    );
+
+    assert!(
+        child
+            .wait_timeout(Duration::from_secs(3))
+            .unwrap()
+            .is_none(),
+        "terminal exited instead of backpressuring PTY output"
+    );
+    let output = collect_until(&mut router, |output| {
+        contains(output, b"PTY-BACKPRESSURE-MARKER")
+    });
+    assert!(contains(&output, b"PTY-BACKPRESSURE-MARKER"));
+    assert!(child.wait_timeout(TIMEOUT).unwrap().unwrap().success());
+}
+
+#[test]
 fn malformed_credentials_fail_before_router_connection() {
     let fixture = Fixture::new("bad-credentials");
     let output = Command::new(env!("CARGO_BIN_EXE_et"))
@@ -158,12 +333,45 @@ fn malformed_credentials_fail_before_router_connection() {
 }
 
 #[test]
+fn bootstrap_parent_reports_terminal_child_startup_failure() {
+    let missing_router =
+        std::env::temp_dir().join(format!("et-rs-missing-router-{}", std::process::id()));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_et"))
+        .args(["terminal", "--serverfifo"])
+        .arg(&missing_router)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "{ID}/{KEY}_xterm-256color").unwrap();
+    let status = child
+        .wait_timeout(TIMEOUT)
+        .unwrap()
+        .expect("terminal bootstrap did not exit within its bounded test deadline");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+
+    assert_eq!(status.code(), Some(2));
+    assert!(
+        stderr.contains("could not connect terminal router"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn router_disconnect_terminates_the_shell() {
     let fixture = Fixture::new("disconnect");
     let mut child = fixture.spawn();
     write_credentials(&mut child);
-    let (mut router, _) = fixture.listener.accept().unwrap();
+    let mut router = fixture.accept();
     let _ = read_local_packet(&mut router).unwrap();
+    acknowledge_registration(&mut router);
     fixture.wait_ready();
     send(
         &mut router,
@@ -174,6 +382,7 @@ fn router_disconnect_terminates_the_shell() {
             flowcontrol: None,
         },
     );
+    expect_startup(&mut router);
     drop(router);
     let status = child.wait_timeout(TIMEOUT).unwrap().unwrap();
     assert!(!status.success());
@@ -185,9 +394,10 @@ fn real_terminal_starts_login_shell_and_loads_profile_color() {
     let shell = fixture.login_probe_shell();
     let mut child = fixture.spawn_with_shell(shell.to_str().unwrap());
     write_credentials(&mut child);
-    let (mut router, _) = fixture.listener.accept().unwrap();
+    let mut router = fixture.accept();
     router.set_read_timeout(Some(TIMEOUT)).unwrap();
     let _ = read_local_packet(&mut router).unwrap();
+    acknowledge_registration(&mut router);
     fixture.wait_ready();
     send(
         &mut router,
@@ -198,6 +408,7 @@ fn real_terminal_starts_login_shell_and_loads_profile_color() {
             flowcontrol: None,
         },
     );
+    expect_startup(&mut router);
     send(
         &mut router,
         TerminalPacketType::TerminalBuffer,
@@ -228,9 +439,10 @@ fn real_terminal_login_shell_preserves_term_without_colorterm() {
     let shell = fixture.login_probe_shell();
     let mut child = fixture.spawn_with_shell(shell.to_str().unwrap());
     write_credentials(&mut child);
-    let (mut router, _) = fixture.listener.accept().unwrap();
+    let mut router = fixture.accept();
     router.set_read_timeout(Some(TIMEOUT)).unwrap();
     let _ = read_local_packet(&mut router).unwrap();
+    acknowledge_registration(&mut router);
     fixture.wait_ready();
     send(
         &mut router,
@@ -241,6 +453,7 @@ fn real_terminal_login_shell_preserves_term_without_colorterm() {
             flowcontrol: None,
         },
     );
+    expect_startup(&mut router);
     send(
         &mut router,
         TerminalPacketType::TerminalBuffer,
@@ -292,6 +505,7 @@ fn real_terminal_emits_motd_before_login_shell_output() {
     let (mut router, _) = fixture.listener.accept().unwrap();
     router.set_read_timeout(Some(TIMEOUT)).unwrap();
     let _ = read_local_packet(&mut router).unwrap();
+    acknowledge_registration(&mut router);
     fixture.wait_ready();
 
     // When: the session initializes and the login shell starts producing output.
@@ -304,6 +518,7 @@ fn real_terminal_emits_motd_before_login_shell_output() {
             flowcontrol: None,
         },
     );
+    expect_startup(&mut router);
     send(
         &mut router,
         TerminalPacketType::TerminalBuffer,
@@ -355,6 +570,7 @@ fn real_terminal_suppresses_motd_when_home_has_hushlogin() {
     let (mut router, _) = fixture.listener.accept().unwrap();
     router.set_read_timeout(Some(TIMEOUT)).unwrap();
     let _ = read_local_packet(&mut router).unwrap();
+    acknowledge_registration(&mut router);
     fixture.wait_ready();
 
     // When: the session runs to the point the login shell has produced output.
@@ -367,6 +583,7 @@ fn real_terminal_suppresses_motd_when_home_has_hushlogin() {
             flowcontrol: None,
         },
     );
+    expect_startup(&mut router);
     send(
         &mut router,
         TerminalPacketType::TerminalBuffer,
@@ -397,6 +614,21 @@ fn count(output: &[u8], marker: &[u8]) -> usize {
         .windows(marker.len())
         .filter(|window| *window == marker)
         .count()
+}
+
+fn acknowledge_registration(router: &mut impl Write) {
+    write_local_packet(router, &status_packet(REGISTRATION_STATUS, Ok(()))).unwrap();
+}
+
+fn expect_startup(router: &mut impl std::io::Read) {
+    let packet = read_local_packet(router).unwrap();
+    parse_status(&packet, STARTUP_STATUS).unwrap_or_else(|error| {
+        panic!(
+            "expected startup status, got header={} payload={:?}: {error}",
+            packet.header(),
+            packet.payload()
+        )
+    });
 }
 
 fn send<M: Message>(router: &mut impl Write, kind: TerminalPacketType, message: &M) {

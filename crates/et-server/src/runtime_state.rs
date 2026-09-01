@@ -15,6 +15,7 @@ pub(crate) struct RuntimeCore {
     pub(crate) handlers: HandlerThreads,
     pub(crate) pre_auth_slots: Arc<PreAuthSlots>,
     pub(crate) shutdown: AtomicBool,
+    pub(crate) forward_resolver: Arc<dyn et_net::forward::ForwardResolver>,
 }
 
 pub(crate) const MAX_PRE_AUTH_CONNECTIONS: usize = 128;
@@ -55,6 +56,8 @@ impl Drop for PreAuthGuard {
 struct TrackedSocket {
     stream: TcpStream,
     registration: Option<RegistrationIdentity>,
+    authenticated: bool,
+    session_owner: bool,
 }
 
 pub(crate) struct RawSockets {
@@ -93,6 +96,8 @@ impl RawSockets {
             TrackedSocket {
                 stream: clone,
                 registration: None,
+                authenticated: false,
+                session_owner: false,
             },
         );
         Ok(RawSocketGuard {
@@ -112,7 +117,7 @@ impl RawSockets {
         Ok(())
     }
 
-    pub(crate) fn shutdown_registration(
+    pub(crate) fn shutdown_inactive_registration(
         &self,
         identity: &RegistrationIdentity,
     ) -> Result<(), RuntimeError> {
@@ -121,10 +126,11 @@ impl RawSockets {
             .lock()
             .map_err(|_| RuntimeError::WorkerUnavailable)?;
         for tracked in streams.values() {
-            if tracked
-                .registration
-                .as_ref()
-                .is_some_and(|current| current.same_generation(identity))
+            if !tracked.session_owner
+                && tracked
+                    .registration
+                    .as_ref()
+                    .is_some_and(|current| current.same_generation(identity))
             {
                 let _ = tracked.stream.shutdown(Shutdown::Both);
             }
@@ -143,10 +149,51 @@ impl RawSocketGuard {
             .streams
             .lock()
             .map_err(|_| RuntimeError::WorkerUnavailable)?;
+        // A known-id peer must not allocate an unbounded set of stalled
+        // authentication workers. Newest wins: close the previous raw socket
+        // for this registration generation before assigning this one. A
+        // legitimate client can therefore displace a passkey-less staller.
+        for (id, tracked) in streams.iter() {
+            if *id != self.id
+                && !tracked.authenticated
+                && tracked
+                    .registration
+                    .as_ref()
+                    .is_some_and(|current| current.same_generation(&registration))
+            {
+                let _ = tracked.stream.shutdown(Shutdown::Both);
+            }
+        }
         let tracked = streams
             .get_mut(&self.id)
             .ok_or(RuntimeError::WorkerUnavailable)?;
         tracked.registration = Some(registration);
+        Ok(())
+    }
+
+    pub(crate) fn authenticate(&mut self) -> Result<(), RuntimeError> {
+        let mut streams = self
+            .sockets
+            .streams
+            .lock()
+            .map_err(|_| RuntimeError::WorkerUnavailable)?;
+        let tracked = streams
+            .get_mut(&self.id)
+            .ok_or(RuntimeError::WorkerUnavailable)?;
+        tracked.authenticated = true;
+        Ok(())
+    }
+
+    pub(crate) fn own_session(&mut self) -> Result<(), RuntimeError> {
+        let mut streams = self
+            .sockets
+            .streams
+            .lock()
+            .map_err(|_| RuntimeError::WorkerUnavailable)?;
+        let tracked = streams
+            .get_mut(&self.id)
+            .ok_or(RuntimeError::WorkerUnavailable)?;
+        tracked.session_owner = true;
         Ok(())
     }
 }

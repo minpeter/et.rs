@@ -249,6 +249,10 @@ impl Connection {
         }
     }
 
+    pub fn read_packet_deadline(&mut self, deadline: Instant) -> Result<Packet, ConnError> {
+        self.read_packet_until(deadline)
+    }
+
     pub fn read_packet_until(&mut self, deadline: Instant) -> Result<Packet, ConnError> {
         loop {
             match self.reader.pop() {

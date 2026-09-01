@@ -17,6 +17,7 @@ et-core = { path = "../et-core" }
 prost = "0.13"
 rustix = { version = "1.1.4", features = ["event"] }
 socket2 = { version = "0.6.1", features = ["all"] }
+wait-timeout = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 privdrop = "0.5.6"

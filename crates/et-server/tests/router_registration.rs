@@ -9,14 +9,18 @@ use std::time::Duration;
 
 use et_core::packet::Packet;
 use et_core::proto::{TerminalPacketType, TerminalUserInfo};
-use et_net::local_packet::{write_local_packet, MAX_LOCAL_PACKET_LEN};
+use et_net::local_packet::{read_local_packet, write_local_packet, MAX_LOCAL_PACKET_LEN};
 use et_server::path::select_router_path_for;
-use et_server::{Registry, Router, RouterEvent, RouterReject};
+use et_server::{Registry, Router, RouterEvent, RouterReject, REGISTRATION_TIMEOUT};
 use prost::Message;
 use support::TestDir;
 
 const ID: &str = "abcdefghijklmnop";
 const KEY: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
+
+fn current_ids() -> (i64, i64) {
+    peer_identity()
+}
 
 fn peer_identity() -> (i64, i64) {
     (
@@ -31,12 +35,22 @@ fn info(
     uid: Option<i64>,
     gid: Option<i64>,
 ) -> TerminalUserInfo {
+    info_with_capability(id, key, uid, gid, false)
+}
+
+fn info_with_capability(
+    id: Option<&str>,
+    key: Option<&str>,
+    uid: Option<i64>,
+    gid: Option<i64>,
+    startup_ack: bool,
+) -> TerminalUserInfo {
     TerminalUserInfo {
         id: id.map(str::to_owned),
         passkey: key.map(str::to_owned),
         uid,
         gid,
-        fd: None,
+        fd: startup_ack.then_some(-6),
     }
 }
 
@@ -249,6 +263,81 @@ fn terminal_disconnect_is_typed_and_same_id_can_register_again() {
 }
 
 #[test]
+fn new_router_sends_no_control_packet_to_legacy_terminal() {
+    let dir = TestDir::new();
+    let path = dir.socket();
+    let registry = Registry::new();
+    let selected = select_router_path_for(1000, Some(&path), None, None).unwrap();
+    let mut router = Router::start(selected, registry).unwrap();
+    let (uid, gid) = current_ids();
+    let packet = Packet::new(
+        TerminalPacketType::TerminalUserInfo as u8,
+        info(Some(ID), Some(KEY), Some(uid), Some(gid)).encode_to_vec(),
+    );
+    let mut terminal = connect_packet(&path, &packet);
+    assert_eq!(
+        router.recv_event_timeout(Duration::from_secs(2)).unwrap(),
+        RouterEvent::Registered { id: ID.to_owned() }
+    );
+    terminal
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let error = read_local_packet(&mut terminal).unwrap_err();
+    assert!(matches!(
+        error,
+        et_net::local_packet::LocalPacketError::Io(ref io)
+            if matches!(io.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+    ));
+    router.shutdown().unwrap();
+}
+
+#[test]
+fn broken_registration_ack_rolls_back_and_router_keeps_serving() {
+    let dir = TestDir::new();
+    let path = dir.socket();
+    let registry = Registry::new();
+    let selected = select_router_path_for(1000, Some(&path), None, None).unwrap();
+    let mut router = Router::start(selected, registry.clone()).unwrap();
+    let (uid, gid) = current_ids();
+    let mut broken = UnixStream::connect(&path).unwrap();
+    let packet = Packet::new(
+        TerminalPacketType::TerminalUserInfo as u8,
+        info_with_capability(Some(ID), Some(KEY), Some(uid), Some(gid), true).encode_to_vec(),
+    );
+    write_local_packet(&mut broken, &packet).unwrap();
+    broken.shutdown(Shutdown::Read).unwrap();
+    expect_rejected(&router, RouterReject::RegistryUnavailable);
+    assert!(registry.is_empty().unwrap());
+
+    let packet = Packet::new(
+        TerminalPacketType::TerminalUserInfo as u8,
+        info(Some(ID), Some(KEY), Some(uid), Some(gid)).encode_to_vec(),
+    );
+    let _terminal = connect_packet(&path, &packet);
+    assert_eq!(
+        router.recv_event_timeout(Duration::from_secs(2)).unwrap(),
+        RouterEvent::Registered { id: ID.to_owned() }
+    );
+    router.shutdown().unwrap();
+}
+
+#[test]
+fn idle_registration_expires_on_monotonic_deadline() {
+    let dir = TestDir::new();
+    let path = dir.socket();
+    let selected = select_router_path_for(1000, Some(&path), None, None).unwrap();
+    let mut router = Router::start(selected, Registry::new()).unwrap();
+    let _idle = UnixStream::connect(&path).unwrap();
+    assert_eq!(
+        router
+            .recv_event_timeout(REGISTRATION_TIMEOUT + Duration::from_secs(2))
+            .unwrap(),
+        RouterEvent::Rejected(RouterReject::Timeout)
+    );
+    router.shutdown().unwrap();
+}
+
+#[test]
 fn malformed_local_frames_are_capped_and_classified() {
     let dir = TestDir::new();
     let path = dir.socket();
@@ -310,6 +399,7 @@ fn idle_pending_registration_expires_and_router_remains_live() {
     idle.set_read_timeout(Some(Duration::from_secs(7))).unwrap();
     let mut byte = [0_u8; 1];
     assert_eq!(std::io::Read::read(&mut idle, &mut byte).unwrap(), 0);
+    expect_rejected(&router, RouterReject::Timeout);
 
     let (uid, gid) = peer_identity();
     let packet = Packet::new(

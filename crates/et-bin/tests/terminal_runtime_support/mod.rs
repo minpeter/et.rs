@@ -1,8 +1,9 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -13,6 +14,7 @@ use prost::Message;
 const ID: &str = "abcdefghijklmnop";
 const KEY: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
 const TIMEOUT: Duration = Duration::from_secs(5);
+static FIXTURE_GENERATION: AtomicUsize = AtomicUsize::new(0);
 
 pub const LOGIN_COLOR_MARKER: &[u8] = b"\x1b[31mET-LOGIN-COLOR\x1b[0m";
 pub const NON_LOGIN_MARKER: &[u8] = b"ET-NON-LOGIN";
@@ -27,14 +29,26 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn new(label: &str) -> Self {
+        Self::new_with_ack(label, true)
+    }
+
+    pub fn new_legacy(label: &str) -> Self {
+        Self::new_with_ack(label, false)
+    }
+
+    fn new_with_ack(_label: &str, registration_ack: bool) -> Self {
+        let generation = FIXTURE_GENERATION.fetch_add(1, Ordering::Relaxed);
         let directory =
-            std::env::temp_dir().join(format!("et-rs-terminal-{label}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("etr{:x}{generation:x}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
-        let socket = directory.join("router.sock");
+        let socket = directory.join("r");
         let listener = UnixListener::bind(&socket).unwrap();
-        let ready_socket = directory.join("ready.sock");
+        if registration_ack {
+            et_net::local::write_registration_ack_capability(&socket).unwrap();
+        }
+        let ready_socket = directory.join("a");
         let ready_listener = UnixListener::bind(&ready_socket).unwrap();
         Self {
             directory,
@@ -43,6 +57,21 @@ impl Fixture {
             ready_socket,
             ready_listener,
         }
+    }
+
+    pub fn accept(&self) -> std::os::unix::net::UnixStream {
+        let listener = self.listener.try_clone().unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = sender.send(listener.accept().map(|(stream, _)| stream));
+        });
+        let stream = receiver
+            .recv_timeout(TIMEOUT)
+            .expect("timed out waiting for terminal router connection")
+            .unwrap();
+        stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+        stream.set_write_timeout(Some(TIMEOUT)).unwrap();
+        stream
     }
 
     pub fn spawn(&self) -> std::process::Child {
@@ -145,16 +174,6 @@ impl Drop for Fixture {
 pub fn write_credentials(child: &mut std::process::Child) {
     let mut stdin = child.stdin.take().unwrap();
     writeln!(stdin, "{ID}/{KEY}_xterm-256color").unwrap();
-}
-
-pub fn read_line_timeout(stdout: impl std::io::Read + Send + 'static) -> String {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
-        let _ = sender.send(result);
-    });
-    receiver.recv_timeout(TIMEOUT).unwrap().unwrap()
 }
 
 pub fn contains(output: &[u8], marker: &[u8]) -> bool {

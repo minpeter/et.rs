@@ -23,6 +23,12 @@ impl ActiveSession {
         {
             return Err(SessionError::RecoverBusy);
         }
+        if let Some(flow) = &self.flow_control {
+            if let Err(error) = flow.pause() {
+                self.recovering.store(false, Ordering::Release);
+                return Err(error);
+            }
+        }
         Ok(RecoverPermit { session: self })
     }
 
@@ -31,9 +37,6 @@ impl ActiveSession {
     /// The connection mutex is held only for soft-disconnect/snapshot and for
     /// installing the new stream, not for sequence exchange or peer auth.
     fn recover_body(&self, stream: TcpStream) -> Result<(), SessionError> {
-        if let Some(flow) = &self.flow_control {
-            flow.pause()?;
-        }
         // Phase 1: soft-disconnect and snapshot under a short lock.
         let mut candidate = {
             let connection = lock_timeout(&self.connection, RECOVERY_LOCK_TIMEOUT)?;
@@ -124,12 +127,21 @@ impl ActiveSession {
                         WritePacketError::ReplayOwned(error) => {
                             // Replay owns the failed packet; retain only the
                             // unwritten tail and concurrent plaintext.
+                            self.recover_hold_bytes.fetch_sub(
+                                u64::try_from(payload.len())
+                                    .map_err(|_| SessionError::Unavailable)?,
+                                Ordering::AcqRel,
+                            );
                             hold.extend(remaining);
                             hold.extend(concurrent);
                             return Err(SessionError::Connection(error));
                         }
                     }
                 }
+                self.recover_hold_bytes.fetch_sub(
+                    u64::try_from(payload.len()).map_err(|_| SessionError::Unavailable)?,
+                    Ordering::AcqRel,
+                );
             }
         }
     }

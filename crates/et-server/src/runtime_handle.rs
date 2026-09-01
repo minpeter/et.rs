@@ -51,6 +51,24 @@ impl RuntimeHandle {
             .map_err(HandleError::Session)
     }
 
+    #[doc(hidden)]
+    pub fn wait_for_bridge_generation(
+        &self,
+        id: &str,
+        generation: u64,
+        timeout: Duration,
+    ) -> Result<(), HandleError> {
+        let session = self
+            .core
+            .sessions
+            .active(id)
+            .map_err(HandleError::SessionTable)?
+            .ok_or_else(|| HandleError::NotActive(id.to_owned()))?;
+        session
+            .wait_for_bridge_generation(generation, timeout)
+            .map_err(HandleError::Session)
+    }
+
     pub fn session_state(&self, id: &str) -> Result<Option<SessionState>, HandleError> {
         self.core
             .sessions

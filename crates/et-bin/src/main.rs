@@ -37,7 +37,10 @@ fn main() {
 
     match dispatch(prog, &argv[1..]) {
         Ok(code) => std::process::exit(code),
-        Err(error) => error.exit(),
+        Err(error) => {
+            crate::server_daemon::fail_startup(&error.to_string());
+            error.exit();
+        }
     }
 }
 

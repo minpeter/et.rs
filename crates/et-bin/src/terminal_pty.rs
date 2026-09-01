@@ -723,4 +723,24 @@ mod tests {
         );
         worker.join().unwrap().unwrap();
     }
+
+    #[test]
+    fn maximum_motd_is_split_into_local_frame_sized_chunks() {
+        let output = vec![b'x'; 256 * 1024];
+
+        let chunks = output.chunks(MAX_OUTPUT_CHUNK).collect::<Vec<_>>();
+
+        assert_eq!(chunks.len(), 16);
+        assert!(chunks.iter().all(|chunk| {
+            let message = TerminalBuffer {
+                buffer: Some(chunk.to_vec()),
+            };
+            Packet::new(
+                TerminalPacketType::TerminalBuffer as u8,
+                message.encode_to_vec(),
+            )
+            .wire_len()
+                <= et_net::local_packet::MAX_LOCAL_PACKET_LEN
+        }));
+    }
 }

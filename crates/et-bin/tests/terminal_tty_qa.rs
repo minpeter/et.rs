@@ -294,12 +294,18 @@ impl Stack {
             .spawn()
             .unwrap();
         wait_ready(&mut server, port, &router);
+        let home = directory.join("home");
+        fs::create_dir(&home).unwrap();
+        fs::write(home.join(".hushlogin"), b"").unwrap();
         let ssh = directory.join("ssh");
         fs::write(
             &ssh,
-            "#!/bin/sh\nif [ \"$1\" = \"-G\" ]; then\n\
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"-G\" ]; then\n\
              printf 'hostname 127.0.0.1\\nuser tester\\n'; exit 0; fi\n\
-             for last do :; done\nexec /bin/sh -c \"$last\"\n",
+             for last do :; done\nexport HOME={}\nexec /bin/sh -c \"$last\"\n",
+                shell_quote(home.to_str().unwrap())
+            ),
         )
         .unwrap();
         fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();

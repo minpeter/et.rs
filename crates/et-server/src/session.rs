@@ -46,6 +46,10 @@ pub(crate) struct ActiveSession {
     recover_hold: Mutex<Vec<(u8, Vec<u8>)>>,
     recover_hold_bytes: AtomicU64,
     shutdown: AtomicBool,
+    /// Set only by [`ActiveSession::shutdown`] (full session teardown).
+    /// Distinct from [`Self::shutdown`]: `finish_terminal` also sets that
+    /// flag so the bridge can drain HUP, and recover must still complete.
+    torn_down: AtomicBool,
     /// Only one recover may run at a time. Concurrent returning clients used
     /// to queue on the connection mutex for minutes after a blackhole write.
     recovering: AtomicBool,
@@ -135,6 +139,7 @@ impl ActiveSession {
             recover_hold: Mutex::new(Vec::new()),
             recover_hold_bytes: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
+            torn_down: AtomicBool::new(false),
             recovering: AtomicBool::new(false),
             connection_generation: AtomicU64::new(0),
             flow_control: queue_mode.map(|mode| Arc::new(FlowControl::new(mode))),
@@ -309,6 +314,7 @@ impl ActiveSession {
     }
 
     pub(crate) fn shutdown(&self) -> Result<(), SessionError> {
+        self.torn_down.store(true, Ordering::Release);
         self.shutdown.store(true, Ordering::Release);
         self.join_flow_writer(false)?;
         let _ = self.signal();
@@ -433,5 +439,43 @@ mod tests {
         drop(hold);
         session.recovering.store(false, Ordering::Release);
         drop(permit);
+    }
+
+    #[test]
+    fn recover_refuses_to_revive_a_shutting_down_session() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || TcpStream::connect(address).unwrap());
+        let (stream, _) = listener.accept().unwrap();
+        let _peer = peer.join().unwrap();
+        let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
+        let session =
+            ActiveSession::new(Connection::new_server(stream, &[7; 32]), &terminal, None).unwrap();
+
+        // Terminal HUP sets `shutdown` so the bridge can drain; recover
+        // must still be allowed until full session teardown.
+        session.shutdown.store(true, Ordering::Release);
+        let hup_permit = session.try_begin_recover().unwrap();
+        drop(hup_permit);
+
+        session.torn_down.store(true, Ordering::Release);
+        assert!(matches!(
+            session.try_begin_recover(),
+            Err(SessionError::Unavailable)
+        ));
+
+        session.torn_down.store(false, Ordering::Release);
+        let permit = session.try_begin_recover().unwrap();
+        session.torn_down.store(true, Ordering::Release);
+        let extra = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let extra_addr = extra.local_addr().unwrap();
+        let extra_peer = std::thread::spawn(move || TcpStream::connect(extra_addr).unwrap());
+        let (candidate, _) = extra.accept().unwrap();
+        let _extra_peer = extra_peer.join().unwrap();
+        assert!(matches!(
+            permit.complete(candidate),
+            Err(SessionError::Unavailable)
+        ));
+        assert!(!session.recovering.load(Ordering::Acquire));
     }
 }

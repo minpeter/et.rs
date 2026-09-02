@@ -20,7 +20,9 @@ use et_net::handshake::client_request;
 use et_net::local_packet::{read_local_packet, write_local_packet};
 use et_server::SessionState;
 use prost::Message;
-use runtime_support::{default_payload, initialize, TestRuntime, ID_A, KEY_A, TIMEOUT};
+use runtime_support::{
+    default_payload, initialize, TestRuntime, ID_A, ID_B, KEY_A, KEY_B, TIMEOUT,
+};
 
 // Deadlock watchdog only. Success is driven by exact bridge-generation and
 // terminal-packet events, not by elapsed time.
@@ -552,6 +554,55 @@ fn concurrent_returning_recover_does_not_block_accept_path() {
         .unwrap();
     let forwarded = read_local_packet(&mut terminal).unwrap();
     assert_eq!(forwarded.payload(), b"post-concurrent");
+    server.runtime.shutdown().unwrap();
+}
+
+/// ET #798 AcceptStarvationTest: a recover stuck waiting for the sequence
+/// header must not prevent an unrelated new client from completing accept
+/// and handshake. et.rs already runs accept on its own thread and recover
+/// off the session-table lock; this pins that a fresh id still gets
+/// NewClient promptly.
+#[test]
+fn stuck_recover_still_accepts_unrelated_new_client() {
+    use std::time::Instant;
+
+    let mut server = TestRuntime::start();
+    let mut terminal_a = server.register(ID_A, KEY_A);
+    let _terminal_b = server.register(ID_B, KEY_B);
+    terminal_a.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let key = passkey_to_key(KEY_A).unwrap();
+    let (_client, initial) = initialize(stream, &key, default_payload());
+    assert_eq!(initial.error, None);
+    server
+        .handle
+        .wait_for_state(ID_A, SessionState::Active, TIMEOUT)
+        .unwrap();
+    let _ = read_local_packet(&mut terminal_a).unwrap();
+
+    let address = server.address;
+    let stall = thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        runtime_support::bound(&stream);
+        write_proto(&mut stream, &client_request(ID_A)).unwrap();
+        let response: ConnectResponse = read_proto_limited(&mut stream, 64 * 1024).unwrap();
+        assert_eq!(response.status, Some(ConnectStatus::ReturningClient as i32));
+        thread::sleep(std::time::Duration::from_millis(400));
+        drop(stream);
+    });
+    thread::sleep(std::time::Duration::from_millis(50));
+
+    let started = Instant::now();
+    let (_fresh, response) = server.handshake(ID_B);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "unrelated NewClient handshake took {:?} — accept path blocked behind recover",
+        started.elapsed()
+    );
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+
+    stall.join().unwrap();
     server.runtime.shutdown().unwrap();
 }
 

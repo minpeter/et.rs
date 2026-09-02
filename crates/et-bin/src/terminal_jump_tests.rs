@@ -274,11 +274,12 @@ fn jumphost_drains_buffered_destination_packets_after_hup() {
     for header in 111..116 {
         destination_server.write_packet(header, &[header]).unwrap();
     }
-    let reset = destination_server.try_clone_stream().unwrap();
-    SockRef::from(&reset)
-        .set_linger(Some(Duration::ZERO))
-        .unwrap();
-    drop(reset);
+    // FIN after the queued writes. A linger-0 RST can discard unread
+    // destination bytes on macOS before the relay's BackedReader sees them,
+    // so `read_local_packet` then fails with TruncatedPrefix.
+    let closed = destination_server.try_clone_stream().unwrap();
+    closed.shutdown(std::net::Shutdown::Write).unwrap();
+    drop(closed);
     drop(destination_server);
     let (relay_router, mut router_peer) = et_net::local::wake_pair().unwrap();
     let filler_bytes = saturate_router_output(&relay_router, &router_peer);

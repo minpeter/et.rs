@@ -13,6 +13,7 @@ fn defaults_are_typed_and_do_not_force_an_insecure_router_path() {
     assert_eq!(cfg.port, DEFAULT_PORT);
     assert_eq!(cfg.bind_ip, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     assert_eq!(cfg.server_fifo, None);
+    assert_eq!(cfg.listen_backlog, et_cli::server::DEFAULT_LISTEN_BACKLOG);
 }
 
 #[test]
@@ -37,11 +38,13 @@ fn cli_precedence_skips_shadowed_invalid_ini_values() {
 #[test]
 fn debug_serverfifo_and_networking_values_are_read() {
     let args = ServerArgs::try_parse_from(["etserver"]).unwrap();
-    let ini = "[Networking]\nport=3022\nbind_ip=::1\n[Debug]\nserverfifo=/run/et.sock\n";
+    let ini =
+        "[Networking]\nport=3022\nbind_ip=::1\nbacklog=256\n[Debug]\nserverfifo=/run/et.sock\n";
     let cfg = resolve_config(&args, Some(ini)).unwrap();
     assert_eq!(cfg.port, 3022);
     assert_eq!(cfg.bind_ip, IpAddr::V6(Ipv6Addr::LOCALHOST));
     assert_eq!(cfg.server_fifo, Some(PathBuf::from("/run/et.sock")));
+    assert_eq!(cfg.listen_backlog, 256);
 }
 
 #[test]

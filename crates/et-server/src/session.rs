@@ -434,4 +434,36 @@ mod tests {
         session.recovering.store(false, Ordering::Release);
         drop(permit);
     }
+
+    #[test]
+    fn recover_refuses_to_revive_a_shutting_down_session() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || TcpStream::connect(address).unwrap());
+        let (stream, _) = listener.accept().unwrap();
+        let _peer = peer.join().unwrap();
+        let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
+        let session =
+            ActiveSession::new(Connection::new_server(stream, &[7; 32]), &terminal, None).unwrap();
+
+        session.shutdown.store(true, Ordering::Release);
+        assert!(matches!(
+            session.try_begin_recover(),
+            Err(SessionError::Unavailable)
+        ));
+
+        session.shutdown.store(false, Ordering::Release);
+        let permit = session.try_begin_recover().unwrap();
+        session.shutdown.store(true, Ordering::Release);
+        let extra = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let extra_addr = extra.local_addr().unwrap();
+        let extra_peer = std::thread::spawn(move || TcpStream::connect(extra_addr).unwrap());
+        let (candidate, _) = extra.accept().unwrap();
+        let _extra_peer = extra_peer.join().unwrap();
+        assert!(matches!(
+            permit.complete(candidate),
+            Err(SessionError::Unavailable)
+        ));
+        assert!(!session.recovering.load(Ordering::Acquire));
+    }
 }

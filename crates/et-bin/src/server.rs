@@ -63,17 +63,23 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
         .map_err(|error| clap_io("could not install server signal handlers", error))?;
     let router_path = select_router_path(config.server_fifo.as_deref())
         .map_err(|error| clap_io("could not select terminal router path", error))?;
-    let mut runtime = Runtime::start(config.bind_ip, config.port, router_path)
-        .map_err(|error| clap_io("could not start ET server", error))?;
+    let mut runtime = Runtime::start_with_listen_backlog(
+        config.bind_ip,
+        config.port,
+        router_path,
+        config.listen_backlog,
+    )
+    .map_err(|error| clap_io("could not start ET server", error))?;
     if parsed.daemon_child {
         crate::server_daemon::signal_startup_complete()
             .and_then(|()| crate::server_daemon::signal_runtime_started())
             .map_err(|error| clap::Error::raw(ErrorKind::Io, error))?;
     }
     et_cli::logging::info(format!(
-        "etserver listening on {:?} router {}",
+        "etserver listening on {:?} router {} with backlog {}",
         runtime.tcp_addresses(),
-        runtime.router_path().display()
+        runtime.router_path().display(),
+        runtime.listen_backlog()
     ));
     if !parsed.daemon_child {
         print_ready(&runtime)?;

@@ -16,9 +16,10 @@ impl ActiveSession {
     /// then fail with `RecoverBusy`. The permit releases the flag on drop
     /// (including panic unwind).
     pub(crate) fn try_begin_recover(&self) -> Result<RecoverPermit<'_>, SessionError> {
-        if self.shutdown.load(Ordering::Acquire) {
-            // ET #798: do not start recover on a session that is already
-            // being torn down. Installing a candidate would resurrect it.
+        if self.torn_down.load(Ordering::Acquire) {
+            // ET #798: do not start recover on a session that was fully
+            // torn down. `finish_terminal` / HUP must still be allowed to
+            // complete an in-flight recover so buffered output can drain.
             return Err(SessionError::Unavailable);
         }
         if self
@@ -45,7 +46,7 @@ impl ActiveSession {
         // Phase 1: soft-disconnect and snapshot under a short lock.
         let mut candidate = {
             let connection = lock_timeout(&self.connection, RECOVERY_LOCK_TIMEOUT)?;
-            if self.shutdown.load(Ordering::Acquire) {
+            if self.torn_down.load(Ordering::Acquire) {
                 // ET #798: the session can be torn down while this reconnect
                 // is in flight. Do not snapshot onto a dead connection.
                 drop(connection);
@@ -86,7 +87,7 @@ impl ActiveSession {
         {
             let mut control = lock_timeout(&self.control, RECOVERY_LOCK_TIMEOUT)?;
             let mut connection = lock_timeout(&self.connection, RECOVERY_LOCK_TIMEOUT)?;
-            if self.shutdown.load(Ordering::Acquire) {
+            if self.torn_down.load(Ordering::Acquire) {
                 drop(connection);
                 drop(control);
                 let _ = new_control.shutdown(Shutdown::Both);

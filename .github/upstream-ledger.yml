@@ -87,7 +87,7 @@ commits:
     date: "2026-09-01"
     kind: security
     status: ported
-    note: "#798 accept starvation / stuck reconnect. PROTOCOL_VERSION stays 6."
+    note: "#798 accept starvation / stuck reconnect. Landed in et.rs via #77. PROTOCOL_VERSION stays 6."
     et_pr: 798
   - sha: 3e8db00cdccba4906ca1b995d3fd7c0650a9fac9
     date: "2026-09-01"

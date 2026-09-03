@@ -31,7 +31,7 @@ impl PendingLocalFrame {
     }
 
     /// Write as much as the non-blocking local stream currently accepts.
-    fn try_write(&mut self, terminal: &mut LocalStream) -> io::Result<bool> {
+    fn try_write<W: Write>(&mut self, terminal: &mut W) -> io::Result<bool> {
         while self.offset < self.bytes.len() {
             match terminal.write(&self.bytes[self.offset..]) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
@@ -150,13 +150,10 @@ fn run_mode_poll(
         } else {
             (None, None)
         };
-        let mut terminal_flags = PollFlags::HUP | PollFlags::ERR;
-        if pending_terminal.is_none() && session.can_buffer_write((READ_BUFFER * 2) as i64)? {
-            terminal_flags |= PollFlags::IN;
-        }
-        if pending_local.is_some() {
-            terminal_flags |= PollFlags::OUT;
-        }
+        let terminal_flags = terminal_poll_flags(
+            pending_terminal.is_none() && session.can_buffer_write((READ_BUFFER * 2) as i64)?,
+            pending_local.is_some(),
+        );
         // When the client is down, poll with a short timeout so recovery wakes
         // (via the wake pipe) are still processed promptly and we re-check
         // `session.connected()` after recover installs a new stream.
@@ -637,6 +634,18 @@ fn wait(
     ))
 }
 
+#[cfg(unix)]
+fn terminal_poll_flags(accept_output: bool, local_write_pending: bool) -> PollFlags {
+    let mut flags = PollFlags::HUP | PollFlags::ERR;
+    if accept_output {
+        flags |= PollFlags::IN;
+    }
+    if local_write_pending {
+        flags |= PollFlags::OUT;
+    }
+    flags
+}
+
 fn forward_error(error: et_net::forward::ForwardError) -> SessionError {
     SessionError::Io(io::Error::other(error))
 }
@@ -755,5 +764,71 @@ fn drain(wake: &mut LocalStream) -> Result<(), SessionError> {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(SessionError::Io(error)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use super::*;
+
+    enum WriteStep {
+        Accept(usize),
+        WouldBlock,
+    }
+
+    struct ScriptedWriter {
+        steps: VecDeque<WriteStep>,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for ScriptedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            match self.steps.pop_front().expect("unexpected write") {
+                WriteStep::Accept(limit) => {
+                    let count = bytes.len().min(limit);
+                    self.bytes.extend_from_slice(&bytes[..count]);
+                    Ok(count)
+                }
+                WriteStep::WouldBlock => Err(io::ErrorKind::WouldBlock.into()),
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn local_frame_retains_partial_write_across_backpressure() {
+        let packet = Packet::new(
+            TerminalPacketType::TerminalBuffer as u8,
+            b"ordered".to_vec(),
+        );
+        let expected = encode_local_packet(&packet).unwrap();
+        let mut pending = PendingLocalFrame::new(&packet).unwrap();
+        let mut writer = ScriptedWriter {
+            steps: VecDeque::from([
+                WriteStep::Accept(5),
+                WriteStep::WouldBlock,
+                WriteStep::Accept(usize::MAX),
+            ]),
+            bytes: Vec::new(),
+        };
+
+        assert!(!pending.try_write(&mut writer).unwrap());
+        assert_eq!(writer.bytes, expected[..5]);
+        assert!(pending.try_write(&mut writer).unwrap());
+        assert_eq!(writer.bytes, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_local_write_polls_both_terminal_directions() {
+        let flags = terminal_poll_flags(true, true);
+
+        assert!(flags.contains(PollFlags::IN));
+        assert!(flags.contains(PollFlags::OUT));
     }
 }

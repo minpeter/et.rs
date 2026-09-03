@@ -138,3 +138,39 @@ fn remote_completion_bounds_a_retained_packet_behind_stalled_output() {
     assert_eq!(entered_rx.recv().unwrap(), 64 * 1024);
     release_tx.send(()).unwrap();
 }
+
+#[test]
+fn remote_completion_attempts_retained_output_before_draining() {
+    let output = crate::client_output::ConsoleOutput::new(
+        et_cli::client::FlowControlMode::Backpressure,
+        Box::new(Vec::<u8>::new()),
+    )
+    .unwrap();
+    let retained = et_core::packet::Packet::new(
+        TerminalPacketType::TerminalBuffer as u8,
+        TerminalBuffer {
+            buffer: Some(vec![b'x'; 64 * 1024 + 1]),
+        }
+        .encode_to_vec(),
+    );
+    let mut terminal_modes = TerminalModeState::default();
+    let mut forwarder = Forwarder::start(Vec::new()).unwrap();
+
+    let error = finish_remote_completion(
+        output,
+        Some(retained),
+        None,
+        true,
+        &mut terminal_modes,
+        &mut forwarder,
+        None,
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("terminal output packet exceeds console queue capacity"),
+        "unexpected error: {error}"
+    );
+}

@@ -440,7 +440,9 @@ fn run_writer(
         };
         #[cfg(unix)]
         signal_capacity(capacity_signal);
-        if let Err(error) = writer.write_all(&bytes.bytes).and_then(|()| writer.flush()) {
+        if let Err(error) =
+            write_all_with_progress(shared, writer, &bytes.bytes).and_then(|()| writer.flush())
+        {
             if let Ok(mut state) = shared.state.lock() {
                 state.error = Some(error);
                 state.stopping = true;
@@ -452,10 +454,6 @@ fn run_writer(
             return;
         }
         bytes.terminal_modes.observe(&bytes.bytes);
-        if let Ok(mut state) = shared.state.lock() {
-            state.worker_progress = state.worker_progress.wrapping_add(1);
-            shared.wake.notify_all();
-        }
         if crate::client_terminal::contains_cursor_report_request(&bytes.bytes) {
             if let Ok(mut state) = shared.state.lock() {
                 state.cursor_reports += 1;
@@ -464,6 +462,30 @@ fn run_writer(
             signal_capacity(capacity_signal);
         }
     }
+}
+
+fn write_all_with_progress(
+    shared: &Shared,
+    writer: &mut dyn Write,
+    mut bytes: &[u8],
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match writer.write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(count) => {
+                bytes = &bytes[count..];
+                let mut state = shared
+                    .state
+                    .lock()
+                    .map_err(|_| io::Error::other("console output worker unavailable"))?;
+                state.worker_progress = state.worker_progress.wrapping_add(1);
+                shared.wake.notify_all();
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn wait_for_graceful_drain(shared: &Shared) -> io::Result<bool> {

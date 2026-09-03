@@ -16,30 +16,29 @@ impl ActiveSession {
     /// then fail with `RecoverBusy`. The permit releases the flag on drop
     /// (including panic unwind).
     pub(crate) fn try_begin_recover(&self) -> Result<RecoverPermit<'_>, SessionError> {
-        if self.torn_down.load(Ordering::Acquire) {
-            // ET #798: do not start recover on a session that was fully
-            // torn down. `finish_terminal` / HUP must still be allowed to
-            // complete an in-flight recover so buffered output can drain.
-            return Err(SessionError::Unavailable);
-        }
         #[cfg(test)]
         if let Some((reached, release)) = self.recover_admission_hook.lock().unwrap().take() {
             reached.send(()).unwrap();
             release.recv().unwrap();
         }
-        if self
-            .recovering
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
         {
-            return Err(SessionError::RecoverBusy);
-        }
-        // Teardown may have started after the optimistic check but before we
-        // claimed recovery. Re-check after the claim so admission is ordered
-        // against teardown, and release the claim when teardown won.
-        if self.torn_down.load(Ordering::Acquire) {
-            self.recovering.store(false, Ordering::Release);
-            return Err(SessionError::Unavailable);
+            let _admission = self
+                .recover_admission
+                .lock()
+                .map_err(|_| SessionError::Unavailable)?;
+            if self.torn_down.load(Ordering::Acquire) {
+                // ET #798: do not start recover on a session that was fully
+                // torn down. `finish_terminal` / HUP must still be allowed to
+                // complete an in-flight recover so buffered output can drain.
+                return Err(SessionError::Unavailable);
+            }
+            if self
+                .recovering
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(SessionError::RecoverBusy);
+            }
         }
         if let Some(flow) = &self.flow_control {
             if let Err(error) = flow.pause() {

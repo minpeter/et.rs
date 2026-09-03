@@ -53,6 +53,9 @@ pub(crate) struct ActiveSession {
     /// Only one recover may run at a time. Concurrent returning clients used
     /// to queue on the connection mutex for minutes after a blackhole write.
     recovering: AtomicBool,
+    /// Orders full teardown against the recovery admission claim. The
+    /// recovery handshake itself runs without this lock.
+    recover_admission: Mutex<()>,
     #[cfg(test)]
     recover_admission_hook: Mutex<
         Option<(
@@ -148,6 +151,7 @@ impl ActiveSession {
             shutdown: AtomicBool::new(false),
             torn_down: AtomicBool::new(false),
             recovering: AtomicBool::new(false),
+            recover_admission: Mutex::new(()),
             #[cfg(test)]
             recover_admission_hook: Mutex::new(None),
             connection_generation: AtomicU64::new(0),
@@ -332,7 +336,13 @@ impl ActiveSession {
     }
 
     pub(crate) fn shutdown(&self) -> Result<(), SessionError> {
-        self.torn_down.store(true, Ordering::Release);
+        {
+            let _admission = self
+                .recover_admission
+                .lock()
+                .map_err(|_| SessionError::Unavailable)?;
+            self.torn_down.store(true, Ordering::Release);
+        }
         self.shutdown.store(true, Ordering::Release);
         self.join_flow_writer(false)?;
         let _ = self.signal();

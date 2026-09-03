@@ -259,6 +259,47 @@ fn remote_session_end_cancels_writer_after_graceful_drain_stalls() {
         .is_ok());
 }
 
+#[test]
+fn remote_session_end_keeps_draining_partial_write_progress() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct SlowPartialWriter {
+        entered: Option<mpsc::SyncSender<()>>,
+    }
+    impl Write for SlowPartialWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if let Some(entered) = self.entered.take() {
+                entered.send(()).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(600));
+            Ok(bytes.len().min(1))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_observer = Arc::clone(&cancelled);
+    let output = ConsoleOutput::new_with_cancel(
+        FlowControlMode::Backpressure,
+        Box::new(SlowPartialWriter {
+            entered: Some(entered_tx),
+        }),
+        Box::new(move || cancel_observer.store(true, Ordering::Release)),
+    )
+    .unwrap();
+    assert!(output
+        .try_write(b"ok", &TerminalModeState::default())
+        .unwrap());
+    entered_rx.recv().unwrap();
+
+    assert!(output
+        .complete(ConsoleCompletion::RemoteSessionEnded)
+        .is_ok());
+    assert!(!cancelled.load(Ordering::Acquire));
+}
+
 #[cfg(unix)]
 #[test]
 fn cancellable_stdout_fails_when_output_is_closed() {

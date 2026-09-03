@@ -20,7 +20,7 @@ use crate::error::ClientError;
 use crate::initial_connect::{connect_initial, reconnect, Endpoint, ReconnectOutcome};
 use crate::resolver::{EndpointResolver, SystemResolver};
 use crate::ssh_config::resolve_ssh_config;
-use crate::ssh_process::{run_bootstrap, run_shell_probe, SshRunner, SystemSsh};
+use crate::ssh_process::{run_bootstrap, run_shell_probe, SshRunner, SshSession, SystemSsh};
 
 const RECONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -136,8 +136,16 @@ fn run_client(
 
     let requested_user = command_user(destination.user, args.username.clone());
     validate_ssh_destination(&destination.host, requested_user.as_deref())?;
-    let resolved = resolve_ssh_config(
+    let mut ssh_session = SshSession::start(
         runner,
+        &destination.host,
+        requested_user.as_deref(),
+        args.jumphost.as_deref(),
+        &args.ssh_option,
+        deadline,
+    );
+    let resolved = resolve_ssh_config(
+        &ssh_session,
         &destination.host,
         requested_user.as_deref(),
         &args.ssh_option,
@@ -178,7 +186,7 @@ fn run_client(
         None
     } else {
         let probe = build_shell_probe(&probe_request);
-        Some(run_shell_probe(runner, &probe, deadline)?)
+        Some(run_shell_probe(&ssh_session, &probe, deadline)?)
     };
     let remote_mode = resolve_remote_mode(args, detected_shell);
     let provisional = provisional_credentials()?;
@@ -214,7 +222,7 @@ fn run_client(
     }
     let invocation = build_invocation(&request, &provisional);
     et_cli::logging::verbose(1, bootstrap_log_message(&request));
-    let mut credentials = run_bootstrap(runner, &invocation, deadline)?;
+    let mut credentials = run_bootstrap(&ssh_session, &invocation, deadline)?;
     et_cli::logging::info("etserver started");
     // Without a jumphost the ET connection goes straight to the destination.
     // With one, upstream starts a second `etterminal --jump` on the jumphost
@@ -232,8 +240,17 @@ fn run_client(
             .to_owned();
         let jump_user = Some(parsed_jump.user.as_str()).filter(|user| !user.is_empty());
         validate_ssh_destination(&jump_host, jump_user)?;
-        let jump_resolved = resolve_ssh_config(
+        ssh_session.close();
+        ssh_session = SshSession::start(
             runner,
+            &jump_host,
+            jump_user,
+            None,
+            &args.ssh_option,
+            deadline,
+        );
+        let jump_resolved = resolve_ssh_config(
+            &ssh_session,
             &jump_host,
             jump_user,
             &args.ssh_option,
@@ -252,7 +269,7 @@ fn run_client(
             term: request.term.clone(),
         };
         let jump_invocation = build_jump_invocation(&jump_request, &provisional);
-        credentials = run_bootstrap(runner, &jump_invocation, deadline)?;
+        credentials = run_bootstrap(&ssh_session, &jump_invocation, deadline)?;
         endpoint = Endpoint {
             host: jump_resolved.hostname,
             port: args.jport,
@@ -261,6 +278,7 @@ fn run_client(
         // to the jump terminal instead of starting a shell.
         initial_payload.jumphost = Some(true);
     }
+    ssh_session.close();
     if remote_mode.terminal_shell == RemoteShellKind::Posix {
         initial_payload
             .environmentvariables

@@ -1,4 +1,6 @@
-use crate::bootstrap::{validate_ssh_destination, InvocationCompletion, SshInvocation};
+use crate::bootstrap::{
+    is_control_option, validate_ssh_destination, InvocationCompletion, SshInvocation,
+};
 use crate::deadline::Deadline;
 use crate::error::ClientError;
 use crate::ssh_process::{run_checked, SshRunner};
@@ -49,7 +51,12 @@ pub fn resolve_ssh_config(
     // so Windows OpenSSH completes reliably when stdout is a pipe, preserving
     // the bounded SystemSsh capture path.
     let mut args = vec!["-G".to_string(), "-T".to_string()];
-    args.extend(ssh_options.iter().map(|option| format!("-o{option}")));
+    args.extend(
+        ssh_options
+            .iter()
+            .filter(|option| !is_control_option(option))
+            .map(|option| format!("-o{option}")),
+    );
     let destination = match requested_user {
         Some(user) => format!("{user}@{host_alias}"),
         None => host_alias.to_string(),
@@ -60,6 +67,7 @@ pub fn resolve_ssh_config(
         args,
         operation: "resolving SSH configuration",
         completion: InvocationCompletion::Exit,
+        control_path: None,
     };
     parse_ssh_config(
         &run_checked(runner, &invocation, deadline)?,

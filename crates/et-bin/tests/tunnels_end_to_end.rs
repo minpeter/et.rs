@@ -169,7 +169,8 @@ gatewayports no
             .lines()
             .filter(|line| line.contains("WARNING"))
             .count(),
-        1
+        2,
+        "the fake SSH rejects the private master before the imported bind warning: {output}"
     );
     drop(occupied);
     echo.join().unwrap();
@@ -274,7 +275,8 @@ fn imported_remote_rows_are_omitted_while_local_row_stays_live() {
             .lines()
             .filter(|line| line.contains("WARNING"))
             .count(),
-        0
+        1,
+        "only the fake SSH's rejected private master should warn: {output}"
     );
     drop(occupied);
     echo.join().unwrap();
@@ -340,7 +342,8 @@ fn native_jumphost_omits_imported_remote_rows() {
             .lines()
             .filter(|line| line.contains("WARNING"))
             .count(),
-        0
+        2,
+        "the fake SSH rejects one private master for each SSH target: {output}"
     );
     drop(occupied);
     echo.join().unwrap();
@@ -507,8 +510,8 @@ fn cumulative_local_forwards_deduplicate_exact_rows_but_preserve_distinct_destin
             .lines()
             .filter(|line| line.contains("WARNING"))
             .count(),
-        1,
-        "only the distinct same-source row should reach bind-failure policy: {output}"
+        2,
+        "the fake SSH's rejected private master and only the distinct same-source row should warn: {output}"
     );
     echo.join().unwrap();
     stack.shutdown();

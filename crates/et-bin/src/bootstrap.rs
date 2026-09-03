@@ -97,6 +97,7 @@ pub fn build_jump_invocation(
         args,
         operation: "starting the jumphost etterminal",
         completion: InvocationCompletion::Credentials,
+        control_path: None,
     }
 }
 
@@ -151,6 +152,9 @@ pub struct SshInvocation {
     pub args: Vec<String>,
     pub operation: &'static str,
     pub completion: InvocationCompletion,
+    /// An ET-owned multiplexing socket. SystemSsh must not kill arbitrary
+    /// holders of its stdout pipe, because the holder can be this master.
+    pub control_path: Option<std::path::PathBuf>,
 }
 
 pub fn provisional_credentials() -> Result<Credentials, ClientError> {
@@ -182,6 +186,7 @@ pub fn build_invocation(request: &BootstrapRequest, credentials: &Credentials) -
         args,
         operation: "starting the remote etterminal",
         completion: InvocationCompletion::Credentials,
+        control_path: None,
     }
 }
 
@@ -204,6 +209,7 @@ pub fn build_shell_probe(request: &BootstrapRequest) -> SshInvocation {
         args,
         operation: "detecting the remote login shell",
         completion: InvocationCompletion::ShellProbe,
+        control_path: None,
     }
 }
 
@@ -221,15 +227,24 @@ fn append_operational_options(args: &mut Vec<String>, options: &[String]) {
     );
 }
 
-fn is_forced_operational_option(option: &str) -> bool {
-    let key = option
-        .trim_start()
-        .split(|character: char| character == '=' || character.is_ascii_whitespace())
-        .next()
-        .unwrap_or(option);
+pub(crate) fn is_forced_operational_option(option: &str) -> bool {
+    let key = ssh_option_key(option);
     FILTERED_SSH_OPTION_KEYS
         .iter()
         .any(|filtered| key.eq_ignore_ascii_case(filtered))
+}
+
+pub(crate) fn is_control_option(option: &str) -> bool {
+    let key = ssh_option_key(option);
+    key.eq_ignore_ascii_case("ControlMaster") || key.eq_ignore_ascii_case("ControlPath")
+}
+
+fn ssh_option_key(option: &str) -> &str {
+    option
+        .trim_start()
+        .split(|character: char| character == '=' || character.is_ascii_whitespace())
+        .next()
+        .unwrap_or(option)
 }
 
 pub fn parse_shell_probe(stdout: &[u8]) -> Result<RemoteShell, ClientError> {

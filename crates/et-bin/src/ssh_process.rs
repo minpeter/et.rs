@@ -1,5 +1,7 @@
 use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -7,8 +9,8 @@ use std::time::Duration;
 use wait_timeout::ChildExt;
 
 use crate::bootstrap::{
-    parse_id_passkey, parse_shell_probe, Credentials, InvocationCompletion, RemoteShell,
-    SshInvocation,
+    is_forced_operational_option, parse_id_passkey, parse_shell_probe, Credentials,
+    InvocationCompletion, RemoteShell, SshInvocation,
 };
 use crate::deadline::Deadline;
 use crate::error::ClientError;
@@ -18,6 +20,10 @@ pub const MAX_SSH_STDOUT: usize = 1024 * 1024;
 // budget for SSH configuration, authentication, propagation of a structured
 // remote timeout, and cancellation cleanup.
 pub const DEFAULT_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(120);
+// Darwin's sockaddr_un limit is 104 bytes and Linux's is 108. Keep room for
+// OpenSSH's trailing NUL and platform-specific handling.
+#[cfg(unix)]
+const MAX_CONTROL_PATH_BYTES: usize = 90;
 
 #[derive(Debug)]
 pub struct SshOutput {
@@ -51,6 +57,186 @@ impl SystemSsh {
     pub fn deadline(self) -> Deadline {
         Deadline::after(self.timeout)
     }
+}
+
+/// SSH runner scoped to one ET bootstrap. When its private master starts,
+/// every config query, probe, and bootstrap invocation is directed to that
+/// socket. A startup failure leaves the wrapped runner unchanged.
+pub struct SshSession<'a> {
+    runner: &'a dyn SshRunner,
+    master: Option<OwnedControlMaster>,
+}
+
+struct OwnedControlMaster {
+    directory: PathBuf,
+    path: PathBuf,
+    destination: String,
+}
+
+impl<'a> SshSession<'a> {
+    pub fn start(
+        runner: &'a dyn SshRunner,
+        host: &str,
+        user: Option<&str>,
+        jumphost: Option<&str>,
+        ssh_options: &[String],
+        deadline: Deadline,
+    ) -> Self {
+        let destination = user.map_or_else(|| host.to_owned(), |user| format!("{user}@{host}"));
+        let Some(directory) = create_control_directory() else {
+            et_cli::logging::warn("could not create private SSH control directory; continuing without ET multiplexing");
+            return Self {
+                runner,
+                master: None,
+            };
+        };
+        let path = directory.join("master");
+        let mut args = vec!["-MNf".to_owned()];
+        if let Some(jumphost) = jumphost {
+            args.extend(["-J".to_owned(), jumphost.to_owned()]);
+        }
+        args.extend([
+            "-oControlMaster=yes".to_owned(),
+            format!("-oControlPath={}", path.display()),
+            "-oControlPersist=no".to_owned(),
+            "-oClearAllForwardings=yes".to_owned(),
+            "-oRemoteCommand=none".to_owned(),
+            "-oPermitLocalCommand=no".to_owned(),
+            "-oSessionType=default".to_owned(),
+        ]);
+        args.extend(
+            ssh_options
+                .iter()
+                .filter(|option| !is_forced_operational_option(option))
+                .map(|option| format!("-o{option}")),
+        );
+        args.push(destination.clone());
+        let start = SshInvocation {
+            program: "ssh".to_owned(),
+            args,
+            operation: "starting the private SSH control master",
+            completion: InvocationCompletion::Exit,
+            control_path: None,
+        };
+        if run_checked(runner, &start, deadline).is_err() {
+            et_cli::logging::warn(
+                "private SSH control master failed to start; continuing without ET multiplexing",
+            );
+            let _ = std::fs::remove_dir_all(directory);
+            return Self {
+                runner,
+                master: None,
+            };
+        }
+        Self {
+            runner,
+            master: Some(OwnedControlMaster {
+                directory,
+                path,
+                destination,
+            }),
+        }
+    }
+
+    pub fn close(&mut self) {
+        let Some(master) = self.master.take() else {
+            return;
+        };
+        let stop = SshInvocation {
+            program: "ssh".to_owned(),
+            args: vec![
+                "-O".to_owned(),
+                "exit".to_owned(),
+                "-oControlMaster=no".to_owned(),
+                format!("-oControlPath={}", master.path.display()),
+                master.destination,
+            ],
+            operation: "stopping the private SSH control master",
+            completion: InvocationCompletion::Exit,
+            control_path: Some(master.path.clone()),
+        };
+        if run_checked(self.runner, &stop, Deadline::after(Duration::from_secs(5))).is_err() {
+            et_cli::logging::warn("private SSH control master did not stop cleanly");
+        }
+        let _ = std::fs::remove_dir_all(master.directory);
+    }
+}
+
+impl SshRunner for SshSession<'_> {
+    fn run(
+        &self,
+        invocation: &SshInvocation,
+        deadline: Deadline,
+    ) -> Result<SshOutput, ClientError> {
+        let Some(master) = self.master.as_ref() else {
+            return self.runner.run(invocation, deadline);
+        };
+        let mut invocation = invocation.clone();
+        let insertion = usize::from(invocation.args.first().is_some_and(|arg| arg == "-G")) * 2;
+        invocation.args.splice(
+            insertion..insertion,
+            [
+                "-oControlMaster=no".to_owned(),
+                format!("-oControlPath={}", master.path.display()),
+            ],
+        );
+        invocation.control_path = Some(master.path.clone());
+        self.runner.run(&invocation, deadline)
+    }
+}
+
+impl Drop for SshSession<'_> {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+fn create_control_directory() -> Option<PathBuf> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let root = control_directory_root(&std::env::temp_dir());
+    for _ in 0..16 {
+        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = root.join(format!("et-ssh-{}-{serial}", std::process::id()));
+        if create_private_directory(&path).is_ok() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn control_directory_root(temp: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        let longest_path = temp
+            .join(format!("et-ssh-{}-{}", u32::MAX, u64::MAX))
+            .join("master");
+        if control_path_len(&longest_path) <= MAX_CONTROL_PATH_BYTES {
+            return temp.to_owned();
+        }
+        PathBuf::from("/tmp")
+    }
+    #[cfg(not(unix))]
+    {
+        temp.to_owned()
+    }
+}
+
+#[cfg(unix)]
+fn control_path_len(path: &Path) -> usize {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().len()
+}
+
+#[cfg(unix)]
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    std::fs::create_dir(path)
 }
 
 impl SshRunner for SystemSsh {
@@ -87,7 +273,11 @@ impl SshRunner for SystemSsh {
         };
         // Identify the stdout pipe so descendants that outlive ssh while still
         // holding it can be found even after they re-parent to init.
-        let pipe = pipe_identity(&stdout);
+        let pipe = invocation
+            .control_path
+            .is_none()
+            .then(|| pipe_identity(&stdout))
+            .flatten();
         let (receiver, reader) = match spawn_reader(stdout, invocation.completion) {
             Ok(reader) => reader,
             Err(error) => {
@@ -531,6 +721,31 @@ mod tests {
         ExitStatus::from_raw(code as u32)
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn private_control_directory_is_restrictive_and_socket_path_is_short() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = create_control_directory().unwrap();
+        let path = directory.join("master");
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(
+            control_path_len(&path) <= MAX_CONTROL_PATH_BYTES,
+            "{path:?}"
+        );
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn long_temporary_directory_uses_short_control_root() {
+        let long_temp = PathBuf::from("/").join("x".repeat(MAX_CONTROL_PATH_BYTES + 1));
+        assert_eq!(control_directory_root(&long_temp), Path::new("/tmp"));
+    }
+
     struct ProbeRunner {
         status: i32,
         stdout: &'static [u8],
@@ -560,6 +775,7 @@ mod tests {
             args: Vec::new(),
             operation: "probe",
             completion: InvocationCompletion::ShellProbe,
+            control_path: None,
         };
         assert_eq!(
             run_shell_probe(
@@ -583,6 +799,7 @@ mod tests {
             args: Vec::new(),
             operation: "probe",
             completion: InvocationCompletion::ShellProbe,
+            control_path: None,
         };
         assert_eq!(
             run_shell_probe(
@@ -606,6 +823,7 @@ mod tests {
             args: Vec::new(),
             operation: "probe",
             completion: InvocationCompletion::ShellProbe,
+            control_path: None,
         };
         assert!(matches!(
             run_shell_probe(
@@ -685,6 +903,7 @@ mod tests {
             args: args.iter().map(|arg| (*arg).to_string()).collect(),
             operation: "testing bootstrap",
             completion: InvocationCompletion::Exit,
+            control_path: None,
         }
     }
 

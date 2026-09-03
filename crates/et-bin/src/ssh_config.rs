@@ -29,6 +29,7 @@ struct ForwardPolicies {
 pub struct ResolvedSshConfig {
     pub hostname: String,
     pub user: Option<String>,
+    pub port: u16,
     pub exit_on_forward_failure: bool,
     pub local_forwards: Vec<PortForwardSourceRequest>,
 }
@@ -113,6 +114,7 @@ fn parse_ssh_config(
         .unwrap_or(false);
     let mut hostname = None;
     let mut user = None;
+    let mut port = None;
     let mut local_forwards = Vec::new();
     if parse_local_forwards {
         for _ in unsupported_dynamic_forwards(text) {
@@ -129,6 +131,9 @@ fn parse_ssh_config(
             }
             Some(key) if key.eq_ignore_ascii_case("user") => {
                 user = fields.next().map(str::to_string);
+            }
+            Some(key) if key.eq_ignore_ascii_case("port") => {
+                port = fields.next().and_then(|port| port.parse::<u16>().ok());
             }
             Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("dynamicforward") => {}
             Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("localforward") => {
@@ -150,6 +155,7 @@ fn parse_ssh_config(
     Ok(ResolvedSshConfig {
         hostname,
         user,
+        port: port.unwrap_or(22),
         exit_on_forward_failure,
         local_forwards,
     })
@@ -432,6 +438,7 @@ mod tests {
             ResolvedSshConfig {
                 hostname: "127.0.0.1".to_string(),
                 user: Some("config-user".to_string()),
+                port: 22,
                 exit_on_forward_failure: false,
                 local_forwards: Vec::new(),
             }

@@ -1,7 +1,6 @@
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -59,106 +58,127 @@ impl SystemSsh {
     }
 }
 
-/// SSH runner scoped to one ET bootstrap. When its private master starts,
-/// every config query, probe, and bootstrap invocation is directed to that
-/// socket. A startup failure leaves the wrapped runner unchanged.
+/// SSH runner scoped to one ET bootstrap. It first preserves any working
+/// user-configured master, then converges on ET's destination-wide master.
 pub struct SshSession<'a> {
     runner: &'a dyn SshRunner,
-    master: Option<OwnedControlMaster>,
+    control_path: Option<PathBuf>,
 }
 
-struct OwnedControlMaster {
-    directory: PathBuf,
-    path: PathBuf,
-    destination: String,
+pub struct SshMasterTarget<'a> {
+    pub host_alias: &'a str,
+    pub user: Option<&'a str>,
+    pub resolved_host: &'a str,
+    pub resolved_port: u16,
+    pub jumphost: Option<&'a str>,
 }
 
 impl<'a> SshSession<'a> {
     pub fn start(
         runner: &'a dyn SshRunner,
-        host: &str,
-        user: Option<&str>,
-        jumphost: Option<&str>,
+        target: SshMasterTarget<'_>,
         ssh_options: &[String],
         deadline: Deadline,
     ) -> Self {
-        let destination = user.map_or_else(|| host.to_owned(), |user| format!("{user}@{host}"));
-        let Some(directory) = create_control_directory() else {
+        let destination = target.user.map_or_else(
+            || target.host_alias.to_owned(),
+            |user| format!("{user}@{}", target.host_alias),
+        );
+        let jumphost = target.jumphost;
+        if check_master(runner, &destination, jumphost, ssh_options, None, deadline) {
+            return Self {
+                runner,
+                control_path: None,
+            };
+        }
+
+        let Some(directory) = ensure_control_directory() else {
             et_cli::logging::warn("could not create private SSH control directory; continuing without ET multiplexing");
             return Self {
                 runner,
-                master: None,
+                control_path: None,
             };
         };
-        let path = directory.join("master");
-        let mut args = vec!["-MNf".to_owned()];
-        if let Some(jumphost) = jumphost {
-            args.extend(["-J".to_owned(), jumphost.to_owned()]);
-        }
-        args.extend([
-            "-oControlMaster=yes".to_owned(),
-            format!("-oControlPath={}", path.display()),
-            "-oControlPersist=no".to_owned(),
-            "-oClearAllForwardings=yes".to_owned(),
-            "-oRemoteCommand=none".to_owned(),
-            "-oPermitLocalCommand=no".to_owned(),
-            "-oSessionType=default".to_owned(),
-        ]);
-        args.extend(
-            ssh_options
-                .iter()
-                .filter(|option| !is_forced_operational_option(option))
-                .map(|option| format!("-o{option}")),
-        );
-        args.push(destination.clone());
-        let start = SshInvocation {
-            program: "ssh".to_owned(),
-            args,
-            operation: "starting the private SSH control master",
-            completion: InvocationCompletion::Exit,
-            control_path: None,
-        };
-        if run_checked(runner, &start, deadline).is_err() {
-            et_cli::logging::warn(
-                "private SSH control master failed to start; continuing without ET multiplexing",
-            );
-            let _ = std::fs::remove_dir_all(directory);
+        let path = directory.join(destination_hash(
+            target.user.unwrap_or(""),
+            target.resolved_host,
+            target.resolved_port,
+            jumphost,
+        ));
+        if check_master(
+            runner,
+            &destination,
+            jumphost,
+            ssh_options,
+            Some(&path),
+            deadline,
+        ) {
             return Self {
                 runner,
-                master: None,
+                control_path: Some(path),
             };
         }
+
+        let lock_path = path.with_extension("lock");
+        match StartupLock::acquire(lock_path.clone()) {
+            Some(_lock) => {
+                if !check_master(
+                    runner,
+                    &destination,
+                    jumphost,
+                    ssh_options,
+                    Some(&path),
+                    deadline,
+                ) && !start_master(runner, &destination, jumphost, ssh_options, &path, deadline)
+                {
+                    et_cli::logging::warn(
+                        "private SSH control master failed to start; continuing without ET multiplexing",
+                    );
+                    return Self {
+                        runner,
+                        control_path: None,
+                    };
+                }
+            }
+            None => {
+                let wait_started = std::time::Instant::now();
+                while lock_path.exists() && wait_started.elapsed() < Duration::from_secs(5) {
+                    if check_master(
+                        runner,
+                        &destination,
+                        jumphost,
+                        ssh_options,
+                        Some(&path),
+                        deadline,
+                    ) {
+                        return Self {
+                            runner,
+                            control_path: Some(path),
+                        };
+                    }
+                    let Some(remaining) = deadline.remaining() else {
+                        break;
+                    };
+                    let race_remaining =
+                        Duration::from_secs(5).saturating_sub(wait_started.elapsed());
+                    thread::sleep(remaining.min(race_remaining).min(Duration::from_millis(25)));
+                }
+            }
+        }
+
+        let control_path = check_master(
+            runner,
+            &destination,
+            jumphost,
+            ssh_options,
+            Some(&path),
+            deadline,
+        )
+        .then_some(path);
         Self {
             runner,
-            master: Some(OwnedControlMaster {
-                directory,
-                path,
-                destination,
-            }),
+            control_path,
         }
-    }
-
-    pub fn close(&mut self) {
-        let Some(master) = self.master.take() else {
-            return;
-        };
-        let stop = SshInvocation {
-            program: "ssh".to_owned(),
-            args: vec![
-                "-O".to_owned(),
-                "exit".to_owned(),
-                "-oControlMaster=no".to_owned(),
-                format!("-oControlPath={}", master.path.display()),
-                master.destination,
-            ],
-            operation: "stopping the private SSH control master",
-            completion: InvocationCompletion::Exit,
-            control_path: Some(master.path.clone()),
-        };
-        if run_checked(self.runner, &stop, Deadline::after(Duration::from_secs(5))).is_err() {
-            et_cli::logging::warn("private SSH control master did not stop cleanly");
-        }
-        let _ = std::fs::remove_dir_all(master.directory);
     }
 }
 
@@ -168,57 +188,159 @@ impl SshRunner for SshSession<'_> {
         invocation: &SshInvocation,
         deadline: Deadline,
     ) -> Result<SshOutput, ClientError> {
-        let Some(master) = self.master.as_ref() else {
+        let Some(path) = self.control_path.as_ref() else {
             return self.runner.run(invocation, deadline);
         };
         let mut invocation = invocation.clone();
-        let insertion = usize::from(invocation.args.first().is_some_and(|arg| arg == "-G")) * 2;
         invocation.args.splice(
-            insertion..insertion,
+            0..0,
             [
                 "-oControlMaster=no".to_owned(),
-                format!("-oControlPath={}", master.path.display()),
+                format!("-oControlPath={}", path.display()),
             ],
         );
-        invocation.control_path = Some(master.path.clone());
+        invocation.control_path = Some(path.clone());
         self.runner.run(&invocation, deadline)
     }
 }
 
-impl Drop for SshSession<'_> {
-    fn drop(&mut self) {
-        self.close();
+fn check_master(
+    runner: &dyn SshRunner,
+    destination: &str,
+    jumphost: Option<&str>,
+    ssh_options: &[String],
+    control_path: Option<&Path>,
+    deadline: Deadline,
+) -> bool {
+    let mut args = vec!["-O".to_owned(), "check".to_owned()];
+    if let Some(jumphost) = jumphost {
+        args.extend(["-J".to_owned(), jumphost.to_owned()]);
+    }
+    if let Some(path) = control_path {
+        args.extend([
+            "-oControlMaster=no".to_owned(),
+            format!("-oControlPath={}", path.display()),
+        ]);
+    }
+    append_master_options(&mut args, ssh_options);
+    args.push("-oLogLevel=QUIET".to_owned());
+    args.push(destination.to_owned());
+    run_checked(
+        runner,
+        &SshInvocation {
+            program: "ssh".to_owned(),
+            args,
+            operation: "checking for an SSH control master",
+            completion: InvocationCompletion::Exit,
+            control_path: control_path.map(Path::to_owned),
+        },
+        deadline,
+    )
+    .is_ok()
+}
+
+fn start_master(
+    runner: &dyn SshRunner,
+    destination: &str,
+    jumphost: Option<&str>,
+    ssh_options: &[String],
+    path: &Path,
+    deadline: Deadline,
+) -> bool {
+    let mut args = vec!["-MNf".to_owned()];
+    if let Some(jumphost) = jumphost {
+        args.extend(["-J".to_owned(), jumphost.to_owned()]);
+    }
+    args.extend([
+        "-oControlMaster=yes".to_owned(),
+        format!("-oControlPath={}", path.display()),
+        "-oControlPersist=15".to_owned(),
+    ]);
+    append_master_options(&mut args, ssh_options);
+    args.push(destination.to_owned());
+    run_checked(
+        runner,
+        &SshInvocation {
+            program: "ssh".to_owned(),
+            args,
+            operation: "starting the private SSH control master",
+            completion: InvocationCompletion::Exit,
+            control_path: None,
+        },
+        deadline,
+    )
+    .is_ok()
+}
+
+fn append_master_options(args: &mut Vec<String>, ssh_options: &[String]) {
+    args.extend([
+        "-oClearAllForwardings=yes".to_owned(),
+        "-oRemoteCommand=none".to_owned(),
+        "-oPermitLocalCommand=no".to_owned(),
+        "-oSessionType=default".to_owned(),
+    ]);
+    args.extend(
+        ssh_options
+            .iter()
+            .filter(|option| !is_forced_operational_option(option))
+            .map(|option| format!("-o{option}")),
+    );
+}
+
+struct StartupLock(PathBuf);
+
+impl StartupLock {
+    fn acquire(path: PathBuf) -> Option<Self> {
+        std::fs::create_dir(&path).ok().map(|()| Self(path))
     }
 }
 
-fn create_control_directory() -> Option<PathBuf> {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let root = control_directory_root(&std::env::temp_dir());
-    for _ in 0..16 {
-        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
-        let path = root.join(format!("et-ssh-{}-{serial}", std::process::id()));
-        if create_private_directory(&path).is_ok() {
-            return Some(path);
-        }
+impl Drop for StartupLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.0);
     }
-    None
+}
+
+fn ensure_control_directory() -> Option<PathBuf> {
+    let path = control_directory_root(&std::env::temp_dir());
+    match create_private_directory(&path) {
+        Ok(()) => Some(path),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists && private_directory(&path) => {
+            Some(path)
+        }
+        Err(_) => None,
+    }
 }
 
 fn control_directory_root(temp: &Path) -> PathBuf {
     #[cfg(unix)]
-    {
-        let longest_path = temp
-            .join(format!("et-ssh-{}-{}", u32::MAX, u64::MAX))
-            .join("master");
-        if control_path_len(&longest_path) <= MAX_CONTROL_PATH_BYTES {
-            return temp.to_owned();
-        }
-        PathBuf::from("/tmp")
-    }
+    let suffix = format!("et-ssh-{}", rustix::process::getuid().as_raw());
     #[cfg(not(unix))]
-    {
-        temp.to_owned()
+    let suffix = "et-ssh";
+    let path = temp.join(&suffix);
+    #[cfg(unix)]
+    if control_path_len(&path.join("0".repeat(32))) > MAX_CONTROL_PATH_BYTES {
+        return PathBuf::from("/tmp").join(suffix);
     }
+    path
+}
+
+fn destination_hash(user: &str, host: &str, port: u16, jumphost: Option<&str>) -> String {
+    const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+    let mut hash = OFFSET;
+    for value in [
+        user,
+        &host.to_ascii_lowercase(),
+        &port.to_string(),
+        jumphost.unwrap_or(""),
+    ] {
+        for byte in value.len().to_be_bytes().into_iter().chain(value.bytes()) {
+            hash ^= u128::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    }
+    format!("{hash:032x}")
 }
 
 #[cfg(unix)]
@@ -234,9 +356,24 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
     builder.mode(0o700).create(path)
 }
 
+#[cfg(unix)]
+fn private_directory(path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.is_dir()
+            && metadata.uid() == rustix::process::getuid().as_raw()
+            && metadata.permissions().mode() & 0o777 == 0o700
+    })
+}
+
 #[cfg(not(unix))]
 fn create_private_directory(path: &Path) -> io::Result<()> {
     std::fs::create_dir(path)
+}
+
+#[cfg(not(unix))]
+fn private_directory(path: &Path) -> bool {
+    path.is_dir()
 }
 
 impl SshRunner for SystemSsh {
@@ -726,8 +863,12 @@ mod tests {
     fn private_control_directory_is_restrictive_and_socket_path_is_short() {
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = create_control_directory().unwrap();
-        let path = directory.join("master");
+        let temp = std::env::temp_dir().join(format!("et-control-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir(&temp).unwrap();
+        let directory = control_directory_root(&temp);
+        create_private_directory(&directory).unwrap();
+        let path = directory.join(destination_hash("user", "host", 22, None));
         assert_eq!(
             std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
             0o700
@@ -736,14 +877,17 @@ mod tests {
             control_path_len(&path) <= MAX_CONTROL_PATH_BYTES,
             "{path:?}"
         );
-        std::fs::remove_dir(directory).unwrap();
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
     fn long_temporary_directory_uses_short_control_root() {
         let long_temp = PathBuf::from("/").join("x".repeat(MAX_CONTROL_PATH_BYTES + 1));
-        assert_eq!(control_directory_root(&long_temp), Path::new("/tmp"));
+        assert_eq!(
+            control_directory_root(&long_temp),
+            Path::new("/tmp").join(format!("et-ssh-{}", rustix::process::getuid().as_raw()))
+        );
     }
 
     struct ProbeRunner {

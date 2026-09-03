@@ -49,6 +49,22 @@ struct FakeSsh {
     stdin: PathBuf,
 }
 
+impl Drop for FakeSsh {
+    fn drop(&mut self) {
+        for invocation in self.invocations() {
+            for argument in invocation {
+                if let Some(path) = argument.strip_prefix("-oControlPath=") {
+                    let path = std::path::Path::new(path);
+                    let _ = fs::remove_file(path);
+                    if let Some(parent) = path.parent() {
+                        let _ = fs::remove_dir(parent);
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl FakeSsh {
     fn new() -> Self {
         let dir = TestDir::new("ssh");
@@ -64,6 +80,13 @@ for arg in "$@"; do
   case "$arg" in -oControlPath=*) control_path=${arg#-oControlPath=} ;; esac
 done
 printf "\0" >> "$ET_FAKE_ARGV"
+if [ "$1" = "-O" ] && [ "$2" = "check" ]; then
+  if [ -n "$control_path" ]; then
+    [ -e "$control_path" ] && exit 0
+    exit 255
+  fi
+  exit "${ET_FAKE_USER_MASTER_EXIT:-255}"
+fi
 if [ "$1" = "-MNf" ]; then
   if [ "${ET_FAKE_MASTER_EXIT:-0}" -ne 0 ]; then
     exit "$ET_FAKE_MASTER_EXIT"
@@ -103,6 +126,7 @@ exit "$ET_FAKE_EXIT"
         command
             .env_clear()
             .env("PATH", &self.dir.0)
+            .env("TMPDIR", &self.dir.0)
             .env("ET_FAKE_ARGV", &self.argv)
             .env("ET_FAKE_STDIN", &self.stdin)
             .env("ET_FAKE_CONFIG", config)
@@ -112,6 +136,7 @@ exit "$ET_FAKE_EXIT"
             .env("ET_FAKE_PROBE_STDOUT", "__ET_COMSPEC__%ComSpec%\n")
             .env("ET_FAKE_PROBE_EXIT", "0")
             .env("ET_FAKE_MASTER_EXIT", "0")
+            .env("ET_FAKE_USER_MASTER_EXIT", "255")
             .stdin(Stdio::null());
         command
     }
@@ -494,18 +519,22 @@ fn bootstrap_ssh_invocations_share_a_private_session_control_path() {
     assert!(output.status.success(), "{}", stderr(&output));
 
     let invocations = fake.invocations();
-    assert_eq!(invocations.len(), 5, "{invocations:?}");
+    assert_eq!(invocations.len(), 8, "{invocations:?}");
+    assert_eq!(invocations[0], ["-G", "-T", "server-alias"]);
+    assert_eq!(&invocations[1][..2], ["-O", "check"]);
+    assert!(invocations[1]
+        .iter()
+        .all(|arg| !arg.starts_with("-oControlPath=")));
 
-    let control_argument = invocations[0]
+    let control_argument = invocations[4]
         .iter()
         .find(|arg| arg.starts_with("-oControlPath="))
         .expect("master start must name a ControlPath");
     let control_path = control_argument.strip_prefix("-oControlPath=").unwrap();
     let path = std::path::Path::new(control_path);
-    assert_eq!(
-        path.file_name().and_then(|name| name.to_str()),
-        Some("master")
-    );
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap();
+    assert_eq!(file_name.len(), 32);
+    assert!(file_name.bytes().all(|byte| byte.is_ascii_hexdigit()));
     assert!(path
         .parent()
         .and_then(|dir| dir.file_name())
@@ -513,47 +542,80 @@ fn bootstrap_ssh_invocations_share_a_private_session_control_path() {
         .is_some_and(|name| name.starts_with("et-ssh-")));
     assert!(path.is_absolute(), "{path:?}");
 
-    assert_eq!(invocations[0][0], "-MNf");
-    assert!(invocations[0]
+    assert_eq!(invocations[4][0], "-MNf");
+    assert!(invocations[4]
         .iter()
         .any(|arg| arg == "-oControlMaster=yes"));
-    assert!(invocations[0]
+    assert!(invocations[4]
         .iter()
-        .any(|arg| arg == "-oControlPersist=no"));
-    assert_eq!(invocations[0].last().unwrap(), "server-alias");
+        .any(|arg| arg == "-oControlPersist=15"));
+    assert_eq!(invocations[4].last().unwrap(), "config-user@server-alias");
 
     let private_options = ["-oControlMaster=no", control_argument.as_str()];
-    assert_eq!(
-        &invocations[1][..4],
-        ["-G", "-T", private_options[0], private_options[1]]
-    );
-    for invocation in &invocations[2..=3] {
+    for invocation in [&invocations[2], &invocations[3], &invocations[5]] {
+        assert_eq!(
+            &invocation[..4],
+            ["-O", "check", private_options[0], private_options[1]]
+        );
+    }
+    for invocation in &invocations[6..=7] {
         assert_eq!(&invocation[..2], private_options);
     }
-    assert!(invocations[2]
+    assert!(invocations[6]
         .last()
         .unwrap()
         .contains(WINDOWS_PROBE_SENTINEL));
-    assert!(invocations[3].last().unwrap().starts_with("printf '%s\\n'"));
+    assert!(invocations[7].last().unwrap().starts_with("printf '%s\\n'"));
+    assert!(
+        path.exists(),
+        "ControlPersist socket did not survive the session"
+    );
+}
 
-    assert_eq!(
-        invocations[4],
-        [
-            "-O",
-            "exit",
-            "-oControlMaster=no",
-            control_argument,
-            "server-alias",
-        ]
-    );
-    assert!(
-        !path.exists(),
-        "private control path survived cleanup: {path:?}"
-    );
-    assert!(
-        !path.parent().unwrap().exists(),
-        "private control directory survived cleanup: {path:?}"
-    );
+#[test]
+fn control_path_is_stable_for_a_destination_and_distinct_between_destinations() {
+    let fake = FakeSsh::new();
+    let mut paths = Vec::new();
+    for (destination, config) in [
+        ("server-alias", RESOLVED_CONFIG),
+        ("server-alias", RESOLVED_CONFIG),
+        (
+            "other-alias",
+            "host other-alias\nuser other-user\nhostname 127.0.0.1\nport 22\n",
+        ),
+    ] {
+        let before = fake.invocations().len();
+        let (port, server) = initial_payload_server();
+        let output = fake
+            .command(config, VALID_MARKER, 0, "")
+            .args(["-N", &format!("{destination}:{port}")])
+            .output()
+            .unwrap();
+        server.join().unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        let invocation = fake.invocations();
+        let session_paths = invocation[before..]
+            .iter()
+            .flat_map(|argv| argv.iter())
+            .filter_map(|arg| arg.strip_prefix("-oControlPath="))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(session_paths.len(), 1, "{invocation:?}");
+        paths.push((*session_paths.first().unwrap()).to_owned());
+    }
+    assert_eq!(paths.len(), 3, "{paths:?}");
+    assert_eq!(paths[0], paths[1], "same destination: {paths:?}");
+    assert_ne!(paths[0], paths[2], "different destinations: {paths:?}");
+    for path in paths {
+        let file_name = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap();
+        assert_eq!(file_name.len(), 32, "{path}");
+        assert!(
+            file_name.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{path}"
+        );
+    }
 }
 
 #[test]
@@ -570,9 +632,11 @@ fn bootstrap_falls_back_when_private_control_master_fails() {
     assert!(output.status.success(), "{}", stderr(&output));
 
     let invocations = fake.invocations();
-    assert_eq!(invocations.len(), 4, "{invocations:?}");
-    assert_eq!(invocations[0][0], "-MNf");
-    for invocation in &invocations[1..] {
+    assert_eq!(invocations.len(), 7, "{invocations:?}");
+    assert_eq!(invocations[0][0], "-G");
+    assert_eq!(&invocations[1][..2], ["-O", "check"]);
+    assert_eq!(invocations[4][0], "-MNf");
+    for invocation in &invocations[5..] {
         assert!(
             invocation
                 .iter()
@@ -580,15 +644,34 @@ fn bootstrap_falls_back_when_private_control_master_fails() {
             "fallback invocation unexpectedly uses ET control socket: {invocation:?}"
         );
     }
-    let control_path = invocations[0]
+    let control_path = invocations[4]
         .iter()
         .find_map(|arg| arg.strip_prefix("-oControlPath="))
         .unwrap();
     assert!(!std::path::Path::new(control_path).exists());
-    assert!(!std::path::Path::new(control_path)
-        .parent()
-        .unwrap()
-        .exists());
+}
+
+#[test]
+fn working_user_control_master_is_preferred_without_overriding_its_path() {
+    let (port, server) = initial_payload_server();
+    let fake = FakeSsh::new();
+    let output = fake
+        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
+        .env("ET_FAKE_USER_MASTER_EXIT", "0")
+        .args(["-N", &format!("server-alias:{port}")])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let invocations = fake.invocations();
+    assert_eq!(invocations.len(), 4, "{invocations:?}");
+    assert_eq!(invocations[0], ["-G", "-T", "server-alias"]);
+    assert_eq!(&invocations[1][..2], ["-O", "check"]);
+    assert!(invocations
+        .iter()
+        .flatten()
+        .all(|arg| arg != "-MNf" && !arg.starts_with("-oControlPath=")));
 }
 
 const WINDOWS_PROBE_SENTINEL: &str = "__ET_COMSPEC__";

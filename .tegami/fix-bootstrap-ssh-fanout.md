@@ -2,27 +2,35 @@
 et: patch
 ---
 
-Give each ET SSH bootstrap a private ControlMaster and route its configuration
-query, login-shell probe, and terminal bootstrap through the ET-owned socket.
-The socket lives at `<short-temp>/et-ssh-<pid>-<serial>/master` in a mode-0700
-directory. ET asks OpenSSH to stop the master after bootstrap and removes the
-whole private directory; a startup failure falls back to ordinary independent
-SSH invocations. Long Unix temporary-directory paths fall back to `/tmp` so the
-socket remains below conservative `sockaddr_un` limits.
+Share SSH bootstrap transport connections across ET processes targeting the
+same effective destination. ET first runs the configuration-only query, then
+checks for a working user-configured ControlMaster without supplying a
+ControlPath. A working user master remains preferred and ET's operational
+commands use it unchanged.
 
-User `ControlMaster` and `ControlPath` options remain filtered, so ET neither
-reuses nor removes a user's socket. Isolation remains forced with
-`ClearAllForwardings=yes`, `RemoteCommand=none`, `PermitLocalCommand=no`, and
-`SessionType=default`.
+When no user master exists, ET hashes the effective SSH user, resolved host,
+resolved port, and jumphost into a stable 32-hex-character socket name under a
+mode-0700 per-user `et-ssh-<uid>` directory. Long Unix temporary-directory
+paths fall back to `/tmp`, keeping the complete socket path below a conservative
+90-byte `sockaddr_un` limit.
 
-Local OpenSSH 10.2 diagnosis against the machine's localhost sshd:
+An atomic destination-specific `.lock` directory serializes master startup.
+The lock holder checks the socket again before starting OpenSSH; contenders
+check that exact socket until the winner publishes it or releases the lock.
+This converges concurrent ET processes on one master rather than allowing a
+ControlMaster bind race. Master setup failures fall back to ordinary SSH
+invocations.
 
-- Baseline `ssh -vvv -G -T ... localhost` emitted no `Connecting to` or mux
-  line: `-G` is configuration-only and opens no TCP connection.
-- Baseline shell-probe and bootstrap-shaped commands each emitted
-  `debug1: Connecting to localhost [::1] port 22.`
-- Starting the ET-shaped master emitted one `Connecting to` line and
-  `new mux listener [.../master]`.
-- The probe and bootstrap through that socket emitted
-  `mux_client_request_session` and no `Connecting to` line.
-- `ssh -O exit` emitted `Exit request sent.`; the socket was absent afterward.
+The ET master uses `ControlPersist=15`. Sessions never send `ssh -O exit` and
+never unlink the shared socket, so one ET process cannot tear down transport
+used by another. OpenSSH removes the socket after the persisted master becomes
+idle; the private parent directory is retained for later destination masters.
+
+User `ControlMaster` and `ControlPath` command-line options remain filtered.
+Isolation remains forced with `ClearAllForwardings=yes`, `RemoteCommand=none`,
+`PermitLocalCommand=no`, and `SessionType=default`.
+
+Local OpenSSH diagnosis against localhost showed configuration and `-O check`
+operations open no TCP connections. A master start emitted one `Connecting to`
+line and a mux listener; probe and bootstrap operations emitted
+`mux_client_request_session` without a new `Connecting to` line.

@@ -20,7 +20,9 @@ use crate::error::ClientError;
 use crate::initial_connect::{connect_initial, reconnect, Endpoint, ReconnectOutcome};
 use crate::resolver::{EndpointResolver, SystemResolver};
 use crate::ssh_config::resolve_ssh_config;
-use crate::ssh_process::{run_bootstrap, run_shell_probe, SshRunner, SshSession, SystemSsh};
+use crate::ssh_process::{
+    run_bootstrap, run_shell_probe, SshMasterTarget, SshRunner, SshSession, SystemSsh,
+};
 
 const RECONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -136,22 +138,27 @@ fn run_client(
 
     let requested_user = command_user(destination.user, args.username.clone());
     validate_ssh_destination(&destination.host, requested_user.as_deref())?;
-    let mut ssh_session = SshSession::start(
-        runner,
-        &destination.host,
-        requested_user.as_deref(),
-        args.jumphost.as_deref(),
-        &args.ssh_option,
-        deadline,
-    );
     let resolved = resolve_ssh_config(
-        &ssh_session,
+        runner,
         &destination.host,
         requested_user.as_deref(),
         &args.ssh_option,
         true,
         deadline,
     )?;
+    let user = requested_user.or_else(|| resolved.user.clone());
+    let ssh_session = SshSession::start(
+        runner,
+        SshMasterTarget {
+            host_alias: &destination.host,
+            user: user.as_deref(),
+            resolved_host: &resolved.hostname,
+            resolved_port: resolved.port,
+            jumphost: args.jumphost.as_deref(),
+        },
+        &args.ssh_option,
+        deadline,
+    );
     forward_config.apply_ssh_config(&resolved)?;
     if args.jumphost.is_some() {
         bound_jumphost_locale_environment(
@@ -167,7 +174,6 @@ fn run_client(
     // tunnels can be multiplexed immediately (avoids pre-handshake accept races).
     let local_sources = forward_config.local_sources;
     let mut initial_payload = forward_config.initial_payload;
-    let user = requested_user.or(resolved.user);
     validate_ssh_destination(&destination.host, user.as_deref())?;
     let probe_request = BootstrapRequest {
         user: user.clone(),
@@ -240,23 +246,29 @@ fn run_client(
             .to_owned();
         let jump_user = Some(parsed_jump.user.as_str()).filter(|user| !user.is_empty());
         validate_ssh_destination(&jump_host, jump_user)?;
-        ssh_session.close();
-        ssh_session = SshSession::start(
-            runner,
-            &jump_host,
-            jump_user,
-            None,
-            &args.ssh_option,
-            deadline,
-        );
         let jump_resolved = resolve_ssh_config(
-            &ssh_session,
+            runner,
             &jump_host,
             jump_user,
             &args.ssh_option,
             false,
             deadline,
         )?;
+        let jump_effective_user = jump_user
+            .map(str::to_owned)
+            .or_else(|| jump_resolved.user.clone());
+        let jump_session = SshSession::start(
+            runner,
+            SshMasterTarget {
+                host_alias: &jump_host,
+                user: jump_effective_user.as_deref(),
+                resolved_host: &jump_resolved.hostname,
+                resolved_port: jump_resolved.port,
+                jumphost: None,
+            },
+            &args.ssh_option,
+            deadline,
+        );
         let jump_request = JumpBootstrapRequest {
             jumphost: jumphost.to_owned(),
             destination_host: endpoint.host.clone(),
@@ -269,7 +281,7 @@ fn run_client(
             term: request.term.clone(),
         };
         let jump_invocation = build_jump_invocation(&jump_request, &provisional);
-        credentials = run_bootstrap(&ssh_session, &jump_invocation, deadline)?;
+        credentials = run_bootstrap(&jump_session, &jump_invocation, deadline)?;
         endpoint = Endpoint {
             host: jump_resolved.hostname,
             port: args.jport,
@@ -278,7 +290,6 @@ fn run_client(
         // to the jump terminal instead of starting a shell.
         initial_payload.jumphost = Some(true);
     }
-    ssh_session.close();
     if remote_mode.terminal_shell == RemoteShellKind::Posix {
         initial_payload
             .environmentvariables

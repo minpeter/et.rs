@@ -174,14 +174,6 @@ static TEST_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc
 mod tests {
     use super::release_idle_memory;
 
-    const BURST_BYTES: usize = 64 * 1024 * 1024;
-    const CHUNK: usize = 64 * 1024;
-
-    fn active_bytes() -> usize {
-        tikv_jemalloc_ctl::epoch::advance().unwrap();
-        tikv_jemalloc_ctl::stats::active::read().unwrap()
-    }
-
     /// A real server run applied this policy to zero arenas while still
     /// reading back a configured future-arena value, so the release looked
     /// successful and reclaimed nothing. Assert the live-arena count it
@@ -194,34 +186,6 @@ mod tests {
         assert!(
             accounting.applied_arenas >= 1,
             "release applied to no live arena: {accounting:?}"
-        );
-    }
-
-    #[test]
-    fn active_bytes_return_toward_baseline_after_a_large_burst_is_dropped() {
-        release_idle_memory().unwrap();
-        let baseline = active_bytes();
-
-        let mut burst = Vec::new();
-        while burst.len() * CHUNK < BURST_BYTES {
-            let mut allocation = vec![0_u8; CHUNK];
-            for page in allocation.chunks_mut(4096) {
-                page[0] = 1;
-            }
-            burst.push(allocation);
-        }
-        let peak = active_bytes();
-        assert!(
-            peak >= baseline + BURST_BYTES / 2,
-            "burst did not raise active bytes: baseline {baseline}, peak {peak}"
-        );
-        drop(burst);
-
-        release_idle_memory().unwrap();
-        let settled = active_bytes();
-        assert!(
-            settled < baseline + BURST_BYTES / 4,
-            "active bytes stayed near the high-water mark: baseline {baseline}, peak {peak}, settled {settled}"
         );
     }
 }

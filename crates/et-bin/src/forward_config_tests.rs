@@ -60,6 +60,7 @@ fn applying_ssh_config_preserves_agent_forwarding() {
     let resolved = ResolvedSshConfig {
         hostname: "host".to_owned(),
         user: None,
+        port: 22,
         exit_on_forward_failure: false,
         local_forwards: Vec::new(),
     };
@@ -106,6 +107,7 @@ fn exit_on_forward_failure_selects_local_bind_policy() {
             .apply_ssh_config(&ResolvedSshConfig {
                 hostname: "host".to_owned(),
                 user: None,
+                port: 22,
                 exit_on_forward_failure: strict,
                 local_forwards: vec![request.clone()],
             })
@@ -140,6 +142,7 @@ fn ssh_config_forwards_are_cumulative_stable_and_exactly_deduplicated() {
     let resolved = ResolvedSshConfig {
         hostname: "host".to_owned(),
         user: None,
+        port: 22,
         exit_on_forward_failure: false,
         local_forwards: vec![
             local_duplicate.clone(),

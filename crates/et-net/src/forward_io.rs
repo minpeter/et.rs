@@ -788,21 +788,21 @@ mod tests {
     fn same_reader_parks_at_exact_window_and_resumes_after_delivery() {
         let (stream, mut peer) = UnixStream::pair().unwrap();
         let window = FlowWindow {
-            bytes: i64::try_from(2 * READ_CHUNK).unwrap(),
+            bytes: 2,
             packets: 4,
         };
-        let transfer = usize::try_from(2 * window.bytes).unwrap();
+        let transfer = 4;
         let (commands, command_receiver) = command_channel(4);
         let (cancel, cancel_receiver) = channel::bounded(1);
         let abandoned = Arc::new(AtomicBool::new(false));
-        let (active, handles) = spawn_io(
-            Role::Source,
-            1,
+        let (active, handles) = spawn_io_with_read_limit(
+            (Role::Source, 1),
             ForwardStream::Unix(stream),
             Some(window),
             commands,
             cancel_receiver,
             abandoned,
+            1,
         )
         .unwrap();
         let (write_done_tx, write_done_rx) = mpsc::sync_channel(0);
@@ -828,7 +828,7 @@ mod tests {
         assert_eq!(first.bytes, window.bytes);
         assert_eq!(active.in_flight.load(Ordering::Acquire), window.bytes);
 
-        apply_delivery(&active, window);
+        apply_delivery(&active, first);
 
         for _ in 0..2 {
             let Command::Read {

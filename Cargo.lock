@@ -453,6 +453,7 @@ dependencies = [
  "prost",
  "rustix",
  "tikv-jemalloc-ctl",
+ "tikv-jemallocator",
 ]
 
 [[package]]

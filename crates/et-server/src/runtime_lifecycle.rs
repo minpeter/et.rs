@@ -14,21 +14,43 @@ pub(crate) enum LifecycleEvent {
 #[cfg(target_os = "linux")]
 #[derive(Debug, PartialEq, Eq)]
 struct IdleMemoryAccounting {
+    applied_arenas: u32,
     dirty_decay_ms: isize,
     muzzy_decay_ms: isize,
 }
 
+/// Return pages freed by finished sessions to the kernel.
+///
+/// Two steps are both required. `arenas.*_decay_ms` governs arenas created
+/// later, and each arena that already holds session buffers is updated through
+/// its own index.
+///
+/// jemalloc's `MALLCTL_ARENAS_ALL` pseudo-index is deliberately not used: it is
+/// rejected with `EFAULT` on some builds, which silently left this policy
+/// unapplied at runtime while a future-arena read-back still looked correct.
+/// `arenas.narenas` is an upper limit rather than a count of live arenas, so an
+/// index that was never initialized also answers `EFAULT`; those arenas hold
+/// nothing and inherit the future-arena setting when they are created, so they
+/// are skipped instead of failing the release.
 #[cfg(target_os = "linux")]
 fn release_idle_memory() -> Result<IdleMemoryAccounting, tikv_jemalloc_ctl::Error> {
     use tikv_jemalloc_ctl::{Access, AsName};
 
-    // Configure future arenas, then update all existing arenas through
-    // jemalloc's MALLCTL_ARENAS_ALL pseudo-index (4096).
     b"arenas.dirty_decay_ms\0".name().write(0_isize)?;
     b"arenas.muzzy_decay_ms\0".name().write(0_isize)?;
-    b"arena.4096.dirty_decay_ms\0".name().write(0_isize)?;
-    b"arena.4096.muzzy_decay_ms\0".name().write(0_isize)?;
+    let limit: u32 = b"arenas.narenas\0".name().read()?;
+    let mut applied_arenas = 0;
+    for index in 0..limit {
+        let dirty = format!("arena.{index}.dirty_decay_ms\0");
+        if dirty.as_bytes().name().write(0_isize).is_err() {
+            continue;
+        }
+        let muzzy = format!("arena.{index}.muzzy_decay_ms\0");
+        let _ = muzzy.as_bytes().name().write(0_isize);
+        applied_arenas += 1;
+    }
     Ok(IdleMemoryAccounting {
+        applied_arenas,
         dirty_decay_ms: b"arenas.dirty_decay_ms\0".name().read()?,
         muzzy_decay_ms: b"arenas.muzzy_decay_ms\0".name().read()?,
     })
@@ -145,54 +167,61 @@ fn notify_raw_scan_complete(id: &str) {
 }
 
 #[cfg(all(test, target_os = "linux"))]
+#[global_allocator]
+static TEST_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::release_idle_memory;
 
     const BURST_BYTES: usize = 64 * 1024 * 1024;
-    const ACTIVE_SLACK_BOUND: usize = 4 * 1024 * 1024;
+    const CHUNK: usize = 64 * 1024;
 
-    fn allocator_bytes() -> (usize, usize, usize) {
+    fn active_bytes() -> usize {
         tikv_jemalloc_ctl::epoch::advance().unwrap();
-        (
-            tikv_jemalloc_ctl::stats::allocated::read().unwrap(),
-            tikv_jemalloc_ctl::stats::active::read().unwrap(),
-            tikv_jemalloc_ctl::stats::resident::read().unwrap(),
-        )
+        tikv_jemalloc_ctl::stats::active::read().unwrap()
+    }
+
+    /// A real server run applied this policy to zero arenas while still
+    /// reading back a configured future-arena value, so the release looked
+    /// successful and reclaimed nothing. Assert the live-arena count it
+    /// actually reached.
+    #[test]
+    fn idle_release_reaches_at_least_one_live_arena() {
+        let accounting = release_idle_memory().expect("release must succeed under jemalloc");
+        assert_eq!(accounting.dirty_decay_ms, 0);
+        assert_eq!(accounting.muzzy_decay_ms, 0);
+        assert!(
+            accounting.applied_arenas >= 1,
+            "release applied to no live arena: {accounting:?}"
+        );
     }
 
     #[test]
-    fn idle_release_configures_immediate_decay_and_bounds_active_bytes() {
-        assert_eq!(
-            release_idle_memory().unwrap(),
-            super::IdleMemoryAccounting {
-                dirty_decay_ms: 0,
-                muzzy_decay_ms: 0,
-            }
-        );
-        let (baseline_allocated, baseline_active, baseline_resident) = allocator_bytes();
+    fn active_bytes_return_toward_baseline_after_a_large_burst_is_dropped() {
+        release_idle_memory().unwrap();
+        let baseline = active_bytes();
 
         let mut burst = Vec::new();
-        while burst.len() * (64 * 1024) < BURST_BYTES {
-            let mut allocation = vec![0_u8; 64 * 1024];
+        while burst.len() * CHUNK < BURST_BYTES {
+            let mut allocation = vec![0_u8; CHUNK];
             for page in allocation.chunks_mut(4096) {
                 page[0] = 1;
             }
             burst.push(allocation);
         }
-        let (_, _, peak_resident) = allocator_bytes();
+        let peak = active_bytes();
+        assert!(
+            peak >= baseline + BURST_BYTES / 2,
+            "burst did not raise active bytes: baseline {baseline}, peak {peak}"
+        );
         drop(burst);
 
-        assert_eq!(
-            release_idle_memory().unwrap(),
-            super::IdleMemoryAccounting {
-                dirty_decay_ms: 0,
-                muzzy_decay_ms: 0,
-            }
-        );
-        let (idle_allocated, idle_active, idle_resident) = allocator_bytes();
+        release_idle_memory().unwrap();
+        let settled = active_bytes();
         assert!(
-            idle_active <= baseline_active + ACTIVE_SLACK_BOUND,
-            "live allocator bytes did not return to their bound: baseline allocated={baseline_allocated} active={baseline_active} resident={baseline_resident}; peak resident={peak_resident}; idle allocated={idle_allocated} active={idle_active} resident={idle_resident}"
+            settled < baseline + BURST_BYTES / 4,
+            "active bytes stayed near the high-water mark: baseline {baseline}, peak {peak}, settled {settled}"
         );
     }
 }

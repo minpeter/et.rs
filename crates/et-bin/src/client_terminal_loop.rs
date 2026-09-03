@@ -1,4 +1,3 @@
-#[cfg(unix)]
 use std::collections::VecDeque;
 #[cfg(unix)]
 use std::io::{self, Read, Write};
@@ -12,7 +11,8 @@ use et_core::proto::TerminalPacketType;
 #[cfg(unix)]
 use et_net::connection::Connection;
 #[cfg(unix)]
-use et_net::forward::{is_forward_packet, Forwarder};
+use et_net::forward::is_forward_packet;
+use et_net::forward::Forwarder;
 #[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags};
 #[cfg(unix)]
@@ -20,16 +20,16 @@ use rustix::time::Timespec;
 
 #[cfg(unix)]
 use crate::client_output::{ConsoleCompletion, GRACEFUL_DRAIN_STALL_TIMEOUT};
+use crate::client_terminal::terminal_text;
 #[cfg(unix)]
 use crate::client_terminal::DisplayOutcome;
 use crate::client_terminal::TerminalModeState;
 #[cfg(unix)]
 use crate::client_terminal::{
     classify_forward_completion, connection_ended, encoded_buffer, recover_transport,
-    terminal_error, terminal_io, terminal_size_payload, terminal_text, write_owned_recovering,
+    terminal_error, terminal_io, terminal_size_payload, write_owned_recovering,
     write_terminal_size_recovering, OwnedWriteOutcome, RetainedCompletion,
 };
-#[cfg(unix)]
 use crate::error::ClientError;
 #[cfg(unix)]
 use crate::initial_connect::ReconnectOutcome;
@@ -38,7 +38,6 @@ use crate::initial_connect::ReconnectOutcome;
 const INPUT_CHUNK: usize = 16 * 1024;
 #[cfg(unix)]
 const MISSED_KEEPALIVES: u32 = 3;
-#[cfg(unix)]
 const FORWARD_BACKLOG_CAPACITY: usize = 257;
 
 #[cfg(unix)]

@@ -119,6 +119,7 @@ impl Worker {
                 // A peer that advertises nothing gets nothing back, and both
                 // ends stay on unwindowed behavior.
                 window: (error.is_none() && peer_advertised.is_some()).then(advertised_window),
+                // debug
                 error,
             },
         )

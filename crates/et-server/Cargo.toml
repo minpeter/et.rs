@@ -19,3 +19,12 @@ prost = "0.13"
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", default-features = false, features = ["socket", "user"] }
 rustix = { version = "1.1.4", features = ["event", "net", "process", "time"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats"] }
+
+# The idle-release policy only exists when jemalloc is the active allocator,
+# which the shipped binary installs. The unit test installs it too so it
+# exercises the real control path instead of the system allocator.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tikv-jemallocator = "0.7.0"

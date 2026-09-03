@@ -47,6 +47,7 @@ struct FakeSsh {
     dir: TestDir,
     argv: PathBuf,
     stdin: PathBuf,
+    client_pids: PathBuf,
 }
 
 impl Drop for FakeSsh {
@@ -71,6 +72,7 @@ impl FakeSsh {
         let script = dir.0.join("ssh");
         let argv = dir.0.join("argv");
         let stdin = dir.0.join("stdin");
+        let client_pids = dir.0.join("client_pids");
         fs::write(
             &script,
             r#"#!/bin/sh
@@ -80,6 +82,12 @@ for arg in "$@"; do
   case "$arg" in -oControlPath=*) control_path=${arg#-oControlPath=} ;; esac
 done
 printf "\0" >> "$ET_FAKE_ARGV"
+# Record the invoking `et` client's pid so tests can assert the ControlPath
+# carries no per-process component. $PPID is that client, not this shell's own
+# pid, which is what makes the assertion meaningful.
+if [ -n "$ET_FAKE_CLIENT_PIDS" ]; then
+  echo "$PPID" >> "$ET_FAKE_CLIENT_PIDS"
+fi
 if [ "$1" = "-O" ] && [ "$2" = "check" ]; then
   if [ -n "$control_path" ]; then
     [ -e "$control_path" ] && exit 0
@@ -120,7 +128,13 @@ exit "$ET_FAKE_EXIT"
         permissions.set_mode(0o755);
         fs::set_permissions(script, permissions).unwrap();
         fs::write(&argv, []).unwrap();
-        Self { dir, argv, stdin }
+        fs::write(&client_pids, []).unwrap();
+        Self {
+            dir,
+            argv,
+            stdin,
+            client_pids,
+        }
     }
 
     fn command(&self, config: &str, stdout: &str, exit: i32, stderr: &str) -> Command {
@@ -140,6 +154,7 @@ exit "$ET_FAKE_EXIT"
             .env("ET_FAKE_MASTER_EXIT", "0")
             .env("ET_FAKE_USER_MASTER_EXIT", "255")
             .env("ET_FAKE_MKSOCKET", env!("CARGO_BIN_EXE_mksocket"))
+            .env("ET_FAKE_CLIENT_PIDS", &self.client_pids)
             .stdin(Stdio::null());
         command
     }
@@ -626,6 +641,23 @@ fn control_path_is_stable_for_a_destination_and_distinct_between_destinations() 
         2,
         "exactly two distinct destinations were used: {pids:?}"
     );
+    // Assert against the pids of the `et` clients that actually ran. Searching
+    // for the harness's own pid would be unsound: it is a different process,
+    // and a 32-hex hash can contain any decimal digits by coincidence.
+    let client_pids = fs::read_to_string(&fake.client_pids).unwrap();
+    let client_pids = client_pids
+        .split_whitespace()
+        .filter(|value| !value.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(!client_pids.is_empty(), "fake ssh recorded no client pid");
+    for path in &paths {
+        for pid in &client_pids {
+            assert!(
+                !path.contains(pid),
+                "ControlPath must not embed the client pid {pid}: {path}"
+            );
+        }
+    }
     for path in paths {
         let file_name = std::path::Path::new(&path)
             .file_name()
@@ -635,13 +667,6 @@ fn control_path_is_stable_for_a_destination_and_distinct_between_destinations() 
         assert!(
             file_name.bytes().all(|byte| byte.is_ascii_hexdigit()),
             "{path}"
-        );
-        // The 32-hex basename is a hash, so a decimal pid cannot appear
-        // literally; check the whole path, which is where a pid or a serial
-        // would realistically be appended.
-        assert!(
-            !path.contains(&std::process::id().to_string()),
-            "ControlPath must not embed the client pid: {path}"
         );
         for serial in 0..4u32 {
             assert!(

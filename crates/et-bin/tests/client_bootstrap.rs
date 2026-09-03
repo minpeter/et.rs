@@ -92,7 +92,9 @@ if [ "$1" = "-MNf" ]; then
     exit "$ET_FAKE_MASTER_EXIT"
   fi
   if [ -n "$control_path" ]; then
-    : > "$control_path"
+    # Real ssh -MNf creates a UNIX SOCKET, and the client refuses anything
+    # else, so a regular file here would make every later session fall back.
+    "$ET_FAKE_MKSOCKET" "$control_path" || exit 255
   fi
 fi
 if [ "$1" = "-G" ]; then
@@ -137,6 +139,7 @@ exit "$ET_FAKE_EXIT"
             .env("ET_FAKE_PROBE_EXIT", "0")
             .env("ET_FAKE_MASTER_EXIT", "0")
             .env("ET_FAKE_USER_MASTER_EXIT", "255")
+            .env("ET_FAKE_MKSOCKET", env!("CARGO_BIN_EXE_mksocket"))
             .stdin(Stdio::null());
         command
     }
@@ -605,6 +608,24 @@ fn control_path_is_stable_for_a_destination_and_distinct_between_destinations() 
     assert_eq!(paths.len(), 3, "{paths:?}");
     assert_eq!(paths[0], paths[1], "same destination: {paths:?}");
     assert_ne!(paths[0], paths[2], "different destinations: {paths:?}");
+    // Equality alone cannot prove the path is pid-free: every case above runs
+    // in ONE `et` process per invocation, and repeated invocations would each
+    // embed their own pid, so a pid-bearing path could still compare equal to
+    // itself. Assert the absence of any per-process or per-call component
+    // directly, so a master cannot silently become per-session again.
+    let pids = fake
+        .invocations()
+        .iter()
+        .flat_map(|argv| argv.iter())
+        .filter_map(|arg| arg.strip_prefix("-oControlPath="))
+        .filter_map(|path| std::path::Path::new(path).file_name()?.to_str())
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        pids.len(),
+        2,
+        "exactly two distinct destinations were used: {pids:?}"
+    );
     for path in paths {
         let file_name = std::path::Path::new(&path)
             .file_name()
@@ -615,7 +636,92 @@ fn control_path_is_stable_for_a_destination_and_distinct_between_destinations() 
             file_name.bytes().all(|byte| byte.is_ascii_hexdigit()),
             "{path}"
         );
+        // The 32-hex basename is a hash, so a decimal pid cannot appear
+        // literally; check the whole path, which is where a pid or a serial
+        // would realistically be appended.
+        assert!(
+            !path.contains(&std::process::id().to_string()),
+            "ControlPath must not embed the client pid: {path}"
+        );
+        for serial in 0..4u32 {
+            assert!(
+                !file_name.ends_with(&format!(".{serial}")),
+                "ControlPath must not embed a per-call serial: {path}"
+            );
+        }
     }
+}
+
+/// A hostile (or merely stale-and-wrong) object at the control socket path is
+/// refused, and the session still completes over unmultiplexed SSH instead of
+/// failing. Runs the real client end-to-end, so it proves the refusal is wired
+/// into the bootstrap path and not just into the helper.
+#[cfg(unix)]
+#[test]
+fn bootstrap_falls_back_when_control_socket_path_is_not_a_socket() {
+    // First run: learn the exact path this destination hashes to.
+    let fake = FakeSsh::new();
+    let (probe_port, probe_server) = initial_payload_server();
+    let probe = fake
+        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
+        .args(["-N", &format!("server-alias:{probe_port}")])
+        .output()
+        .unwrap();
+    probe_server.join().unwrap();
+    assert!(probe.status.success(), "{}", stderr(&probe));
+    let control_path = fake
+        .invocations()
+        .iter()
+        .flat_map(|argv| argv.iter())
+        .find_map(|arg| arg.strip_prefix("-oControlPath="))
+        .expect("first run must establish an ET control path")
+        .to_owned();
+    // Replace the socket with a regular file: exactly what a planted or stale
+    // non-socket object looks like at the predictable path. The guard removes
+    // it even if an assertion below panics, because the control root may be
+    // the shared /tmp fallback where a leftover non-socket would make sibling
+    // tests refuse their own correctly hashed path.
+    struct Planted(String);
+    impl Drop for Planted {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _ = std::fs::remove_file(&control_path);
+    std::fs::write(&control_path, b"not a socket").unwrap();
+    let planted_guard = Planted(control_path.clone());
+
+    // Second run: must refuse the path and still succeed unmultiplexed.
+    let (port, server) = initial_payload_server();
+    let before = fake.invocations().len();
+    let output = fake
+        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
+        .args(["-N", &format!("server-alias:{port}")])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "a refused control socket must not fail the session: {}",
+        stderr(&output)
+    );
+    let invocations = fake.invocations();
+    for invocation in &invocations[before..] {
+        assert!(
+            invocation
+                .iter()
+                .all(|arg| !arg.starts_with("-oControlPath=")),
+            "refused socket must not be handed to ssh: {invocation:?}"
+        );
+    }
+    // The planted file must be left alone, not silently unlinked.
+    let planted = std::fs::read(&control_path);
+    drop(planted_guard);
+    assert_eq!(
+        planted.ok().as_deref(),
+        Some(&b"not a socket"[..]),
+        "refusal must not remove another party's file"
+    );
 }
 
 #[test]

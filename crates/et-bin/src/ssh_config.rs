@@ -47,11 +47,39 @@ pub fn resolve_ssh_config(
     parse_local_forwards: bool,
     deadline: Deadline,
 ) -> Result<ResolvedSshConfig, ClientError> {
+    resolve_ssh_config_on_port(
+        runner,
+        host_alias,
+        requested_user,
+        None,
+        ssh_options,
+        parse_local_forwards,
+        deadline,
+    )
+}
+
+/// Resolve SSH configuration, honouring a port given explicitly on the command
+/// line (`host:port`). The explicit port must reach `ssh -G`, because the
+/// resolved port becomes part of the control-master identity: resolving
+/// without it yields the config/default port and would multiplex a session for
+/// `host:2200` through a master established for `host:22`.
+pub fn resolve_ssh_config_on_port(
+    runner: &dyn SshRunner,
+    host_alias: &str,
+    requested_user: Option<&str>,
+    explicit_port: Option<u16>,
+    ssh_options: &[String],
+    parse_local_forwards: bool,
+    deadline: Deadline,
+) -> Result<ResolvedSshConfig, ClientError> {
     validate_ssh_destination(host_alias, requested_user)?;
     // Config expansion never opens a remote session. Disable PTY allocation
     // so Windows OpenSSH completes reliably when stdout is a pipe, preserving
     // the bounded SystemSsh capture path.
     let mut args = vec!["-G".to_string(), "-T".to_string()];
+    if let Some(port) = explicit_port {
+        args.extend(["-p".to_string(), port.to_string()]);
+    }
     args.extend(
         ssh_options
             .iter()
@@ -442,6 +470,57 @@ mod tests {
                 exit_on_forward_failure: false,
                 local_forwards: Vec::new(),
             }
+        );
+    }
+
+    struct PortCapturingRunner {
+        args: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl SshRunner for PortCapturingRunner {
+        fn run(&self, invocation: &SshInvocation, _: Deadline) -> Result<SshOutput, ClientError> {
+            self.args.lock().unwrap().clone_from(&invocation.args);
+            // `ssh -G` echoes the port it actually resolved. When an explicit
+            // `-p` is supplied, that is the port it reports.
+            let port = invocation
+                .args
+                .iter()
+                .position(|arg| arg == "-p")
+                .and_then(|index| invocation.args.get(index + 1))
+                .map_or("22", String::as_str);
+            Ok(SshOutput {
+                status: Some(success_status()),
+                stdout: format!(
+                    "host jump-alias\nuser config-user\nhostname 127.0.0.1\nport {port}\n"
+                )
+                .into_bytes(),
+            })
+        }
+    }
+
+    #[test]
+    fn explicit_port_reaches_the_config_query_and_the_resolved_port() {
+        let runner = PortCapturingRunner {
+            args: std::sync::Mutex::new(Vec::new()),
+        };
+        let resolved = resolve_ssh_config_on_port(
+            &runner,
+            "jump-alias",
+            None,
+            Some(2200),
+            &[],
+            false,
+            Deadline::after(Duration::from_secs(1)),
+        )
+        .unwrap();
+        let args = runner.args.lock().unwrap().clone();
+        assert!(
+            args.windows(2).any(|pair| pair == ["-p", "2200"]),
+            "explicit port must be passed to `ssh -G`: {args:?}"
+        );
+        assert_eq!(
+            resolved.port, 2200,
+            "resolved port must honour the explicit port, not the default"
         );
     }
 

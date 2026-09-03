@@ -105,6 +105,18 @@ impl<'a> SshSession<'a> {
             target.resolved_port,
             jumphost,
         ));
+        // Never hand ssh a path that already exists as something other than a
+        // socket, or as a symlink: fall back rather than "repairing" it, since
+        // removing another party's file is itself an attack primitive.
+        if !usable_control_socket(&path) {
+            et_cli::logging::warn(
+                "SSH control socket path is not a private socket; continuing without ET multiplexing",
+            );
+            return Self {
+                runner,
+                control_path: None,
+            };
+        }
         if check_master(
             runner,
             &destination,
@@ -359,11 +371,37 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
 #[cfg(unix)]
 fn private_directory(path: &Path) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // symlink_metadata, never metadata: the control root can live in a
+    // world-writable /tmp, where another user may plant a symlink under the
+    // name we expect. Following it would validate their target, not our path.
     std::fs::symlink_metadata(path).is_ok_and(|metadata| {
         metadata.is_dir()
             && metadata.uid() == rustix::process::getuid().as_raw()
             && metadata.permissions().mode() & 0o777 == 0o700
     })
+}
+
+/// Whether the multiplexing socket path is safe to hand to ssh.
+///
+/// An absent path is fine: ssh's own master creates it. Anything that already
+/// exists must be a real Unix socket and must not be a symlink, so a planted
+/// file, directory, or link cannot redirect our sessions. The parent directory
+/// is separately proven to be a uid-owned 0700 real directory, which is what
+/// keeps another *user* out; a same-uid process is inside our trust boundary
+/// either way (it can ptrace us), exactly as OpenSSH's own predictable
+/// `~/.ssh/cm-%r@%h:%p` ControlPaths already assume.
+#[cfg(unix)]
+fn usable_control_socket(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata.file_type().is_socket(),
+        Err(error) => error.kind() == io::ErrorKind::NotFound,
+    }
+}
+
+#[cfg(not(unix))]
+fn usable_control_socket(_path: &Path) -> bool {
+    true
 }
 
 #[cfg(not(unix))]
@@ -867,7 +905,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir(&temp).unwrap();
         let directory = control_directory_root(&temp);
-        create_private_directory(&directory).unwrap();
+        // `control_directory_root` falls back to the SHARED `/tmp/et-ssh-<uid>`
+        // when the temp path is too long for a socket, so this directory may
+        // already exist from another test or an earlier run. Only the resulting
+        // ownership and mode matter here, not who created it.
+        match create_private_directory(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                assert!(private_directory(&directory), "{directory:?}");
+            }
+            Err(error) => panic!("{directory:?}: {error}"),
+        }
         let path = directory.join(destination_hash("user", "host", 22, None));
         assert_eq!(
             std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
@@ -877,6 +925,77 @@ mod tests {
             control_path_len(&path) <= MAX_CONTROL_PATH_BYTES,
             "{path:?}"
         );
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_control_root_is_refused() {
+        let temp = std::env::temp_dir().join(format!("et-symlink-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir(&temp).unwrap();
+        // A directory the attacker owns, reached through a name we would trust.
+        let elsewhere = temp.join("elsewhere");
+        create_private_directory(&elsewhere).unwrap();
+        let link = temp.join("link");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        // The symlink target is a perfectly good private directory, so any
+        // check that follows links is satisfied. It must still be refused.
+        assert!(
+            !private_directory(&link),
+            "a symlink must never be accepted as the control root"
+        );
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_socket_must_be_a_socket_and_not_a_symlink() {
+        let temp = std::env::temp_dir().join(format!("et-socket-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        create_private_directory(&temp).unwrap();
+
+        // Nothing there yet: usable, because ssh is the one that creates it.
+        let absent = temp.join("a".repeat(32));
+        assert!(usable_control_socket(&absent), "absent path must be usable");
+
+        // A planted regular file must not be handed to ssh.
+        let regular = temp.join("b".repeat(32));
+        std::fs::write(&regular, b"not a socket").unwrap();
+        assert!(
+            !usable_control_socket(&regular),
+            "a regular file must be refused"
+        );
+
+        // A directory must not be handed to ssh either.
+        let directory = temp.join("c".repeat(32));
+        std::fs::create_dir(&directory).unwrap();
+        assert!(
+            !usable_control_socket(&directory),
+            "a directory must be refused"
+        );
+
+        // A dangling symlink resolves to nothing, but must be refused on its
+        // own type rather than treated as an absent (creatable) path.
+        let dangling = temp.join("d".repeat(32));
+        std::os::unix::fs::symlink(temp.join("nowhere"), &dangling).unwrap();
+        assert!(
+            !usable_control_socket(&dangling),
+            "a dangling symlink must be refused"
+        );
+
+        // A symlink pointing at a real socket is the interesting case: the
+        // target passes every type check, so only symlink_metadata catches it.
+        let real = temp.join("e".repeat(32));
+        let _listener = std::os::unix::net::UnixListener::bind(&real).unwrap();
+        assert!(usable_control_socket(&real), "a real socket must be usable");
+        let to_socket = temp.join("f".repeat(32));
+        std::os::unix::fs::symlink(&real, &to_socket).unwrap();
+        assert!(
+            !usable_control_socket(&to_socket),
+            "a symlink to a socket must still be refused"
+        );
+
         std::fs::remove_dir_all(temp).unwrap();
     }
 

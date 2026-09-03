@@ -19,7 +19,7 @@ use crate::deadline::Deadline;
 use crate::error::ClientError;
 use crate::initial_connect::{connect_initial, reconnect, Endpoint, ReconnectOutcome};
 use crate::resolver::{EndpointResolver, SystemResolver};
-use crate::ssh_config::resolve_ssh_config;
+use crate::ssh_config::{resolve_ssh_config, resolve_ssh_config_on_port};
 use crate::ssh_process::{
     run_bootstrap, run_shell_probe, SshMasterTarget, SshRunner, SshSession, SystemSsh,
 };
@@ -138,6 +138,9 @@ fn run_client(
 
     let requested_user = command_user(destination.user, args.username.clone());
     validate_ssh_destination(&destination.host, requested_user.as_deref())?;
+    // The positional `host:port` is the ET server port, not an SSH port, so it
+    // must not be forwarded to the config query. Only the jumphost grammar
+    // below carries an explicit SSH port.
     let resolved = resolve_ssh_config(
         runner,
         &destination.host,
@@ -246,10 +249,24 @@ fn run_client(
             .to_owned();
         let jump_user = Some(parsed_jump.user.as_str()).filter(|user| !user.is_empty());
         validate_ssh_destination(&jump_host, jump_user)?;
-        let jump_resolved = resolve_ssh_config(
+        // An explicit `jump:2200` must reach the config query, because the
+        // resolved port is part of the control-master identity and the jump
+        // bootstrap emits `-p 2200`. Resolving without it would hash (and
+        // start) a master for port 22 and then force the 2200 session onto it.
+        let jump_explicit_port = parsed_jump
+            .port_suffix
+            .strip_prefix(':')
+            .map(|port| {
+                port.parse::<u16>()
+                    .map_err(|_| et_cli::host::HostError::BadPort(port.to_owned()))
+            })
+            .transpose()
+            .map_err(ClientError::Host)?;
+        let jump_resolved = resolve_ssh_config_on_port(
             runner,
             &jump_host,
             jump_user,
+            jump_explicit_port,
             &args.ssh_option,
             false,
             deadline,

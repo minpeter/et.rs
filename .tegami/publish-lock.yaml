@@ -1,21 +1,25 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Apply SSH configuration port forwarding\n\nThe client now reads effective `LocalForward` entries from OpenSSH\nconfiguration and applies them as ET tunnels alongside command-line tunnels.\nConfigured destination hostnames, explicit bind addresses, `GatewayPorts`, and\n`ExitOnForwardFailure` are preserved. `RemoteForward` remains available through\nthe explicit `-r` option and is not imported from SSH configuration.\n"
-    filename: add-ssh-config-forwarding.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Add opt-in terminal flow control\n\nClients can now select lossless backpressure or oldest-output discard when\nterminal output outruns the network, keeping Ctrl-C and prompt responses\nbounded without changing the default session behavior.\n"
+    filename: add-opt-in-flow-control.md
     v: 0.0.0
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Show the login message of the day\n\nTerminal sessions now display the message of the day before the login shell\nstarts, matching an interactive `ssh` login. The banner includes Ubuntu's\ngenerated dynamic message followed by `pam_motd`'s default file and directory\nsources, honors `.hushlogin`, and never reaches the shell as input.\nReconnecting to the same session does not print it again.\n"
-    filename: feat-session-motd.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Align MOTD and shell prompt spacing\n\nAvoid an extra blank line between the MOTD and an interactive shell prompt\nwhen the login shell emits an initial newline.\n"
+    filename: fix-motd-prompt-spacing.md
     v: 0.0.0
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Harden SSH configuration port forwarding\n\nOperational SSH commands now force isolated forwarding, command, session, and\ncontrol socket settings after filtering conflicting user options, while\nconfiguration queries still read supported `LocalForward` rows.\nThis intentionally overrides user `ClearAllForwardings`, `RemoteCommand`,\n`PermitLocalCommand`, `ControlMaster`, `ControlPath`, and `SessionType`\nsettings for ET's probe and bootstrap commands.\n\nReverse listeners bind with the authenticated session identity, reject wildcard\nor privileged authority escalation, and enforce a transactional per-session\nlistener limit without capping client-side local listeners. Unix forwarding\nhelpers clear supplementary groups, authenticate router peers, and roll back\nsocket paths and created directories on every failed setup or descriptor\ntransfer. Any explicit reverse bind failure aborts the session and releases\nsibling listeners without adding a protocol extension.\n\nForward initialization now has absolute payload, resolver, helper, and response\ndeadlines; resolver work and pending router registrations are bounded. Unix\nsocket teardown stays anchored in the session user's helper so privileged\ncleanup cannot follow a replaced parent path. Forwarded TCP destinations are\nalso resolved and connected as the authenticated session user.\n"
-    filename: fix-ssh-config-forwarding-hardening.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Bound flow-control shutdown and recovery admission\n\nFlow-controlled clients now cancel stalled console drains instead of hanging\nduring shutdown, report closed output streams promptly, and keep client input\nmoving while terminal output is backpressured. Reconnects are also rejected\nwhen session teardown wins the recovery-admission race.\n"
+    filename: fix-release-blocker-races.md
     v: 0.0.0
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Complete SSH forwarding compatibility and authority hardening\n\nSSH-config forwarding now preserves explicit bind and destination addresses,\nhonors `ExitOnForwardFailure`, and keeps setup failures transactional across\ndirect and native-jumphost sessions.\n\nReverse listeners remain bound to authenticated loopback authority, helper\nprocesses drop supplementary privileges portably, forwarding listener limits\napply only to server-side reverse tunnels, and failed Unix listener setup no\nlonger leaves filesystem residue.\n"
-    filename: fix-ssh-config-forwarding-postmerge-audit.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Keep terminal startup reliable under heavy load\n\nTerminal startup now uses authenticated, bounded registration and structured\nstartup acknowledgements before reporting readiness. Initialization remains\nresponsive under load while forged identities, stalled peers, premature\nsuccess, leaked children, and unbounded admission are rejected or cleaned up.\n"
+    filename: fix-terminal-startup-under-load.md
+    v: 0.0.0
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Port EternalTerminal #798 accept-starvation fix\n\nA stuck client reconnect no longer starves `etserver` accept. Recovery\nalready ran off the session-table lock and refused a second in-flight\nreconnect for the same id; this port also refuses recover after full\nsession teardown (so a torn-down session cannot be resurrected) while\nstill allowing recover through terminal HUP so buffered output can\ndrain. It also raises the TCP `listen(2)` backlog from 32 to 128,\noverridable with `backlog` in the `[Networking]` section of the server\nconfig. Non-positive values fall back to 128. `PROTOCOL_VERSION` stays\n6. Upstream `#801` / `#803` / `#802` (HTM/Windows/coverage, TIOCGWINSZ,\nWindows build) are classified `skip` and not ported.\n"
+    filename: port-eternal-terminal-798.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - add-ssh-config-forwarding.md
-      - feat-session-motd.md
-      - fix-ssh-config-forwarding-hardening.md
-      - fix-ssh-config-forwarding-postmerge-audit.md
+      - add-opt-in-flow-control.md
+      - fix-motd-prompt-spacing.md
+      - fix-release-blocker-races.md
+      - fix-terminal-startup-under-load.md
+      - port-eternal-terminal-798.md
     id: cargo:et
     updated: true

@@ -1,4 +1,5 @@
 use et_net::local::LocalStream;
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
@@ -16,6 +17,9 @@ use crate::session::{ActiveSession, SessionError, SessionWriteError};
 
 const READ_BUFFER: usize = 16 * 1024;
 const CLIENT_READ_BATCH: usize = 64;
+// A saturated peer can have one held packet behind its 256-slot worker queue.
+// Reading that bounded amount breaks the cycle without making ingress unbounded.
+const FORWARD_BACKLOG_CAPACITY: usize = 257;
 
 struct PendingLocalFrame {
     bytes: Vec<u8>,
@@ -96,13 +100,13 @@ fn run_mode_poll(
     let mut decoder = LocalPacketDecoder::new();
     let (mut connected, mut connection_generation) = session.connection_state()?;
     session.note_bridge_generation(connection_generation)?;
-    // A forwarding packet the worker had no room for. While it is held, no
-    // further client packets are read (ordering) and the client socket is not
-    // watched for readability (it would busy-loop the poll).
-    let mut pending_forward: Option<Packet> = None;
-    // An outbound forwarding packet that could not fit in the disconnected
-    // replay buffer. Keep ownership until recovery restores write capacity.
-    let mut pending_outbound: Option<Packet> = None;
+    // Forwarding packets awaiting worker capacity. Keeping one bounded spill
+    // slot lets the transport continue reading when both peers saturate at
+    // once, while this FIFO preserves forwarding order.
+    let mut pending_forward = VecDeque::with_capacity(FORWARD_BACKLOG_CAPACITY);
+    // Outbound packets awaiting transport capacity. The bounded spill slot
+    // keeps transport reads live while preserving wire order.
+    let mut pending_outbound = VecDeque::with_capacity(FORWARD_BACKLOG_CAPACITY);
     // A complete terminal packet already read from the local stream. Retain
     // ownership across backpressure instead of dropping it or reading ahead.
     let mut pending_terminal: Option<Packet> = None;
@@ -113,24 +117,26 @@ fn run_mode_poll(
     let mut terminal_eof = false;
     let mut client_buffered = false;
     loop {
-        let mut resume_outbound_drain = false;
         if session.is_shutting_down() {
             return Ok(());
         }
         // Retry the held packet first: draining the forwarder's outbound
         // queue below is what frees worker capacity, so this makes progress
         // every iteration instead of deadlocking on a blocking send.
-        if let Some(packet) = pending_forward.take() {
-            pending_forward = forwarder.try_receive(packet).map_err(forward_error)?;
-        }
-        if let Some(packet) = pending_outbound.take() {
-            pending_outbound =
-                send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
-            resume_outbound_drain = pending_outbound.is_none();
-        }
-        if let Some(packet) = pending_terminal.take() {
-            pending_terminal =
-                send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
+        flush_forwarding(&forwarder, &mut pending_forward)?;
+        let outbound_before = pending_outbound.len();
+        flush_outbound(
+            &session,
+            &mut pending_outbound,
+            &mut connected,
+            &mut connection_generation,
+        )?;
+        let resume_outbound_drain = outbound_before > 0 && pending_outbound.is_empty();
+        if pending_outbound.is_empty() {
+            if let Some(packet) = pending_terminal.take() {
+                pending_terminal =
+                    send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
+            }
         }
         let (client, polled_generation) = if connected {
             match session.try_clone_stream() {
@@ -163,8 +169,7 @@ fn run_mode_poll(
             forwarder.wake().map_err(forward_error)?,
             client.as_ref(),
             terminal_flags,
-            pending_forward.is_some()
-                || pending_outbound.is_some()
+            pending_forward.len() >= FORWARD_BACKLOG_CAPACITY
                 || pending_local.is_some()
                 || !connected,
             client_buffered,
@@ -225,8 +230,7 @@ fn run_mode_poll(
                 || client_events_are_stale
                 || client_events.contains(PollFlags::IN));
         if client_data_ready
-            && pending_forward.is_none()
-            && pending_outbound.is_none()
+            && pending_forward.len() < FORWARD_BACKLOG_CAPACITY
             && pending_local.is_none()
         {
             client_buffered = false;
@@ -241,7 +245,7 @@ fn run_mode_poll(
                         true
                     }
                     Ok(Some(packet)) if is_forward_packet(packet.header()) => {
-                        pending_forward = forwarder.try_receive(packet).map_err(forward_error)?;
+                        enqueue_forwarding(&forwarder, &mut pending_forward, packet)?;
                         true
                     }
                     Ok(Some(packet)) => {
@@ -251,8 +255,9 @@ fn run_mode_poll(
                                 Some(PendingLocalFrame::new(&packet).map_err(SessionError::Io)?);
                         }
                         if let Some(control) = control {
-                            pending_outbound = send_or_hold(
+                            enqueue_outbound(
                                 &session,
+                                &mut pending_outbound,
                                 control,
                                 &mut connected,
                                 &mut connection_generation,
@@ -277,10 +282,7 @@ fn run_mode_poll(
                 if !read_packet {
                     break;
                 }
-                if pending_forward.is_some()
-                    || pending_outbound.is_some()
-                    || pending_local.is_some()
-                {
+                if pending_forward.len() >= FORWARD_BACKLOG_CAPACITY || pending_local.is_some() {
                     client_buffered = true;
                     break;
                 }
@@ -300,13 +302,18 @@ fn run_mode_poll(
                 observed_generation,
             )?;
         }
-        if pending_outbound.is_none()
+        if pending_outbound.is_empty()
             && (resume_outbound_drain || forward_events.intersects(PollFlags::IN | PollFlags::HUP))
         {
             while let Some(packet) = forwarder.try_outbound().map_err(forward_error)? {
-                pending_outbound =
-                    send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
-                if pending_outbound.is_some() {
+                enqueue_outbound(
+                    &session,
+                    &mut pending_outbound,
+                    packet,
+                    &mut connected,
+                    &mut connection_generation,
+                )?;
+                if !pending_outbound.is_empty() {
                     break;
                 }
             }
@@ -335,10 +342,8 @@ fn run_mode_windows(
     let mut decoder = LocalPacketDecoder::new();
     let (mut connected, mut connection_generation) = session.connection_state()?;
     session.note_bridge_generation(connection_generation)?;
-    // A forwarding packet the worker had no room for; while it is held, no
-    // further client packets are read so forwarding data stays ordered.
-    let mut pending_forward: Option<Packet> = None;
-    let mut pending_outbound: Option<Packet> = None;
+    let mut pending_forward = VecDeque::with_capacity(FORWARD_BACKLOG_CAPACITY);
+    let mut pending_outbound = VecDeque::with_capacity(FORWARD_BACKLOG_CAPACITY);
     let mut pending_terminal: Option<Packet> = None;
     let mut pending_local: Option<PendingLocalFrame> = None;
     loop {
@@ -357,21 +362,23 @@ fn run_mode_windows(
         // Retry the held packet first: draining the forwarder's outbound
         // queue below is what frees worker capacity, so this makes progress
         // every 10ms tick instead of deadlocking on a blocking send.
-        if let Some(packet) = pending_forward.take() {
-            match forwarder.try_receive(packet).map_err(forward_error)? {
-                Some(held) => pending_forward = Some(held),
-                None => progress = true,
+        let pending_before = pending_forward.len();
+        flush_forwarding(&forwarder, &mut pending_forward)?;
+        progress |= pending_forward.len() < pending_before;
+        let outbound_before = pending_outbound.len();
+        flush_outbound(
+            &session,
+            &mut pending_outbound,
+            &mut connected,
+            &mut connection_generation,
+        )?;
+        progress |= pending_outbound.len() < outbound_before;
+        if pending_outbound.is_empty() {
+            if let Some(packet) = pending_terminal.take() {
+                pending_terminal =
+                    send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
+                progress |= pending_terminal.is_none();
             }
-        }
-        if let Some(packet) = pending_outbound.take() {
-            pending_outbound =
-                send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
-            progress |= pending_outbound.is_none();
-        }
-        if let Some(packet) = pending_terminal.take() {
-            pending_terminal =
-                send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
-            progress |= pending_terminal.is_none();
         }
 
         // Connection state changes are announced through the wake channel.
@@ -407,10 +414,7 @@ fn run_mode_windows(
         // Client -> terminal / forwarder.
         if connected {
             for _ in 0..CLIENT_READ_BATCH {
-                if pending_forward.is_some()
-                    || pending_outbound.is_some()
-                    || pending_local.is_some()
-                {
+                if pending_forward.len() >= FORWARD_BACKLOG_CAPACITY || pending_local.is_some() {
                     break;
                 }
                 match session.try_read_packet() {
@@ -421,8 +425,7 @@ fn run_mode_windows(
                             pending_local =
                                 Some(PendingLocalFrame::new(&packet).map_err(SessionError::Io)?);
                         } else if is_forward_packet(packet.header()) {
-                            pending_forward =
-                                forwarder.try_receive(packet).map_err(forward_error)?;
+                            enqueue_forwarding(&forwarder, &mut pending_forward, packet)?;
                         } else {
                             let (local, control) = forward_client_packet(&session, packet)?;
                             if let Some(packet) = local {
@@ -431,8 +434,9 @@ fn run_mode_windows(
                                 );
                             }
                             if let Some(control) = control {
-                                pending_outbound = send_or_hold(
+                                enqueue_outbound(
                                     &session,
+                                    &mut pending_outbound,
                                     control,
                                     &mut connected,
                                     &mut connection_generation,
@@ -457,14 +461,19 @@ fn run_mode_windows(
         }
 
         // Forwarding -> client.
-        while pending_outbound.is_none() {
+        while pending_outbound.is_empty() {
             let Some(packet) = forwarder.try_outbound().map_err(forward_error)? else {
                 break;
             };
             progress = true;
-            pending_outbound =
-                send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
-            if pending_outbound.is_some() {
+            enqueue_outbound(
+                &session,
+                &mut pending_outbound,
+                packet,
+                &mut connected,
+                &mut connection_generation,
+            )?;
+            if !pending_outbound.is_empty() {
                 break;
             }
         }
@@ -489,6 +498,77 @@ fn drain_available(wake: &mut LocalStream) -> Result<bool, SessionError> {
             Err(error) => return Err(SessionError::Io(error)),
         }
     }
+}
+
+fn enqueue_forwarding(
+    forwarder: &Forwarder,
+    pending: &mut VecDeque<Packet>,
+    packet: Packet,
+) -> Result<(), SessionError> {
+    if pending.is_empty() {
+        if let Some(packet) = forwarder.try_receive(packet).map_err(forward_error)? {
+            pending.push_back(packet);
+        }
+    } else {
+        debug_assert!(pending.len() < FORWARD_BACKLOG_CAPACITY);
+        pending.push_back(packet);
+    }
+    Ok(())
+}
+
+fn flush_forwarding(
+    forwarder: &Forwarder,
+    pending: &mut VecDeque<Packet>,
+) -> Result<(), SessionError> {
+    while let Some(packet) = pending.pop_front() {
+        if let Some(packet) = forwarder.try_receive(packet).map_err(forward_error)? {
+            pending.push_front(packet);
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn enqueue_outbound(
+    session: &ActiveSession,
+    pending: &mut VecDeque<Packet>,
+    packet: Packet,
+    connected: &mut bool,
+    connection_generation: &mut u64,
+) -> Result<(), SessionError> {
+    if pending.is_empty() {
+        if let Some(packet) = send_or_hold(session, packet, connected, connection_generation)? {
+            pending.push_back(packet);
+        }
+    } else if packet.header() == TerminalPacketType::KeepAlive as u8
+        && pending.len() == FORWARD_BACKLOG_CAPACITY
+        && pending
+            .back()
+            .is_some_and(|queued| queued.header() == TerminalPacketType::KeepAlive as u8)
+    {
+        // Keep-alive acknowledgements are cumulative, so the newest response
+        // supersedes an older unsent response without growing the queue.
+        *pending.back_mut().expect("checked above") = packet;
+    } else {
+        debug_assert!(pending.len() < FORWARD_BACKLOG_CAPACITY);
+        pending.push_back(packet);
+    }
+    Ok(())
+}
+
+fn flush_outbound(
+    session: &ActiveSession,
+    pending: &mut VecDeque<Packet>,
+    connected: &mut bool,
+    connection_generation: &mut u64,
+) -> Result<(), SessionError> {
+    while let Some(packet) = pending.pop_front() {
+        if let Some(packet) = send_or_hold(session, packet, connected, connection_generation)? {
+            pending.push_front(packet);
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn send_or_hold(

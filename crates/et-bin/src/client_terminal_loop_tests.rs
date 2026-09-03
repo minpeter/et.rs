@@ -118,7 +118,7 @@ fn remote_completion_bounds_a_retained_packet_behind_stalled_output() {
             .send(finish_remote_completion(
                 output,
                 Some(retained),
-                None,
+                VecDeque::new(),
                 true,
                 &mut terminal_modes,
                 &mut forwarder,
@@ -159,7 +159,7 @@ fn remote_completion_attempts_retained_output_before_draining() {
     let error = finish_remote_completion(
         output,
         Some(retained),
-        None,
+        VecDeque::new(),
         true,
         &mut terminal_modes,
         &mut forwarder,

@@ -61,6 +61,8 @@ where
         et_net::local::minimize_terminal_output_buffering(&router)
             .map_err(|error| format!("could not bound terminal output buffering: {error}"))?;
     }
+    #[cfg(unix)]
+    let motd = crate::terminal_motd::load();
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -114,7 +116,11 @@ where
                 if !output_delay.is_zero() {
                     thread::sleep(output_delay);
                 }
-                forward_output(&mut pty_reader, &worker_writer, &worker_cancelled)
+                #[cfg(unix)]
+                let prefix = motd.as_deref();
+                #[cfg(not(unix))]
+                let prefix = None;
+                forward_output(&mut pty_reader, &worker_writer, &worker_cancelled, prefix)
             });
             let _ = output_tx.send(WorkerEvent::Output(result));
             signal(output_wake);
@@ -183,10 +189,6 @@ where
                 .lock()
                 .map_err(|_| "terminal router writer is unavailable".to_owned())?;
             started(&mut writer)?;
-            // Keep startup status ahead of every user-visible byte while
-            // preserving current-main's MOTD-before-shell ordering.
-            #[cfg(unix)]
-            crate::terminal_motd::emit(&mut writer)?;
             Ok(())
         });
     let output_started = setup.is_ok();
@@ -292,28 +294,76 @@ fn forward_output(
     reader: &mut dyn Read,
     router: &Mutex<LocalStream>,
     cancelled: &AtomicBool,
+    prefix: Option<&[u8]>,
 ) -> Result<(), String> {
+    if let Some(prefix) = prefix {
+        for chunk in prefix.chunks(MAX_OUTPUT_CHUNK) {
+            write_output(router, cancelled, chunk)?;
+        }
+    }
     let mut buffer = [0u8; MAX_OUTPUT_CHUNK];
+    let mut startup = prefix.map(|_| Vec::with_capacity(3));
     loop {
         let count = reader
             .read(&mut buffer)
             .map_err(|error| format!("could not read PTY output: {error}"))?;
         if count == 0 {
+            if let Some(startup) = startup {
+                write_output(router, cancelled, &startup)?;
+            }
             return Ok(());
         }
-        let message = TerminalBuffer {
-            buffer: Some(buffer[..count].to_vec()),
-        };
-        let packet = Packet::new(
-            TerminalPacketType::TerminalBuffer as u8,
-            message.encode_to_vec(),
-        );
-        let mut router = router
-            .lock()
-            .map_err(|_| "terminal router writer is unavailable".to_owned())?;
-        write_local_packet_until_cancelled(&mut *router, &packet, cancelled)
-            .map_err(|error| format!("could not forward PTY output: {error}"))?;
+        if let Some(mut pending) = startup.take() {
+            let mut consumed = 0;
+            while consumed < count && pending.len() < 3 {
+                pending.push(buffer[consumed]);
+                consumed += 1;
+                if pending == b"\n" || pending == b"\r\n" || pending == b"\r\r\n" {
+                    pending.clear();
+                    break;
+                }
+                if !b"\r\r\n".starts_with(&pending) && !b"\r\n".starts_with(&pending) {
+                    break;
+                }
+            }
+            if !pending.is_empty()
+                && (b"\r\r\n".starts_with(&pending) || b"\r\n".starts_with(&pending))
+                && pending.len() < 3
+            {
+                startup = Some(pending);
+                if consumed == count {
+                    continue;
+                }
+            } else {
+                write_output(router, cancelled, &pending)?;
+            }
+            write_output(router, cancelled, &buffer[consumed..count])?;
+            continue;
+        }
+        write_output(router, cancelled, &buffer[..count])?;
     }
+}
+
+fn write_output(
+    router: &Mutex<LocalStream>,
+    cancelled: &AtomicBool,
+    output: &[u8],
+) -> Result<(), String> {
+    if output.is_empty() {
+        return Ok(());
+    }
+    let message = TerminalBuffer {
+        buffer: Some(output.to_vec()),
+    };
+    let packet = Packet::new(
+        TerminalPacketType::TerminalBuffer as u8,
+        message.encode_to_vec(),
+    );
+    let mut router = router
+        .lock()
+        .map_err(|_| "terminal router writer is unavailable".to_owned())?;
+    write_local_packet_until_cancelled(&mut *router, &packet, cancelled)
+        .map_err(|error| format!("could not forward PTY output: {error}"))
 }
 
 struct PumpCompletion {
@@ -561,6 +611,51 @@ mod tests {
     use prost::Message;
     use std::io::Cursor;
 
+    struct SegmentedReader {
+        segments: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    impl Read for SegmentedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let Some(segment) = self.segments.pop_front() else {
+                return Ok(0);
+            };
+            buffer[..segment.len()].copy_from_slice(&segment);
+            Ok(segment.len())
+        }
+    }
+
+    fn collect_forwarded(segments: &[&[u8]], prefix: Option<&[u8]>) -> (Vec<Vec<u8>>, Vec<u8>) {
+        let (writer, mut peer) = et_net::local::wake_pair().unwrap();
+        let (packets_tx, packets_rx) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let mut packets = Vec::new();
+            loop {
+                match read_local_packet(&mut peer) {
+                    Ok(packet) => packets.push(
+                        TerminalBuffer::decode(packet.payload())
+                            .unwrap()
+                            .buffer
+                            .unwrap(),
+                    ),
+                    Err(et_net::local_packet::LocalPacketError::TruncatedPrefix) => break,
+                    Err(error) => panic!("reading forwarded output packet: {error}"),
+                }
+            }
+            let _ = packets_tx.send(packets);
+        });
+        let writer = Mutex::new(writer);
+        let cancelled = AtomicBool::new(false);
+        let mut reader = SegmentedReader {
+            segments: segments.iter().map(|segment| segment.to_vec()).collect(),
+        };
+        forward_output(&mut reader, &writer, &cancelled, prefix).unwrap();
+        drop(writer);
+        let packets = packets_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let output = packets.concat();
+        (packets, output)
+    }
+
     #[cfg(unix)]
     #[test]
     fn normal_immediate_exit_drains_delayed_output_before_eof() {
@@ -671,6 +766,7 @@ mod tests {
                 &mut Cursor::new(b"immediate output"),
                 &worker_writer,
                 &worker_cancelled,
+                None,
             )
         });
 
@@ -693,5 +789,41 @@ mod tests {
             TerminalPacketType::TerminalBuffer as u8
         );
         worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn maximum_motd_is_split_into_local_frame_sized_chunks() {
+        let output = vec![b'x'; crate::terminal_motd::MAX_MOTD_TOTAL];
+
+        let (packets, forwarded) = collect_forwarded(&[], Some(&output));
+
+        assert_eq!(packets.len(), output.len().div_ceil(MAX_OUTPUT_CHUNK));
+        assert!(packets
+            .iter()
+            .all(|packet| packet.len() == MAX_OUTPUT_CHUNK));
+        assert_eq!(forwarded, output);
+    }
+
+    #[test]
+    fn motd_newline_elision_is_independent_of_pty_read_boundaries() {
+        for segments in [
+            vec![b"\r".as_slice(), b"\r\nprompt".as_slice()],
+            vec![b"\r\r".as_slice(), b"\nprompt".as_slice()],
+            vec![b"\r".as_slice(), b"\n".as_slice(), b"prompt".as_slice()],
+            vec![b"\n".as_slice(), b"prompt".as_slice()],
+        ] {
+            let (_, output) = collect_forwarded(&segments, Some(b"motd\r\n"));
+            assert_eq!(output, b"motd\r\nprompt", "segments={segments:?}");
+        }
+    }
+
+    #[test]
+    fn unmatched_startup_bytes_are_preserved_across_pty_reads() {
+        let (_, output) = collect_forwarded(
+            &[b"\r".as_slice(), b"Xprompt".as_slice()],
+            Some(b"motd\r\n"),
+        );
+
+        assert_eq!(output, b"motd\r\n\rXprompt");
     }
 }

@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::net::{IpAddr, Ipv6Addr};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -59,6 +59,52 @@ fn two_forwarders_relay_a_real_tcp_round_trip() {
     assert_eq!(&echoed, b"hello");
 
     drop(application);
+    source.shutdown().unwrap();
+    destination.shutdown().unwrap();
+    echo.join().unwrap();
+}
+
+#[test]
+fn forwarded_tcp_delivers_reply_after_client_write_shutdown() {
+    // Given: a real forwarded TCP stream to an echo server that replies only
+    // after it observes EOF, then half-closes its own write side.
+    const PAYLOAD_LEN: usize = 20 * 1024;
+    let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|index| index as u8).collect();
+    let destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let destination_port = destination.local_addr().unwrap().port();
+    let echo = thread::spawn(move || {
+        let (mut stream, _) = destination.accept().unwrap();
+        stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+        stream.set_write_timeout(Some(TIMEOUT)).unwrap();
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).unwrap();
+        stream.write_all(&received).unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+    });
+    let source_port = reserve_port();
+    let source = Forwarder::start(vec![request(source_port, destination_port)]).unwrap();
+    let destination = Forwarder::start(Vec::new()).unwrap();
+    let mut application = TcpStream::connect((Ipv4Addr::LOCALHOST, source_port)).unwrap();
+    application.set_read_timeout(Some(TIMEOUT)).unwrap();
+    application.set_write_timeout(Some(TIMEOUT)).unwrap();
+    destination
+        .receive(source.wait_outbound(TIMEOUT).unwrap())
+        .unwrap();
+    source
+        .receive(destination.wait_outbound(TIMEOUT).unwrap())
+        .unwrap();
+
+    // When: the client writes the whole payload and half-closes its write side.
+    application.write_all(&payload).unwrap();
+    application.shutdown(Shutdown::Write).unwrap();
+    relay_forward_data_until_close(&source, &destination);
+    relay_forward_data_until_close(&destination, &source);
+
+    // Then: the echoed bytes arrive byte-exact before EOF.
+    let mut reply = Vec::new();
+    application.read_to_end(&mut reply).unwrap();
+    assert_eq!(reply, payload);
+
     source.shutdown().unwrap();
     destination.shutdown().unwrap();
     echo.join().unwrap();
@@ -620,6 +666,26 @@ fn assert_authenticated_wildcard_rejected(loopback: IpAddr, wildcard: IpAddr, ow
 
 fn request(source: u16, destination: u16) -> PortForwardSourceRequest {
     request_on("127.0.0.1", source, destination)
+}
+
+fn port_forward_data_closed(packet: &Packet) -> bool {
+    if packet.header() != TerminalPacketType::PortForwardData as u8 {
+        return false;
+    }
+    et_core::proto::PortForwardData::decode(packet.payload())
+        .ok()
+        .is_some_and(|data| data.closed.unwrap_or(false) || data.error.is_some())
+}
+
+fn relay_forward_data_until_close(from: &Forwarder, to: &Forwarder) {
+    loop {
+        let packet = from.wait_outbound(TIMEOUT).unwrap();
+        let closed = port_forward_data_closed(&packet);
+        to.receive(packet).unwrap();
+        if closed {
+            break;
+        }
+    }
 }
 
 fn request_on(host: &str, source: u16, destination: u16) -> PortForwardSourceRequest {

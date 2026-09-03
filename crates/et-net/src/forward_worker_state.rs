@@ -13,8 +13,8 @@ use prost::Message;
 use crate::forward_endpoint::Endpoint;
 
 use super::{
-    spawn_connector, spawn_io, ActiveIo, ForwardError, ForwardStream, Role, Worker, WriteCommand,
-    MAX_ACTIVE_SOCKETS, MAX_DATA_PACKET,
+    close_write, spawn_connector, spawn_io, ActiveIo, ForwardError, ForwardStream, Role, Worker,
+    WriteCommand, MAX_ACTIVE_SOCKETS, MAX_DATA_PACKET,
 };
 
 impl Worker {
@@ -153,8 +153,21 @@ impl Worker {
         } else {
             Role::Source
         };
-        if data.closed.unwrap_or(false) || data.error.is_some() {
+        if data.error.is_some() {
             self.remove(role, socket_id);
+            return Ok(());
+        }
+        if data.closed.unwrap_or(false) {
+            let Some(active) = self.map(role).get_mut(&socket_id) else {
+                return Ok(());
+            };
+            if !close_write(active) {
+                return Err(ForwardError::Unavailable);
+            }
+            let fully_closed = active.read_closed;
+            if fully_closed {
+                self.remove(role, socket_id);
+            }
             return Ok(());
         }
         if buffer.is_empty() {
@@ -186,6 +199,18 @@ impl Worker {
                 .fetch_sub(byte_count, std::sync::atomic::Ordering::AcqRel);
             Err(ForwardError::Unavailable)
         }
+    }
+
+    pub(super) fn read_closed(&mut self, role: Role, socket_id: i32) -> Result<(), ForwardError> {
+        let fully_closed = self.map(role).get_mut(&socket_id).is_some_and(|active| {
+            active.read_closed = true;
+            active.write_closed
+        });
+        self.send_data(role, socket_id, Vec::new(), true, None)?;
+        if fully_closed {
+            self.remove(role, socket_id);
+        }
+        Ok(())
     }
 
     pub(super) fn send_data(

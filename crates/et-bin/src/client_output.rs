@@ -12,6 +12,7 @@ use std::os::fd::AsFd;
 use std::process::{ChildStderr, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use et_cli::client::FlowControlMode;
 #[cfg(unix)]
@@ -19,6 +20,7 @@ use et_net::local::LocalStream;
 
 const OUTPUT_BYTES: usize = 64 * 1024;
 const OUTPUT_PACKETS: usize = 4096;
+pub(crate) const GRACEFUL_DRAIN_STALL_TIMEOUT: Duration = Duration::from_secs(1);
 
 struct OutputEntry {
     bytes: Vec<u8>,
@@ -32,6 +34,7 @@ struct State {
     error: Option<io::Error>,
     cursor_reports: usize,
     worker_done: bool,
+    worker_progress: usize,
 }
 
 struct Shared {
@@ -106,9 +109,15 @@ impl ConsoleOutput {
             let child = Arc::new(Mutex::new(child));
             let cancel_child = Arc::clone(&child);
             let graceful_child = Arc::clone(&child);
-            Self::new_with_lifecycle(
+            Self::new_with_lifecycle_factory(
                 mode,
-                Box::new(WindowsHelperWriter { input, ack }),
+                move |shared| {
+                    Box::new(WindowsHelperWriter {
+                        input,
+                        ack,
+                        shared: Arc::clone(shared),
+                    })
+                },
                 Box::new(move || cancel_windows_helper(&cancel_child)),
                 Box::new(move || wait_windows_helper(&graceful_child)),
             )
@@ -131,10 +140,22 @@ impl ConsoleOutput {
 
     pub(crate) fn new_with_lifecycle(
         mode: FlowControlMode,
-        mut writer: Box<dyn Write + Send>,
+        writer: Box<dyn Write + Send>,
         cancel: Box<dyn FnOnce() + Send>,
         graceful_finish: Box<dyn FnOnce() -> io::Result<()> + Send>,
     ) -> io::Result<Self> {
+        Self::new_with_lifecycle_factory(mode, move |_| writer, cancel, graceful_finish)
+    }
+
+    fn new_with_lifecycle_factory<F>(
+        mode: FlowControlMode,
+        writer: F,
+        cancel: Box<dyn FnOnce() + Send>,
+        graceful_finish: Box<dyn FnOnce() -> io::Result<()> + Send>,
+    ) -> io::Result<Self>
+    where
+        F: FnOnce(&Arc<Shared>) -> Box<dyn Write + Send>,
+    {
         #[cfg(unix)]
         let (capacity_wake, mut capacity_signal) = {
             let (wake, signal) = et_net::local::wake_pair()?;
@@ -175,9 +196,11 @@ impl ConsoleOutput {
                 error: None,
                 cursor_reports: 0,
                 worker_done: false,
+                worker_progress: 0,
             }),
             wake: Condvar::new(),
         });
+        let mut writer = writer(&shared);
         let worker_shared = Arc::clone(&shared);
         let worker = thread::Builder::new()
             .name("et-console-output".to_owned())
@@ -315,7 +338,15 @@ impl ConsoleOutput {
     }
 
     pub(crate) fn finish_gracefully(&mut self) -> io::Result<()> {
-        let Some(shared) = &self.shared else {
+        self.finish_gracefully_with_stall(false)
+    }
+
+    pub(crate) fn finish_gracefully_after_stall(&mut self) -> io::Result<()> {
+        self.finish_gracefully_with_stall(true)
+    }
+
+    fn finish_gracefully_with_stall(&mut self, already_stalled: bool) -> io::Result<()> {
+        let Some(shared) = self.shared.clone() else {
             return Ok(());
         };
         {
@@ -326,14 +357,31 @@ impl ConsoleOutput {
             state.stopping = true;
             shared.wake.notify_all();
         }
-        if let Some(worker) = self.worker.take() {
-            worker
-                .join()
-                .map_err(|_| io::Error::other("console output worker panicked"))?;
+        let stalled = already_stalled || wait_for_graceful_drain(&shared)?;
+        if stalled {
+            if let Some(cancel) = self.cancel.take() {
+                cancel();
+            }
         }
-        self.check_error()?;
-        if let Some(finish) = self.graceful_finish.take() {
-            finish()?;
+        // Cancellation normally wakes the writer immediately. A blocking
+        // descriptor can still race between poll readiness and its write,
+        // though, so never turn the bounded drain into an unbounded join.
+        let worker_done = !stalled || !wait_for_graceful_drain(&shared)?;
+        if worker_done {
+            if let Some(worker) = self.worker.take() {
+                worker
+                    .join()
+                    .map_err(|_| io::Error::other("console output worker panicked"))?;
+            }
+            self.check_error()?;
+            if let Some(finish) = self.graceful_finish.take() {
+                finish()?;
+            }
+        } else {
+            // Dropping a JoinHandle detaches the irrecoverably blocked writer.
+            // The client is already terminating and the worker retains its Arc.
+            self.worker = None;
+            self.graceful_finish = None;
         }
         self.cancel = None;
         self.shared = None;
@@ -352,6 +400,17 @@ impl ConsoleOutput {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    pub(crate) fn worker_progress(&self) -> io::Result<usize> {
+        let Some(shared) = &self.shared else {
+            return Ok(0);
+        };
+        let state = shared
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("console output worker unavailable"))?;
+        Ok(state.worker_progress)
     }
 
     #[cfg(unix)]
@@ -377,7 +436,8 @@ impl ConsoleOutput {
 
 impl Drop for ConsoleOutput {
     fn drop(&mut self) {
-        if let Some(shared) = &self.shared {
+        let shared = self.shared.clone();
+        if let Some(shared) = &shared {
             if let Ok(mut state) = shared.state.lock() {
                 state.stopping = true;
                 shared.wake.notify_all();
@@ -387,8 +447,15 @@ impl Drop for ConsoleOutput {
         if let Some(cancel) = self.cancel.take() {
             cancel();
         }
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        let worker_done = shared
+            .as_deref()
+            .is_none_or(|shared| matches!(wait_for_graceful_drain(shared), Ok(false)));
+        if worker_done {
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        } else {
+            self.worker = None;
         }
     }
 }
@@ -430,7 +497,9 @@ fn run_writer(
         };
         #[cfg(unix)]
         signal_capacity(capacity_signal);
-        if let Err(error) = writer.write_all(&bytes.bytes).and_then(|()| writer.flush()) {
+        if let Err(error) =
+            write_all_with_progress(shared, writer, &bytes.bytes).and_then(|()| writer.flush())
+        {
             if let Ok(mut state) = shared.state.lock() {
                 state.error = Some(error);
                 state.stopping = true;
@@ -452,10 +521,67 @@ fn run_writer(
     }
 }
 
+fn write_all_with_progress(
+    shared: &Shared,
+    writer: &mut dyn Write,
+    mut bytes: &[u8],
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match writer.write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(count) => {
+                bytes = &bytes[count..];
+                report_worker_progress(shared)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn report_worker_progress(shared: &Shared) -> io::Result<()> {
+    let mut state = shared
+        .state
+        .lock()
+        .map_err(|_| io::Error::other("console output worker unavailable"))?;
+    state.worker_progress = state.worker_progress.wrapping_add(1);
+    shared.wake.notify_all();
+    Ok(())
+}
+
+fn wait_for_graceful_drain(shared: &Shared) -> io::Result<bool> {
+    let mut state = shared
+        .state
+        .lock()
+        .map_err(|_| io::Error::other("console output worker unavailable"))?;
+    let mut progress = state.worker_progress;
+    let mut deadline = Instant::now() + GRACEFUL_DRAIN_STALL_TIMEOUT;
+    while !state.worker_done {
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(true);
+        }
+        let (next, timeout) = shared
+            .wake
+            .wait_timeout(state, deadline.saturating_duration_since(now))
+            .map_err(|_| io::Error::other("console output worker unavailable"))?;
+        state = next;
+        if state.worker_progress != progress {
+            progress = state.worker_progress;
+            deadline = Instant::now() + GRACEFUL_DRAIN_STALL_TIMEOUT;
+        } else if timeout.timed_out() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(windows)]
 struct WindowsHelperWriter {
     input: ChildStdin,
     ack: ChildStderr,
+    shared: Arc<Shared>,
 }
 
 #[cfg(windows)]
@@ -466,13 +592,28 @@ impl Write for WindowsHelperWriter {
         self.input.write_all(&length.to_le_bytes())?;
         self.input.write_all(bytes)?;
         self.input.flush()?;
-        let mut ack = [0u8; 1];
-        std::io::Read::read_exact(&mut self.ack, &mut ack)?;
-        if ack != [1] {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "console helper acknowledgement is invalid",
-            ));
+        let mut acknowledged = 0usize;
+        loop {
+            let mut ack = [0u8; 4];
+            std::io::Read::read_exact(&mut self.ack, &mut ack)?;
+            let count = u32::from_le_bytes(ack) as usize;
+            if count == 0 {
+                if acknowledged == bytes.len() {
+                    break;
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "console helper acknowledgement is incomplete",
+                ));
+            }
+            if count > bytes.len() - acknowledged {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "console helper acknowledgement is invalid",
+                ));
+            }
+            acknowledged += count;
+            report_worker_progress(&self.shared)?;
         }
         Ok(bytes.len())
     }
@@ -518,13 +659,30 @@ pub(crate) fn run_windows_helper() -> i32 {
             Err(_) => return 1,
         }
         let mut bytes = vec![0u8; u32::from_le_bytes(length) as usize];
-        if std::io::Read::read_exact(&mut input, &mut bytes).is_err()
-            || output
-                .write_all(&bytes)
-                .and_then(|()| output.flush())
+        if bytes.is_empty() || std::io::Read::read_exact(&mut input, &mut bytes).is_err() {
+            return 1;
+        }
+        let mut remaining = bytes.as_slice();
+        while !remaining.is_empty() {
+            let chunk = &remaining[..remaining.len().min(4096)];
+            let count = match output.write(chunk) {
+                Ok(0) => return 1,
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return 1,
+            };
+            remaining = &remaining[count..];
+            if acknowledgements
+                .write_all(&(count as u32).to_le_bytes())
+                .and_then(|()| acknowledgements.flush())
                 .is_err()
+            {
+                return 1;
+            }
+        }
+        if output.flush().is_err()
             || acknowledgements
-                .write_all(&[1])
+                .write_all(&0u32.to_le_bytes())
                 .and_then(|()| acknowledgements.flush())
                 .is_err()
         {
@@ -571,6 +729,16 @@ impl Write for CancellableStdout {
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         "console output cancelled",
+                    ));
+                }
+                Ok(_)
+                    if descriptors[0]
+                        .revents()
+                        .intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) =>
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "console output is unavailable",
                     ));
                 }
                 Ok(_) if descriptors[0].revents().contains(PollFlags::OUT) => {

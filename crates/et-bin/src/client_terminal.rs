@@ -241,6 +241,10 @@ impl RetainedCompletion {
         }
         Ok(self.forwarding.is_none() && self.terminal.is_none())
     }
+
+    pub(crate) fn terminal_pending(&self) -> bool {
+        self.terminal.is_some()
+    }
 }
 
 pub(crate) fn display_packet_with<F>(

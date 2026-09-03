@@ -53,6 +53,16 @@ pub(crate) struct ActiveSession {
     /// Only one recover may run at a time. Concurrent returning clients used
     /// to queue on the connection mutex for minutes after a blackhole write.
     recovering: AtomicBool,
+    /// Orders full teardown against the recovery admission claim. The
+    /// recovery handshake itself runs without this lock.
+    recover_admission: Mutex<()>,
+    #[cfg(test)]
+    recover_admission_hook: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     connection_generation: AtomicU64,
     flow_control: Option<Arc<FlowControl>>,
     flow_writer: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -141,6 +151,9 @@ impl ActiveSession {
             shutdown: AtomicBool::new(false),
             torn_down: AtomicBool::new(false),
             recovering: AtomicBool::new(false),
+            recover_admission: Mutex::new(()),
+            #[cfg(test)]
+            recover_admission_hook: Mutex::new(None),
             connection_generation: AtomicU64::new(0),
             flow_control: queue_mode.map(|mode| Arc::new(FlowControl::new(mode))),
             flow_writer: Mutex::new(None),
@@ -166,6 +179,15 @@ impl ActiveSession {
             .as_ref()
             .expect("test session must enable flow control")
             .install_enqueue_hook(reached);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_recover_admission_hook(
+        &self,
+        reached: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.recover_admission_hook.lock().unwrap() = Some((reached, release));
     }
 
     pub(crate) fn send_packet(&self, header: u8, payload: &[u8]) -> Result<(), SessionError> {
@@ -314,7 +336,13 @@ impl ActiveSession {
     }
 
     pub(crate) fn shutdown(&self) -> Result<(), SessionError> {
-        self.torn_down.store(true, Ordering::Release);
+        {
+            let _admission = self
+                .recover_admission
+                .lock()
+                .map_err(|_| SessionError::Unavailable)?;
+            self.torn_down.store(true, Ordering::Release);
+        }
         self.shutdown.store(true, Ordering::Release);
         self.join_flow_writer(false)?;
         let _ = self.signal();
@@ -476,6 +504,38 @@ mod tests {
             permit.complete(candidate),
             Err(SessionError::Unavailable)
         ));
+        assert!(!session.recovering.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn teardown_winning_during_recover_admission_rejects_and_releases_claim() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || TcpStream::connect(address).unwrap());
+        let (stream, _) = listener.accept().unwrap();
+        let _peer = peer.join().unwrap();
+        let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
+        let session = Arc::new(
+            ActiveSession::new(Connection::new_server(stream, &[7; 32]), &terminal, None).unwrap(),
+        );
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        session.install_recover_admission_hook(reached_tx, release_rx);
+
+        std::thread::scope(|scope| {
+            let recovering = Arc::clone(&session);
+            let attempt = scope.spawn(move || {
+                assert!(matches!(
+                    recovering.try_begin_recover(),
+                    Err(SessionError::Unavailable)
+                ));
+            });
+            reached_rx.recv().unwrap();
+            session.shutdown().unwrap();
+            release_tx.send(()).unwrap();
+            attempt.join().unwrap();
+        });
+
         assert!(!session.recovering.load(Ordering::Acquire));
     }
 }

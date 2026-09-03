@@ -1,5 +1,7 @@
 ---
-et: patch
+packages:
+  et:
+    type: patch
 ---
 
 Keep a saturated port forward moving in both directions at once. A large

@@ -15,6 +15,14 @@
 
 use std::ffi::OsString;
 
+// A global allocator is a whole-program decision, so it is declared here in the
+// shipped binary rather than in a library that every role links. jemalloc is
+// used on Linux because its safe control API can return idle arenas to the
+// kernel; the system allocator's trim entry point would need forbidden FFI.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn main() {
     #[cfg(windows)]
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__et-console-writer")) {

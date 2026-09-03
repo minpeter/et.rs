@@ -15,8 +15,8 @@ use crossbeam_channel as channel;
 use crate::forward::{ForwardError, Outbound};
 use crate::forward_endpoint::ForwardStream;
 use crate::forward_io::{
-    abort_io, spawn_connector, spawn_io, spawn_listener, stop_io, ActiveIo, BoundSource,
-    ListenerStop, WriteCommand,
+    abort_io, close_write, spawn_connector, spawn_io, spawn_listener, stop_io, ActiveIo,
+    BoundSource, ListenerStop, WriteCommand,
 };
 use et_core::packet::Packet;
 use et_core::proto::SocketEndpoint;
@@ -370,10 +370,7 @@ impl Worker {
                     socket_id,
                     buffer,
                 } => self.send_data(role, socket_id, buffer, false, None),
-                Command::Closed { role, socket_id } => {
-                    self.remove(role, socket_id);
-                    self.send_data(role, socket_id, Vec::new(), true, None)
-                }
+                Command::Closed { role, socket_id } => self.read_closed(role, socket_id),
                 Command::IoFailed {
                     role,
                     socket_id,

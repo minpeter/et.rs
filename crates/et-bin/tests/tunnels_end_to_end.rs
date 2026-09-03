@@ -645,7 +645,9 @@ fn cli_local_and_reverse_tunnels_relay_real_tcp_payloads() {
         None,
     );
     await_fifo(&reverse_gate, &mut reverse_client);
-    assert_ready_tcp_round_trip(reverse_source_port, b"reverse");
+    if let Err(error) = ready_tcp_round_trip(reverse_source_port, b"reverse") {
+        panic_tunnel_failure(error, &mut reverse_client, &mut stack);
+    }
     stop(&mut reverse_client);
     reverse_echo.join().unwrap();
     stack.shutdown();
@@ -707,10 +709,9 @@ fn cli_ssh_agent_forwarding_relays_a_real_unix_socket() {
     let remote_agent_path = await_fifo(&gate, &mut client);
     let mut remote = UnixStream::connect(&remote_agent_path).unwrap();
     remote.set_read_timeout(Some(TIMEOUT)).unwrap();
-    remote.write_all(b"agent").unwrap();
-    let mut echoed = [0u8; 5];
-    remote.read_exact(&mut echoed).unwrap();
-    assert_eq!(&echoed, b"agent");
+    if let Err(error) = try_stream_round_trip(&mut remote, b"agent") {
+        panic_tunnel_failure(error, &mut client, &mut stack);
+    }
     drop(remote);
     stop(&mut client);
     agent_echo.join().unwrap();
@@ -883,9 +884,13 @@ fn try_stream_round_trip(stream: &mut (impl Read + Write), payload: &[u8]) -> st
 }
 
 fn assert_ready_tcp_round_trip(port: u16, payload: &[u8]) {
+    ready_tcp_round_trip(port, payload).unwrap();
+}
+
+fn ready_tcp_round_trip(port: u16, payload: &[u8]) -> std::io::Result<()> {
     let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
     stream.set_read_timeout(Some(TIMEOUT)).unwrap();
-    try_stream_round_trip(&mut stream, payload).unwrap();
+    try_stream_round_trip(&mut stream, payload)
 }
 
 fn assert_unix_round_trip(path: &std::path::Path, payload: &[u8]) {
@@ -977,4 +982,22 @@ fn await_fifo(path: &std::path::Path, child: &mut Child) -> String {
 fn stop(child: &mut Child) {
     child.kill().unwrap();
     let _ = child.wait().unwrap();
+}
+
+fn panic_tunnel_failure(error: std::io::Error, child: &mut Child, stack: &mut Stack) -> ! {
+    let status_before = child.try_wait().unwrap();
+    if status_before.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let status_after = child.try_wait().unwrap();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    let server = stack.failure_diagnostics();
+    panic!(
+        "tunnel round-trip failed: {error}; client status before={status_before:?} \
+         after={status_after:?}; client stderr={stderr}; {server}"
+    );
 }

@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::process::{Command, Stdio};
@@ -88,6 +88,24 @@ impl Stack {
         let pid = Pid::from_raw(i32::try_from(server.id()).unwrap());
         kill(pid, Signal::SIGTERM).unwrap();
         assert!(server.wait_timeout(TIMEOUT).unwrap().unwrap().success());
+    }
+
+    pub fn failure_diagnostics(&mut self) -> String {
+        let Some(mut server) = self.server.take() else {
+            return "server already stopped".to_owned();
+        };
+        let status_before = server.try_wait().unwrap();
+        if status_before.is_none() {
+            let pid = Pid::from_raw(i32::try_from(server.id()).unwrap());
+            let _ = kill(pid, Signal::SIGTERM);
+            let _ = server.wait_timeout(TIMEOUT);
+        }
+        let status_after = server.try_wait().unwrap();
+        let mut stderr = String::new();
+        if let Some(mut pipe) = server.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        format!("server status before={status_before:?} after={status_after:?}; stderr={stderr}")
     }
 }
 

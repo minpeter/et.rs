@@ -20,7 +20,7 @@ pub struct Stack {
     pub terminal: std::path::PathBuf,
     pub ssh_count: std::path::PathBuf,
     pub port: u16,
-    pub server: Option<std::process::Child>,
+    server: Option<std::process::Child>,
 }
 
 impl Stack {
@@ -47,11 +47,9 @@ impl Stack {
             ),
         )
         .unwrap();
-        let server_forward_trace = directory.join("server-forward.trace");
         let mut server = Command::new(env!("CARGO_BIN_EXE_et"))
             .args(["server", "--cfgfile"])
             .arg(&config)
-            .env("ET_FORWARD_TRACE", &server_forward_trace)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

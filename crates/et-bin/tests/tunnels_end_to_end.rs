@@ -39,10 +39,6 @@ fn ssh_config_local_tunnel_relays_while_remote_forward_is_omitted() {
     client
         .env("PATH", &stack.directory)
         .env("ET_SSH_COUNT", &stack.ssh_count)
-        .env(
-            "ET_FORWARD_TRACE",
-            stack.directory.join("client-forward.trace"),
-        )
         .env("ET_SSH_CONFIG", config)
         .env("ET_SSH_READY", &gate)
         .stdin(Stdio::null())
@@ -783,23 +779,19 @@ fn spawn_client(
 ) -> Child {
     let command = if agent.is_some() {
         format!(
-            "printf %s \"$SSH_AUTH_SOCK\" > {}; exec tail -f /dev/null",
-            shell_quote(gate.to_str().unwrap())
+            "printf %s \"$SSH_AUTH_SOCK\" > {gate}; exec cat < {gate}",
+            gate = shell_quote(gate.to_str().unwrap())
         )
     } else {
         format!(
-            "printf ready > {}; exec tail -f /dev/null",
-            shell_quote(gate.to_str().unwrap())
+            "printf ready > {gate}; exec cat < {gate}",
+            gate = shell_quote(gate.to_str().unwrap())
         )
     };
     let mut process = Command::new(env!("CARGO_BIN_EXE_et"));
     process
         .env("PATH", &stack.directory)
         .env("ET_SSH_COUNT", &stack.ssh_count)
-        .env(
-            "ET_FORWARD_TRACE",
-            stack.directory.join("client-forward.trace"),
-        )
         .env("ET_SHELL", "/bin/sh")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -992,7 +984,7 @@ fn stop(child: &mut Child) {
     let _ = child.wait().unwrap();
 }
 
-fn panic_tunnel_failure(error: std::io::Error, child: &mut Child, stack: &mut Stack) -> ! {
+fn panic_tunnel_failure(error: std::io::Error, child: &mut Child, _stack: &mut Stack) -> ! {
     let status_before = child.try_wait().unwrap();
     if status_before.is_none() {
         let _ = child.kill();
@@ -1003,28 +995,8 @@ fn panic_tunnel_failure(error: std::io::Error, child: &mut Child, stack: &mut St
     if let Some(mut pipe) = child.stderr.take() {
         let _ = pipe.read_to_string(&mut stderr);
     }
-    let server = if let Some(mut server) = stack.server.take() {
-        let status_before = server.try_wait().unwrap();
-        if status_before.is_none() {
-            let _ = server.kill();
-            let _ = server.wait();
-        }
-        let status_after = server.try_wait().unwrap();
-        let mut stderr = String::new();
-        if let Some(mut pipe) = server.stderr.take() {
-            let _ = pipe.read_to_string(&mut stderr);
-        }
-        format!("server status before={status_before:?} after={status_after:?}; stderr={stderr}")
-    } else {
-        "server already stopped".to_owned()
-    };
-    let client_trace =
-        fs::read_to_string(stack.directory.join("client-forward.trace")).unwrap_or_default();
-    let server_trace =
-        fs::read_to_string(stack.directory.join("server-forward.trace")).unwrap_or_default();
     panic!(
         "tunnel round-trip failed: {error}; client status before={status_before:?} \
-         after={status_after:?}; client stderr={stderr}; {server}; \
-         client forwarding trace={client_trace}; server forwarding trace={server_trace}"
+         after={status_after:?}; client stderr={stderr}"
     );
 }

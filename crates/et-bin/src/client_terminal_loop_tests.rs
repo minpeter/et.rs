@@ -81,3 +81,60 @@ fn pending_console_output_does_not_block_terminal_input() {
     release_tx.send(()).unwrap();
     drop(output);
 }
+
+#[test]
+fn remote_completion_bounds_a_retained_packet_behind_stalled_output() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+    let (release_tx, release_rx) = mpsc::channel();
+    let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+    let cancel_observer = std::sync::Arc::clone(&cancelled);
+    let output = crate::client_output::ConsoleOutput::new_with_cancel(
+        et_cli::client::FlowControlMode::Backpressure,
+        Box::new(GatedConsole {
+            entered: entered_tx,
+            release: release_rx,
+        }),
+        Box::new(move || cancel_observer.store(true, Ordering::Release)),
+    )
+    .unwrap();
+    let modes = TerminalModeState::default();
+    assert!(output.try_write(&vec![1; 64 * 1024], &modes).unwrap());
+    assert_eq!(entered_rx.recv().unwrap(), 64 * 1024);
+    assert!(output.try_write(&vec![2; 64 * 1024], &modes).unwrap());
+    let retained = et_core::packet::Packet::new(
+        TerminalPacketType::TerminalBuffer as u8,
+        TerminalBuffer {
+            buffer: Some(b"retained".to_vec()),
+        }
+        .encode_to_vec(),
+    );
+    let mut forwarder = Forwarder::start(Vec::new()).unwrap();
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    thread::spawn(move || {
+        let mut terminal_modes = TerminalModeState::default();
+        done_tx
+            .send(finish_remote_completion(
+                output,
+                Some(retained),
+                None,
+                true,
+                &mut terminal_modes,
+                &mut forwarder,
+                None,
+            ))
+            .unwrap();
+    });
+
+    assert!(done_rx
+        .recv_timeout(Duration::from_secs(4))
+        .expect("retained output kept remote completion blocked")
+        .is_ok());
+    assert!(cancelled.load(Ordering::Acquire));
+
+    // Let the detached writer finish so the test leaves no blocked thread.
+    release_tx.send(()).unwrap();
+    assert_eq!(entered_rx.recv().unwrap(), 64 * 1024);
+    release_tx.send(()).unwrap();
+}

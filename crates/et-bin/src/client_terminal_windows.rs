@@ -18,7 +18,7 @@ use et_core::proto::TerminalPacketType;
 use et_net::connection::Connection;
 use et_net::forward::{is_forward_packet, Forwarder};
 
-use crate::client_output::ConsoleCompletion;
+use crate::client_output::{ConsoleCompletion, GRACEFUL_DRAIN_STALL_TIMEOUT};
 use crate::client_terminal::{
     classify_forward_completion, connection_ended, encoded_buffer, recover_transport,
     terminal_error, terminal_io, terminal_size_payload, terminal_text, write_owned_recovering,
@@ -332,7 +332,7 @@ where
 }
 
 fn finish_remote_completion(
-    output: crate::client_output::ConsoleOutput,
+    mut output: crate::client_output::ConsoleOutput,
     pending_output: Option<et_core::packet::Packet>,
     pending_forward: Option<et_core::packet::Packet>,
     terminal_enabled: bool,
@@ -341,6 +341,10 @@ fn finish_remote_completion(
     current_outbound: Option<et_core::packet::Packet>,
 ) -> Result<(), ClientError> {
     let mut retained = RetainedCompletion::new(pending_output, pending_forward);
+    let mut output_progress = output
+        .worker_progress()
+        .map_err(|error| terminal_io("tracking retained terminal output", error))?;
+    let mut output_deadline = Instant::now() + GRACEFUL_DRAIN_STALL_TIMEOUT;
     loop {
         output
             .check_error()
@@ -363,6 +367,23 @@ fn finish_remote_completion(
             return output
                 .complete(ConsoleCompletion::RemoteSessionEnded)
                 .map_err(|error| terminal_io("draining terminal output", error));
+        }
+        if retained.terminal_pending() {
+            let progress = output
+                .worker_progress()
+                .map_err(|error| terminal_io("tracking retained terminal output", error))?;
+            if progress != output_progress {
+                output_progress = progress;
+                output_deadline = Instant::now() + GRACEFUL_DRAIN_STALL_TIMEOUT;
+            } else if Instant::now() >= output_deadline {
+                let abandoned = forwarder
+                    .shutdown_hard()
+                    .map_err(|error| terminal_text(error.to_string()))?;
+                classify_forward_completion(current_outbound, abandoned)?;
+                return output
+                    .finish_gracefully_after_stall()
+                    .map_err(|error| terminal_io("cancelling stalled terminal output", error));
+            }
         }
         if let Some(packet) = forwarder
             .try_outbound()

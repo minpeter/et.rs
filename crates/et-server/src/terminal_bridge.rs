@@ -1,12 +1,12 @@
 use et_net::local::LocalStream;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::sync::Arc;
 
 use et_core::packet::Packet;
 use et_core::proto::TerminalPacketType;
 use et_net::connection::ConnError;
 use et_net::forward::{is_forward_packet, Forwarder};
-use et_net::local_packet::{write_local_packet, LocalPacketDecoder};
+use et_net::local_packet::{encode_local_packet, LocalPacketDecoder};
 #[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags};
 #[cfg(unix)]
@@ -16,6 +16,34 @@ use crate::session::{ActiveSession, SessionError, SessionWriteError};
 
 const READ_BUFFER: usize = 16 * 1024;
 const CLIENT_READ_BATCH: usize = 64;
+
+struct PendingLocalFrame {
+    bytes: Vec<u8>,
+    offset: usize,
+}
+
+impl PendingLocalFrame {
+    fn new(packet: &Packet) -> io::Result<Self> {
+        Ok(Self {
+            bytes: encode_local_packet(packet)?,
+            offset: 0,
+        })
+    }
+
+    /// Write as much as the non-blocking local stream currently accepts.
+    fn try_write(&mut self, terminal: &mut LocalStream) -> io::Result<bool> {
+        while self.offset < self.bytes.len() {
+            match terminal.write(&self.bytes[self.offset..]) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(count) => self.offset += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(true)
+    }
+}
 
 /// Which upstream server loop this bridge reproduces.
 ///
@@ -78,6 +106,9 @@ fn run_mode_poll(
     // A complete terminal packet already read from the local stream. Retain
     // ownership across backpressure instead of dropping it or reading ahead.
     let mut pending_terminal: Option<Packet> = None;
+    // A partially written client packet. Its frame and offset must survive
+    // local-stream backpressure, and ordered client reads pause behind it.
+    let mut pending_local: Option<PendingLocalFrame> = None;
     let mut terminal_closing = false;
     let mut terminal_eof = false;
     let mut client_buffered = false;
@@ -119,8 +150,13 @@ fn run_mode_poll(
         } else {
             (None, None)
         };
-        let accept_terminal =
-            pending_terminal.is_none() && session.can_buffer_write((READ_BUFFER * 2) as i64)?;
+        let mut terminal_flags = PollFlags::HUP | PollFlags::ERR;
+        if pending_terminal.is_none() && session.can_buffer_write((READ_BUFFER * 2) as i64)? {
+            terminal_flags |= PollFlags::IN;
+        }
+        if pending_local.is_some() {
+            terminal_flags |= PollFlags::OUT;
+        }
         // When the client is down, poll with a short timeout so recovery wakes
         // (via the wake pipe) are still processed promptly and we re-check
         // `session.connected()` after recover installs a new stream.
@@ -129,8 +165,11 @@ fn run_mode_poll(
             &wake,
             forwarder.wake().map_err(forward_error)?,
             client.as_ref(),
-            accept_terminal,
-            pending_forward.is_some() || pending_outbound.is_some() || !connected,
+            terminal_flags,
+            pending_forward.is_some()
+                || pending_outbound.is_some()
+                || pending_local.is_some()
+                || !connected,
             client_buffered,
         )?;
         let client_events_are_stale = wake_events.intersects(PollFlags::IN | PollFlags::HUP);
@@ -143,6 +182,16 @@ fn run_mode_poll(
             session.note_bridge_generation(connection_generation)?;
         }
         terminal_closing |= terminal_events.intersects(PollFlags::HUP | PollFlags::ERR);
+        if pending_local.is_some() && terminal_events.contains(PollFlags::OUT) {
+            let complete = pending_local
+                .as_mut()
+                .expect("checked above")
+                .try_write(&mut terminal)
+                .map_err(SessionError::Io)?;
+            if complete {
+                pending_local = None;
+            }
+        }
         if pending_terminal.is_none()
             && !terminal_eof
             && (terminal_closing || terminal_events.contains(PollFlags::IN))
@@ -178,7 +227,11 @@ fn run_mode_poll(
             && (client_buffered
                 || client_events_are_stale
                 || client_events.contains(PollFlags::IN));
-        if client_data_ready && pending_forward.is_none() && pending_outbound.is_none() {
+        if client_data_ready
+            && pending_forward.is_none()
+            && pending_outbound.is_none()
+            && pending_local.is_none()
+        {
             client_buffered = false;
             for index in 0..CLIENT_READ_BATCH {
                 let read_packet = match session.try_read_packet() {
@@ -186,7 +239,8 @@ fn run_mode_poll(
                     // terminal, which owns the destination connection.
                     Ok(Some(packet)) if mode == BridgeMode::Jumphost => {
                         let packet = jumphost_client_packet(&session, packet)?;
-                        write_local_packet(&mut terminal, &packet).map_err(SessionError::Io)?;
+                        pending_local =
+                            Some(PendingLocalFrame::new(&packet).map_err(SessionError::Io)?);
                         true
                     }
                     Ok(Some(packet)) if is_forward_packet(packet.header()) => {
@@ -194,9 +248,12 @@ fn run_mode_poll(
                         true
                     }
                     Ok(Some(packet)) => {
-                        if let Some(control) =
-                            forward_client_packet(&session, &mut terminal, packet)?
-                        {
+                        let (local, control) = forward_client_packet(&session, packet)?;
+                        if let Some(packet) = local {
+                            pending_local =
+                                Some(PendingLocalFrame::new(&packet).map_err(SessionError::Io)?);
+                        }
+                        if let Some(control) = control {
                             pending_outbound = send_or_hold(
                                 &session,
                                 control,
@@ -223,7 +280,10 @@ fn run_mode_poll(
                 if !read_packet {
                     break;
                 }
-                if pending_forward.is_some() || pending_outbound.is_some() {
+                if pending_forward.is_some()
+                    || pending_outbound.is_some()
+                    || pending_local.is_some()
+                {
                     client_buffered = true;
                     break;
                 }
@@ -283,11 +343,19 @@ fn run_mode_windows(
     let mut pending_forward: Option<Packet> = None;
     let mut pending_outbound: Option<Packet> = None;
     let mut pending_terminal: Option<Packet> = None;
+    let mut pending_local: Option<PendingLocalFrame> = None;
     loop {
         if session.is_shutting_down() {
             return Ok(());
         }
         let mut progress = false;
+
+        if let Some(frame) = pending_local.as_mut() {
+            if frame.try_write(&mut terminal).map_err(SessionError::Io)? {
+                pending_local = None;
+                progress = true;
+            }
+        }
 
         // Retry the held packet first: draining the forwarder's outbound
         // queue below is what frees worker capacity, so this makes progress
@@ -342,7 +410,10 @@ fn run_mode_windows(
         // Client -> terminal / forwarder.
         if connected {
             for _ in 0..CLIENT_READ_BATCH {
-                if pending_forward.is_some() || pending_outbound.is_some() {
+                if pending_forward.is_some()
+                    || pending_outbound.is_some()
+                    || pending_local.is_some()
+                {
                     break;
                 }
                 match session.try_read_packet() {
@@ -350,19 +421,26 @@ fn run_mode_windows(
                         progress = true;
                         if mode == BridgeMode::Jumphost {
                             let packet = jumphost_client_packet(&session, packet)?;
-                            write_local_packet(&mut terminal, &packet).map_err(SessionError::Io)?;
+                            pending_local =
+                                Some(PendingLocalFrame::new(&packet).map_err(SessionError::Io)?);
                         } else if is_forward_packet(packet.header()) {
                             pending_forward =
                                 forwarder.try_receive(packet).map_err(forward_error)?;
-                        } else if let Some(control) =
-                            forward_client_packet(&session, &mut terminal, packet)?
-                        {
-                            pending_outbound = send_or_hold(
-                                &session,
-                                control,
-                                &mut connected,
-                                &mut connection_generation,
-                            )?;
+                        } else {
+                            let (local, control) = forward_client_packet(&session, packet)?;
+                            if let Some(packet) = local {
+                                pending_local = Some(
+                                    PendingLocalFrame::new(&packet).map_err(SessionError::Io)?,
+                                );
+                            }
+                            if let Some(control) = control {
+                                pending_outbound = send_or_hold(
+                                    &session,
+                                    control,
+                                    &mut connected,
+                                    &mut connection_generation,
+                                )?;
+                            }
                         }
                     }
                     Ok(None) => break,
@@ -512,15 +590,10 @@ fn wait(
     wake: &LocalStream,
     forward_wake: &LocalStream,
     client: Option<&std::net::TcpStream>,
-    accept_terminal: bool,
+    terminal_flags: PollFlags,
     forward_blocked: bool,
     client_buffered: bool,
 ) -> Result<(PollFlags, PollFlags, PollFlags, PollFlags), SessionError> {
-    let terminal_flags = if accept_terminal {
-        PollFlags::IN | PollFlags::HUP | PollFlags::ERR
-    } else {
-        PollFlags::HUP | PollFlags::ERR
-    };
     // While a forwarding packet is held for worker capacity the client is not
     // read, so do not watch it for readability, and wake on a 10ms cadence to
     // retry the held packet even when nothing else becomes ready.
@@ -640,17 +713,14 @@ fn jumphost_terminal_packet(
 
 fn forward_client_packet(
     session: &ActiveSession,
-    terminal: &mut LocalStream,
     packet: Packet,
-) -> Result<Option<Packet>, SessionError> {
+) -> Result<(Option<Packet>, Option<Packet>), SessionError> {
     match packet.header() {
         value
             if value == TerminalPacketType::TerminalBuffer as u8
                 || value == TerminalPacketType::TerminalInfo as u8 =>
         {
-            write_local_packet(terminal, &packet)
-                .map_err(SessionError::Io)
-                .map(|()| None)
+            Ok((Some(packet), None))
         }
         header if header == TerminalPacketType::KeepAlive as u8 => {
             if let Some(ack) = et_core::keepalive::decode_ack(packet.payload()) {
@@ -659,10 +729,13 @@ fn forward_client_packet(
             // The echo acknowledges everything read from the client, letting
             // an et.rs client trim its own replay backup. Legacy peers
             // (upstream C++, released et.rs) ignore the payload.
-            Ok(Some(Packet::new(
-                TerminalPacketType::KeepAlive as u8,
-                session.keepalive_ack()?.to_vec(),
-            )))
+            Ok((
+                None,
+                Some(Packet::new(
+                    TerminalPacketType::KeepAlive as u8,
+                    session.keepalive_ack()?.to_vec(),
+                )),
+            ))
         }
         _ => Err(SessionError::Io(io::Error::new(
             io::ErrorKind::InvalidData,

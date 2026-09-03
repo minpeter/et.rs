@@ -20,7 +20,7 @@ use et_net::local::LocalStream;
 
 const OUTPUT_BYTES: usize = 64 * 1024;
 const OUTPUT_PACKETS: usize = 4096;
-const GRACEFUL_DRAIN_STALL_TIMEOUT: Duration = Duration::from_secs(1);
+pub(crate) const GRACEFUL_DRAIN_STALL_TIMEOUT: Duration = Duration::from_secs(1);
 
 struct OutputEntry {
     bytes: Vec<u8>,
@@ -338,6 +338,14 @@ impl ConsoleOutput {
     }
 
     pub(crate) fn finish_gracefully(&mut self) -> io::Result<()> {
+        self.finish_gracefully_with_stall(false)
+    }
+
+    pub(crate) fn finish_gracefully_after_stall(&mut self) -> io::Result<()> {
+        self.finish_gracefully_with_stall(true)
+    }
+
+    fn finish_gracefully_with_stall(&mut self, already_stalled: bool) -> io::Result<()> {
         let Some(shared) = self.shared.clone() else {
             return Ok(());
         };
@@ -349,20 +357,31 @@ impl ConsoleOutput {
             state.stopping = true;
             shared.wake.notify_all();
         }
-        let stalled = wait_for_graceful_drain(&shared)?;
+        let stalled = already_stalled || wait_for_graceful_drain(&shared)?;
         if stalled {
             if let Some(cancel) = self.cancel.take() {
                 cancel();
             }
         }
-        if let Some(worker) = self.worker.take() {
-            worker
-                .join()
-                .map_err(|_| io::Error::other("console output worker panicked"))?;
-        }
-        self.check_error()?;
-        if let Some(finish) = self.graceful_finish.take() {
-            finish()?;
+        // Cancellation normally wakes the writer immediately. A blocking
+        // descriptor can still race between poll readiness and its write,
+        // though, so never turn the bounded drain into an unbounded join.
+        let worker_done = !stalled || !wait_for_graceful_drain(&shared)?;
+        if worker_done {
+            if let Some(worker) = self.worker.take() {
+                worker
+                    .join()
+                    .map_err(|_| io::Error::other("console output worker panicked"))?;
+            }
+            self.check_error()?;
+            if let Some(finish) = self.graceful_finish.take() {
+                finish()?;
+            }
+        } else {
+            // Dropping a JoinHandle detaches the irrecoverably blocked writer.
+            // The client is already terminating and the worker retains its Arc.
+            self.worker = None;
+            self.graceful_finish = None;
         }
         self.cancel = None;
         self.shared = None;
@@ -381,6 +400,17 @@ impl ConsoleOutput {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    pub(crate) fn worker_progress(&self) -> io::Result<usize> {
+        let Some(shared) = &self.shared else {
+            return Ok(0);
+        };
+        let state = shared
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("console output worker unavailable"))?;
+        Ok(state.worker_progress)
     }
 
     #[cfg(unix)]
@@ -406,7 +436,8 @@ impl ConsoleOutput {
 
 impl Drop for ConsoleOutput {
     fn drop(&mut self) {
-        if let Some(shared) = &self.shared {
+        let shared = self.shared.clone();
+        if let Some(shared) = &shared {
             if let Ok(mut state) = shared.state.lock() {
                 state.stopping = true;
                 shared.wake.notify_all();
@@ -416,8 +447,15 @@ impl Drop for ConsoleOutput {
         if let Some(cancel) = self.cancel.take() {
             cancel();
         }
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        let worker_done = shared
+            .as_deref()
+            .is_none_or(|shared| matches!(wait_for_graceful_drain(shared), Ok(false)));
+        if worker_done {
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        } else {
+            self.worker = None;
         }
     }
 }

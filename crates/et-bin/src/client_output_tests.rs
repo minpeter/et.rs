@@ -260,6 +260,56 @@ fn remote_session_end_cancels_writer_after_graceful_drain_stalls() {
 }
 
 #[test]
+fn stalled_remote_completion_does_not_join_an_uninterruptible_write() {
+    struct UninterruptibleWriter {
+        entered: mpsc::SyncSender<()>,
+        release: mpsc::Receiver<()>,
+    }
+    impl Write for UninterruptibleWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+    let (release_tx, release_rx) = mpsc::channel();
+    let (cancelled_tx, cancelled_rx) = mpsc::sync_channel(0);
+    let output = ConsoleOutput::new_with_cancel(
+        FlowControlMode::Backpressure,
+        Box::new(UninterruptibleWriter {
+            entered: entered_tx,
+            release: release_rx,
+        }),
+        Box::new(move || cancelled_tx.send(()).unwrap()),
+    )
+    .unwrap();
+    assert!(output
+        .try_write(b"blocked", &TerminalModeState::default())
+        .unwrap());
+    entered_rx.recv().unwrap();
+
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    std::thread::spawn(move || {
+        done_tx
+            .send(output.complete(ConsoleCompletion::RemoteSessionEnded))
+            .unwrap();
+    });
+    cancelled_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("stalled graceful drain did not invoke cancellation");
+    assert!(done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("completion joined an uninterruptible writer")
+        .is_ok());
+    release_tx.send(()).unwrap();
+}
+
+#[test]
 fn partial_writes_report_progress_before_completion_and_drain_every_byte() {
     struct PartialWriter {
         output: Arc<Mutex<Vec<u8>>>,

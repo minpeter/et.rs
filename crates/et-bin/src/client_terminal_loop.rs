@@ -17,7 +17,7 @@ use rustix::event::{poll, PollFd, PollFlags};
 use rustix::time::Timespec;
 
 #[cfg(unix)]
-use crate::client_output::ConsoleCompletion;
+use crate::client_output::{ConsoleCompletion, GRACEFUL_DRAIN_STALL_TIMEOUT};
 #[cfg(unix)]
 use crate::client_terminal::DisplayOutcome;
 use crate::client_terminal::TerminalModeState;
@@ -522,6 +522,10 @@ fn finish_remote_completion(
     current_outbound: Option<et_core::packet::Packet>,
 ) -> Result<(), ClientError> {
     let mut retained = RetainedCompletion::new(pending_output, pending_forward);
+    let mut output_progress = output
+        .worker_progress()
+        .map_err(|error| terminal_io("tracking retained terminal output", error))?;
+    let mut output_deadline = Instant::now() + GRACEFUL_DRAIN_STALL_TIMEOUT;
     loop {
         output
             .check_error()
@@ -544,6 +548,23 @@ fn finish_remote_completion(
             return output
                 .complete(ConsoleCompletion::RemoteSessionEnded)
                 .map_err(|error| terminal_io("draining terminal output", error));
+        }
+        if retained.terminal_pending() {
+            let progress = output
+                .worker_progress()
+                .map_err(|error| terminal_io("tracking retained terminal output", error))?;
+            if progress != output_progress {
+                output_progress = progress;
+                output_deadline = Instant::now() + GRACEFUL_DRAIN_STALL_TIMEOUT;
+            } else if Instant::now() >= output_deadline {
+                let abandoned = forwarder
+                    .shutdown_hard()
+                    .map_err(|error| terminal_text(error.to_string()))?;
+                classify_forward_completion(current_outbound, abandoned)?;
+                return output
+                    .finish_gracefully_after_stall()
+                    .map_err(|error| terminal_io("cancelling stalled terminal output", error));
+            }
         }
         if let Some(packet) = forwarder
             .try_outbound()

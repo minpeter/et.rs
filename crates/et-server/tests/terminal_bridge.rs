@@ -12,6 +12,91 @@ use et_net::local_packet::{read_local_packet, write_local_packet};
 use prost::Message;
 use runtime_support::{default_payload, initialize, TestRuntime, ID_A, KEY_A, TIMEOUT};
 
+#[cfg(unix)]
+#[test]
+fn terminal_input_backpressure_preserves_duplex_progress_and_order() {
+    use std::io::{self, Read};
+    use std::thread;
+    use std::time::Instant;
+
+    fn read_exact_retry(
+        stream: &mut et_net::local::LocalStream,
+        buffer: &mut [u8],
+        deadline: Instant,
+    ) {
+        let mut offset = 0;
+        while offset < buffer.len() {
+            match stream.read(&mut buffer[offset..]) {
+                Ok(0) => panic!("terminal closed while reading input frame"),
+                Ok(count) => offset += count,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "input frame did not arrive");
+                    thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("reading input frame failed: {error}"),
+            }
+        }
+    }
+
+    let mut server = TestRuntime::start();
+    let mut terminal = server.register(ID_A, KEY_A);
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let key = passkey_to_key(KEY_A).unwrap();
+    let (mut client, initial) = initialize(stream, &key, default_payload());
+    assert_eq!(initial.error, None);
+    let _init = read_local_packet(&mut terminal).unwrap();
+
+    // These frames exceed the default local-stream capacity in aggregate.
+    // Reading only the first prefix leaves the bridge with a retained partial
+    // frame before terminal output is sent in the opposite direction.
+    let input_payloads: Vec<Vec<u8>> = (0..8).map(|index| vec![0x50 + index; 60 * 1024]).collect();
+    for payload in &input_payloads {
+        client
+            .write_packet(TerminalPacketType::TerminalInfo as u8, payload)
+            .unwrap();
+    }
+
+    let mut prefix = [0u8; std::mem::size_of::<i64>()];
+    let deadline = Instant::now() + TIMEOUT;
+    read_exact_retry(&mut terminal, &mut prefix, deadline);
+
+    let output = TerminalBuffer {
+        buffer: Some(b"output-during-input-backpressure".to_vec()),
+    };
+    write_local_packet(
+        &mut terminal,
+        &Packet::new(
+            TerminalPacketType::TerminalBuffer as u8,
+            output.encode_to_vec(),
+        ),
+    )
+    .unwrap();
+    let received = client.read_packet().unwrap();
+    assert_eq!(TerminalBuffer::decode(received.payload()).unwrap(), output);
+
+    // Finish every retained frame and verify no packet was dropped or written
+    // out of order while terminal output made progress in the other direction.
+    let length = usize::try_from(i64::from_ne_bytes(prefix)).unwrap();
+    let mut serialized = vec![0; length];
+    read_exact_retry(&mut terminal, &mut serialized, deadline);
+    let first = Packet::from_serialized(&serialized).unwrap();
+    assert_eq!(first.payload(), input_payloads[0]);
+    for expected in &input_payloads[1..] {
+        let mut next_prefix = [0u8; std::mem::size_of::<i64>()];
+        read_exact_retry(&mut terminal, &mut next_prefix, deadline);
+        let next_length = usize::try_from(i64::from_ne_bytes(next_prefix)).unwrap();
+        let mut next_serialized = vec![0; next_length];
+        read_exact_retry(&mut terminal, &mut next_serialized, deadline);
+        let next = Packet::from_serialized(&next_serialized).unwrap();
+        assert_eq!(next.payload(), expected);
+    }
+
+    drop(terminal);
+    server.runtime.shutdown().unwrap();
+}
+
 #[test]
 fn encrypted_client_and_registered_terminal_exchange_packets() {
     let mut server = TestRuntime::start();

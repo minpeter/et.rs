@@ -22,12 +22,24 @@ impl ActiveSession {
             // complete an in-flight recover so buffered output can drain.
             return Err(SessionError::Unavailable);
         }
+        #[cfg(test)]
+        if let Some((reached, release)) = self.recover_admission_hook.lock().unwrap().take() {
+            reached.send(()).unwrap();
+            release.recv().unwrap();
+        }
         if self
             .recovering
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return Err(SessionError::RecoverBusy);
+        }
+        // Teardown may have started after the optimistic check but before we
+        // claimed recovery. Re-check after the claim so admission is ordered
+        // against teardown, and release the claim when teardown won.
+        if self.torn_down.load(Ordering::Acquire) {
+            self.recovering.store(false, Ordering::Release);
+            return Err(SessionError::Unavailable);
         }
         if let Some(flow) = &self.flow_control {
             if let Err(error) = flow.pause() {

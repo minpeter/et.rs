@@ -128,10 +128,7 @@ fn run_mode_poll(
             forwarder.wake().map_err(forward_error)?,
             client.as_ref(),
             accept_terminal,
-            pending_forward.is_some()
-                || pending_outbound.is_some()
-                || pending_terminal.is_some()
-                || !connected,
+            pending_forward.is_some() || pending_outbound.is_some() || !connected,
         )?;
         let client_events_are_stale = wake_events.intersects(PollFlags::IN | PollFlags::HUP);
         if client_events_are_stale {

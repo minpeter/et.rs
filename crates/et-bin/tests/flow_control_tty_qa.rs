@@ -80,9 +80,9 @@ fn flow_control_keeps_ctrl_c_and_prompt_responsive_on_a_slow_link() {
              trap 'interrupted=1; printf \"\\nFLOW-INTERRUPTED\\n\"' INT; \
              printf 'FLOW-%s\\n' START; \
              IFS= read -r flow_release; \
-             i=0; while [ -z \"$interrupted\" ] && [ \"$i\" -lt 65536 ]; do \
+             while [ -z \"$interrupted\" ]; do \
              printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'; \
-             i=$((i + 1)); done; trap - INT; printf 'FLOW-%s\\n' READY"
+             done; trap - INT; printf 'FLOW-%s\\n' READY"
         )
         .unwrap();
         let startup_timeout = Duration::from_secs(10);

@@ -209,6 +209,78 @@ fn local_input_close_cancels_blocked_output_before_join() {
 }
 
 #[test]
+fn remote_session_end_cancels_writer_after_graceful_drain_stalls() {
+    struct BlockedWriter {
+        entered: mpsc::SyncSender<()>,
+        release: mpsc::Receiver<()>,
+    }
+    impl Write for BlockedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+    let (release_tx, release_rx) = mpsc::channel();
+    let (cancelled_tx, cancelled_rx) = mpsc::sync_channel(0);
+    let output = ConsoleOutput::new_with_cancel(
+        FlowControlMode::Backpressure,
+        Box::new(BlockedWriter {
+            entered: entered_tx,
+            release: release_rx,
+        }),
+        Box::new(move || {
+            cancelled_tx.send(()).unwrap();
+            release_tx.send(()).unwrap();
+        }),
+    )
+    .unwrap();
+    assert!(output
+        .try_write(b"blocked", &TerminalModeState::default())
+        .unwrap());
+    entered_rx.recv().unwrap();
+
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    std::thread::spawn(move || {
+        done_tx
+            .send(output.complete(ConsoleCompletion::RemoteSessionEnded))
+            .unwrap();
+    });
+    cancelled_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("stalled graceful drain did not invoke cancellation");
+    assert!(done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn cancellable_stdout_fails_when_output_is_closed() {
+    use std::os::unix::net::UnixStream;
+
+    let (output, peer) = UnixStream::pair().unwrap();
+    let file = File::from(rustix::io::dup(output.as_fd()).unwrap());
+    drop(output);
+    drop(peer);
+    let (cancel, _cancel_signal) = et_net::local::wake_pair().unwrap();
+    let mut writer = CancellableStdout { file, cancel };
+
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    std::thread::spawn(move || done_tx.send(writer.write(b"closed")).unwrap());
+    let error = done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("closed output readiness caused write to spin")
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+}
+
+#[test]
 fn last_packet_broken_pipe_is_reported_without_another_packet() {
     struct Broken;
     impl Write for Broken {

@@ -12,6 +12,7 @@ use std::os::fd::AsFd;
 use std::process::{ChildStderr, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use et_cli::client::FlowControlMode;
 #[cfg(unix)]
@@ -19,6 +20,7 @@ use et_net::local::LocalStream;
 
 const OUTPUT_BYTES: usize = 64 * 1024;
 const OUTPUT_PACKETS: usize = 4096;
+const GRACEFUL_DRAIN_STALL_TIMEOUT: Duration = Duration::from_secs(1);
 
 struct OutputEntry {
     bytes: Vec<u8>,
@@ -32,6 +34,7 @@ struct State {
     error: Option<io::Error>,
     cursor_reports: usize,
     worker_done: bool,
+    worker_progress: usize,
 }
 
 struct Shared {
@@ -175,6 +178,7 @@ impl ConsoleOutput {
                 error: None,
                 cursor_reports: 0,
                 worker_done: false,
+                worker_progress: 0,
             }),
             wake: Condvar::new(),
         });
@@ -315,7 +319,7 @@ impl ConsoleOutput {
     }
 
     pub(crate) fn finish_gracefully(&mut self) -> io::Result<()> {
-        let Some(shared) = &self.shared else {
+        let Some(shared) = self.shared.clone() else {
             return Ok(());
         };
         {
@@ -325,6 +329,12 @@ impl ConsoleOutput {
                 .map_err(|_| io::Error::other("console output worker unavailable"))?;
             state.stopping = true;
             shared.wake.notify_all();
+        }
+        let stalled = wait_for_graceful_drain(&shared)?;
+        if stalled {
+            if let Some(cancel) = self.cancel.take() {
+                cancel();
+            }
         }
         if let Some(worker) = self.worker.take() {
             worker
@@ -442,6 +452,10 @@ fn run_writer(
             return;
         }
         bytes.terminal_modes.observe(&bytes.bytes);
+        if let Ok(mut state) = shared.state.lock() {
+            state.worker_progress = state.worker_progress.wrapping_add(1);
+            shared.wake.notify_all();
+        }
         if crate::client_terminal::contains_cursor_report_request(&bytes.bytes) {
             if let Ok(mut state) = shared.state.lock() {
                 state.cursor_reports += 1;
@@ -450,6 +464,33 @@ fn run_writer(
             signal_capacity(capacity_signal);
         }
     }
+}
+
+fn wait_for_graceful_drain(shared: &Shared) -> io::Result<bool> {
+    let mut state = shared
+        .state
+        .lock()
+        .map_err(|_| io::Error::other("console output worker unavailable"))?;
+    let mut progress = state.worker_progress;
+    let mut deadline = Instant::now() + GRACEFUL_DRAIN_STALL_TIMEOUT;
+    while !state.worker_done {
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(true);
+        }
+        let (next, timeout) = shared
+            .wake
+            .wait_timeout(state, deadline.saturating_duration_since(now))
+            .map_err(|_| io::Error::other("console output worker unavailable"))?;
+        state = next;
+        if state.worker_progress != progress {
+            progress = state.worker_progress;
+            deadline = Instant::now() + GRACEFUL_DRAIN_STALL_TIMEOUT;
+        } else if timeout.timed_out() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(windows)]
@@ -571,6 +612,16 @@ impl Write for CancellableStdout {
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         "console output cancelled",
+                    ));
+                }
+                Ok(_)
+                    if descriptors[0]
+                        .revents()
+                        .intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) =>
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "console output is unavailable",
                     ));
                 }
                 Ok(_) if descriptors[0].revents().contains(PollFlags::OUT) => {

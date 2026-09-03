@@ -167,9 +167,12 @@ fn real_client_recovers_same_shell_and_once_only_buffered_output() {
     assert!(text.contains("RECONNECT-TERMIOS:"), "output={text}");
     assert!(text.contains(":CODE:0:"), "output={text}");
     assert!(termios_restored(&text), "output={text}");
-    // One credential-free login-shell probe plus one credential bootstrap.
-    // Reconnects stay on the encrypted ET transport and must not invoke SSH.
-    assert_eq!(fs::read_to_string(&stack.ssh_count).unwrap(), "xx");
+    // This fixture's fake SSH rejects the user-master check, two race-safe
+    // ET-master checks, and the master start before the probe and bootstrap run
+    // unmultiplexed. Against a real sshd these checks open no TCP connections
+    // and the operations share the destination master. Reconnects stay on the
+    // encrypted ET transport and must not invoke SSH again.
+    assert_eq!(fs::read_to_string(&stack.ssh_count).unwrap(), "xxxxxx");
     proxy.join();
     stack.shutdown();
 }

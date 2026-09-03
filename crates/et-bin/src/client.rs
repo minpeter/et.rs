@@ -19,8 +19,10 @@ use crate::deadline::Deadline;
 use crate::error::ClientError;
 use crate::initial_connect::{connect_initial, reconnect, Endpoint, ReconnectOutcome};
 use crate::resolver::{EndpointResolver, SystemResolver};
-use crate::ssh_config::resolve_ssh_config;
-use crate::ssh_process::{run_bootstrap, run_shell_probe, SshRunner, SystemSsh};
+use crate::ssh_config::{resolve_ssh_config, resolve_ssh_config_on_port};
+use crate::ssh_process::{
+    run_bootstrap, run_shell_probe, SshMasterTarget, SshRunner, SshSession, SystemSsh,
+};
 
 const RECONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -136,6 +138,9 @@ fn run_client(
 
     let requested_user = command_user(destination.user, args.username.clone());
     validate_ssh_destination(&destination.host, requested_user.as_deref())?;
+    // The positional `host:port` is the ET server port, not an SSH port, so it
+    // must not be forwarded to the config query. Only the jumphost grammar
+    // below carries an explicit SSH port.
     let resolved = resolve_ssh_config(
         runner,
         &destination.host,
@@ -144,6 +149,19 @@ fn run_client(
         true,
         deadline,
     )?;
+    let user = requested_user.or_else(|| resolved.user.clone());
+    let ssh_session = SshSession::start(
+        runner,
+        SshMasterTarget {
+            host_alias: &destination.host,
+            user: user.as_deref(),
+            resolved_host: &resolved.hostname,
+            resolved_port: resolved.port,
+            jumphost: args.jumphost.as_deref(),
+        },
+        &args.ssh_option,
+        deadline,
+    );
     forward_config.apply_ssh_config(&resolved)?;
     if args.jumphost.is_some() {
         bound_jumphost_locale_environment(
@@ -159,7 +177,6 @@ fn run_client(
     // tunnels can be multiplexed immediately (avoids pre-handshake accept races).
     let local_sources = forward_config.local_sources;
     let mut initial_payload = forward_config.initial_payload;
-    let user = requested_user.or(resolved.user);
     validate_ssh_destination(&destination.host, user.as_deref())?;
     let probe_request = BootstrapRequest {
         user: user.clone(),
@@ -178,7 +195,7 @@ fn run_client(
         None
     } else {
         let probe = build_shell_probe(&probe_request);
-        Some(run_shell_probe(runner, &probe, deadline)?)
+        Some(run_shell_probe(&ssh_session, &probe, deadline)?)
     };
     let remote_mode = resolve_remote_mode(args, detected_shell);
     let provisional = provisional_credentials()?;
@@ -214,7 +231,7 @@ fn run_client(
     }
     let invocation = build_invocation(&request, &provisional);
     et_cli::logging::verbose(1, bootstrap_log_message(&request));
-    let mut credentials = run_bootstrap(runner, &invocation, deadline)?;
+    let mut credentials = run_bootstrap(&ssh_session, &invocation, deadline)?;
     et_cli::logging::info("etserver started");
     // Without a jumphost the ET connection goes straight to the destination.
     // With one, upstream starts a second `etterminal --jump` on the jumphost
@@ -232,14 +249,43 @@ fn run_client(
             .to_owned();
         let jump_user = Some(parsed_jump.user.as_str()).filter(|user| !user.is_empty());
         validate_ssh_destination(&jump_host, jump_user)?;
-        let jump_resolved = resolve_ssh_config(
+        // An explicit `jump:2200` must reach the config query, because the
+        // resolved port is part of the control-master identity and the jump
+        // bootstrap emits `-p 2200`. Resolving without it would hash (and
+        // start) a master for port 22 and then force the 2200 session onto it.
+        let jump_explicit_port = parsed_jump
+            .port_suffix
+            .strip_prefix(':')
+            .map(|port| {
+                port.parse::<u16>()
+                    .map_err(|_| et_cli::host::HostError::BadPort(port.to_owned()))
+            })
+            .transpose()
+            .map_err(ClientError::Host)?;
+        let jump_resolved = resolve_ssh_config_on_port(
             runner,
             &jump_host,
             jump_user,
+            jump_explicit_port,
             &args.ssh_option,
             false,
             deadline,
         )?;
+        let jump_effective_user = jump_user
+            .map(str::to_owned)
+            .or_else(|| jump_resolved.user.clone());
+        let jump_session = SshSession::start(
+            runner,
+            SshMasterTarget {
+                host_alias: &jump_host,
+                user: jump_effective_user.as_deref(),
+                resolved_host: &jump_resolved.hostname,
+                resolved_port: jump_resolved.port,
+                jumphost: None,
+            },
+            &args.ssh_option,
+            deadline,
+        );
         let jump_request = JumpBootstrapRequest {
             jumphost: jumphost.to_owned(),
             destination_host: endpoint.host.clone(),
@@ -252,7 +298,7 @@ fn run_client(
             term: request.term.clone(),
         };
         let jump_invocation = build_jump_invocation(&jump_request, &provisional);
-        credentials = run_bootstrap(runner, &jump_invocation, deadline)?;
+        credentials = run_bootstrap(&jump_session, &jump_invocation, deadline)?;
         endpoint = Endpoint {
             host: jump_resolved.hostname,
             port: args.jport,

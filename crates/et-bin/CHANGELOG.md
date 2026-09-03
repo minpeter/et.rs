@@ -1,3 +1,43 @@
+## et@0.0.20
+
+### Add opt-in terminal flow control
+
+Clients can now select lossless backpressure or oldest-output discard when
+terminal output outruns the network, keeping Ctrl-C and prompt responses
+bounded without changing the default session behavior.
+
+### Align MOTD and shell prompt spacing
+
+Avoid an extra blank line between the MOTD and an interactive shell prompt
+when the login shell emits an initial newline.
+
+### Bound flow-control shutdown and recovery admission
+
+Flow-controlled clients now cancel stalled console drains instead of hanging
+during shutdown, report closed output streams promptly, and keep client input
+moving while terminal output is backpressured. Reconnects are also rejected
+when session teardown wins the recovery-admission race.
+
+### Keep terminal startup reliable under heavy load
+
+Terminal startup now uses authenticated, bounded registration and structured
+startup acknowledgements before reporting readiness. Initialization remains
+responsive under load while forged identities, stalled peers, premature
+success, leaked children, and unbounded admission are rejected or cleaned up.
+
+### Port EternalTerminal #798 accept-starvation fix
+
+A stuck client reconnect no longer starves `etserver` accept. Recovery
+already ran off the session-table lock and refused a second in-flight
+reconnect for the same id; this port also refuses recover after full
+session teardown (so a torn-down session cannot be resurrected) while
+still allowing recover through terminal HUP so buffered output can
+drain. It also raises the TCP `listen(2)` backlog from 32 to 128,
+overridable with `backlog` in the `[Networking]` section of the server
+config. Non-positive values fall back to 128. `PROTOCOL_VERSION` stays
+6. Upstream `#801` / `#803` / `#802` (HTM/Windows/coverage, TIOCGWINSZ,
+Windows build) are classified `skip` and not ported.
+
 ## et@0.0.19
 
 ### Apply SSH configuration port forwarding

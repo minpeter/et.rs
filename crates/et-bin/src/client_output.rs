@@ -555,11 +555,20 @@ impl Write for WindowsHelperWriter {
         self.input.write_all(bytes)?;
         self.input.flush()?;
         let mut acknowledged = 0usize;
-        while acknowledged < bytes.len() {
+        loop {
             let mut ack = [0u8; 4];
             std::io::Read::read_exact(&mut self.ack, &mut ack)?;
             let count = u32::from_le_bytes(ack) as usize;
-            if count == 0 || count > bytes.len() - acknowledged {
+            if count == 0 {
+                if acknowledged == bytes.len() {
+                    break;
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "console helper acknowledgement is incomplete",
+                ));
+            }
+            if count > bytes.len() - acknowledged {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "console helper acknowledgement is invalid",
@@ -625,14 +634,21 @@ pub(crate) fn run_windows_helper() -> i32 {
                 Err(_) => return 1,
             };
             remaining = &remaining[count..];
-            if (remaining.is_empty() && output.flush().is_err())
-                || acknowledgements
-                    .write_all(&(count as u32).to_le_bytes())
-                    .and_then(|()| acknowledgements.flush())
-                    .is_err()
+            if acknowledgements
+                .write_all(&(count as u32).to_le_bytes())
+                .and_then(|()| acknowledgements.flush())
+                .is_err()
             {
                 return 1;
             }
+        }
+        if output.flush().is_err()
+            || acknowledgements
+                .write_all(&0u32.to_le_bytes())
+                .and_then(|()| acknowledgements.flush())
+                .is_err()
+        {
+            return 1;
         }
     }
 }

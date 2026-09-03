@@ -80,6 +80,7 @@ fn run_mode_poll(
     let mut pending_terminal: Option<Packet> = None;
     let mut terminal_closing = false;
     let mut terminal_eof = false;
+    let mut client_buffered = false;
     loop {
         let mut resume_outbound_drain = false;
         if session.is_shutting_down() {
@@ -130,6 +131,7 @@ fn run_mode_poll(
             client.as_ref(),
             accept_terminal,
             pending_forward.is_some() || pending_outbound.is_some() || !connected,
+            client_buffered,
         )?;
         let client_events_are_stale = wake_events.intersects(PollFlags::IN | PollFlags::HUP);
         if client_events_are_stale {
@@ -172,22 +174,24 @@ fn run_mode_poll(
         // Recovery authentication may read more than its proof packet into
         // BackedReader. Drain it after the wake even when the new socket no
         // longer has kernel-level readability.
-        let client_data_ready =
-            connected && (client_events_are_stale || client_events.contains(PollFlags::IN));
-        if client_data_ready {
-            for _ in 0..CLIENT_READ_BATCH {
-                if pending_forward.is_some() || pending_outbound.is_some() {
-                    break;
-                }
-                match session.try_read_packet() {
+        let client_data_ready = connected
+            && (client_buffered
+                || client_events_are_stale
+                || client_events.contains(PollFlags::IN));
+        if client_data_ready && pending_forward.is_none() && pending_outbound.is_none() {
+            client_buffered = false;
+            for index in 0..CLIENT_READ_BATCH {
+                let read_packet = match session.try_read_packet() {
                     // Jumphost relays every packet verbatim to the jump
                     // terminal, which owns the destination connection.
                     Ok(Some(packet)) if mode == BridgeMode::Jumphost => {
                         let packet = jumphost_client_packet(&session, packet)?;
                         write_local_packet(&mut terminal, &packet).map_err(SessionError::Io)?;
+                        true
                     }
                     Ok(Some(packet)) if is_forward_packet(packet.header()) => {
                         pending_forward = forwarder.try_receive(packet).map_err(forward_error)?;
+                        true
                     }
                     Ok(Some(packet)) => {
                         if let Some(control) =
@@ -200,8 +204,9 @@ fn run_mode_poll(
                                 &mut connection_generation,
                             )?;
                         }
+                        true
                     }
-                    Ok(None) => break,
+                    Ok(None) => false,
                     Err(error) => {
                         if client_transport_error(
                             &error,
@@ -209,10 +214,19 @@ fn run_mode_poll(
                             &mut connected,
                             &mut connection_generation,
                         )? {
-                            break;
+                            false
+                        } else {
+                            return Err(error);
                         }
-                        return Err(error);
                     }
+                };
+                if !read_packet {
+                    break;
+                }
+                if index + 1 == CLIENT_READ_BATCH {
+                    // `try_read_packet` can leave complete packets in its
+                    // userspace decoder after the kernel socket is drained.
+                    client_buffered = true;
                 }
             }
         }
@@ -496,6 +510,7 @@ fn wait(
     client: Option<&std::net::TcpStream>,
     accept_terminal: bool,
     forward_blocked: bool,
+    client_buffered: bool,
 ) -> Result<(PollFlags, PollFlags, PollFlags, PollFlags), SessionError> {
     let terminal_flags = if accept_terminal {
         PollFlags::IN | PollFlags::HUP | PollFlags::ERR
@@ -510,7 +525,9 @@ fn wait(
     } else {
         PollFlags::IN | PollFlags::HUP | PollFlags::ERR
     };
-    let timeout = if forward_blocked {
+    let timeout = if client_buffered && !forward_blocked {
+        Some(Timespec::try_from(std::time::Duration::ZERO).expect("zero fits timespec"))
+    } else if forward_blocked {
         Some(Timespec::try_from(std::time::Duration::from_millis(10)).expect("10ms fits timespec"))
     } else {
         None

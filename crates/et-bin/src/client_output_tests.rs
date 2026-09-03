@@ -260,44 +260,62 @@ fn remote_session_end_cancels_writer_after_graceful_drain_stalls() {
 }
 
 #[test]
-fn remote_session_end_keeps_draining_partial_write_progress() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    struct SlowPartialWriter {
-        entered: Option<mpsc::SyncSender<()>>,
+fn partial_writes_report_progress_before_completion_and_drain_every_byte() {
+    struct PartialWriter {
+        output: Arc<Mutex<Vec<u8>>>,
+        calls: usize,
+        second_entered: mpsc::SyncSender<()>,
+        release_second: mpsc::Receiver<()>,
     }
-    impl Write for SlowPartialWriter {
+    impl Write for PartialWriter {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            if let Some(entered) = self.entered.take() {
-                entered.send(()).unwrap();
+            if self.calls == 1 {
+                self.second_entered.send(()).unwrap();
+                self.release_second.recv().unwrap();
             }
-            std::thread::sleep(Duration::from_millis(600));
-            Ok(bytes.len().min(1))
+            self.calls += 1;
+            self.output.lock().unwrap().push(bytes[0]);
+            Ok(1)
         }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
-    let (entered_tx, entered_rx) = mpsc::sync_channel(0);
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let cancel_observer = Arc::clone(&cancelled);
-    let output = ConsoleOutput::new_with_cancel(
-        FlowControlMode::Backpressure,
-        Box::new(SlowPartialWriter {
-            entered: Some(entered_tx),
-        }),
-        Box::new(move || cancel_observer.store(true, Ordering::Release)),
-    )
-    .unwrap();
-    assert!(output
-        .try_write(b"ok", &TerminalModeState::default())
-        .unwrap());
-    entered_rx.recv().unwrap();
 
-    assert!(output
-        .complete(ConsoleCompletion::RemoteSessionEnded)
-        .is_ok());
-    assert!(!cancelled.load(Ordering::Acquire));
+    let shared = Arc::new(Shared {
+        state: Mutex::new(State {
+            queue: VecDeque::new(),
+            bytes: 0,
+            stopping: false,
+            error: None,
+            cursor_reports: 0,
+            worker_done: false,
+            worker_progress: 0,
+        }),
+        wake: Condvar::new(),
+    });
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let (second_entered_tx, second_entered_rx) = mpsc::sync_channel(0);
+    let (release_second_tx, release_second_rx) = mpsc::sync_channel(0);
+    let worker_shared = Arc::clone(&shared);
+    let worker_output = Arc::clone(&output);
+    let worker = std::thread::spawn(move || {
+        let mut writer = PartialWriter {
+            output: worker_output,
+            calls: 0,
+            second_entered: second_entered_tx,
+            release_second: release_second_rx,
+        };
+        write_all_with_progress(&worker_shared, &mut writer, b"ok")
+    });
+
+    second_entered_rx.recv().unwrap();
+    assert_eq!(*output.lock().unwrap(), b"o");
+    assert_eq!(shared.state.lock().unwrap().worker_progress, 1);
+    release_second_tx.send(()).unwrap();
+    worker.join().unwrap().unwrap();
+    assert_eq!(*output.lock().unwrap(), b"ok");
+    assert_eq!(shared.state.lock().unwrap().worker_progress, 2);
 }
 
 #[cfg(unix)]

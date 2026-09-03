@@ -1,7 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-#[cfg(unix)]
-use std::io::Write;
-use std::io::{self};
+use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -19,10 +17,91 @@ use crate::forward_io::{
     subtract_saturating, ActiveIo, BoundSource, FlowWindow, ListenerStop, WriteCommand,
 };
 use et_core::packet::Packet;
-use et_core::proto::SocketEndpoint;
+use et_core::proto::{PortForwardData, SocketEndpoint, TerminalPacketType};
+use prost::Message;
 
 const MAX_ACTIVE_SOCKETS: usize = 256;
 const MAX_DATA_PACKET: usize = 64 * 1024;
+
+pub(crate) fn trace_forward(event: std::fmt::Arguments<'_>) {
+    let Some(path) = std::env::var_os("ET_FORWARD_TRACE") else {
+        return;
+    };
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path);
+    match file {
+        Ok(mut file) => {
+            if let Err(error) = writeln!(file, "pid={} {event}", std::process::id()) {
+                eprintln!("forward trace write failed: {error}");
+            }
+        }
+        Err(error) => eprintln!("forward trace open failed: {error}"),
+    }
+}
+
+fn trace_command(command: &Command) {
+    match command {
+        Command::Packet(packet) if packet.header() == TerminalPacketType::PortForwardData as u8 => {
+            match PortForwardData::decode(packet.payload()) {
+                Ok(data) => trace_forward(format_args!(
+                    "packet data direction={:?} socket={:?} bytes={} closed={:?} error={:?} \
+                     credit={:?}",
+                    data.sourcetodestination,
+                    data.socketid,
+                    data.buffer.as_ref().map_or(0, Vec::len),
+                    data.closed,
+                    data.error,
+                    data.window.map(|window| (window.bytes, window.packets))
+                )),
+                Err(error) => trace_forward(format_args!("packet data decode_error={error}")),
+            }
+        }
+        Command::Packet(packet) => trace_forward(format_args!(
+            "packet header={} bytes={}",
+            packet.header(),
+            packet.payload().len()
+        )),
+        Command::Accepted { client_fd, .. } => {
+            trace_forward(format_args!("accepted client_fd={client_fd}"))
+        }
+        Command::Connected {
+            client_fd,
+            socket_id,
+            result,
+        } => trace_forward(format_args!(
+            "connected client_fd={client_fd} socket={socket_id} ok={}",
+            result.is_ok()
+        )),
+        Command::Read {
+            role,
+            socket_id,
+            buffer,
+            ..
+        } => trace_forward(format_args!(
+            "read role={role:?} socket={socket_id} bytes={}",
+            buffer.len()
+        )),
+        Command::Drained {
+            role,
+            socket_id,
+            bytes,
+        } => trace_forward(format_args!(
+            "drained role={role:?} socket={socket_id} bytes={bytes}"
+        )),
+        Command::Closed { role, socket_id } => {
+            trace_forward(format_args!("closed role={role:?} socket={socket_id}"))
+        }
+        Command::IoFailed {
+            role,
+            socket_id,
+            error,
+        } => trace_forward(format_args!(
+            "io_failed role={role:?} socket={socket_id} error={error}"
+        )),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Role {
@@ -380,6 +459,7 @@ impl Worker {
             let Some(command) = commands.recv() else {
                 break Ok(());
             };
+            trace_command(&command);
             let step = match command {
                 Command::Packet(packet) => self.handle_packet(packet),
                 Command::Accepted {

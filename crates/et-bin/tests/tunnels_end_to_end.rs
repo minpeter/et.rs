@@ -39,6 +39,10 @@ fn ssh_config_local_tunnel_relays_while_remote_forward_is_omitted() {
     client
         .env("PATH", &stack.directory)
         .env("ET_SSH_COUNT", &stack.ssh_count)
+        .env(
+            "ET_FORWARD_TRACE",
+            stack.directory.join("client-forward.trace"),
+        )
         .env("ET_SSH_CONFIG", config)
         .env("ET_SSH_READY", &gate)
         .stdin(Stdio::null())
@@ -792,6 +796,10 @@ fn spawn_client(
     process
         .env("PATH", &stack.directory)
         .env("ET_SSH_COUNT", &stack.ssh_count)
+        .env(
+            "ET_FORWARD_TRACE",
+            stack.directory.join("client-forward.trace"),
+        )
         .env("ET_SHELL", "/bin/sh")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -995,9 +1003,28 @@ fn panic_tunnel_failure(error: std::io::Error, child: &mut Child, stack: &mut St
     if let Some(mut pipe) = child.stderr.take() {
         let _ = pipe.read_to_string(&mut stderr);
     }
-    let server = stack.failure_diagnostics();
+    let server = if let Some(mut server) = stack.server.take() {
+        let status_before = server.try_wait().unwrap();
+        if status_before.is_none() {
+            let _ = server.kill();
+            let _ = server.wait();
+        }
+        let status_after = server.try_wait().unwrap();
+        let mut stderr = String::new();
+        if let Some(mut pipe) = server.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        format!("server status before={status_before:?} after={status_after:?}; stderr={stderr}")
+    } else {
+        "server already stopped".to_owned()
+    };
+    let client_trace =
+        fs::read_to_string(stack.directory.join("client-forward.trace")).unwrap_or_default();
+    let server_trace =
+        fs::read_to_string(stack.directory.join("server-forward.trace")).unwrap_or_default();
     panic!(
         "tunnel round-trip failed: {error}; client status before={status_before:?} \
-         after={status_after:?}; client stderr={stderr}; {server}"
+         after={status_after:?}; client stderr={stderr}; {server}; \
+         client forwarding trace={client_trace}; server forwarding trace={server_trace}"
     );
 }

@@ -7,7 +7,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use et_net::listener::bind_tcp;
+use et_net::listener::{bind_tcp_with_backlog, DEFAULT_LISTEN_BACKLOG};
 
 use crate::path::RouterPath;
 use crate::registry::Registry;
@@ -21,6 +21,10 @@ use crate::runtime_state::{
 };
 use crate::session_table::SessionTable;
 
+#[cfg(all(test, unix))]
+#[path = "runtime_recovery_test.rs"]
+mod recovery_tests;
+
 pub struct Runtime {
     core: Arc<RuntimeCore>,
     router: Option<Router>,
@@ -30,6 +34,7 @@ pub struct Runtime {
     accept_workers: Vec<JoinHandle<Result<(), RuntimeError>>>,
     tcp_addresses: Vec<SocketAddr>,
     router_path: PathBuf,
+    listen_backlog: i32,
 }
 
 impl Runtime {
@@ -46,6 +51,21 @@ impl Runtime {
         )
     }
 
+    pub fn start_with_listen_backlog(
+        bind_ip: IpAddr,
+        port: u16,
+        router_path: RouterPath,
+        listen_backlog: i32,
+    ) -> Result<Self, RuntimeError> {
+        Self::start_configured(
+            bind_ip,
+            port,
+            router_path,
+            Arc::new(et_net::forward::SystemForwardResolver),
+            listen_backlog,
+        )
+    }
+
     #[doc(hidden)]
     pub fn start_with_forward_resolver(
         bind_ip: IpAddr,
@@ -53,7 +73,23 @@ impl Runtime {
         router_path: RouterPath,
         forward_resolver: Arc<dyn et_net::forward::ForwardResolver>,
     ) -> Result<Self, RuntimeError> {
-        let bound = bind_tcp(bind_ip, port)?;
+        Self::start_configured(
+            bind_ip,
+            port,
+            router_path,
+            forward_resolver,
+            DEFAULT_LISTEN_BACKLOG,
+        )
+    }
+
+    fn start_configured(
+        bind_ip: IpAddr,
+        port: u16,
+        router_path: RouterPath,
+        forward_resolver: Arc<dyn et_net::forward::ForwardResolver>,
+        listen_backlog: i32,
+    ) -> Result<Self, RuntimeError> {
+        let bound = bind_tcp_with_backlog(bind_ip, port, listen_backlog)?;
         let mut tcp_addresses = Vec::new();
         for listener in bound.iter() {
             tcp_addresses.push(listener.local_addr().map_err(|source| RuntimeError::Io {
@@ -95,6 +131,7 @@ impl Runtime {
             accept_workers: Vec::new(),
             tcp_addresses,
             router_path: router_name,
+            listen_backlog: bound.listen_backlog(),
         };
         for listener in bound.into_listeners() {
             let (wake_reader, wake_writer) = match et_net::local::wake_pair() {
@@ -136,6 +173,10 @@ impl Runtime {
 
     pub fn router_path(&self) -> &Path {
         &self.router_path
+    }
+
+    pub fn listen_backlog(&self) -> i32 {
+        self.listen_backlog
     }
 
     pub fn shutdown(&mut self) -> Result<(), RuntimeError> {
@@ -294,7 +335,8 @@ mod tests {
         let (assignment_tx, assignment_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
         let (scan_tx, scan_rx) = mpsc::sync_channel(1);
-        crate::runtime_handler::install_raw_assignment_hook(ID, assignment_tx, release_rx);
+        let identity = runtime.core.registry.get(ID).unwrap().unwrap().identity();
+        crate::runtime_handler::install_raw_assignment_hook(identity, assignment_tx, release_rx);
         crate::runtime_lifecycle::install_raw_scan_hook(ID, scan_tx);
 
         let mut client = connect_request(address);

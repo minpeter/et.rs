@@ -58,6 +58,7 @@ fn malformed_initialization_and_shell_spawn_failure_are_typed() {
         &TermInit {
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
+            flowcontrol: None,
         },
     );
     assert!(!failed_child
@@ -94,6 +95,7 @@ fn shell_exit_reaps_background_process_group() {
         &TermInit {
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
+            flowcontrol: None,
         },
     );
     let mut output = String::new();

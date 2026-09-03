@@ -7,6 +7,8 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
+
+use crossbeam_channel as channel;
 use std::time::{Duration, Instant};
 
 use et_core::packet::Packet;
@@ -14,7 +16,9 @@ use et_core::proto::{PortForwardSourceRequest, TerminalPacketType};
 
 use crate::forward_endpoint::{Endpoint, ResolvedEndpoint};
 use crate::forward_io::BoundSource;
-use crate::forward_worker::{command_channel, run, Command, CommandSender, TryCommandError};
+use crate::forward_worker::{
+    command_channel, run, Command, CommandSender, TryCommandError, WorkerChannels,
+};
 
 const CHANNEL_CAPACITY: usize = 256;
 /// Maximum reverse listeners owned by one terminal session, after DNS fanout
@@ -302,7 +306,8 @@ pub struct SkippedForward {
 
 pub struct Forwarder {
     commands: CommandSender,
-    outbound: mpsc::Receiver<Outbound>,
+    outbound: channel::Receiver<Outbound>,
+    cancel: Option<channel::Sender<()>>,
     /// Readiness channel for outbound packets. Unix callers poll it exactly
     /// like upstream's `select()`; Windows callers drain [`Forwarder::try_outbound`]
     /// on the client loop's 10ms cadence instead, because a socket pair created
@@ -311,6 +316,7 @@ pub struct Forwarder {
     wake: UnixStream,
     shutdown: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    abandoned: Arc<AtomicBool>,
 }
 
 impl Forwarder {
@@ -404,7 +410,10 @@ fn start_forwarder_hook(
     ensure_setup_deadline(deadline)?;
     let session_user = owner;
     let (commands_tx, commands_rx) = command_channel(CHANNEL_CAPACITY);
-    let (outbound_tx, outbound_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+    let (outbound_tx, outbound_rx) = channel::bounded(CHANNEL_CAPACITY);
+    let (cancel_tx, cancel_rx) = channel::bounded(1);
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let worker_abandoned = abandoned.clone();
     #[cfg(unix)]
     let (wake, wake_writer) = {
         let (reader, writer) = UnixStream::pair()?;
@@ -426,9 +435,13 @@ fn start_forwarder_hook(
             worker_start();
             run(
                 sources,
-                commands_rx,
-                worker_commands,
-                outbound_tx,
+                WorkerChannels {
+                    receiver: commands_rx,
+                    sender: worker_commands,
+                    outbound: outbound_tx,
+                    cancel: cancel_rx,
+                    abandoned: worker_abandoned,
+                },
                 #[cfg(unix)]
                 wake_writer,
                 (listener_stop_reader, session_user, worker_shutdown),
@@ -442,10 +455,12 @@ fn start_forwarder_hook(
     let forwarder = Forwarder {
         commands: commands_tx,
         outbound: outbound_rx,
+        cancel: Some(cancel_tx),
         #[cfg(unix)]
         wake,
         shutdown,
         worker: Some(worker),
+        abandoned,
     };
     before_publish();
     ensure_setup_deadline(deadline)?;
@@ -495,8 +510,8 @@ impl Forwarder {
         drain_wake(&self.wake)?;
         match self.outbound.try_recv() {
             Ok(result) => result.map(Some),
-            Err(mpsc::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::TryRecvError::Disconnected) => Err(ForwardError::Unavailable),
+            Err(channel::TryRecvError::Empty) => Ok(None),
+            Err(channel::TryRecvError::Disconnected) => Err(ForwardError::Unavailable),
         }
     }
 
@@ -508,6 +523,27 @@ impl Forwarder {
 
     pub fn shutdown(mut self) -> Result<(), ForwardError> {
         self.stop()
+    }
+
+    /// Cancel independently of bounded command/output capacity and join the
+    /// worker. Returns true when queued commands or outbound packets could not
+    /// be completed and were explicitly abandoned.
+    pub fn shutdown_hard(&mut self) -> Result<bool, ForwardError> {
+        self.shutdown.store(true, Ordering::Release);
+        self.cancel.take();
+        let mut abandoned = !self.commands.is_empty() || !self.outbound.is_empty();
+        self.commands.shutdown();
+        if let Some(worker) = self.worker.take() {
+            worker.join().map_err(|_| ForwardError::Unavailable)?;
+        }
+        while self.outbound.try_recv().is_ok() {
+            abandoned = true;
+        }
+        if !self.commands.is_empty() {
+            abandoned = true;
+        }
+        abandoned |= self.abandoned.load(Ordering::Acquire);
+        Ok(abandoned)
     }
 
     fn stop(&mut self) -> Result<(), ForwardError> {
@@ -522,7 +558,9 @@ impl Forwarder {
 
 impl Drop for Forwarder {
     fn drop(&mut self) {
-        let _ = self.stop();
+        // Drop is an abort path and must not block behind bounded forwarding
+        // queues. Callers that require graceful completion use `shutdown`.
+        let _ = self.shutdown_hard();
     }
 }
 

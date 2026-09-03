@@ -10,10 +10,10 @@
 #   note: short string
 #   et_pr: optional upstream PR number
 #
-# Classified 2026-08-22. #784 marked ported after et.rs #31 / 906a7ca.
+# Classified 2026-09-02. #798 marked ported in this et.rs PR.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-08-22"
+classified: "2026-09-02"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -77,3 +77,27 @@ commits:
     status: skip
     note: "#788 non-tty console keep-alive; not wire/security"
     et_pr: 788
+  - sha: fcce83924326ab5743878f2d58a534bd8a6bc22c
+    date: "2026-09-01"
+    kind: other
+    status: skip
+    note: "#801 HTM/Windows/coverage; not et.rs server accept/reconnect"
+    et_pr: 801
+  - sha: 50b961d9e9eb6daf57d8a5ce9cae8f9209bffe44
+    date: "2026-09-01"
+    kind: security
+    status: ported
+    note: "#798 accept starvation / stuck reconnect. Landed in et.rs via #77. PROTOCOL_VERSION stays 6."
+    et_pr: 798
+  - sha: 3e8db00cdccba4906ca1b995d3fd7c0650a9fac9
+    date: "2026-09-01"
+    kind: product
+    status: skip
+    note: "#803 TIOCGWINSZ; Unix terminal-size observation only"
+    et_pr: 803
+  - sha: 342c0dfb32882c94df6aa18092fc897015222c0b
+    date: "2026-09-02"
+    kind: ci
+    status: skip
+    note: "#802 Windows build/test parity; not a wire or server-lock change"
+    et_pr: 802

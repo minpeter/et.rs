@@ -121,53 +121,45 @@ impl Fixture {
 
     /// Wrapper that emits an ANSI palette color marker only when argv[1] is `-l`.
     pub fn login_probe_shell(&self) -> std::path::PathBuf {
-        let path = self.directory.join("login-probe-shell");
-        fs::write(
-            &path,
-            "#!/bin/sh\n\
-             if [ \"${1-}\" = \"-l\" ]; then\n\
-             printf '\\033[31mET-LOGIN-COLOR\\033[0m\\n'\n\
-             shift\n\
-             exec /bin/sh \"$@\"\n\
-             fi\n\
-             printf 'ET-NON-LOGIN\\n'\n\
-             exec /bin/sh \"$@\"\n",
+        self.login_shell_wrapper(
+            "login-probe-shell",
+            "printf '\\033[31mET-LOGIN-COLOR\\033[0m\\n'",
+            "printf 'ET-NON-LOGIN\\n'\n",
         )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-        path
     }
 
     /// Wrapper that emits a prompt marker immediately when invoked as a login shell.
     pub fn prompt_probe_shell(&self) -> std::path::PathBuf {
-        let path = self.directory.join("prompt-probe-shell");
-        fs::write(
-            &path,
-            "#!/bin/sh\n\
-             if [ \"${1-}\" = \"-l\" ]; then\n\
-             printf 'ET-PROMPT> '\n\
-             shift\n\
-             exec /bin/sh \"$@\"\n\
-             fi\n\
-             exec /bin/sh \"$@\"\n",
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-        path
+        self.login_shell_wrapper("prompt-probe-shell", "printf 'ET-PROMPT> '", "")
     }
 
     /// Login-shell wrapper matching profiles that begin by moving to a fresh line.
     pub fn leading_newline_prompt_shell(&self) -> std::path::PathBuf {
-        let path = self.directory.join("leading-newline-prompt-shell");
+        self.login_shell_wrapper(
+            "leading-newline-prompt-shell",
+            "printf '\\r\\nET-PROMPT> '",
+            "",
+        )
+    }
+
+    fn login_shell_wrapper(
+        &self,
+        name: &str,
+        login_output: &str,
+        non_login_output: &str,
+    ) -> std::path::PathBuf {
+        let path = self.directory.join(name);
         fs::write(
             &path,
-            "#!/bin/sh\n\
-             if [ \"${1-}\" = \"-l\" ]; then\n\
-             printf '\\r\\nET-PROMPT> '\n\
-             shift\n\
-             exec /bin/sh \"$@\"\n\
-             fi\n\
-             exec /bin/sh \"$@\"\n",
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"${{1-}}\" = \"-l\" ]; then\n\
+                 {login_output}\n\
+                 shift\n\
+                 exec /bin/sh \"$@\"\n\
+                 fi\n\
+                 {non_login_output}exec /bin/sh \"$@\"\n"
+            ),
         )
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();

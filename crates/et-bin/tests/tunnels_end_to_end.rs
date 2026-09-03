@@ -16,8 +16,6 @@ use reconnect_stack::{mkfifo, shell_quote, Stack};
 use tunnel_support::SingleCutProxy;
 use wait_timeout::ChildExt;
 
-// Process creation can legitimately exceed ten seconds under the load this
-// suite exercises; every wait remains bounded by the exact FIFO/process event.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 #[test]
@@ -820,10 +818,36 @@ fn spawn_client(
 }
 
 fn spawn_tcp_echo_once(listener: TcpListener, expected: &'static [u8]) -> thread::JoinHandle<()> {
+    let address = listener.local_addr().unwrap();
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_cancelled = std::sync::Arc::clone(&cancelled);
+    let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        // Accept multiple times so readiness probes do not exhaust a one-shot echo.
+        loop {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            let mut payload = vec![0u8; expected.len()];
+            if stream.read_exact(&mut payload).is_err() {
+                if worker_cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                continue;
+            }
+            assert_eq!(payload, expected);
+            stream.write_all(&payload).unwrap();
+            completed_tx.send(()).unwrap();
+            return;
+        }
+    });
     thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream.set_read_timeout(Some(TIMEOUT)).unwrap();
-        echo_once(&mut stream, expected);
+        if completed_rx.recv_timeout(TIMEOUT + TIMEOUT).is_err() {
+            cancelled.store(true, std::sync::atomic::Ordering::Release);
+            drop(TcpStream::connect(address));
+            worker.join().unwrap();
+            panic!("TCP echo did not receive its payload before the deadline");
+        }
+        worker.join().unwrap();
     })
 }
 

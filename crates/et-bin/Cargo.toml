@@ -41,6 +41,9 @@ ctrlc = "3.5"
 # Safe CreateProcessW wrapper with an explicit inherited-handle allowlist.
 windows-spawn = "0.1.0"
 
+[dev-dependencies]
+socket2 = "0.6.1"
+
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 nix = { version = "0.31.3", default-features = false, features = ["fs", "poll"] }
 rustix = { version = "1.1.4", features = ["process"] }

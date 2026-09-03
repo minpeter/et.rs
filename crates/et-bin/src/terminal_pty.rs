@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use et_core::packet::Packet;
-use et_core::proto::{TerminalBuffer, TerminalPacketType};
+use et_core::proto::{FlowControlMode, TerminalBuffer, TerminalPacketType};
 use et_net::local::LocalStream;
 use et_net::local_packet::{write_local_packet_until_cancelled, LocalPacketDecoder};
 #[cfg(unix)]
@@ -23,7 +23,7 @@ use sysinfo::{Pid as SystemPid, ProcessesToUpdate, Signal as SystemSignal, Syste
 const MAX_OUTPUT_CHUNK: usize = 16 * 1024;
 const FINAL_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-use crate::terminal_protocol::{handle_packet, read_initial_environment, read_ready_packet};
+use crate::terminal_protocol::{handle_packet, read_initialization, read_ready_packet};
 
 enum WorkerEvent {
     Output(Result<(), String>),
@@ -54,7 +54,13 @@ fn run_with_command<F>(
 where
     F: FnOnce(&mut LocalStream) -> Result<(), String>,
 {
-    let environment = read_initial_environment(&mut router)?;
+    let initialization = read_initialization(&mut router)?;
+    if initialization.flow_control != FlowControlMode::None {
+        // Keep terminal output in the server's bounded application queue,
+        // rather than a large opaque local-socket queue (upstream PR #730).
+        et_net::local::minimize_terminal_output_buffering(&router)
+            .map_err(|error| format!("could not bound terminal output buffering: {error}"))?;
+    }
     #[cfg(unix)]
     let motd = crate::terminal_motd::load();
     let pair = native_pty_system()
@@ -66,7 +72,7 @@ where
         })
         .map_err(|error| format!("could not open PTY: {error}"))?;
     command.env("TERM", term);
-    for (name, value) in environment {
+    for (name, value) in initialization.environment {
         command.env(name, value);
     }
     // Complete every fallible descriptor allocation before creating the shell.
@@ -787,11 +793,11 @@ mod tests {
 
     #[test]
     fn maximum_motd_is_split_into_local_frame_sized_chunks() {
-        let output = vec![b'x'; 256 * 1024];
+        let output = vec![b'x'; crate::terminal_motd::MAX_MOTD_TOTAL];
 
         let (packets, forwarded) = collect_forwarded(&[], Some(&output));
 
-        assert_eq!(packets.len(), 16);
+        assert_eq!(packets.len(), output.len().div_ceil(MAX_OUTPUT_CHUNK));
         assert!(packets
             .iter()
             .all(|packet| packet.len() == MAX_OUTPUT_CHUNK));

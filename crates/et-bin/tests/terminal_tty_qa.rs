@@ -19,6 +19,22 @@ static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
 #[test]
 fn real_tty_restores_termios_and_propagates_resize() {
+    let mut last_output = String::new();
+    for _ in 0..3 {
+        let output = run_termios_resize_session();
+        if output.contains("client is not registered") {
+            // The helper can win the TCP handshake before etterterminal
+            // finishes registering on a loaded macOS runner.
+            last_output = output;
+            continue;
+        }
+        assert_termios_resize_session(&output);
+        return;
+    }
+    panic!("client never registered after retries: {last_output:?}");
+}
+
+fn run_termios_resize_session() -> String {
     let stack = Stack::start();
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -62,11 +78,15 @@ fn real_tty_restores_termios_and_propagates_resize() {
         .unwrap();
     let status = child.wait().unwrap();
     assert!(status.success(), "status={status:?} output={output:?}");
+    output
+}
+
+fn assert_termios_resize_session(output: &str) {
     assert!(output.contains("TTY-G004"), "{output:?}");
     assert!(output.contains("30 90"), "{output:?}");
     assert!(output.contains("TERMIOS-RESTORED:"), "{output:?}");
     assert!(output.contains(":CODE:0:"), "{output:?}");
-    assert!(termios_restored(&output), "{output:?}");
+    assert!(termios_restored(output), "{output:?}");
     assert!(
         !output.contains("Connection to 127.0.0.1 closed."),
         "command sessions must not print an interactive close banner: {output:?}"

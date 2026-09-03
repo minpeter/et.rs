@@ -6,7 +6,7 @@ use std::thread;
 
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use et_core::proto::{TerminalBuffer, TerminalInfo, TerminalPacketType};
-use et_net::connection::{ConnError, Connection};
+use et_net::connection::{ConnError, Connection, WritePacketError};
 use et_net::forward::Forwarder;
 use prost::Message;
 #[cfg(unix)]
@@ -44,6 +44,7 @@ pub struct TerminalOptions<'a> {
     pub command: Option<&'a str>,
     pub no_exit: bool,
     pub keepalive: u32,
+    pub flow_control: et_cli::client::FlowControlMode,
     pub terminal_enabled: bool,
     pub lines: RemoteLines,
     pub connection_name: &'a str,
@@ -52,7 +53,7 @@ pub struct TerminalOptions<'a> {
 pub fn run<F>(
     mut connection: Connection,
     options: TerminalOptions<'_>,
-    forwarder: Forwarder,
+    mut forwarder: Forwarder,
     mut reconnect: F,
 ) -> Result<(), ClientError>
 where
@@ -62,6 +63,7 @@ where
         command,
         no_exit,
         keepalive,
+        flow_control,
         terminal_enabled,
         lines,
         connection_name,
@@ -78,30 +80,33 @@ where
     let mut terminal_modes = TerminalModeState::default();
     // The network can disappear immediately after the initial handshake (a
     // laptop waking up is particularly prone to this).  These writes are
-    // replay-buffered by `Connection`, so once recovery succeeds they must
-    // not be sent again; doing so would duplicate a `--command`.  Recover the
-    // transport and let the buffered packet be replayed instead.
+    // replay-buffered by `Connection`. Retry plaintext only when admission
+    // failed before replay ownership; after admission, recover and let the
+    // buffered packet replay instead of duplicating a `--command`.
     if terminal_enabled {
-        let initial_size = send_size(&mut connection);
-        if !recover_initial_transport(
-            &mut connection,
-            &mut reconnect,
-            terminal_enabled,
-            initial_size,
-        )? {
-            return raw_mode.finish(Ok(()), close_message, terminal_modes.alternate_screen);
+        if let Some(initial_size) = terminal_size_payload()? {
+            if matches!(
+                write_terminal_size_recovering(&mut connection, &initial_size, &mut reconnect)?,
+                OwnedWriteOutcome::SessionEnded
+            ) {
+                return raw_mode.finish(Ok(()), close_message, terminal_modes.alternate_screen());
+            }
         }
     }
     if terminal_enabled {
         if let Some(command) = command {
-            let initial_command = send_command(&mut connection, command, no_exit, lines);
-            if !recover_initial_transport(
-                &mut connection,
-                &mut reconnect,
-                terminal_enabled,
-                initial_command,
-            )? {
-                return raw_mode.finish(Ok(()), close_message, terminal_modes.alternate_screen);
+            let initial_command = command_payload(command, no_exit, lines)?;
+            if matches!(
+                write_owned_recovering(
+                    &mut connection,
+                    TerminalPacketType::TerminalBuffer as u8,
+                    &initial_command,
+                    &mut reconnect,
+                    terminal_enabled,
+                )?,
+                OwnedWriteOutcome::SessionEnded
+            ) {
+                return raw_mode.finish(Ok(()), close_message, terminal_modes.alternate_screen());
             }
         }
     }
@@ -146,11 +151,12 @@ where
             crate::client_terminal_loop::PumpOptions {
                 read_stdin,
                 keepalive_seconds: keepalive,
+                flow_control,
                 terminal_enabled,
                 auto_cursor_report,
                 terminal_modes: &mut terminal_modes,
             },
-            &forwarder,
+            &mut forwarder,
             reconnect,
         );
         signal_handle.close();
@@ -163,14 +169,15 @@ where
         crate::client_terminal_loop::PumpOptions {
             read_stdin,
             keepalive_seconds: keepalive,
+            flow_control,
             terminal_enabled,
             auto_cursor_report,
             terminal_modes: &mut terminal_modes,
         },
-        &forwarder,
+        &mut forwarder,
         reconnect,
     );
-    raw_mode.finish(result, close_message, terminal_modes.alternate_screen)
+    raw_mode.finish(result, close_message, terminal_modes.alternate_screen())
 }
 
 /// Device Status Report request (`ESC [ 6 n`).
@@ -184,10 +191,69 @@ pub(crate) const CURSOR_REPORT_REPLY: &[u8] = b"\x1b[1;1R";
 /// emits that request on startup and waits for the answer, which an interactive
 /// terminal emulator provides. Non-interactive sessions have no emulator to
 /// answer, so the caller replies on their behalf (see `auto_cursor_report`).
-pub(crate) fn display_packet(
+pub(crate) enum DisplayOutcome {
+    Displayed { cursor_report: bool },
+    Pending(et_core::packet::Packet),
+}
+
+pub(crate) struct RetainedCompletion {
+    terminal: Option<et_core::packet::Packet>,
+    forwarding: Option<et_core::packet::Packet>,
+}
+
+pub(crate) fn classify_forward_completion(
+    current_outbound: Option<et_core::packet::Packet>,
+    abandoned: bool,
+) -> Result<(), ClientError> {
+    if current_outbound.is_some() || abandoned {
+        return Err(terminal_text(
+            "remote session ended with undeliverable outbound forwarding data",
+        ));
+    }
+    Ok(())
+}
+
+impl RetainedCompletion {
+    pub(crate) fn new(
+        terminal: Option<et_core::packet::Packet>,
+        forwarding: Option<et_core::packet::Packet>,
+    ) -> Self {
+        Self {
+            terminal,
+            forwarding,
+        }
+    }
+
+    pub(crate) fn advance<T, F>(
+        &mut self,
+        mut admit_terminal: T,
+        mut admit_forwarding: F,
+    ) -> Result<bool, ClientError>
+    where
+        T: FnMut(et_core::packet::Packet) -> Result<Option<et_core::packet::Packet>, ClientError>,
+        F: FnMut(et_core::packet::Packet) -> Result<Option<et_core::packet::Packet>, ClientError>,
+    {
+        if let Some(packet) = self.forwarding.take() {
+            self.forwarding = admit_forwarding(packet)?;
+        }
+        if let Some(packet) = self.terminal.take() {
+            self.terminal = admit_terminal(packet)?;
+        }
+        Ok(self.forwarding.is_none() && self.terminal.is_none())
+    }
+
+    pub(crate) fn terminal_pending(&self) -> bool {
+        self.terminal.is_some()
+    }
+}
+
+pub(crate) fn display_packet_with<F>(
     packet: et_core::packet::Packet,
-    terminal_modes: &mut TerminalModeState,
-) -> Result<bool, ClientError> {
+    mut output: F,
+) -> Result<DisplayOutcome, ClientError>
+where
+    F: FnMut(&[u8]) -> Result<bool, ClientError>,
+{
     match packet.header() {
         value if value == TerminalPacketType::TerminalBuffer as u8 => {
             let message = TerminalBuffer::decode(packet.payload())
@@ -195,31 +261,31 @@ pub(crate) fn display_packet(
             let bytes = message
                 .buffer
                 .ok_or_else(|| terminal_text("terminal output is missing bytes"))?;
-            terminal_modes.observe(&bytes);
-            io::stdout()
-                .lock()
-                .write_all(&bytes)
-                .and_then(|()| io::stdout().lock().flush())
-                .map_err(|error| terminal_io("writing terminal output", error))?;
-            Ok(contains_cursor_report_request(&bytes))
+            if !output(&bytes)? {
+                return Ok(DisplayOutcome::Pending(packet));
+            }
+            Ok(DisplayOutcome::Displayed {
+                cursor_report: contains_cursor_report_request(&bytes),
+            })
         }
-        value if value == TerminalPacketType::KeepAlive as u8 => Ok(false),
+        value if value == TerminalPacketType::KeepAlive as u8 => Ok(DisplayOutcome::Displayed {
+            cursor_report: false,
+        }),
         _ => Err(terminal_text("server sent an unsupported terminal packet")),
     }
 }
 
-fn contains_cursor_report_request(bytes: &[u8]) -> bool {
+pub(crate) fn contains_cursor_report_request(bytes: &[u8]) -> bool {
     bytes
         .windows(CURSOR_REPORT_REQUEST.len())
         .any(|window| window == CURSOR_REPORT_REQUEST)
 }
 
-fn send_command(
-    connection: &mut Connection,
+fn command_payload(
     command: &str,
     no_exit: bool,
     lines: RemoteLines,
-) -> Result<(), ClientError> {
+) -> Result<Vec<u8>, ClientError> {
     if command.contains('\0') || command.len() > 64 * 1024 {
         return Err(terminal_text("remote command is invalid or too large"));
     }
@@ -236,26 +302,143 @@ fn send_command(
     let mut bytes = Vec::with_capacity(command.len() + suffix.len());
     bytes.extend_from_slice(command.as_bytes());
     bytes.extend_from_slice(suffix.as_bytes());
-    send_buffer_checked(connection, &bytes)
+    Ok(encoded_buffer(&bytes))
 }
 
-pub(crate) fn send_buffer(connection: &mut Connection, bytes: &[u8]) -> Result<(), ConnError> {
-    let message = TerminalBuffer {
+pub(crate) fn encoded_buffer(bytes: &[u8]) -> Vec<u8> {
+    TerminalBuffer {
         buffer: Some(bytes.to_vec()),
-    };
+    }
+    .encode_to_vec()
+}
+
+#[cfg(test)]
+pub(crate) fn send_buffer(connection: &mut Connection, bytes: &[u8]) -> Result<(), ConnError> {
     connection.write_packet(
         TerminalPacketType::TerminalBuffer as u8,
-        &message.encode_to_vec(),
+        &encoded_buffer(bytes),
     )
 }
 
-fn send_buffer_checked(connection: &mut Connection, bytes: &[u8]) -> Result<(), ClientError> {
-    send_buffer(connection, bytes).map_err(ClientError::Transport)
+pub(crate) enum OwnedWriteOutcome {
+    Written,
+    Recovered,
+    SessionEnded,
 }
 
-pub(crate) fn send_size(connection: &mut Connection) -> Result<(), ClientError> {
+#[derive(Clone, Copy)]
+pub(crate) enum OwnedWritePolicy {
+    ExactPlaintext,
+    ReplaceableTerminalSize,
+}
+
+pub(crate) fn write_owned_recovering<F>(
+    connection: &mut Connection,
+    header: u8,
+    payload: &[u8],
+    reconnect: &mut F,
+    send_terminal_size: bool,
+) -> Result<OwnedWriteOutcome, ClientError>
+where
+    F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
+{
+    write_owned_recovering_with(
+        connection,
+        header,
+        payload,
+        reconnect,
+        send_terminal_size,
+        |connection, header, payload| connection.write_packet_owned(header, payload),
+    )
+}
+
+fn write_owned_recovering_with<F, W>(
+    connection: &mut Connection,
+    header: u8,
+    payload: &[u8],
+    reconnect: &mut F,
+    send_terminal_size: bool,
+    write: W,
+) -> Result<OwnedWriteOutcome, ClientError>
+where
+    F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
+    W: FnMut(&mut Connection, u8, &[u8]) -> Result<(), WritePacketError>,
+{
+    write_owned_with_policy(
+        connection,
+        header,
+        payload,
+        OwnedWritePolicy::ExactPlaintext,
+        write,
+        |connection, _policy| recover_transport(connection, reconnect, send_terminal_size),
+    )
+}
+
+fn write_owned_with_policy<W, R>(
+    connection: &mut Connection,
+    header: u8,
+    payload: &[u8],
+    policy: OwnedWritePolicy,
+    mut write: W,
+    mut recover: R,
+) -> Result<OwnedWriteOutcome, ClientError>
+where
+    W: FnMut(&mut Connection, u8, &[u8]) -> Result<(), WritePacketError>,
+    R: FnMut(&mut Connection, OwnedWritePolicy) -> Result<bool, ClientError>,
+{
+    let mut recovered = false;
+    loop {
+        match write(connection, header, payload) {
+            Ok(()) => {
+                return Ok(if recovered {
+                    OwnedWriteOutcome::Recovered
+                } else {
+                    OwnedWriteOutcome::Written
+                });
+            }
+            Err(WritePacketError::BeforeReplay(error)) if connection_ended(&error) => {
+                connection.disconnect();
+                if !recover(connection, policy)? {
+                    return Ok(OwnedWriteOutcome::SessionEnded);
+                }
+                recovered = true;
+                if matches!(policy, OwnedWritePolicy::ReplaceableTerminalSize) {
+                    return Ok(OwnedWriteOutcome::Recovered);
+                }
+            }
+            Err(WritePacketError::ReplayOwned(error)) if connection_ended(&error) => {
+                return Ok(if recover(connection, policy)? {
+                    OwnedWriteOutcome::Recovered
+                } else {
+                    OwnedWriteOutcome::SessionEnded
+                });
+            }
+            Err(error) => return Err(terminal_error(error.into_inner())),
+        }
+    }
+}
+
+pub(crate) fn write_terminal_size_recovering<F>(
+    connection: &mut Connection,
+    payload: &[u8],
+    reconnect: &mut F,
+) -> Result<OwnedWriteOutcome, ClientError>
+where
+    F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
+{
+    write_owned_with_policy(
+        connection,
+        TerminalPacketType::TerminalInfo as u8,
+        payload,
+        OwnedWritePolicy::ReplaceableTerminalSize,
+        |connection, header, payload| connection.write_packet_owned(header, payload),
+        |connection, _policy| recover_transport(connection, reconnect, true),
+    )
+}
+
+pub(crate) fn terminal_size_payload() -> Result<Option<Vec<u8>>, ClientError> {
     if !io::stdout().is_terminal() {
-        return Ok(());
+        return Ok(None);
     }
     let (columns, rows) = size().map_err(|error| terminal_io("reading terminal size", error))?;
     let message = TerminalInfo {
@@ -265,12 +448,7 @@ pub(crate) fn send_size(connection: &mut Connection) -> Result<(), ClientError> 
         width: Some(0),
         height: Some(0),
     };
-    connection
-        .write_packet(
-            TerminalPacketType::TerminalInfo as u8,
-            &message.encode_to_vec(),
-        )
-        .map_err(ClientError::Transport)
+    Ok(Some(message.encode_to_vec()))
 }
 
 /// Finish an initial client write without losing a session to a race between
@@ -279,6 +457,7 @@ pub(crate) fn send_size(connection: &mut Connection) -> Result<(), ClientError> 
 /// `Connection` has already retained a packet whose socket write failed.
 /// Recovery replays that exact packet, so this deliberately does not retry
 /// `result` after reconnecting (retrying a command could execute it twice).
+#[cfg(test)]
 fn recover_initial_transport<F>(
     connection: &mut Connection,
     reconnect: &mut F,
@@ -313,15 +492,30 @@ pub(crate) fn recover_transport<F>(
 where
     F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
 {
+    let mut replay_owns_size = false;
     loop {
         match reconnect(connection)? {
             ReconnectOutcome::SessionEnded => return Ok(false),
-            ReconnectOutcome::Recovered if !send_terminal_size => return Ok(true),
-            ReconnectOutcome::Recovered => match send_size(connection) {
-                Ok(()) => return Ok(true),
-                Err(ClientError::Transport(error)) if connection_ended(&error) => {}
-                Err(error) => return Err(error),
-            },
+            ReconnectOutcome::Recovered if !send_terminal_size || replay_owns_size => {
+                return Ok(true);
+            }
+            ReconnectOutcome::Recovered => {
+                let Some(payload) = terminal_size_payload()? else {
+                    return Ok(true);
+                };
+                match connection
+                    .write_packet_owned(TerminalPacketType::TerminalInfo as u8, &payload)
+                {
+                    Ok(()) => return Ok(true),
+                    Err(WritePacketError::BeforeReplay(error)) if connection_ended(&error) => {
+                        connection.disconnect();
+                    }
+                    Err(WritePacketError::ReplayOwned(error)) if connection_ended(&error) => {
+                        replay_owns_size = true;
+                    }
+                    Err(error) => return Err(terminal_error(error.into_inner())),
+                }
+            }
         }
     }
 }
@@ -350,28 +544,38 @@ const GRACEFUL_TERMINAL_MODE_RESET: &[u8] = b"\x1b[<64u\x1b[=0;1u\
 \x1b[>4;0m\x1b[?2004l\x1b[?1004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h";
 
 #[derive(Default)]
-pub(crate) struct TerminalModeState {
+struct TerminalModeInner {
     alternate_prefix_len: usize,
     alternate_screen: bool,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct TerminalModeState(std::sync::Arc<std::sync::Mutex<TerminalModeInner>>);
+
 impl TerminalModeState {
-    fn observe(&mut self, bytes: &[u8]) {
+    pub(crate) fn observe(&self, bytes: &[u8]) {
         const PREFIX: &[u8] = b"\x1b[?1049";
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
         for &byte in bytes {
-            if self.alternate_prefix_len == PREFIX.len() {
+            if state.alternate_prefix_len == PREFIX.len() {
                 match byte {
-                    b'h' => self.alternate_screen = true,
-                    b'l' => self.alternate_screen = false,
+                    b'h' => state.alternate_screen = true,
+                    b'l' => state.alternate_screen = false,
                     _ => {}
                 }
-                self.alternate_prefix_len = usize::from(byte == PREFIX[0]);
-            } else if byte == PREFIX[self.alternate_prefix_len] {
-                self.alternate_prefix_len += 1;
+                state.alternate_prefix_len = usize::from(byte == PREFIX[0]);
+            } else if byte == PREFIX[state.alternate_prefix_len] {
+                state.alternate_prefix_len += 1;
             } else {
-                self.alternate_prefix_len = usize::from(byte == PREFIX[0]);
+                state.alternate_prefix_len = usize::from(byte == PREFIX[0]);
             }
         }
+    }
+
+    pub(crate) fn alternate_screen(&self) -> bool {
+        self.0.lock().is_ok_and(|state| state.alternate_screen)
     }
 }
 

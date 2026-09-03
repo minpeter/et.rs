@@ -16,7 +16,7 @@ use rustix::fs::{Mode, OFlags};
 /// `pam_motd(8)` limits each message to 64 KiB.
 const MAX_MOTD_MESSAGE: usize = 64 * 1024;
 /// Bound aggregate startup output when many directory messages exist.
-const MAX_MOTD_TOTAL: usize = 256 * 1024;
+pub(crate) const MAX_MOTD_TOTAL: usize = 256 * 1024;
 /// Bound directory enumeration as well as emitted bytes.
 const MAX_MOTD_ENTRIES: usize = 1024;
 /// Operator override naming one file to display instead of the defaults.

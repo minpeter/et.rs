@@ -8,6 +8,7 @@ use et_core::crypto::{
     CryptoHandler, EncryptError, DIR_CLIENT_TO_SERVER, DIR_SERVER_TO_CLIENT, KEY_LEN,
 };
 use et_core::packet::Packet;
+use socket2::SockRef;
 #[path = "connection_recovery.rs"]
 mod recovery;
 
@@ -22,6 +23,8 @@ pub use recovery::{DEFAULT_RECOVERY_TIMEOUT, MAX_RECOVERY_PROTO_LEN};
 /// [`write_all_until`] with this deadline so the transport soft-disconnects
 /// and recovery can proceed.
 pub const DEFAULT_LIVE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+pub const FLOW_CONTROL_LIVE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const FLOW_CONTROL_SOCKET_BUFFER_BYTES: usize = 32 * 1024;
 
 #[derive(Debug)]
 pub enum ConnError {
@@ -30,6 +33,7 @@ pub enum ConnError {
     Recover(RecoverError),
     Encrypt(EncryptError),
     Backpressure,
+    PacketTooLarge,
     SequenceOutOfRange(i64),
     InvalidRecoverySequence(Option<i32>),
 }
@@ -38,6 +42,45 @@ pub struct Connection {
     stream: TcpStream,
     writer: BackedWriter,
     reader: BackedReader,
+    live_write_timeout: Duration,
+}
+
+pub struct PreparedWrite {
+    live: Option<(TcpStream, Vec<u8>, Duration)>,
+}
+
+#[derive(Debug)]
+pub enum WritePacketError {
+    BeforeReplay(ConnError),
+    ReplayOwned(ConnError),
+}
+
+impl WritePacketError {
+    pub fn into_inner(self) -> ConnError {
+        match self {
+            Self::BeforeReplay(error) | Self::ReplayOwned(error) => error,
+        }
+    }
+}
+
+impl PreparedWrite {
+    pub fn send(self) -> Result<(), WritePacketError> {
+        let Some((mut stream, frame, timeout)) = self.live else {
+            return Ok(());
+        };
+        write_live_frame(&mut stream, &frame, timeout)
+            .map_err(ConnError::Io)
+            .map_err(WritePacketError::ReplayOwned)
+    }
+
+    fn send_until(self, deadline: Instant) -> Result<(), WritePacketError> {
+        let Some((mut stream, frame, _timeout)) = self.live else {
+            return Ok(());
+        };
+        write_live_frame_until(&mut stream, &frame, deadline)
+            .map_err(ConnError::Io)
+            .map_err(WritePacketError::ReplayOwned)
+    }
 }
 
 impl Connection {
@@ -54,43 +97,88 @@ impl Connection {
             stream,
             writer: BackedWriter::new(CryptoHandler::new(key, encrypt), true),
             reader: BackedReader::new(CryptoHandler::new(key, decrypt), true),
+            live_write_timeout: DEFAULT_LIVE_WRITE_TIMEOUT,
         }
     }
 
     pub fn write_packet(&mut self, header: u8, payload: &[u8]) -> Result<(), ConnError> {
-        self.write_packet_with_deadline(header, payload, None)
+        self.write_packet_owned(header, payload)
+            .map_err(WritePacketError::into_inner)
     }
 
-    fn write_packet_with_deadline(
+    pub fn write_packet_owned(
+        &mut self,
+        header: u8,
+        payload: &[u8],
+    ) -> Result<(), WritePacketError> {
+        self.write_packet_owned_until(header, payload, None)
+    }
+
+    fn write_packet_owned_until(
         &mut self,
         header: u8,
         payload: &[u8],
         deadline: Option<Instant>,
-    ) -> Result<(), ConnError> {
+    ) -> Result<(), WritePacketError> {
+        let prepared = self.prepare_write_packet(header, payload)?;
+        let result = match deadline {
+            Some(deadline) => prepared.send_until(deadline),
+            None => prepared.send(),
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.disconnect();
+                Err(error)
+            }
+        }
+    }
+
+    pub fn prepare_write_packet(
+        &mut self,
+        header: u8,
+        payload: &[u8],
+    ) -> Result<PreparedWrite, WritePacketError> {
+        self.prepare_write_packet_with(header, payload, TcpStream::try_clone)
+    }
+
+    pub fn prepare_write_packet_with<F>(
+        &mut self,
+        header: u8,
+        payload: &[u8],
+        clone_stream: F,
+    ) -> Result<PreparedWrite, WritePacketError>
+    where
+        F: FnOnce(&TcpStream) -> io::Result<TcpStream>,
+    {
         // Probe first so a half-closed peer (laptop sleep, Wi-Fi drop) moves
         // the writer into the disconnected catch-up buffer before we try to
         // push bytes onto a dead socket.
-        if let Err(_error) = self.refresh_connectivity() {
+        if self.refresh_connectivity().is_err() {
             self.disconnect();
         }
-        match self.writer.write_packet(header, payload)? {
-            WriterOutcome::Send(frame) => {
-                let deadline = deadline.unwrap_or_else(|| {
-                    Instant::now()
-                        .checked_add(DEFAULT_LIVE_WRITE_TIMEOUT)
-                        .unwrap_or_else(Instant::now)
-                });
-                if let Err(_error) = self.write_live_frame_until(&frame, deadline) {
-                    // The encrypted packet is already in the replay backup
-                    // (BackedWriter pushes before returning Send). Mark the
-                    // transport disconnected so further writes buffer for a
-                    // returning client instead of tearing the session down.
-                    self.disconnect();
-                }
-                Ok(())
-            }
-            WriterOutcome::BufferedOnly => Ok(()),
-            WriterOutcome::Skipped => Err(ConnError::Backpressure),
+        // Cloning is the only fallible transport preparation. Do it before
+        // encryption advances the nonce/sequence and inserts replay history.
+        let live_stream = self
+            .writer
+            .connected()
+            .then(|| {
+                clone_stream(&self.stream)
+                    .map_err(ConnError::Io)
+                    .map_err(WritePacketError::BeforeReplay)
+            })
+            .transpose()?;
+        match self
+            .writer
+            .write_packet(header, payload)
+            .map_err(ConnError::Encrypt)
+            .map_err(WritePacketError::BeforeReplay)?
+        {
+            WriterOutcome::Send(frame) => Ok(PreparedWrite {
+                live: live_stream.map(|stream| (stream, frame, self.live_write_timeout)),
+            }),
+            WriterOutcome::BufferedOnly => Ok(PreparedWrite { live: None }),
+            WriterOutcome::Skipped => Err(WritePacketError::BeforeReplay(ConnError::Backpressure)),
         }
     }
 
@@ -103,7 +191,8 @@ impl Connection {
         if !self.connected() {
             return Err(io::Error::from(io::ErrorKind::NotConnected).into());
         }
-        self.write_packet(header, payload)?;
+        self.write_packet_owned(header, payload)
+            .map_err(WritePacketError::into_inner)?;
         if self.connected() {
             Ok(())
         } else {
@@ -125,37 +214,12 @@ impl Connection {
         if !self.connected() {
             return Err(io::Error::from(io::ErrorKind::NotConnected).into());
         }
-        self.write_packet_with_deadline(header, payload, Some(deadline))?;
+        self.write_packet_owned_until(header, payload, Some(deadline))
+            .map_err(WritePacketError::into_inner)?;
         if self.connected() {
             Ok(())
         } else {
             Err(io::Error::from(io::ErrorKind::NotConnected).into())
-        }
-    }
-
-    /// Write a framed packet to a still-connected peer with a bounded timeout.
-    ///
-    /// Uses a write loop (not bare `write_all`) so each `write` is capped by
-    /// the remaining deadline. On any incomplete write we error out and the
-    /// caller soft-disconnects: the old TCP path is abandoned (and shut down
-    /// by the soft-disconnect path) so a partial frame left on the wire cannot
-    /// desync a later recovery, which always uses a new stream.
-    ///
-    /// Restores a cleared write timeout afterwards so recovery / handshake
-    /// code that sets its own deadlines is not left with a stale value.
-    fn write_live_frame_until(&mut self, frame: &[u8], deadline: Instant) -> io::Result<()> {
-        let result = write_all_until(&mut self.stream, frame, deadline);
-        // Best-effort restore: a failed clear must not hide a write error.
-        let clear = self.stream.set_write_timeout(None);
-        match (result, clear) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), _) => {
-                // Force the peer off the half-written frame so it reconnects
-                // rather than blocking on the rest of a truncated record.
-                let _ = self.stream.shutdown(Shutdown::Both);
-                Err(error)
-            }
-            (Ok(()), Err(error)) => Err(error),
         }
     }
 
@@ -292,6 +356,21 @@ impl Connection {
         Ok(())
     }
 
+    /// Keep opt-in flow-control backlog in the application queue instead of
+    /// allowing the kernel send queue to autotune to multiple megabytes.
+    pub fn minimize_output_buffering(&mut self) -> Result<(), ConnError> {
+        self.live_write_timeout = FLOW_CONTROL_LIVE_WRITE_TIMEOUT;
+        let socket = SockRef::from(&self.stream);
+        socket
+            .set_send_buffer_size(FLOW_CONTROL_SOCKET_BUFFER_BYTES)
+            .map_err(ConnError::Io)?;
+        #[cfg(target_os = "linux")]
+        socket
+            .set_tcp_notsent_lowat(FLOW_CONTROL_SOCKET_BUFFER_BYTES as u32)
+            .map_err(ConnError::Io)?;
+        Ok(())
+    }
+
     pub fn writer_sequence(&self) -> i64 {
         self.writer.sequence()
     }
@@ -339,6 +418,37 @@ impl Connection {
     }
 }
 
+fn write_live_frame(stream: &mut TcpStream, frame: &[u8], timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "live write deadline"))?;
+    write_live_frame_until(stream, frame, deadline)
+}
+
+/// Write a framed packet to a still-connected peer before an absolute deadline.
+///
+/// On an incomplete write, shut down the abandoned transport so a partial
+/// frame cannot desynchronize a later recovery on a replacement stream.
+fn write_live_frame_until(
+    stream: &mut TcpStream,
+    frame: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    let result = write_all_until(stream, frame, deadline);
+    // Best-effort restore: a failed clear must not hide a write error.
+    let clear = stream.set_write_timeout(None);
+    match (result, clear) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) => {
+            // Force the peer off the half-written frame so it reconnects
+            // rather than blocking on the rest of a truncated record.
+            let _ = stream.shutdown(Shutdown::Both);
+            Err(error)
+        }
+        (Ok(()), Err(error)) => Err(error),
+    }
+}
+
 /// Write the full buffer before `deadline`, refreshing the socket write
 /// timeout on each attempt so a blackholed peer cannot pin the caller.
 fn write_all_until(stream: &mut TcpStream, mut buffer: &[u8], deadline: Instant) -> io::Result<()> {
@@ -358,4 +468,41 @@ fn write_all_until(stream: &mut TcpStream, mut buffer: &[u8], deadline: Instant)
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::thread;
+
+    #[test]
+    fn clone_failure_does_not_advance_writer_nonce_or_sequence() {
+        // Given: an authenticated connection whose transport clone fails.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let connector = thread::spawn(move || TcpStream::connect(address).unwrap());
+        let (server_stream, _) = listener.accept().unwrap();
+        let client_stream = connector.join().unwrap();
+        let key = [19u8; KEY_LEN];
+        let mut sender = Connection::new_client(client_stream, &key);
+        let mut receiver = Connection::new_server(server_stream, &key);
+
+        // When: preparation fails, then the same logical packet is retried.
+        let failure = sender.prepare_write_packet_with(7, b"once", |_| {
+            Err(io::Error::other("injected clone failure"))
+        });
+        assert!(matches!(
+            failure,
+            Err(WritePacketError::BeforeReplay(ConnError::Io(_)))
+        ));
+        assert_eq!(sender.writer_sequence(), 0);
+        sender.write_packet(7, b"once").unwrap();
+
+        // Then: the peer decrypts sequence zero exactly once.
+        let packet = receiver.read_packet().unwrap();
+        assert_eq!((packet.header(), packet.payload()), (7, b"once".as_slice()));
+        assert_eq!(sender.writer_sequence(), 1);
+        assert_eq!(receiver.reader_sequence(), 1);
+    }
 }

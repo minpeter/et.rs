@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use et_cli::tunnel::MAX_UNIX_SOCKET_PATH;
-use et_core::packet::{Packet, HEADER_LEN};
-use et_core::proto::{InitialPayload, TerminalPacketType};
+use et_core::packet::Packet;
+use et_core::proto::{InitialPayload, TermInit, TerminalPacketType};
 use et_net::local_packet::MAX_LOCAL_PACKET_LEN;
 use prost::Message;
 
@@ -83,8 +83,18 @@ pub(crate) fn locale_environment_capacity(reserved: usize) -> usize {
 pub(crate) fn bounded_locale_environment(
     candidates: impl IntoIterator<Item = (String, String)>,
     reserved: &BTreeMap<String, usize>,
+    flowcontrol: Option<i32>,
 ) -> Result<Vec<(String, String)>, usize> {
-    let mut packet_len = HEADER_LEN;
+    let mut packet_len = Packet::new(
+        TerminalPacketType::TerminalInit as u8,
+        TermInit {
+            environmentnames: Vec::new(),
+            environmentvalues: Vec::new(),
+            flowcontrol,
+        }
+        .encode_to_vec(),
+    )
+    .wire_len();
     for (name, value_len) in reserved {
         packet_len = packet_len
             .saturating_add(encoded_string_field_len(name.len()))
@@ -163,7 +173,8 @@ mod tests {
     };
     use et_core::packet::Packet;
     use et_core::proto::{
-        InitialPayload, PortForwardSourceRequest, SocketEndpoint, TerminalPacketType,
+        FlowControlMode, InitialPayload, PortForwardSourceRequest, SocketEndpoint, TermInit,
+        TerminalPacketType,
     };
     use et_net::local_packet::MAX_LOCAL_PACKET_LEN;
     use prost::Message;
@@ -189,6 +200,7 @@ mod tests {
             jumphost: Some(false),
             reversetunnels: vec![request; 128],
             environmentvariables: Default::default(),
+            flowcontrol: None,
         };
         let mut locale = vec![
             ("LC_ALL".to_owned(), "C".to_owned()),
@@ -222,6 +234,71 @@ mod tests {
             modeled.encode_to_vec(),
         )
         .wire_len()
+    }
+
+    #[test]
+    fn terminal_environment_budget_includes_opted_in_flow_control_bytes() {
+        for mode in [FlowControlMode::Backpressure, FlowControlMode::Discard] {
+            // Given: one locale value whose flow-control-free TermInit lands
+            // exactly on the local framing limit.
+            let reserved = std::collections::BTreeMap::new();
+            let name = "LANG".to_owned();
+            let value_len = (MAX_LOCAL_PACKET_LEN - 32..MAX_LOCAL_PACKET_LEN)
+                .find(|value_len| {
+                    let init = TermInit {
+                        environmentnames: vec![name.clone()],
+                        environmentvalues: vec!["x".repeat(*value_len)],
+                        flowcontrol: None,
+                    };
+                    Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec())
+                        .wire_len()
+                        == MAX_LOCAL_PACKET_LEN
+                })
+                .unwrap();
+
+            // When: locale selection budgets the opt-in enum field.
+            let selected = super::bounded_locale_environment(
+                [(name, "x".repeat(value_len))],
+                &reserved,
+                Some(mode as i32),
+            )
+            .unwrap();
+
+            // Then: the server's actual TermInit remains within the local cap.
+            let init = TermInit {
+                environmentnames: selected.iter().map(|(name, _)| name.clone()).collect(),
+                environmentvalues: selected.into_iter().map(|(_, value)| value).collect(),
+                flowcontrol: Some(mode as i32),
+            };
+            assert!(
+                Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec(),)
+                    .wire_len()
+                    <= MAX_LOCAL_PACKET_LEN
+            );
+        }
+    }
+
+    #[test]
+    fn absent_flow_control_keeps_the_existing_exact_boundary() {
+        let reserved = std::collections::BTreeMap::new();
+        let name = "LANG".to_owned();
+        let value_len = (MAX_LOCAL_PACKET_LEN - 32..MAX_LOCAL_PACKET_LEN)
+            .find(|value_len| {
+                let init = TermInit {
+                    environmentnames: vec![name.clone()],
+                    environmentvalues: vec!["x".repeat(*value_len)],
+                    flowcontrol: None,
+                };
+                Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec()).wire_len()
+                    == MAX_LOCAL_PACKET_LEN
+            })
+            .unwrap();
+
+        let selected =
+            super::bounded_locale_environment([(name, "x".repeat(value_len))], &reserved, None)
+                .unwrap();
+
+        assert_eq!(selected[0].1.len(), value_len);
     }
 
     #[test]

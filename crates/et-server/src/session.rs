@@ -1,15 +1,15 @@
 use et_net::local::LocalStream;
-use std::io::{self, Write};
+use std::io;
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use et_core::backed_writer::{
     MAX_BACKUP_PACKETS, MAX_DISCONNECT_PACKETS, MAX_RECOVERY_BACKUP_BYTES,
 };
-use et_core::proto::TerminalPacketType;
-use et_net::connection::DEFAULT_RECOVERY_TIMEOUT;
+use et_core::flow_control::FlowControlMode as QueueMode;
+use et_core::packet::Packet;
 use et_net::connection::{ConnError, Connection};
 
 /// How long `recover` may wait for the session mutexes.
@@ -20,7 +20,19 @@ use et_net::connection::{ConnError, Connection};
 /// deadline, piled-up returning clients fail fast and retry instead of
 /// blocking the accept path for minutes. Recovery network I/O itself runs
 /// *without* the connection mutex (see [`ActiveSession::recover_body`]).
-const RECOVERY_LOCK_TIMEOUT: Duration = DEFAULT_RECOVERY_TIMEOUT;
+const RECOVERY_LOCK_TIMEOUT: Duration = et_net::connection::DEFAULT_RECOVERY_TIMEOUT;
+const FLOW_CONTROL_BUFFER_BYTES: usize = 64 * 1024;
+
+#[path = "session_flow.rs"]
+mod session_flow;
+#[cfg(test)]
+#[path = "session_flow_test.rs"]
+mod session_flow_tests;
+#[path = "session_io.rs"]
+mod session_io;
+#[path = "session_recovery.rs"]
+mod session_recovery;
+use session_flow::FlowControl;
 
 pub(crate) struct ActiveSession {
     connection: Mutex<Connection>,
@@ -34,10 +46,26 @@ pub(crate) struct ActiveSession {
     recover_hold: Mutex<Vec<(u8, Vec<u8>)>>,
     recover_hold_bytes: AtomicU64,
     shutdown: AtomicBool,
+    /// Set only by [`ActiveSession::shutdown`] (full session teardown).
+    /// Distinct from [`Self::shutdown`]: `finish_terminal` also sets that
+    /// flag so the bridge can drain HUP, and recover must still complete.
+    torn_down: AtomicBool,
     /// Only one recover may run at a time. Concurrent returning clients used
     /// to queue on the connection mutex for minutes after a blackhole write.
     recovering: AtomicBool,
+    /// Orders full teardown against the recovery admission claim. The
+    /// recovery handshake itself runs without this lock.
+    recover_admission: Mutex<()>,
+    #[cfg(test)]
+    recover_admission_hook: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     connection_generation: AtomicU64,
+    flow_control: Option<Arc<FlowControl>>,
+    flow_writer: Mutex<Option<std::thread::JoinHandle<()>>>,
     bridge_generation: Mutex<u64>,
     bridge_changed: Condvar,
 }
@@ -45,6 +73,20 @@ pub(crate) struct ActiveSession {
 pub(crate) enum SessionConnection {
     Starting(TcpStream),
     Active(Arc<ActiveSession>),
+}
+
+#[derive(Debug)]
+pub enum SessionWriteError {
+    BeforeReplay(SessionError),
+    ReplayOwned(SessionError),
+}
+
+impl SessionWriteError {
+    fn into_inner(self) -> SessionError {
+        match self {
+            Self::BeforeReplay(error) | Self::ReplayOwned(error) => error,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -83,9 +125,16 @@ impl std::error::Error for SessionError {
 
 impl ActiveSession {
     pub(crate) fn new(
-        connection: Connection,
+        mut connection: Connection,
         terminal: &LocalStream,
+        flow_control: Option<i32>,
     ) -> Result<Self, SessionError> {
+        let queue_mode = queue_mode(flow_control);
+        if queue_mode.is_some() {
+            connection
+                .minimize_output_buffering()
+                .map_err(SessionError::Connection)?;
+        }
         let control = connection
             .try_clone_stream()
             .map_err(SessionError::Connection)?;
@@ -100,40 +149,123 @@ impl ActiveSession {
             recover_hold: Mutex::new(Vec::new()),
             recover_hold_bytes: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
+            torn_down: AtomicBool::new(false),
             recovering: AtomicBool::new(false),
+            recover_admission: Mutex::new(()),
+            #[cfg(test)]
+            recover_admission_hook: Mutex::new(None),
             connection_generation: AtomicU64::new(0),
+            flow_control: queue_mode.map(|mode| Arc::new(FlowControl::new(mode))),
+            flow_writer: Mutex::new(None),
             bridge_generation: Mutex::new(0),
             bridge_changed: Condvar::new(),
         })
     }
 
+    pub(crate) fn start_flow_writer(self: &Arc<Self>) {
+        let Some(state) = self.flow_control.clone() else {
+            return;
+        };
+        let session = Arc::downgrade(self);
+        let handle = std::thread::spawn(move || session_flow::run_writer(session, state));
+        if let Ok(mut writer) = self.flow_writer.lock() {
+            *writer = Some(handle);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_flow_enqueue_hook(&self, reached: std::sync::mpsc::SyncSender<()>) {
+        self.flow_control
+            .as_ref()
+            .expect("test session must enable flow control")
+            .install_enqueue_hook(reached);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_recover_admission_hook(
+        &self,
+        reached: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.recover_admission_hook.lock().unwrap() = Some((reached, release));
+    }
+
     pub(crate) fn send_packet(&self, header: u8, payload: &[u8]) -> Result<(), SessionError> {
+        match self.send_packet_owned(header, payload) {
+            Ok(()) => Ok(()),
+            Err(SessionWriteError::BeforeReplay(SessionError::Connection(ConnError::Io(_)))) => {
+                self.connection
+                    .lock()
+                    .map_err(|_| SessionError::Unavailable)?
+                    .disconnect();
+                self.send_packet_owned(header, payload)
+                    .map_err(SessionWriteError::into_inner)
+            }
+            Err(error) => Err(error.into_inner()),
+        }
+    }
+
+    pub(crate) fn send_packet_owned(
+        &self,
+        header: u8,
+        payload: &[u8],
+    ) -> Result<(), SessionWriteError> {
+        self.send_packet_owned_with(header, payload, |connection, header, payload| {
+            connection.write_packet_owned(header, payload)
+        })
+    }
+
+    fn send_packet_owned_with<W>(
+        &self,
+        header: u8,
+        payload: &[u8],
+        mut write: W,
+    ) -> Result<(), SessionWriteError>
+    where
+        W: FnMut(&mut Connection, u8, &[u8]) -> Result<(), et_net::connection::WritePacketError>,
+    {
+        if let Some(state) = &self.flow_control {
+            return state
+                .enqueue(Packet::new(header, payload))
+                .map_err(SessionWriteError::BeforeReplay);
+        }
         // While a recover holds the single-flight permit, queue terminal
         // output instead of contending on the connection mutex for the
         // recovery network RTT. Flushed after the new stream is installed.
-        if self.queue_if_recovering(header, payload)? {
+        if self
+            .queue_if_recovering(header, payload)
+            .map_err(SessionWriteError::BeforeReplay)?
+        {
             return Ok(());
         }
         let mut connection = self
             .connection
             .lock()
-            .map_err(|_| SessionError::Unavailable)?;
+            .map_err(|_| SessionWriteError::BeforeReplay(SessionError::Unavailable))?;
         // Recover may have started after the fast path check. Drop the
         // connection lock before taking `recover_hold` (flush takes hold
         // then connection — reverse order deadlocks).
         if self.recovering.load(Ordering::Acquire) {
             drop(connection);
-            if self.queue_if_recovering(header, payload)? {
+            if self
+                .queue_if_recovering(header, payload)
+                .map_err(SessionWriteError::BeforeReplay)?
+            {
                 return Ok(());
             }
             connection = self
                 .connection
                 .lock()
-                .map_err(|_| SessionError::Unavailable)?;
+                .map_err(|_| SessionWriteError::BeforeReplay(SessionError::Unavailable))?;
         }
-        connection
-            .write_packet(header, payload)
-            .map_err(SessionError::Connection)
+        write(&mut connection, header, payload).map_err(|error| match error {
+            et_net::connection::WritePacketError::BeforeReplay(error) => {
+                SessionWriteError::BeforeReplay(SessionError::Connection(error))
+            }
+            et_net::connection::WritePacketError::ReplayOwned(error) => {
+                SessionWriteError::ReplayOwned(SessionError::Connection(error))
+            }
+        })
     }
 
     fn queue_if_recovering(&self, header: u8, payload: &[u8]) -> Result<bool, SessionError> {
@@ -170,114 +302,9 @@ impl ActiveSession {
         Ok(true)
     }
 
-    /// Acquire the single-flight recover permit without speaking on the wire.
-    ///
-    /// Callers must send `ReturningClient` only after this succeeds, so a
-    /// concurrent recover does not commit the peer to sequence exchange and
-    /// then fail with `RecoverBusy`. The permit releases the flag on drop
-    /// (including panic unwind).
-    pub(crate) fn try_begin_recover(&self) -> Result<RecoverPermit<'_>, SessionError> {
-        if self
-            .recovering
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err(SessionError::RecoverBusy);
-        }
-        Ok(RecoverPermit { session: self })
-    }
-
-    /// Prepare → network handshake off-lock → install → flush hold.
-    ///
-    /// The connection mutex is held only for soft-disconnect/snapshot and for
-    /// installing the new stream, not for sequence exchange or peer auth.
-    fn recover_body(&self, stream: TcpStream) -> Result<(), SessionError> {
-        // Phase 1: soft-disconnect and snapshot under a short lock.
-        let mut candidate = {
-            let connection = lock_timeout(&self.connection, RECOVERY_LOCK_TIMEOUT)?;
-            // Snapshot onto the new stream without closing or disconnecting
-            // the live victim socket (ET #784 / ANT-2026-VAMER5RC). Terminal
-            // output during the off-lock handshake is queued in
-            // `recover_hold` because `recovering` is set. A failed recover
-            // must leave the existing session intact.
-            connection.prepare_recovery_candidate(stream)
-        };
-
-        // Phase 2: recovery network I/O without the session connection lock.
-        candidate
-            .run_recovery_handshake(DEFAULT_RECOVERY_TIMEOUT)
-            .map_err(SessionError::Connection)?;
-        // Any packet that decrypts with the session key authenticates the
-        // returning client; it is requeued and handled by the session loop.
-        candidate
-            .authenticate_peer(DEFAULT_RECOVERY_TIMEOUT)
-            .map_err(SessionError::Connection)?;
-        let ack = candidate.keepalive_ack();
-        candidate
-            .write_packet_live(TerminalPacketType::KeepAlive as u8, &ack)
-            .map_err(SessionError::Connection)?;
-        let new_control = candidate
-            .try_clone_stream()
-            .map_err(SessionError::Connection)?;
-
-        // Phase 3: install under a short lock.
-        {
-            let mut control = lock_timeout(&self.control, RECOVERY_LOCK_TIMEOUT)?;
-            let mut connection = lock_timeout(&self.connection, RECOVERY_LOCK_TIMEOUT)?;
-            let old_control = std::mem::replace(&mut *control, new_control);
-            let _ = old_control.shutdown(Shutdown::Both);
-            *connection = candidate;
-            self.connection_generation.fetch_add(1, Ordering::Release);
-        }
-
-        // Phase 4: drain terminal output queued while the handshake ran.
-        // Still under `recovering` so concurrent send_packet keeps queuing
-        // until the permit drops; Drop flushes once more after clearing.
-        self.flush_recover_hold()
-    }
-
-    fn flush_recover_hold(&self) -> Result<(), SessionError> {
-        loop {
-            let batch = {
-                let mut hold = self
-                    .recover_hold
-                    .lock()
-                    .map_err(|_| SessionError::Unavailable)?;
-                if hold.is_empty() {
-                    return Ok(());
-                }
-                std::mem::take(&mut *hold)
-            };
-            let batch_bytes = batch.iter().fold(0u64, |total, (_, payload)| {
-                total.saturating_add(payload.len() as u64)
-            });
-            let mut connection = lock_timeout(&self.connection, RECOVERY_LOCK_TIMEOUT)?;
-            let mut remaining = batch.into_iter();
-            while let Some((header, payload)) = remaining.next() {
-                if let Err(error) = connection.write_packet(header, &payload) {
-                    // Release the connection lock before taking `recover_hold`
-                    // (send_packet may hold hold → connection; reverse deadlocks).
-                    drop(connection);
-                    // Put the failed packet and unwritten tail back ahead of
-                    // anything concurrent senders queued after we took `batch`.
-                    let mut hold = self
-                        .recover_hold
-                        .lock()
-                        .map_err(|_| SessionError::Unavailable)?;
-                    let concurrent = std::mem::take(&mut *hold);
-                    hold.push((header, payload));
-                    hold.extend(remaining);
-                    hold.extend(concurrent);
-                    return Err(SessionError::Connection(error));
-                }
-            }
-            self.recover_hold_bytes
-                .fetch_sub(batch_bytes, Ordering::AcqRel);
-        }
-    }
-
     pub(crate) fn finish_terminal(&self) -> Result<(), SessionError> {
         self.shutdown.store(true, Ordering::Release);
+        let flow_result = self.join_flow_writer(true);
         let _ = self.signal();
         let terminal = self
             .terminal_control
@@ -286,15 +313,38 @@ impl ActiveSession {
         let _ = terminal.shutdown(Shutdown::Both);
         drop(terminal);
         let control = self.control.lock().map_err(|_| SessionError::Unavailable)?;
-        match control.shutdown(Shutdown::Write) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
-            Err(error) => Err(SessionError::Io(error)),
+        let control_result = if flow_result.is_err() {
+            control.shutdown(Shutdown::Both)
+        } else {
+            control.shutdown(Shutdown::Write)
+        };
+        match control_result {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotConnected => {}
+            Err(error) => return Err(SessionError::Io(error)),
         }
+        drop(control);
+        if let Err(error) = flow_result {
+            let mut connection = self
+                .connection
+                .lock()
+                .map_err(|_| SessionError::Unavailable)?;
+            let _ = connection.shutdown();
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) fn shutdown(&self) -> Result<(), SessionError> {
+        {
+            let _admission = self
+                .recover_admission
+                .lock()
+                .map_err(|_| SessionError::Unavailable)?;
+            self.torn_down.store(true, Ordering::Release);
+        }
         self.shutdown.store(true, Ordering::Release);
+        self.join_flow_writer(false)?;
         let _ = self.signal();
         let terminal = self
             .terminal_control
@@ -316,206 +366,54 @@ impl ActiveSession {
         connection.shutdown().map_err(SessionError::Connection)
     }
 
-    pub(crate) fn take_wake_reader(&self) -> Result<LocalStream, SessionError> {
-        self.wake_reader
-            .lock()
-            .map_err(|_| SessionError::Unavailable)?
-            .take()
-            .ok_or(SessionError::Unavailable)
-    }
-
-    #[cfg_attr(windows, allow(dead_code))]
-    pub(crate) fn try_clone_stream(&self) -> Result<(TcpStream, u64), SessionError> {
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| SessionError::Unavailable)?;
-        let generation = self.connection_generation.load(Ordering::Acquire);
-        let stream = connection
-            .try_clone_stream()
-            .map_err(SessionError::Connection)?;
-        Ok((stream, generation))
-    }
-
-    pub(crate) fn try_read_packet(&self) -> Result<Option<et_core::packet::Packet>, SessionError> {
-        self.connection
-            .lock()
-            .map_err(|_| SessionError::Unavailable)?
-            .try_read_packet()
-            .map_err(SessionError::Connection)
-    }
-
-    pub(crate) fn note_bridge_generation(&self, generation: u64) -> Result<(), SessionError> {
-        let mut observed = self
-            .bridge_generation
-            .lock()
-            .map_err(|_| SessionError::Unavailable)?;
-        if generation > *observed {
-            *observed = generation;
-            self.bridge_changed.notify_all();
-        }
-        Ok(())
-    }
-
-    pub(crate) fn wait_for_bridge_generation(
-        &self,
-        expected: u64,
-        timeout: Duration,
-    ) -> Result<(), SessionError> {
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or(SessionError::Unavailable)?;
-        let mut observed = self
-            .bridge_generation
-            .lock()
-            .map_err(|_| SessionError::Unavailable)?;
-        while *observed < expected {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or(SessionError::RecoverBusy)?;
-            let (next, result) = self
-                .bridge_changed
-                .wait_timeout(observed, remaining)
-                .map_err(|_| SessionError::Unavailable)?;
-            observed = next;
-            if result.timed_out() && *observed < expected {
-                return Err(SessionError::RecoverBusy);
+    fn join_flow_writer(&self, graceful: bool) -> Result<(), SessionError> {
+        if let Some(state) = &self.flow_control {
+            if graceful {
+                state.stop_gracefully();
+            } else {
+                state.stop_hard();
             }
         }
+        let handle = self
+            .flow_writer
+            .lock()
+            .map_err(|_| SessionError::Unavailable)?
+            .take();
+        if handle.is_some_and(|handle| handle.join().is_err()) {
+            return Err(SessionError::Unavailable);
+        }
+        if graceful
+            && self
+                .flow_control
+                .as_ref()
+                .is_some_and(|state| state.unrecoverable())
+        {
+            return Err(SessionError::Connection(ConnError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "terminal ended before retained flow output could be delivered",
+            ))));
+        }
         Ok(())
     }
 
-    pub(crate) fn connection_state(&self) -> Result<(bool, u64), SessionError> {
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| SessionError::Unavailable)?;
-        Ok((
-            connection.connected(),
-            self.connection_generation.load(Ordering::Acquire),
-        ))
-    }
-
-    /// Soft-drop the encrypted client transport without killing the terminal.
-    ///
-    /// Used when the client TCP path dies (sleep, Wi-Fi, NAT) so terminal
-    /// output keeps buffering and a returning client can recover the same
-    /// session. Does not set the session shutdown flag or close the terminal.
-    pub(crate) fn mark_client_disconnected(
-        &self,
-        expected_generation: u64,
-    ) -> Result<bool, SessionError> {
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| SessionError::Unavailable)?;
-        if self.connection_generation.load(Ordering::Acquire) != expected_generation {
-            return Ok(false);
+    fn stop_flow_writer(&self) {
+        if let Some(state) = &self.flow_control {
+            state.stop_hard();
         }
-        connection.disconnect();
-        Ok(true)
-    }
-
-    /// Apply a client delivery acknowledgement to the replay backup.
-    pub(crate) fn acknowledge_delivery(&self, sequence: i64) -> Result<(), SessionError> {
-        self.connection
-            .lock()
-            .map_err(|_| SessionError::Unavailable)?
-            .acknowledge_delivery(sequence);
-        Ok(())
-    }
-
-    /// Keep-alive payload acknowledging everything read from the client.
-    pub(crate) fn keepalive_ack(
-        &self,
-    ) -> Result<[u8; et_core::keepalive::ACK_PAYLOAD_LEN], SessionError> {
-        Ok(self
-            .connection
-            .lock()
-            .map_err(|_| SessionError::Unavailable)?
-            .keepalive_ack())
-    }
-
-    pub(crate) fn can_buffer_write(&self, bytes: i64) -> Result<bool, SessionError> {
-        let hold = self
-            .recover_hold
-            .lock()
-            .map_err(|_| SessionError::Unavailable)?;
-        if hold.len() >= MAX_BACKUP_PACKETS + MAX_DISCONNECT_PACKETS {
-            return Ok(false);
-        }
-        let held =
-            i64::try_from(self.recover_hold_bytes.load(Ordering::Acquire)).unwrap_or(i64::MAX);
-        let requested = held.checked_add(bytes).unwrap_or(i64::MAX);
-        if requested > MAX_RECOVERY_BACKUP_BYTES {
-            return Ok(false);
-        }
-        Ok(self
-            .connection
-            .lock()
-            .map_err(|_| SessionError::Unavailable)?
-            .can_buffer_write(requested))
-    }
-
-    pub(crate) fn is_shutting_down(&self) -> bool {
-        self.shutdown.load(Ordering::Acquire)
-    }
-
-    fn signal(&self) -> Result<(), SessionError> {
-        self.wake_writer
-            .lock()
-            .map_err(|_| SessionError::Unavailable)?
-            .write_all(&[1])
-            .map_err(SessionError::Io)
     }
 }
 
-/// Single-flight recover permit. Dropping it (normally or on panic) always
-/// clears [`ActiveSession::recovering`] and wakes the terminal bridge.
-pub(crate) struct RecoverPermit<'a> {
-    session: &'a ActiveSession,
-}
-
-impl RecoverPermit<'_> {
-    /// Run the recovery handshake and install the new stream.
-    pub(crate) fn complete(self, stream: TcpStream) -> Result<(), SessionError> {
-        // `self` drops after this returns (or panics), clearing `recovering`
-        // and flushing any straggler hold packets.
-        self.session.recover_body(stream)
-    }
-}
-
-impl Drop for RecoverPermit<'_> {
+impl Drop for ActiveSession {
     fn drop(&mut self) {
-        // Flush while still marked recovering so send_packet keeps queuing
-        // rather than racing into a half-installed connection.
-        let _ = self.session.flush_recover_hold();
-        self.session.recovering.store(false, Ordering::Release);
-        // Catch anything that observed `recovering` and queued after the first
-        // flush but before the flag cleared (re-check is under the hold lock).
-        let _ = self.session.flush_recover_hold();
-        // Wake the bridge even on failure so it re-checks connection state.
-        let _ = self.session.signal();
+        self.stop_flow_writer();
     }
 }
 
-/// Acquire a [`Mutex`] with a deadline so recover cannot park forever behind a
-/// bridge thread blocked in a live write.
-fn lock_timeout<T>(mutex: &Mutex<T>, timeout: Duration) -> Result<MutexGuard<'_, T>, SessionError> {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or(SessionError::RecoverBusy)?;
-    loop {
-        match mutex.try_lock() {
-            Ok(guard) => return Ok(guard),
-            Err(TryLockError::Poisoned(_)) => return Err(SessionError::Unavailable),
-            Err(TryLockError::WouldBlock) => {
-                if Instant::now() >= deadline {
-                    return Err(SessionError::RecoverBusy);
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }
+fn queue_mode(value: Option<i32>) -> Option<QueueMode> {
+    match value.and_then(|value| et_core::proto::FlowControlMode::try_from(value).ok()) {
+        None | Some(et_core::proto::FlowControlMode::None) => None,
+        Some(et_core::proto::FlowControlMode::Backpressure) => Some(QueueMode::Backpressure),
+        Some(et_core::proto::FlowControlMode::Discard) => Some(QueueMode::Discard),
     }
 }
 
@@ -545,7 +443,7 @@ mod tests {
         let _peer = peer.join().unwrap();
         let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
         let session =
-            ActiveSession::new(Connection::new_server(stream, &[7; 32]), &terminal).unwrap();
+            ActiveSession::new(Connection::new_server(stream, &[7; 32]), &terminal, None).unwrap();
         let permit = session.try_begin_recover().unwrap();
 
         for index in 0..4u8 {
@@ -569,5 +467,75 @@ mod tests {
         drop(hold);
         session.recovering.store(false, Ordering::Release);
         drop(permit);
+    }
+
+    #[test]
+    fn recover_refuses_to_revive_a_shutting_down_session() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || TcpStream::connect(address).unwrap());
+        let (stream, _) = listener.accept().unwrap();
+        let _peer = peer.join().unwrap();
+        let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
+        let session =
+            ActiveSession::new(Connection::new_server(stream, &[7; 32]), &terminal, None).unwrap();
+
+        // Terminal HUP sets `shutdown` so the bridge can drain; recover
+        // must still be allowed until full session teardown.
+        session.shutdown.store(true, Ordering::Release);
+        let hup_permit = session.try_begin_recover().unwrap();
+        drop(hup_permit);
+
+        session.torn_down.store(true, Ordering::Release);
+        assert!(matches!(
+            session.try_begin_recover(),
+            Err(SessionError::Unavailable)
+        ));
+
+        session.torn_down.store(false, Ordering::Release);
+        let permit = session.try_begin_recover().unwrap();
+        session.torn_down.store(true, Ordering::Release);
+        let extra = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let extra_addr = extra.local_addr().unwrap();
+        let extra_peer = std::thread::spawn(move || TcpStream::connect(extra_addr).unwrap());
+        let (candidate, _) = extra.accept().unwrap();
+        let _extra_peer = extra_peer.join().unwrap();
+        assert!(matches!(
+            permit.complete(candidate),
+            Err(SessionError::Unavailable)
+        ));
+        assert!(!session.recovering.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn teardown_winning_during_recover_admission_rejects_and_releases_claim() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || TcpStream::connect(address).unwrap());
+        let (stream, _) = listener.accept().unwrap();
+        let _peer = peer.join().unwrap();
+        let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
+        let session = Arc::new(
+            ActiveSession::new(Connection::new_server(stream, &[7; 32]), &terminal, None).unwrap(),
+        );
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        session.install_recover_admission_hook(reached_tx, release_rx);
+
+        std::thread::scope(|scope| {
+            let recovering = Arc::clone(&session);
+            let attempt = scope.spawn(move || {
+                assert!(matches!(
+                    recovering.try_begin_recover(),
+                    Err(SessionError::Unavailable)
+                ));
+            });
+            reached_rx.recv().unwrap();
+            session.shutdown().unwrap();
+            release_tx.send(()).unwrap();
+            attempt.join().unwrap();
+        });
+
+        assert!(!session.recovering.load(Ordering::Acquire));
     }
 }

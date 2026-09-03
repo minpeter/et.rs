@@ -38,6 +38,7 @@ impl std::fmt::Display for ConnError {
             Self::Recover(error) => write!(f, "recover: {error}"),
             Self::Encrypt(error) => write!(f, "encrypt: {error}"),
             Self::Backpressure => write!(f, "disconnected write buffer is full"),
+            Self::PacketTooLarge => write!(f, "packet exceeds the bounded output lane"),
             Self::SequenceOutOfRange(sequence) => {
                 write!(f, "sequence number {sequence} exceeds the wire format")
             }

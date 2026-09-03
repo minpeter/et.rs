@@ -83,37 +83,25 @@ pub(crate) fn run(
 }
 
 #[cfg(test)]
-struct RawScanHook {
-    id: String,
-    complete: std::sync::mpsc::SyncSender<()>,
-}
-
-#[cfg(test)]
-fn raw_scan_hook() -> &'static std::sync::Mutex<Option<RawScanHook>> {
-    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<RawScanHook>>> =
-        std::sync::OnceLock::new();
-    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+fn raw_scan_hooks(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::mpsc::SyncSender<()>>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::mpsc::SyncSender<()>>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 #[cfg(test)]
 pub(crate) fn install_raw_scan_hook(id: &str, complete: std::sync::mpsc::SyncSender<()>) {
-    *raw_scan_hook().lock().unwrap() = Some(RawScanHook {
-        id: id.to_owned(),
-        complete,
-    });
+    raw_scan_hooks()
+        .lock()
+        .unwrap()
+        .insert(id.to_owned(), complete);
 }
 
 #[cfg(test)]
 fn notify_raw_scan_complete(id: &str) {
-    let complete = {
-        let mut installed = raw_scan_hook().lock().unwrap();
-        if installed.as_ref().is_some_and(|hook| hook.id == id) {
-            installed.take().map(|hook| hook.complete)
-        } else {
-            None
-        }
-    };
-    if let Some(complete) = complete {
+    if let Some(complete) = raw_scan_hooks().lock().unwrap().remove(id) {
         let _ = complete.send(());
     }
 }

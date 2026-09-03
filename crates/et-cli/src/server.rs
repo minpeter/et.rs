@@ -8,6 +8,8 @@ use clap::Parser;
 
 pub const DEFAULT_PORT: u16 = 2022;
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/et/config";
+/// Kernel accept-queue depth (`listen(2)` backlog). Matches ET #798.
+pub const DEFAULT_LISTEN_BACKLOG: i32 = 128;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -76,6 +78,8 @@ pub struct ServerConfig {
     pub log_size: u64,
     /// Parsed for upstream compatibility only; et.rs never sends telemetry.
     pub telemetry: bool,
+    /// Depth of the kernel accept queue. Always positive after resolution.
+    pub listen_backlog: i32,
 }
 
 /// Upstream default max log size for `etserver` (20 MiB).
@@ -85,6 +89,7 @@ pub const DEFAULT_LOG_SIZE: u64 = 20_971_520;
 pub enum ConfigError {
     InvalidPort(String),
     InvalidBindIp(String),
+    InvalidBacklog(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -92,6 +97,7 @@ impl std::fmt::Display for ConfigError {
         match self {
             Self::InvalidPort(value) => write!(f, "invalid server port: {value}"),
             Self::InvalidBindIp(value) => write!(f, "invalid server bind IP: {value}"),
+            Self::InvalidBacklog(value) => write!(f, "invalid server listen backlog: {value}"),
         }
     }
 }
@@ -111,6 +117,7 @@ pub fn resolve_config(
         silent: false,
         log_size: DEFAULT_LOG_SIZE,
         telemetry: false,
+        listen_backlog: DEFAULT_LISTEN_BACKLOG,
     };
     let ini_log_directory_set = if let Some(text) = ini_text {
         apply_ini(&mut config, args, text)?
@@ -203,6 +210,16 @@ fn apply_ini(
             ("networking", "bind_ip") if args.bindip.is_none() => {
                 config.bind_ip = parse_bind_ip(value).map_err(ConfigError::InvalidBindIp)?;
             }
+            ("networking", "backlog") => {
+                let parsed = value
+                    .parse::<i32>()
+                    .map_err(|_| ConfigError::InvalidBacklog(value.to_owned()))?;
+                config.listen_backlog = if parsed > 0 {
+                    parsed
+                } else {
+                    DEFAULT_LISTEN_BACKLOG
+                };
+            }
             ("debug", "serverfifo") if args.serverfifo.is_none() && !value.is_empty() => {
                 config.server_fifo = Some(PathBuf::from(value));
             }
@@ -246,6 +263,37 @@ fn parse_bind_ip(value: &str) -> Result<IpAddr, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listen_backlog_ini_defaults_explicit_and_non_positive() {
+        let args = ServerArgs::try_parse_from(["etserver"]).unwrap();
+        assert_eq!(
+            resolve_config(&args, None).unwrap().listen_backlog,
+            DEFAULT_LISTEN_BACKLOG
+        );
+        assert_eq!(
+            resolve_config(&args, Some("[Networking]\nbacklog=512\n"))
+                .unwrap()
+                .listen_backlog,
+            512
+        );
+        assert_eq!(
+            resolve_config(&args, Some("[Networking]\nbacklog=0\n"))
+                .unwrap()
+                .listen_backlog,
+            DEFAULT_LISTEN_BACKLOG
+        );
+        assert_eq!(
+            resolve_config(&args, Some("[Networking]\nbacklog=-8\n"))
+                .unwrap()
+                .listen_backlog,
+            DEFAULT_LISTEN_BACKLOG
+        );
+        assert!(matches!(
+            resolve_config(&args, Some("[Networking]\nbacklog=nope\n")),
+            Err(ConfigError::InvalidBacklog(_))
+        ));
+    }
 
     #[test]
     fn comments_and_unknown_sections_are_ignored() {

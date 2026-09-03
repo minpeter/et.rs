@@ -119,9 +119,12 @@ fn run_client(
             .into(),
         );
     }
-    let mut locale_environment =
-        bounded_locale_environment(ssh_locale_environment(), &reserved_environment)
-            .map_err(crate::forward_config::ForwardConfigError::EnvironmentPacketTooLarge)?;
+    let mut locale_environment = bounded_locale_environment(
+        ssh_locale_environment(),
+        &reserved_environment,
+        forward_config.initial_payload.flowcontrol,
+    )
+    .map_err(crate::forward_config::ForwardConfigError::EnvironmentPacketTooLarge)?;
     if args.jumphost.is_some() {
         bound_jumphost_locale_environment(
             &forward_config.initial_payload,
@@ -305,6 +308,7 @@ fn run_client(
             command: args.command.as_deref(),
             no_exit: args.no_exit,
             keepalive: args.keepalive,
+            flow_control: args.flow_control,
             terminal_enabled: !args.no_terminal,
             lines: crate::client_terminal::RemoteLines::from(remote_mode.terminal_shell),
             connection_name: &request.host_alias,

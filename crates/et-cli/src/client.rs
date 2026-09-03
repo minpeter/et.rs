@@ -91,6 +91,18 @@ pub struct ClientArgs {
     #[arg(short = 'l', long = "logdir")]
     pub logdir: Option<String>,
 
+    #[arg(
+        long = "flow-control",
+        value_enum,
+        default_value_t = FlowControlMode::None,
+        help = "Bound terminal output when it outruns the network",
+        long_help = "Choose how terminal output behaves when it outruns the network.\n\n\
+                     none preserves the existing replay behavior. backpressure pauses the remote \
+                     producer at a bounded queue without losing output. discard drops the oldest \
+                     terminal output while preserving control traffic so the display stays current."
+    )]
+    pub flow_control: FlowControlMode,
+
     #[arg(long = "logtostdout")]
     pub logtostdout: bool,
 
@@ -133,6 +145,29 @@ pub enum RemoteShellKind {
     Cmd,
     /// PowerShell: `<cmd>; exit` terminated with CRLF.
     Powershell,
+}
+
+/// Terminal-output behavior when the producer outruns the network.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FlowControlMode {
+    /// Preserve the existing unbounded replay behavior.
+    #[default]
+    None,
+    /// Pause the terminal producer while the bounded output queue is full.
+    Backpressure,
+    /// Drop the oldest queued terminal output to keep the display current.
+    Discard,
+}
+
+impl FlowControlMode {
+    /// Optional protobuf value; `none` stays absent for legacy wire parity.
+    pub const fn protocol_value(self) -> Option<i32> {
+        match self {
+            Self::None => None,
+            Self::Backpressure => Some(et_core::proto::FlowControlMode::Backpressure as i32),
+            Self::Discard => Some(et_core::proto::FlowControlMode::Discard as i32),
+        }
+    }
 }
 
 impl ClientArgs {
@@ -209,6 +244,23 @@ mod tests {
     fn keepalive_defaults_to_upstream_maximum() {
         let a = ClientArgs::try_parse_from(["et", "host"]).unwrap();
         assert_eq!(a.keepalive, MAX_KEEPALIVE);
+    }
+
+    #[test]
+    fn flow_control_defaults_to_none() {
+        let a = ClientArgs::try_parse_from(["et", "host"]).unwrap();
+        assert_eq!(a.flow_control, FlowControlMode::None);
+    }
+
+    #[test]
+    fn flow_control_parses_opt_in_modes() {
+        let backpressure =
+            ClientArgs::try_parse_from(["et", "host", "--flow-control", "backpressure"]).unwrap();
+        assert_eq!(backpressure.flow_control, FlowControlMode::Backpressure);
+
+        let discard =
+            ClientArgs::try_parse_from(["et", "host", "--flow-control", "discard"]).unwrap();
+        assert_eq!(discard.flow_control, FlowControlMode::Discard);
     }
 
     #[test]

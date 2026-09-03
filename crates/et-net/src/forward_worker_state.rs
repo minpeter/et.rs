@@ -2,6 +2,7 @@
 use std::io::Write;
 use std::io::{self};
 
+use crossbeam_channel as channel;
 use et_core::packet::Packet;
 use et_core::proto::{
     PortForwardData, PortForwardDestinationRequest, PortForwardDestinationResponse, SocketEndpoint,
@@ -111,6 +112,7 @@ impl Worker {
             socket_id,
             destination,
             self.commands.clone(),
+            self.cancel.clone(),
             self.session_user,
         ));
         Ok(())
@@ -168,10 +170,22 @@ impl Worker {
         let Some(active) = self.map_ref(role).get(&socket_id) else {
             return Ok(());
         };
+        let byte_count = buffer.len();
         active
-            .writer
-            .send(WriteCommand::Data(buffer))
-            .map_err(|_| ForwardError::Unavailable)
+            .pending_bytes
+            .fetch_add(byte_count, std::sync::atomic::Ordering::AcqRel);
+        let admitted = channel::select! {
+            send(active.writer, WriteCommand::Data(buffer)) -> result => result.is_ok(),
+            recv(self.cancel) -> _ => false,
+        };
+        if admitted {
+            Ok(())
+        } else {
+            active
+                .pending_bytes
+                .fetch_sub(byte_count, std::sync::atomic::Ordering::AcqRel);
+            Err(ForwardError::Unavailable)
+        }
     }
 
     pub(super) fn send_data(
@@ -211,8 +225,15 @@ impl Worker {
         socket_id: i32,
         stream: ForwardStream,
     ) -> Result<(), ForwardError> {
-        let (active, handles) =
-            spawn_io(role, socket_id, stream, self.commands.clone()).map_err(ForwardError::Io)?;
+        let (active, handles) = spawn_io(
+            role,
+            socket_id,
+            stream,
+            self.commands.clone(),
+            self.cancel.clone(),
+            self.abandoned.clone(),
+        )
+        .map_err(ForwardError::Io)?;
         self.map(role).insert(socket_id, active);
         self.threads.extend(handles);
         Ok(())
@@ -252,21 +273,12 @@ impl Worker {
     }
 
     fn emit<M: Message>(&mut self, header: u8, message: M) -> Result<(), ForwardError> {
-        let mut outbound = Ok(Packet::new(header, message.encode_to_vec()));
-        loop {
-            if self.shutdown.load(std::sync::atomic::Ordering::Acquire) {
-                return Err(ForwardError::Unavailable);
+        let packet = Ok(Packet::new(header, message.encode_to_vec()));
+        channel::select! {
+            send(self.outbound, packet) -> result => {
+                result.map_err(|_| ForwardError::Unavailable)?;
             }
-            match self.outbound.try_send(outbound) {
-                Ok(()) => break,
-                Err(std::sync::mpsc::TrySendError::Full(value)) => {
-                    outbound = value;
-                    std::thread::yield_now();
-                }
-                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                    return Err(ForwardError::Unavailable);
-                }
-            }
+            recv(self.cancel) -> _ => return Err(ForwardError::Unavailable),
         }
         // Unix consumers poll the wake socket; Windows consumers drain
         // `try_outbound` on the client loop's 10ms cadence.

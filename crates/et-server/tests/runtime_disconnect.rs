@@ -8,8 +8,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use et_core::keys::passkey_to_key;
-use et_core::proto::{ConnectStatus, SequenceHeader};
-use et_net::framing_io::read_proto_limited;
+use et_core::proto::ConnectStatus;
 use et_server::SessionState;
 use runtime_support::{default_payload, initialize, TestRuntime, ID_A, KEY_A, TIMEOUT};
 
@@ -69,25 +68,24 @@ fn terminal_eof_removes_active_session_and_allows_fresh_registration() {
 }
 
 #[test]
-fn terminal_eof_interrupts_blocked_returning_recovery() {
+fn terminal_eof_preserves_returning_recovery_after_permit_acquisition() {
     let mut server = TestRuntime::start();
     let terminal = server.register(ID_A, KEY_A);
     let (stream, response) = server.handshake(ID_A);
     assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
     let key = passkey_to_key(KEY_A).unwrap();
-    let (_active_client, initial) = initialize(stream, &key, default_payload());
+    let (mut active_client, initial) = initialize(stream, &key, default_payload());
     assert_eq!(initial.error, None);
     server
         .handle
         .wait_for_state(ID_A, SessionState::Active, TIMEOUT)
         .unwrap();
 
-    let (mut returning, response) = server.handshake(ID_A);
+    let (returning, response) = server.handshake(ID_A);
     assert_eq!(response.status, Some(ConnectStatus::ReturningClient as i32));
-    let _: SequenceHeader = read_proto_limited(&mut returning, 80 * 1024 * 1024).unwrap();
     drop(terminal);
     server.handle.wait_disconnected(ID_A, TIMEOUT).unwrap();
-    assert_prompt_eof_or_reset(&mut returning);
+    active_client.recover(returning).unwrap();
     server.runtime.shutdown().unwrap();
 }
 

@@ -16,6 +16,12 @@ enum TerminalPacketType {
   JUMPHOST_INIT = 10;
 }
 
+enum FlowControlMode {
+  NONE = 0;
+  BACKPRESSURE = 1;
+  DISCARD = 2;
+}
+
 message TerminalBuffer {
   optional bytes buffer = 1;
 }
@@ -61,6 +67,7 @@ message InitialPayload {
   optional bool jumphost = 1 [default = false];
   repeated PortForwardSourceRequest reversetunnels = 2;
   map<string, string> environmentvariables = 3;
+  optional FlowControlMode flowcontrol = 4 [default = NONE];
 }
 
 message InitialResponse {
@@ -75,6 +82,7 @@ message ConfigParams {
 message TermInit {
   repeated string environmentnames = 1;
   repeated string environmentvalues = 2;
+  optional FlowControlMode flowcontrol = 3 [default = NONE];
 }
 
 message TerminalUserInfo {

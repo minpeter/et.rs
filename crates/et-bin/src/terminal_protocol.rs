@@ -2,7 +2,7 @@ use et_net::local::LocalStream;
 use std::io::{self, Read, Write};
 
 use et_core::packet::Packet;
-use et_core::proto::{TermInit, TerminalBuffer, TerminalInfo, TerminalPacketType};
+use et_core::proto::{FlowControlMode, TermInit, TerminalBuffer, TerminalInfo, TerminalPacketType};
 use et_net::local_packet::{read_local_packet, LocalPacketDecoder};
 use portable_pty::{MasterPty, PtySize};
 use prost::Message;
@@ -11,7 +11,12 @@ pub(crate) const MAX_ENVIRONMENT: usize = 128;
 pub(crate) const MAX_ENV_VALUE: usize = 4096;
 const READ_BUFFER: usize = 16 * 1024;
 
-pub fn read_initial_environment(router: &mut LocalStream) -> Result<Vec<(String, String)>, String> {
+pub struct TerminalInitialization {
+    pub environment: Vec<(String, String)>,
+    pub flow_control: FlowControlMode,
+}
+
+pub fn read_initialization(router: &mut LocalStream) -> Result<TerminalInitialization, String> {
     let packet = read_local_packet(router)
         .map_err(|error| format!("could not read terminal initialization: {error}"))?;
     if packet.is_encrypted() || packet.header() != TerminalPacketType::TerminalInit as u8 {
@@ -24,7 +29,12 @@ pub fn read_initial_environment(router: &mut LocalStream) -> Result<Vec<(String,
     {
         return Err("TERMINAL_INIT environment lists are invalid".to_owned());
     }
-    init.environmentnames
+    let flow_control = init
+        .flowcontrol
+        .and_then(|value| FlowControlMode::try_from(value).ok())
+        .unwrap_or(FlowControlMode::None);
+    let environment = init
+        .environmentnames
         .into_iter()
         .zip(init.environmentvalues)
         .map(|(name, value)| {
@@ -34,7 +44,11 @@ pub fn read_initial_environment(router: &mut LocalStream) -> Result<Vec<(String,
             }
             Ok((name, value))
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    Ok(TerminalInitialization {
+        environment,
+        flow_control,
+    })
 }
 
 pub fn read_ready_packet(
@@ -182,18 +196,22 @@ mod tests {
             TermInit {
                 environmentnames: vec!["A".to_owned()],
                 environmentvalues: Vec::new(),
+                flowcontrol: None,
             },
             TermInit {
                 environmentnames: vec!["BAD-NAME".to_owned()],
                 environmentvalues: vec!["value".to_owned()],
+                flowcontrol: None,
             },
             TermInit {
                 environmentnames: vec!["VALID".to_owned()],
                 environmentvalues: vec!["bad\0value".to_owned()],
+                flowcontrol: None,
             },
             TermInit {
                 environmentnames: vec!["VALID".to_owned()],
                 environmentvalues: vec!["x".repeat(MAX_ENV_VALUE + 1)],
+                flowcontrol: None,
             },
         ] {
             let packet = Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec());
@@ -204,6 +222,24 @@ mod tests {
     fn read_environment_packet(packet: Packet) -> Result<Vec<(String, String)>, String> {
         let (mut reader, mut writer) = et_net::local::wake_pair().unwrap();
         write_local_packet(&mut writer, &packet).unwrap();
-        read_initial_environment(&mut reader)
+        read_initialization(&mut reader).map(|initialization| initialization.environment)
+    }
+
+    #[test]
+    fn initialization_retains_the_typed_flow_control_mode() {
+        let (mut terminal, mut server) = et_net::local::wake_pair().unwrap();
+        let init = TermInit {
+            environmentnames: Vec::new(),
+            environmentvalues: Vec::new(),
+            flowcontrol: Some(FlowControlMode::Discard as i32),
+        };
+        write_local_packet(
+            &mut server,
+            &Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec()),
+        )
+        .unwrap();
+
+        let initialization = read_initialization(&mut terminal).unwrap();
+        assert_eq!(initialization.flow_control, FlowControlMode::Discard);
     }
 }

@@ -13,57 +13,53 @@ use prost::Message;
 use crate::forward_endpoint::Endpoint;
 
 use super::{
-    close_write, spawn_connector, spawn_io, ActiveIo, ForwardError, ForwardStream, Role, Worker,
-    WriteCommand, MAX_ACTIVE_SOCKETS, MAX_DATA_PACKET,
+    close_write, spawn_connector, spawn_io, subtract_saturating, ActiveIo, FlowWindow,
+    ForwardError, ForwardStream, Role, Worker, WriteCommand, MAX_ACTIVE_SOCKETS, MAX_DATA_PACKET,
 };
 
 /// Per-socket receive window.
 ///
-/// INVARIANT: this must not exceed what a socket can absorb WITHOUT blocking
-/// the worker thread. `spawn_io` gives each socket a `bounded(64)` writer
-/// channel of chunks up to `READ_CHUNK` (16 KiB), so ~1 MiB is absorbable.
-/// Advertising more lets the peer overfill that channel, at which point
-/// `receive_data`'s blocking send stalls the WORKER, the inbound queue fills
-/// behind it, and the pump stops reading the transport again - the exact
-/// deadlock this change exists to remove. Half the absorbable capacity leaves
-/// room for the in-flight chunk and the packet being decoded.
+/// Both limits must stay below the socket's 64-slot writer channel. A byte
+/// limit alone is insufficient because legal one-byte reads can create far
+/// more packets than the queue can absorb.
 pub(super) const WINDOW_BYTES: i64 = 512 * 1024;
+pub(super) const WINDOW_PACKETS: i64 = 32;
 
 /// Return credit once this much has drained, so a full window costs a bounded
 /// number of control packets instead of one per data packet.
 const CREDIT_RETURN_THRESHOLD: i64 = WINDOW_BYTES / 4;
+const PACKET_CREDIT_RETURN_THRESHOLD: i64 = WINDOW_PACKETS / 4;
 
 pub(super) fn advertised_window() -> PortForwardWindow {
     PortForwardWindow {
         bytes: Some(WINDOW_BYTES),
-        packets: None,
+        packets: Some(WINDOW_PACKETS as i32),
     }
 }
 
-/// Grant credit to a socket's sender and wake its parked reader.
-///
-/// Enabling enforcement here (rather than at socket creation) is what keeps
-/// mixed-version safety: a peer that never advertises a window never enables
-/// it, so that socket stays unwindowed in both directions.
-/// A window field carries two independent facts: an advertised window
-/// (handshake) and a confirmed-delivery byte count (steady state). Applying
-/// both through one helper keeps the accounting in one place.
-///
-/// Enabling enforcement only when a window arrives is what preserves
-/// mixed-version safety: a peer that never advertises a window leaves
-/// `window` at its disabled sentinel, and that socket stays unwindowed.
-fn apply_window(active: &ActiveIo, advertised: Option<i64>, delivered: i64) {
+fn decode_window(window: Option<PortForwardWindow>) -> Option<FlowWindow> {
+    let window = window?;
+    let bytes = window.bytes.filter(|bytes| *bytes > 0)?;
+    let packets = window.packets.filter(|packets| *packets > 0)?;
+    Some(FlowWindow {
+        bytes: bytes.min(WINDOW_BYTES),
+        packets: i64::from(packets).min(WINDOW_PACKETS),
+    })
+}
+
+pub(crate) fn apply_delivery(active: &ActiveIo, delivered: FlowWindow) {
     use std::sync::atomic::Ordering;
-    if let Some(window) = advertised {
-        active.window.store(window, Ordering::Release);
+    if delivered.bytes <= 0 || delivered.packets <= 0 {
+        return;
     }
-    if delivered > 0 {
-        let prior = active.in_flight.fetch_sub(delivered, Ordering::AcqRel);
-        let now = prior - delivered;
-        let window = active.window.load(Ordering::Acquire);
-        if window >= 0 && prior >= window && now < window {
-            let _ = active.in_flight_wake.try_send(());
-        }
+    let prior_bytes = subtract_saturating(&active.in_flight, delivered.bytes);
+    let prior_packets = subtract_saturating(&active.packets_in_flight, delivered.packets);
+    let byte_window = active.window.load(Ordering::Acquire);
+    let packet_window = active.packet_window.load(Ordering::Acquire);
+    if (byte_window >= 0 && prior_bytes >= byte_window)
+        || (packet_window >= 0 && prior_packets >= packet_window)
+    {
+        let _ = active.in_flight_wake.try_send(());
     }
 }
 
@@ -94,17 +90,12 @@ impl Worker {
         client_fd: i32,
         socket_id: i32,
         result: io::Result<ForwardStream>,
-        peer_advertised: Option<i64>,
+        peer_advertised: Option<FlowWindow>,
     ) -> Result<(), ForwardError> {
         self.connecting.remove(&socket_id);
         let error = match result {
             Ok(stream) => {
-                self.activate(Role::Destination, socket_id, stream)?;
-                // Credit is symmetric: grant the peer's window to our sender
-                // and remember what we advertised so returns can be sized.
-                if let Some(active) = self.map(Role::Destination).get_mut(&socket_id) {
-                    apply_window(active, peer_advertised, 0);
-                }
+                self.activate(Role::Destination, socket_id, stream, peer_advertised)?;
                 None
             }
             Err(error) => Some(error.to_string()),
@@ -119,7 +110,6 @@ impl Worker {
                 // A peer that advertises nothing gets nothing back, and both
                 // ends stay on unwindowed behavior.
                 window: (error.is_none() && peer_advertised.is_some()).then(advertised_window),
-                // debug
                 error,
             },
         )
@@ -159,7 +149,7 @@ impl Worker {
         // in a PORT_FORWARD_DESTINATION_RESPONSE with the error field set.
         // Absent window = a peer that predates windowing. Keep it as None so
         // the response withholds a window and both ends stay unwindowed.
-        let peer_advertised = request.window.and_then(|window| window.bytes);
+        let peer_advertised = decode_window(request.window);
         let destination = match Endpoint::parse_destination(request.destination) {
             Ok(destination) => destination,
             Err(error) => return self.connected(client_fd, 0, Err(error), peer_advertised),
@@ -209,12 +199,8 @@ impl Worker {
         // The response carries a window only when the peer supports windowing
         // and the socket was established, so this is the source side's
         // negotiation point.
-        let peer_advertised = response.window.and_then(|window| window.bytes);
-        self.activate(Role::Source, socket_id, stream)?;
-        if let Some(active) = self.map(Role::Source).get_mut(&socket_id) {
-            apply_window(active, peer_advertised, 0);
-        }
-        Ok(())
+        let peer_advertised = decode_window(response.window);
+        self.activate(Role::Source, socket_id, stream, peer_advertised)
     }
 
     fn receive_data(&mut self, data: PortForwardData) -> Result<(), ForwardError> {
@@ -236,9 +222,9 @@ impl Worker {
         // Credit returned by the peer frees our sender for THIS socket only.
         // A pure credit packet carries no buffer and must not be mistaken for
         // an empty-data close.
-        if let Some(delivered) = data.window.and_then(|window| window.bytes) {
+        if let Some(delivered) = decode_window(data.window) {
             if let Some(active) = self.map(role).get_mut(&socket_id) {
-                apply_window(active, None, delivered);
+                apply_delivery(active, delivered);
             }
             if buffer.is_empty() && !data.closed.unwrap_or(false) {
                 return Ok(());
@@ -274,17 +260,10 @@ impl Worker {
         active
             .pending_bytes
             .fetch_add(byte_count, std::sync::atomic::Ordering::AcqRel);
-        let send_started = std::time::Instant::now();
         let admitted = channel::select! {
             send(active.writer, WriteCommand::Data(buffer)) -> result => result.is_ok(),
             recv(self.cancel) -> _ => false,
         };
-        if std::env::var_os("ET_CREDIT_DEBUG").is_some() {
-            let waited = send_started.elapsed().as_millis();
-            if waited > 100 {
-                eprintln!("WORKER-SEND-BLOCKED role={role:?} sid={socket_id} waited_ms={waited}");
-            }
-        }
         if !admitted {
             active
                 .pending_bytes
@@ -315,6 +294,7 @@ impl Worker {
         }
         let drained = i64::try_from(received).unwrap_or(i64::MAX);
         active.credit_to_return = active.credit_to_return.saturating_add(drained);
+        active.packet_credit_to_return = active.packet_credit_to_return.saturating_add(1);
         // Batch returns so a full window costs a bounded number of control
         // packets, but ALSO flush whenever the socket has gone idle. Without
         // the idle flush a sub-threshold remainder is stranded, the peer's
@@ -324,11 +304,15 @@ impl Worker {
             .pending_bytes
             .load(std::sync::atomic::Ordering::Acquire)
             == 0;
-        if active.credit_to_return < CREDIT_RETURN_THRESHOLD && !idle {
+        if active.credit_to_return < CREDIT_RETURN_THRESHOLD
+            && active.packet_credit_to_return < PACKET_CREDIT_RETURN_THRESHOLD
+            && !idle
+        {
             return Ok(());
         }
         let credit = std::mem::take(&mut active.credit_to_return);
-        if credit == 0 {
+        let packet_credit = std::mem::take(&mut active.packet_credit_to_return);
+        if credit == 0 || packet_credit == 0 {
             return Ok(());
         }
         self.emit_priority(
@@ -345,7 +329,7 @@ impl Worker {
                 closed: None,
                 window: Some(PortForwardWindow {
                     bytes: Some(credit),
-                    packets: None,
+                    packets: Some(i32::try_from(packet_credit).unwrap_or(i32::MAX)),
                 }),
             },
         )
@@ -400,11 +384,13 @@ impl Worker {
         role: Role,
         socket_id: i32,
         stream: ForwardStream,
+        peer_window: Option<FlowWindow>,
     ) -> Result<(), ForwardError> {
         let (active, handles) = spawn_io(
             role,
             socket_id,
             stream,
+            peer_window,
             self.commands.clone(),
             self.cancel.clone(),
             self.abandoned.clone(),
@@ -428,7 +414,7 @@ impl Worker {
         }
     }
 
-    fn map_ref(&self, role: Role) -> &std::collections::HashMap<i32, ActiveIo> {
+    pub(crate) fn map_ref(&self, role: Role) -> &std::collections::HashMap<i32, ActiveIo> {
         match role {
             Role::Source => &self.sources,
             Role::Destination => &self.destinations,
@@ -477,5 +463,60 @@ impl Worker {
         #[cfg(unix)]
         let _ = self.outbound_wake.write(&[1]);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use super::{
+        decode_window, subtract_saturating, FlowWindow, PortForwardWindow, WINDOW_BYTES,
+        WINDOW_PACKETS,
+    };
+
+    #[test]
+    fn hostile_window_values_are_rejected_or_bounded() {
+        assert_eq!(decode_window(None), None);
+        assert_eq!(
+            decode_window(Some(PortForwardWindow {
+                bytes: Some(0),
+                packets: Some(1),
+            })),
+            None
+        );
+        assert_eq!(
+            decode_window(Some(PortForwardWindow {
+                bytes: Some(-1),
+                packets: Some(1),
+            })),
+            None
+        );
+        assert_eq!(
+            decode_window(Some(PortForwardWindow {
+                bytes: Some(1),
+                packets: None,
+            })),
+            None
+        );
+        assert_eq!(
+            decode_window(Some(PortForwardWindow {
+                bytes: Some(i64::MAX),
+                packets: Some(i32::MAX),
+            })),
+            Some(FlowWindow {
+                bytes: WINDOW_BYTES,
+                packets: WINDOW_PACKETS,
+            })
+        );
+    }
+
+    #[test]
+    fn delivery_confirmation_cannot_underflow_in_flight_bytes() {
+        let in_flight = AtomicI64::new(128);
+        assert_eq!(subtract_saturating(&in_flight, 64), 128);
+        assert_eq!(in_flight.load(Ordering::Acquire), 64);
+        assert_eq!(subtract_saturating(&in_flight, i64::MAX), 64);
+        assert_eq!(in_flight.load(Ordering::Acquire), 0);
     }
 }

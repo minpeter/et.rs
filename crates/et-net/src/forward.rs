@@ -527,9 +527,7 @@ impl Forwarder {
     }
 
     pub fn wait_outbound(&self, timeout: Duration) -> Result<Packet, ForwardError> {
-        self.outbound
-            .recv_timeout(timeout)
-            .map_err(|_| ForwardError::Unavailable)?
+        wait_outbound_from(&self.priority, &self.outbound, timeout)
     }
 
     pub fn shutdown(mut self) -> Result<(), ForwardError> {
@@ -542,12 +540,16 @@ impl Forwarder {
     pub fn shutdown_hard(&mut self) -> Result<bool, ForwardError> {
         self.shutdown.store(true, Ordering::Release);
         self.cancel.take();
-        let mut abandoned = !self.commands.is_empty() || !self.outbound.is_empty();
+        let mut abandoned =
+            !self.commands.is_empty() || !self.priority.is_empty() || !self.outbound.is_empty();
         self.commands.shutdown();
         if let Some(worker) = self.worker.take() {
             worker.join().map_err(|_| ForwardError::Unavailable)?;
         }
         while self.outbound.try_recv().is_ok() {
+            abandoned = true;
+        }
+        while self.priority.try_recv().is_ok() {
             abandoned = true;
         }
         if !self.commands.is_empty() {
@@ -564,6 +566,62 @@ impl Forwarder {
             worker.join().map_err(|_| ForwardError::Unavailable)?;
         }
         Ok(())
+    }
+}
+
+fn wait_outbound_from(
+    priority: &channel::Receiver<Outbound>,
+    outbound: &channel::Receiver<Outbound>,
+    timeout: Duration,
+) -> Result<Packet, ForwardError> {
+    let deadline = Instant::now() + timeout;
+    let mut priority_open = true;
+    let mut outbound_open = true;
+    loop {
+        if priority_open {
+            match priority.try_recv() {
+                Ok(result) => return result,
+                Err(channel::TryRecvError::Empty) => {}
+                Err(channel::TryRecvError::Disconnected) => priority_open = false,
+            }
+        }
+        if outbound_open {
+            match outbound.try_recv() {
+                Ok(result) => return result,
+                Err(channel::TryRecvError::Empty) => {}
+                Err(channel::TryRecvError::Disconnected) => outbound_open = false,
+            }
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(ForwardError::Unavailable);
+        };
+        match (priority_open, outbound_open) {
+            (true, true) => {
+                let timeout = channel::after(remaining);
+                channel::select_biased! {
+                    recv(priority) -> result => match result {
+                        Ok(result) => return result,
+                        Err(_) => priority_open = false,
+                    },
+                    recv(outbound) -> result => match result {
+                        Ok(result) => return result,
+                        Err(_) => outbound_open = false,
+                    },
+                    recv(timeout) -> _ => return Err(ForwardError::Unavailable),
+                }
+            }
+            (true, false) => {
+                return priority
+                    .recv_timeout(remaining)
+                    .map_err(|_| ForwardError::Unavailable)?;
+            }
+            (false, true) => {
+                return outbound
+                    .recv_timeout(remaining)
+                    .map_err(|_| ForwardError::Unavailable)?;
+            }
+            (false, false) => return Err(ForwardError::Unavailable),
+        }
     }
 }
 
@@ -840,6 +898,24 @@ mod tests {
     use std::net::{Ipv4Addr, TcpListener};
     use std::os::unix::net::UnixListener;
     use std::sync::{Barrier, Condvar};
+
+    #[test]
+    fn disconnected_priority_does_not_mask_buffered_outbound_packet() {
+        let (priority_tx, priority_rx) = channel::bounded::<Outbound>(1);
+        let (outbound_tx, outbound_rx) = channel::bounded::<Outbound>(1);
+        outbound_tx
+            .send(Ok(Packet::new(
+                TerminalPacketType::PortForwardData as u8,
+                vec![1, 2, 3],
+            )))
+            .unwrap();
+        drop(priority_tx);
+
+        let packet =
+            wait_outbound_from(&priority_rx, &outbound_rx, Duration::from_secs(1)).unwrap();
+
+        assert_eq!(packet.payload(), &[1, 2, 3]);
+    }
 
     struct GatedResolver {
         started: mpsc::SyncSender<()>,

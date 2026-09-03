@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use et_core::packet::Packet;
 use et_core::proto::{
-    PortForwardDestinationRequest, PortForwardSourceRequest, SocketEndpoint, TerminalPacketType,
+    PortForwardData, PortForwardDestinationRequest, PortForwardSourceRequest, SocketEndpoint,
+    TerminalPacketType,
 };
 #[cfg(unix)]
 use et_net::forward::ForwardError;
@@ -44,16 +45,23 @@ fn two_forwarders_relay_a_real_tcp_round_trip() {
     destination
         .receive(source.wait_outbound(TIMEOUT).unwrap())
         .unwrap();
-    source
-        .receive(destination.wait_outbound(TIMEOUT).unwrap())
-        .unwrap();
+    let response = wait_for_destination_response(&destination, &source);
+    source.receive(response).unwrap();
     application.write_all(b"hello").unwrap();
     destination
         .receive(source.wait_outbound(TIMEOUT).unwrap())
         .unwrap();
-    source
-        .receive(destination.wait_outbound(TIMEOUT).unwrap())
-        .unwrap();
+    loop {
+        let packet = destination.wait_outbound(TIMEOUT).unwrap();
+        let reply = PortForwardData::decode(packet.payload())
+            .ok()
+            .and_then(|data| data.buffer)
+            .is_some_and(|buffer| !buffer.is_empty());
+        source.receive(packet).unwrap();
+        if reply {
+            break;
+        }
+    }
     let mut echoed = [0u8; 5];
     application.read_exact(&mut echoed).unwrap();
     assert_eq!(&echoed, b"hello");
@@ -306,7 +314,7 @@ fn hard_shutdown_reports_admitted_socket_bytes_abandoned() {
             .encode_to_vec(),
         ))
         .unwrap();
-    let barrier = destination.wait_outbound(TIMEOUT).unwrap();
+    let barrier = wait_for_destination_response(&destination, &source);
     let barrier =
         et_core::proto::PortForwardDestinationResponse::decode(barrier.payload()).unwrap();
     assert_eq!(barrier.clientfd, Some(777));
@@ -693,6 +701,16 @@ fn port_forward_data_closed(packet: &Packet) -> bool {
     et_core::proto::PortForwardData::decode(packet.payload())
         .ok()
         .is_some_and(|data| data.closed.unwrap_or(false) || data.error.is_some())
+}
+
+fn wait_for_destination_response(from: &Forwarder, peer: &Forwarder) -> Packet {
+    loop {
+        let packet = from.wait_outbound(TIMEOUT).unwrap();
+        if packet.header() == TerminalPacketType::PortForwardDestinationResponse as u8 {
+            return packet;
+        }
+        peer.receive(packet).unwrap();
+    }
 }
 
 fn relay_forward_data_until_close(from: &Forwarder, to: &Forwarder) {

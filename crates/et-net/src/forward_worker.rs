@@ -15,8 +15,8 @@ use crossbeam_channel as channel;
 use crate::forward::{ForwardError, Outbound};
 use crate::forward_endpoint::ForwardStream;
 use crate::forward_io::{
-    abort_io, close_write, spawn_connector, spawn_io, spawn_listener, stop_io, ActiveIo,
-    BoundSource, ListenerStop, WriteCommand,
+    abort_io, close_write, commit_reservation, spawn_connector, spawn_io, spawn_listener, stop_io,
+    subtract_saturating, ActiveIo, BoundSource, FlowWindow, ListenerStop, WriteCommand,
 };
 use et_core::packet::Packet;
 use et_core::proto::SocketEndpoint;
@@ -46,6 +46,7 @@ pub(crate) enum Command {
         role: Role,
         socket_id: i32,
         buffer: Vec<u8>,
+        committed: channel::Sender<()>,
     },
     /// A chunk was written to the local socket. Credit returns on DELIVERY,
     /// not on receipt: returning on receipt makes each side's credit depend on
@@ -210,7 +211,7 @@ impl CommandReceiver {
     }
 
     #[cfg(all(test, unix))]
-    fn recv_timeout(
+    pub(crate) fn recv_timeout(
         &self,
         timeout: std::time::Duration,
     ) -> Result<Command, mpsc::RecvTimeoutError> {
@@ -313,7 +314,7 @@ struct Worker {
     destinations: HashMap<i32, ActiveIo>,
     /// Window the peer advertised for a socket still being connected, held
     /// until the socket becomes active and credit can be attached to it.
-    pending_windows: HashMap<i32, Option<i64>>,
+    pending_windows: HashMap<i32, Option<FlowWindow>>,
     threads: Vec<JoinHandle<()>>,
     next_socket_id: i32,
     session_user: Option<(u32, u32)>,
@@ -398,17 +399,21 @@ impl Worker {
                     role,
                     socket_id,
                     buffer,
-                } => self.send_data(role, socket_id, buffer, false, None),
+                    committed,
+                } => {
+                    let Some(active) = self.map_ref(role).get(&socket_id) else {
+                        let _ = committed.try_send(());
+                        continue;
+                    };
+                    commit_reservation(active, i64::try_from(buffer.len()).unwrap_or(i64::MAX));
+                    let _ = committed.try_send(());
+                    self.send_data(role, socket_id, buffer, false, None)
+                }
                 Command::Drained {
                     role,
                     socket_id,
                     bytes,
-                } => {
-                    if std::env::var_os("ET_CREDIT_DEBUG").is_some() {
-                        eprintln!("WORKER-GOT-DRAINED role={role:?} sid={socket_id} bytes={bytes}");
-                    }
-                    self.return_credit(role, socket_id, bytes)
-                }
+                } => self.return_credit(role, socket_id, bytes),
                 Command::Closed { role, socket_id } => self.read_closed(role, socket_id),
                 Command::IoFailed {
                     role,
@@ -446,7 +451,7 @@ impl Worker {
     }
 }
 #[path = "forward_worker_state.rs"]
-mod state;
+pub(crate) mod state;
 
 #[cfg(all(test, unix))]
 mod tests {

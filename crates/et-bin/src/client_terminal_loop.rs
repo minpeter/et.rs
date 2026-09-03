@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::collections::VecDeque;
 #[cfg(unix)]
 use std::io::{self, Read, Write};
@@ -12,6 +13,7 @@ use et_core::proto::TerminalPacketType;
 use et_net::connection::Connection;
 #[cfg(unix)]
 use et_net::forward::is_forward_packet;
+#[cfg(unix)]
 use et_net::forward::Forwarder;
 #[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags};
@@ -20,6 +22,7 @@ use rustix::time::Timespec;
 
 #[cfg(unix)]
 use crate::client_output::{ConsoleCompletion, GRACEFUL_DRAIN_STALL_TIMEOUT};
+#[cfg(unix)]
 use crate::client_terminal::terminal_text;
 #[cfg(unix)]
 use crate::client_terminal::DisplayOutcome;
@@ -30,6 +33,7 @@ use crate::client_terminal::{
     terminal_error, terminal_io, terminal_size_payload, write_owned_recovering,
     write_terminal_size_recovering, OwnedWriteOutcome, RetainedCompletion,
 };
+#[cfg(unix)]
 use crate::error::ClientError;
 #[cfg(unix)]
 use crate::initial_connect::ReconnectOutcome;
@@ -38,6 +42,7 @@ use crate::initial_connect::ReconnectOutcome;
 const INPUT_CHUNK: usize = 16 * 1024;
 #[cfg(unix)]
 const MISSED_KEEPALIVES: u32 = 3;
+#[cfg(unix)]
 const FORWARD_BACKLOG_CAPACITY: usize = 257;
 
 #[cfg(unix)]
@@ -175,11 +180,10 @@ where
         // the frame deadline elapsed. Per-socket credit throttles the peer's
         // sender instead, and `pending_output` backpressure remains because it
         // is ordered terminal output, not forwarding.
-        let network_flags = if pending_output.is_none() {
-            PollFlags::IN | PollFlags::HUP | PollFlags::ERR
-        } else {
-            PollFlags::HUP | PollFlags::ERR
-        };
+        let network_flags = network_poll_flags(
+            pending_output.is_some(),
+            pending_forward.len() >= FORWARD_BACKLOG_CAPACITY,
+        );
         let deadline = if pending_output.is_some() {
             next_keepalive
         } else {
@@ -488,6 +492,7 @@ where
     }
 }
 
+#[cfg(unix)]
 fn enqueue_forwarding(
     forwarder: &Forwarder,
     pending: &mut VecDeque<et_core::packet::Packet>,
@@ -507,6 +512,7 @@ fn enqueue_forwarding(
     Ok(())
 }
 
+#[cfg(unix)]
 fn flush_forwarding(
     forwarder: &Forwarder,
     pending: &mut VecDeque<et_core::packet::Packet>,
@@ -521,6 +527,15 @@ fn flush_forwarding(
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn network_poll_flags(output_pending: bool, forwarding_backlog_full: bool) -> PollFlags {
+    let mut flags = PollFlags::HUP | PollFlags::ERR;
+    if !output_pending && !forwarding_backlog_full {
+        flags |= PollFlags::IN;
+    }
+    flags
 }
 
 /// Returns `true` when a cursor position report must be sent back.

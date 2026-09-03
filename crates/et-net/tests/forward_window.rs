@@ -16,13 +16,15 @@ use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 
-use et_core::proto::{PortForwardSourceRequest, SocketEndpoint};
+use et_core::packet::Packet;
+use et_core::proto::{PortForwardData, PortForwardSourceRequest, SocketEndpoint};
 use et_net::forward::Forwarder;
+use prost::Message;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
-// Matches WINDOW_BYTES in forward_worker_state.rs. The test drives more than
-// one window so the window must actually throttle, not merely buffer.
 const WINDOW_BYTES: usize = 512 * 1024;
+const WINDOW_PACKETS: usize = 32;
+const TRANSFER_BYTES: usize = 2 * WINDOW_BYTES;
 
 #[test]
 fn window_throttles_only_the_full_socket_and_delivery_releases_it() {
@@ -31,23 +33,13 @@ fn window_throttles_only_the_full_socket_and_delivery_releases_it() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let destination_port = listener.local_addr().unwrap().port();
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
-    let (drained_tx, drained_rx) = std::sync::mpsc::sync_channel::<usize>(1);
+    let (drained_tx, drained_rx) = std::sync::mpsc::sync_channel::<std::io::Result<usize>>(1);
     let peer = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_millis(200)))
-            .unwrap();
         release_rx.recv().unwrap();
-        let mut total = 0_usize;
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            match stream.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(count) => total += count,
-                Err(_) => break,
-            }
-        }
-        let _ = drained_tx.send(total);
+        let mut received = vec![0_u8; TRANSFER_BYTES];
+        let result = stream.read_exact(&mut received).map(|()| received.len());
+        let _ = drained_tx.send(result);
     });
 
     let source_port = reserve_port();
@@ -63,40 +55,49 @@ fn window_throttles_only_the_full_socket_and_delivery_releases_it() {
         .receive(destination.wait_outbound(TIMEOUT).unwrap())
         .unwrap();
 
-    let payload = vec![1_u8; WINDOW_BYTES];
-    application.write_all(&payload).unwrap();
+    let payload = vec![1_u8; TRANSFER_BYTES];
+    let application_writer = thread::spawn(move || application.write_all(&payload));
 
-    // try_outbound returning None is the state signal that the window is full
-    // and the source reader has parked: there is no more data to send.
     let mut relayed = 0_usize;
-    while let Some(packet) = source.try_outbound().unwrap() {
-        relayed += packet.payload().len();
+    let mut packets = 0_usize;
+    while relayed < WINDOW_BYTES && packets < WINDOW_PACKETS {
+        let packet = source.wait_outbound(TIMEOUT).unwrap();
+        let bytes = forwarded_bytes(&packet);
+        relayed += bytes;
+        packets += usize::from(bytes != 0);
         destination.receive(packet).unwrap();
-        while let Some(confirmation) = destination.try_outbound().unwrap() {
-            source.receive(confirmation).unwrap();
+    }
+    assert!(
+        relayed == WINDOW_BYTES || packets == WINDOW_PACKETS,
+        "source must reach one negotiated window before delivery"
+    );
+    release_tx.send(()).unwrap();
+    while relayed < TRANSFER_BYTES {
+        let confirmation = destination.wait_outbound(TIMEOUT).unwrap();
+        source.receive(confirmation).unwrap();
+        let packet = source.wait_outbound(TIMEOUT).unwrap();
+        relayed += forwarded_bytes(&packet);
+        destination.receive(packet).unwrap();
+        while let Some(packet) = source.try_outbound().unwrap() {
+            relayed += forwarded_bytes(&packet);
+            destination.receive(packet).unwrap();
         }
     }
-
-    assert!(
-        relayed <= WINDOW_BYTES,
-        "source emitted {relayed} bytes past a full window of {WINDOW_BYTES}"
-    );
-
-    release_tx.send(()).unwrap();
-    // Delivery confirmations return credit, the parked source reader wakes,
-    // and the destination drains the data the source was holding. The window
-    // invariant is proven if the flow resumes at all after release; the exact
-    // drained count depends on the harness relay cadence.
-    let drained = drained_rx.recv_timeout(TIMEOUT).unwrap();
-    assert!(
-        drained > 0,
-        "releasing the peer must resume the flow: destination drained nothing"
-    );
+    application_writer.join().unwrap().unwrap();
+    let drained = drained_rx.recv_timeout(TIMEOUT).unwrap().unwrap();
+    assert_eq!(relayed, TRANSFER_BYTES);
+    assert_eq!(drained, TRANSFER_BYTES);
 
     peer.join().unwrap();
-    drop(application);
     source.shutdown().unwrap();
     destination.shutdown().unwrap();
+}
+
+fn forwarded_bytes(packet: &Packet) -> usize {
+    PortForwardData::decode(packet.payload())
+        .unwrap()
+        .buffer
+        .map_or(0, |buffer| buffer.len())
 }
 
 fn reserve_port() -> u16 {

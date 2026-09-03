@@ -400,16 +400,31 @@ impl Connection {
         if !self.writer.connected() {
             return Ok(());
         }
-        if let Err(error) = self.stream.set_nonblocking(true) {
-            self.disconnect();
-            return Err(ConnError::Io(error));
-        }
         let mut byte = [0u8; 1];
-        let probe = self.stream.peek(&mut byte);
-        if let Err(error) = self.stream.set_nonblocking(false) {
-            self.disconnect();
-            return Err(ConnError::Io(error));
-        }
+        // Unix socket clones share the same open-file-description flags.
+        // Toggling O_NONBLOCK here can make an in-flight PreparedWrite on a
+        // sibling clone fail with EAGAIN and tear down a healthy transport.
+        #[cfg(unix)]
+        let probe = rustix::net::recv(
+            &self.stream,
+            &mut byte,
+            rustix::net::RecvFlags::PEEK | rustix::net::RecvFlags::DONTWAIT,
+        )
+        .map(|(count, _)| count)
+        .map_err(io::Error::from);
+        #[cfg(windows)]
+        let probe = {
+            if let Err(error) = self.stream.set_nonblocking(true) {
+                self.disconnect();
+                return Err(ConnError::Io(error));
+            }
+            let probe = self.stream.peek(&mut byte);
+            if let Err(error) = self.stream.set_nonblocking(false) {
+                self.disconnect();
+                return Err(ConnError::Io(error));
+            }
+            probe
+        };
         match probe {
             Ok(0) => self.disconnect(),
             Ok(_) => {}

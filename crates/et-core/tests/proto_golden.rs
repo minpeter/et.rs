@@ -134,3 +134,44 @@ fn flow_control_opt_in_modes_use_additive_proto_fields() {
     assert_eq!(enc(&initial), [0x20, 0x01]);
     assert_eq!(enc(&term), [0x18, 0x02]);
 }
+
+#[test]
+fn port_forward_windows_use_additive_proto_fields() {
+    let f = fixtures();
+    let window = et::PortForwardWindow {
+        bytes: Some(524_288),
+        packets: Some(32),
+    };
+    let request = et::PortForwardDestinationRequest {
+        destination: None,
+        fd: Some(7),
+        window: Some(window),
+    };
+    let response = et::PortForwardDestinationResponse {
+        clientfd: Some(7),
+        socketid: Some(9),
+        error: None,
+        window: Some(window),
+    };
+    let credit = et::PortForwardData {
+        sourcetodestination: Some(true),
+        socketid: Some(9),
+        buffer: None,
+        error: None,
+        closed: None,
+        window: Some(et::PortForwardWindow {
+            bytes: Some(131_072),
+            packets: Some(8),
+        }),
+    };
+
+    assert_eq!(
+        enc(&request),
+        *f.get("proto_portforward_request_window").unwrap()
+    );
+    assert_eq!(
+        enc(&response),
+        *f.get("proto_portforward_response_window").unwrap()
+    );
+    assert_eq!(enc(&credit), *f.get("proto_portforward_credit").unwrap());
+}

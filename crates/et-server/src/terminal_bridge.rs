@@ -2,6 +2,8 @@ use et_net::local::LocalStream;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
+#[cfg(unix)]
+use std::time::Duration;
 
 use et_core::packet::Packet;
 use et_core::proto::TerminalPacketType;
@@ -169,12 +171,16 @@ fn run_mode_poll(
             forwarder.wake().map_err(forward_error)?,
             client.as_ref(),
             terminal_flags,
-            // Forwarding congestion must NOT suppress transport reads: the
-            // transport is shared with keepalives and every other stream, and
-            // suppressing it is what deadlocked two saturated endpoints.
-            // Per-socket credit throttles the peer's sender instead.
-            pending_local.is_some() || !connected,
-            client_buffered,
+            // Keep draining the shared transport while the bounded spill has
+            // room. Once full, stop polling readability to avoid a busy-loop;
+            // per-socket credit makes that state transient for windowed peers.
+            client_wait_policy(
+                pending_local.is_some()
+                    || pending_forward.len() >= FORWARD_BACKLOG_CAPACITY
+                    || !connected,
+                !pending_forward.is_empty() || !connected,
+                client_buffered,
+            ),
         )?;
         let client_events_are_stale = wake_events.intersects(PollFlags::IN | PollFlags::HUP);
         if client_events_are_stale {
@@ -235,9 +241,6 @@ fn run_mode_poll(
             && pending_forward.len() < FORWARD_BACKLOG_CAPACITY
             && pending_local.is_none()
         {
-            if std::env::var_os("ET_CREDIT_DEBUG").is_some() {
-                eprintln!("BRIDGE-READ backlog={}", pending_forward.len());
-            }
             client_buffered = false;
             for index in 0..CLIENT_READ_BATCH {
                 let read_packet = match session.try_read_packet() {
@@ -673,24 +676,12 @@ fn wait(
     forward_wake: &LocalStream,
     client: Option<&std::net::TcpStream>,
     terminal_flags: PollFlags,
-    forward_blocked: bool,
-    client_buffered: bool,
+    client_policy: (PollFlags, Option<Duration>),
 ) -> Result<(PollFlags, PollFlags, PollFlags, PollFlags), SessionError> {
-    // While a forwarding packet is held for worker capacity the client is not
-    // read, so do not watch it for readability, and wake on a 10ms cadence to
-    // retry the held packet even when nothing else becomes ready.
-    let client_flags = if forward_blocked {
-        PollFlags::HUP | PollFlags::ERR
-    } else {
-        PollFlags::IN | PollFlags::HUP | PollFlags::ERR
-    };
-    let timeout = if client_buffered && !forward_blocked {
-        Some(Timespec::try_from(std::time::Duration::ZERO).expect("zero fits timespec"))
-    } else if forward_blocked {
-        Some(Timespec::try_from(std::time::Duration::from_millis(10)).expect("10ms fits timespec"))
-    } else {
-        None
-    };
+    let (client_flags, timeout) = client_policy;
+    let timeout = timeout.map(|duration| {
+        Timespec::try_from(duration).expect("forwarding retry duration fits timespec")
+    });
     let mut descriptors = vec![
         PollFd::new(terminal, terminal_flags),
         PollFd::new(wake, PollFlags::IN | PollFlags::HUP),
@@ -717,6 +708,27 @@ fn wait(
             .map(PollFd::revents)
             .unwrap_or(PollFlags::empty()),
     ))
+}
+
+#[cfg(unix)]
+fn client_wait_policy(
+    client_read_blocked: bool,
+    forwarding_retry_pending: bool,
+    client_buffered: bool,
+) -> (PollFlags, Option<Duration>) {
+    let client_flags = if client_read_blocked {
+        PollFlags::HUP | PollFlags::ERR
+    } else {
+        PollFlags::IN | PollFlags::HUP | PollFlags::ERR
+    };
+    let timeout = if client_buffered && !client_read_blocked {
+        Some(Duration::ZERO)
+    } else if forwarding_retry_pending {
+        Some(Duration::from_millis(10))
+    } else {
+        None
+    };
+    (client_flags, timeout)
 }
 
 #[cfg(unix)]
@@ -915,5 +927,23 @@ mod tests {
 
         assert!(flags.contains(PollFlags::IN));
         assert!(flags.contains(PollFlags::OUT));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forwarding_retry_timeout_does_not_suppress_client_reads_with_spill_capacity() {
+        let (flags, timeout) = client_wait_policy(false, true, false);
+
+        assert!(flags.contains(PollFlags::IN));
+        assert_eq!(timeout, Some(Duration::from_millis(10)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_forwarding_spill_stops_polling_client_readability() {
+        let (flags, timeout) = client_wait_policy(true, true, false);
+
+        assert!(!flags.contains(PollFlags::IN));
+        assert_eq!(timeout, Some(Duration::from_millis(10)));
     }
 }

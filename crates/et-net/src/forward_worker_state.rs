@@ -5,17 +5,63 @@ use std::io::{self};
 use crossbeam_channel as channel;
 use et_core::packet::Packet;
 use et_core::proto::{
-    PortForwardData, PortForwardDestinationRequest, PortForwardDestinationResponse, SocketEndpoint,
-    TerminalPacketType,
+    PortForwardData, PortForwardDestinationRequest, PortForwardDestinationResponse,
+    PortForwardWindow, SocketEndpoint, TerminalPacketType,
 };
 use prost::Message;
 
 use crate::forward_endpoint::Endpoint;
 
 use super::{
-    close_write, spawn_connector, spawn_io, ActiveIo, ForwardError, ForwardStream, Role, Worker,
-    WriteCommand, MAX_ACTIVE_SOCKETS, MAX_DATA_PACKET,
+    close_write, spawn_connector, spawn_io, subtract_saturating, ActiveIo, FlowWindow,
+    ForwardError, ForwardStream, Role, Worker, WriteCommand, MAX_ACTIVE_SOCKETS, MAX_DATA_PACKET,
 };
+
+/// Per-socket receive window.
+///
+/// Both limits must stay below the socket's 64-slot writer channel. A byte
+/// limit alone is insufficient because legal one-byte reads can create far
+/// more packets than the queue can absorb.
+pub(super) const WINDOW_BYTES: i64 = 512 * 1024;
+pub(super) const WINDOW_PACKETS: i64 = 32;
+
+/// Return credit once this much has drained, so a full window costs a bounded
+/// number of control packets instead of one per data packet.
+const CREDIT_RETURN_THRESHOLD: i64 = WINDOW_BYTES / 4;
+const PACKET_CREDIT_RETURN_THRESHOLD: i64 = WINDOW_PACKETS / 4;
+
+pub(super) fn advertised_window() -> PortForwardWindow {
+    PortForwardWindow {
+        bytes: Some(WINDOW_BYTES),
+        packets: Some(WINDOW_PACKETS as i32),
+    }
+}
+
+fn decode_window(window: Option<PortForwardWindow>) -> Option<FlowWindow> {
+    let window = window?;
+    let bytes = window.bytes.filter(|bytes| *bytes > 0)?;
+    let packets = window.packets.filter(|packets| *packets > 0)?;
+    Some(FlowWindow {
+        bytes: bytes.min(WINDOW_BYTES),
+        packets: i64::from(packets).min(WINDOW_PACKETS),
+    })
+}
+
+pub(crate) fn apply_delivery(active: &ActiveIo, delivered: FlowWindow) {
+    use std::sync::atomic::Ordering;
+    if delivered.bytes <= 0 || delivered.packets <= 0 {
+        return;
+    }
+    let prior_bytes = subtract_saturating(&active.in_flight, delivered.bytes);
+    let prior_packets = subtract_saturating(&active.packets_in_flight, delivered.packets);
+    let byte_window = active.window.load(Ordering::Acquire);
+    let packet_window = active.packet_window.load(Ordering::Acquire);
+    if (byte_window >= 0 && prior_bytes >= byte_window)
+        || (packet_window >= 0 && prior_packets >= packet_window)
+    {
+        let _ = active.in_flight_wake.try_send(());
+    }
+}
 
 impl Worker {
     pub(super) fn accepted(
@@ -34,6 +80,7 @@ impl Worker {
             PortForwardDestinationRequest {
                 destination: Some(destination),
                 fd: Some(client_fd),
+                window: Some(advertised_window()),
             },
         )
     }
@@ -43,11 +90,12 @@ impl Worker {
         client_fd: i32,
         socket_id: i32,
         result: io::Result<ForwardStream>,
+        peer_advertised: Option<FlowWindow>,
     ) -> Result<(), ForwardError> {
         self.connecting.remove(&socket_id);
         let error = match result {
             Ok(stream) => {
-                self.activate(Role::Destination, socket_id, stream)?;
+                self.activate(Role::Destination, socket_id, stream, peer_advertised)?;
                 None
             }
             Err(error) => Some(error.to_string()),
@@ -57,6 +105,11 @@ impl Worker {
             PortForwardDestinationResponse {
                 clientfd: Some(client_fd),
                 socketid: error.is_none().then_some(socket_id),
+                // Mixed-version safety: only answer with a window when the
+                // socket was actually established AND the peer advertised one.
+                // A peer that advertises nothing gets nothing back, and both
+                // ends stay on unwindowed behavior.
+                window: (error.is_none() && peer_advertised.is_some()).then(advertised_window),
                 error,
             },
         )
@@ -94,19 +147,24 @@ impl Worker {
         // Upstream (`PortForwardHandler::createDestination`) never tears the
         // session down for a bad destination: every failure is reported back
         // in a PORT_FORWARD_DESTINATION_RESPONSE with the error field set.
+        // Absent window = a peer that predates windowing. Keep it as None so
+        // the response withholds a window and both ends stay unwindowed.
+        let peer_advertised = decode_window(request.window);
         let destination = match Endpoint::parse_destination(request.destination) {
             Ok(destination) => destination,
-            Err(error) => return self.connected(client_fd, 0, Err(error)),
+            Err(error) => return self.connected(client_fd, 0, Err(error), peer_advertised),
         };
         if self.total_sockets() >= MAX_ACTIVE_SOCKETS {
             return self.connected(
                 client_fd,
                 0,
                 Err(io::Error::other("forwarding socket limit reached")),
+                peer_advertised,
             );
         }
         let socket_id = self.allocate_socket_id()?;
         self.connecting.insert(socket_id);
+        self.pending_windows.insert(socket_id, peer_advertised);
         self.threads.push(spawn_connector(
             client_fd,
             socket_id,
@@ -138,7 +196,11 @@ impl Worker {
             stream.shutdown();
             return Ok(());
         };
-        self.activate(Role::Source, socket_id, stream)
+        // The response carries a window only when the peer supports windowing
+        // and the socket was established, so this is the source side's
+        // negotiation point.
+        let peer_advertised = decode_window(response.window);
+        self.activate(Role::Source, socket_id, stream, peer_advertised)
     }
 
     fn receive_data(&mut self, data: PortForwardData) -> Result<(), ForwardError> {
@@ -156,6 +218,17 @@ impl Worker {
         if data.error.is_some() {
             self.remove(role, socket_id);
             return Ok(());
+        }
+        // Credit returned by the peer frees our sender for THIS socket only.
+        // A pure credit packet carries no buffer and must not be mistaken for
+        // an empty-data close.
+        if let Some(delivered) = decode_window(data.window) {
+            if let Some(active) = self.map(role).get_mut(&socket_id) {
+                apply_delivery(active, delivered);
+            }
+            if buffer.is_empty() && !data.closed.unwrap_or(false) {
+                return Ok(());
+            }
         }
         if data.closed.unwrap_or(false) {
             let Some(active) = self.map(role).get_mut(&socket_id) else {
@@ -191,14 +264,75 @@ impl Worker {
             send(active.writer, WriteCommand::Data(buffer)) -> result => result.is_ok(),
             recv(self.cancel) -> _ => false,
         };
-        if admitted {
-            Ok(())
-        } else {
+        if !admitted {
             active
                 .pending_bytes
                 .fetch_sub(byte_count, std::sync::atomic::Ordering::AcqRel);
-            Err(ForwardError::Unavailable)
+            return Err(ForwardError::Unavailable);
         }
+        Ok(())
+    }
+
+    /// Give the peer back credit for bytes our local socket has drained.
+    ///
+    /// This is what replaces "stop reading the transport": the peer's sender
+    /// is throttled per socket, so a congested forwarded socket never stalls
+    /// the shared transport that also carries keepalives.
+    pub(super) fn return_credit(
+        &mut self,
+        role: Role,
+        socket_id: i32,
+        received: usize,
+    ) -> Result<(), ForwardError> {
+        let Some(active) = self.map(role).get_mut(&socket_id) else {
+            return Ok(());
+        };
+        // Only confirm delivery to a windowed peer: an unwindowed peer
+        // tracks no in-flight count, so telling it would be meaningless.
+        if active.window.load(std::sync::atomic::Ordering::Acquire) < 0 {
+            return Ok(());
+        }
+        let drained = i64::try_from(received).unwrap_or(i64::MAX);
+        active.credit_to_return = active.credit_to_return.saturating_add(drained);
+        active.packet_credit_to_return = active.packet_credit_to_return.saturating_add(1);
+        // Batch returns so a full window costs a bounded number of control
+        // packets, but ALSO flush whenever the socket has gone idle. Without
+        // the idle flush a sub-threshold remainder is stranded, the peer's
+        // window shrinks by that much for the rest of the connection, and a
+        // steady stream eventually parks its sender permanently.
+        let idle = active
+            .pending_bytes
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0;
+        if active.credit_to_return < CREDIT_RETURN_THRESHOLD
+            && active.packet_credit_to_return < PACKET_CREDIT_RETURN_THRESHOLD
+            && !idle
+        {
+            return Ok(());
+        }
+        let credit = std::mem::take(&mut active.credit_to_return);
+        let packet_credit = std::mem::take(&mut active.packet_credit_to_return);
+        if credit == 0 || packet_credit == 0 {
+            return Ok(());
+        }
+        self.emit_priority(
+            TerminalPacketType::PortForwardData as u8,
+            PortForwardData {
+                // Credit travels toward the peer that SENDS on this socket,
+                // which is the same direction flag data uses for this role.
+                // Inverting it would land the credit in the peer's other map
+                // and silently strand the sender.
+                sourcetodestination: Some(role == Role::Source),
+                socketid: Some(socket_id),
+                buffer: None,
+                error: None,
+                closed: None,
+                window: Some(PortForwardWindow {
+                    bytes: Some(credit),
+                    packets: Some(i32::try_from(packet_credit).unwrap_or(i32::MAX)),
+                }),
+            },
+        )
     }
 
     pub(super) fn read_closed(&mut self, role: Role, socket_id: i32) -> Result<(), ForwardError> {
@@ -240,6 +374,7 @@ impl Worker {
                 buffer,
                 error,
                 closed,
+                window: None,
             },
         )
     }
@@ -249,11 +384,13 @@ impl Worker {
         role: Role,
         socket_id: i32,
         stream: ForwardStream,
+        peer_window: Option<FlowWindow>,
     ) -> Result<(), ForwardError> {
         let (active, handles) = spawn_io(
             role,
             socket_id,
             stream,
+            peer_window,
             self.commands.clone(),
             self.cancel.clone(),
             self.abandoned.clone(),
@@ -277,7 +414,7 @@ impl Worker {
         }
     }
 
-    fn map_ref(&self, role: Role) -> &std::collections::HashMap<i32, ActiveIo> {
+    pub(crate) fn map_ref(&self, role: Role) -> &std::collections::HashMap<i32, ActiveIo> {
         match role {
             Role::Source => &self.sources,
             Role::Destination => &self.destinations,
@@ -297,6 +434,22 @@ impl Worker {
         Ok(socket_id)
     }
 
+    /// Emit on the priority lane, which the consumer drains before ordinary
+    /// outbound packets. Only valid for control messages whose delivery must
+    /// not wait behind the data flow they regulate.
+    fn emit_priority<M: Message>(&mut self, header: u8, message: M) -> Result<(), ForwardError> {
+        let packet = Ok(Packet::new(header, message.encode_to_vec()));
+        channel::select! {
+            send(self.priority, packet) -> result => {
+                result.map_err(|_| ForwardError::Unavailable)?;
+            }
+            recv(self.cancel) -> _ => return Err(ForwardError::Unavailable),
+        }
+        #[cfg(unix)]
+        let _ = self.outbound_wake.write(&[1]);
+        Ok(())
+    }
+
     fn emit<M: Message>(&mut self, header: u8, message: M) -> Result<(), ForwardError> {
         let packet = Ok(Packet::new(header, message.encode_to_vec()));
         channel::select! {
@@ -310,5 +463,60 @@ impl Worker {
         #[cfg(unix)]
         let _ = self.outbound_wake.write(&[1]);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use super::{
+        decode_window, subtract_saturating, FlowWindow, PortForwardWindow, WINDOW_BYTES,
+        WINDOW_PACKETS,
+    };
+
+    #[test]
+    fn hostile_window_values_are_rejected_or_bounded() {
+        assert_eq!(decode_window(None), None);
+        assert_eq!(
+            decode_window(Some(PortForwardWindow {
+                bytes: Some(0),
+                packets: Some(1),
+            })),
+            None
+        );
+        assert_eq!(
+            decode_window(Some(PortForwardWindow {
+                bytes: Some(-1),
+                packets: Some(1),
+            })),
+            None
+        );
+        assert_eq!(
+            decode_window(Some(PortForwardWindow {
+                bytes: Some(1),
+                packets: None,
+            })),
+            None
+        );
+        assert_eq!(
+            decode_window(Some(PortForwardWindow {
+                bytes: Some(i64::MAX),
+                packets: Some(i32::MAX),
+            })),
+            Some(FlowWindow {
+                bytes: WINDOW_BYTES,
+                packets: WINDOW_PACKETS,
+            })
+        );
+    }
+
+    #[test]
+    fn delivery_confirmation_cannot_underflow_in_flight_bytes() {
+        let in_flight = AtomicI64::new(128);
+        assert_eq!(subtract_saturating(&in_flight, 64), 128);
+        assert_eq!(in_flight.load(Ordering::Acquire), 64);
+        assert_eq!(subtract_saturating(&in_flight, i64::MAX), 64);
+        assert_eq!(in_flight.load(Ordering::Acquire), 0);
     }
 }

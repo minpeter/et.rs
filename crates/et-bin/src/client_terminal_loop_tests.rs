@@ -10,6 +10,21 @@ use crate::client_terminal::send_buffer;
 use et_core::proto::TerminalBuffer;
 use prost::Message;
 
+#[test]
+fn full_forwarding_backlog_stops_polling_network_readability() {
+    let flags = network_poll_flags(false, true);
+
+    assert!(!flags.contains(PollFlags::IN));
+    assert!(flags.contains(PollFlags::HUP | PollFlags::ERR));
+}
+
+#[test]
+fn available_forwarding_backlog_keeps_polling_network_readability() {
+    let flags = network_poll_flags(false, false);
+
+    assert!(flags.contains(PollFlags::IN));
+}
+
 struct GatedConsole {
     entered: mpsc::SyncSender<usize>,
     release: mpsc::Receiver<()>,
@@ -118,7 +133,7 @@ fn remote_completion_bounds_a_retained_packet_behind_stalled_output() {
             .send(finish_remote_completion(
                 output,
                 Some(retained),
-                None,
+                VecDeque::new(),
                 true,
                 &mut terminal_modes,
                 &mut forwarder,
@@ -159,7 +174,7 @@ fn remote_completion_attempts_retained_output_before_draining() {
     let error = finish_remote_completion(
         output,
         Some(retained),
-        None,
+        VecDeque::new(),
         true,
         &mut terminal_modes,
         &mut forwarder,

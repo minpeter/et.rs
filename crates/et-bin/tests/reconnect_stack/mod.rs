@@ -64,7 +64,10 @@ impl Stack {
              if [ -n \"$ET_SSH_CONFIG\" ]; then printf '%s' \"$ET_SSH_CONFIG\"; exit 0; fi\n\
              printf 'hostname 127.0.0.1\\nuser tester\\n'; exit 0; fi\n\
              printf x >> \"$ET_SSH_COUNT\"\nfor last do :; done\n\
-             exec /bin/sh -c \"$last\"\n",
+             output=\"${ET_SSH_COUNT}.output.$$\"\ntrap '/bin/rm -f \"$output\"' EXIT\n\
+             trap 'exit 129' HUP\ntrap 'exit 130' INT\ntrap 'exit 143' TERM\n\
+             /bin/sh -c \"$last\" > \"$output\"\nstatus=$?\n/bin/cat \"$output\" || exit $?\n\
+             exit \"$status\"\n",
         )
         .unwrap();
         fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();

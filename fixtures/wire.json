@@ -27,5 +27,8 @@
   "sockethandler_nativei64_seq42": "0200000000000000082a",
   "sockethandler_nativei64_connectrequest_emptyid": "04000000000000000a001006",
   "backedwriter_be4_h1_terminalbytes_dir0": "000000200101e240a30039804c15085cc2733282bb20b65ef84d9b7199a2df1a19352517",
-  "backedwriter_be4_h0_empty_dir1": "0000001201005051647db88d428264e39f255f4456f1"
+  "backedwriter_be4_h0_empty_dir1": "0000001201005051647db88d428264e39f255f4456f1",
+  "proto_portforward_request_window": "10071a06088080201020",
+  "proto_portforward_response_window": "080710092206088080201020",
+  "proto_portforward_credit": "080110093206088080081008"
 }

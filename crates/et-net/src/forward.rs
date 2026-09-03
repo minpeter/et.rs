@@ -307,6 +307,7 @@ pub struct SkippedForward {
 pub struct Forwarder {
     commands: CommandSender,
     outbound: channel::Receiver<Outbound>,
+    priority: channel::Receiver<Outbound>,
     cancel: Option<channel::Sender<()>>,
     /// Readiness channel for outbound packets. Unix callers poll it exactly
     /// like upstream's `select()`; Windows callers drain [`Forwarder::try_outbound`]
@@ -411,6 +412,11 @@ fn start_forwarder_hook(
     let session_user = owner;
     let (commands_tx, commands_rx) = command_channel(CHANNEL_CAPACITY);
     let (outbound_tx, outbound_rx) = channel::bounded(CHANNEL_CAPACITY);
+    // Credit returns are CONTROL messages for a flow they regulate, so they
+    // must not queue behind the very data they are meant to release. On a
+    // small transport window the data backlog is exactly what delays them,
+    // which parks both senders. Draining this lane first keeps credit moving.
+    let (priority_tx, priority_rx) = channel::bounded(CHANNEL_CAPACITY);
     let (cancel_tx, cancel_rx) = channel::bounded(1);
     let abandoned = Arc::new(AtomicBool::new(false));
     let worker_abandoned = abandoned.clone();
@@ -439,6 +445,7 @@ fn start_forwarder_hook(
                     receiver: commands_rx,
                     sender: worker_commands,
                     outbound: outbound_tx,
+                    priority: priority_tx,
                     cancel: cancel_rx,
                     abandoned: worker_abandoned,
                 },
@@ -455,6 +462,7 @@ fn start_forwarder_hook(
     let forwarder = Forwarder {
         commands: commands_tx,
         outbound: outbound_rx,
+        priority: priority_rx,
         cancel: Some(cancel_tx),
         #[cfg(unix)]
         wake,
@@ -508,6 +516,9 @@ impl Forwarder {
     pub fn try_outbound(&self) -> Result<Option<Packet>, ForwardError> {
         #[cfg(unix)]
         drain_wake(&self.wake)?;
+        if let Ok(result) = self.priority.try_recv() {
+            return result.map(Some);
+        }
         match self.outbound.try_recv() {
             Ok(result) => result.map(Some),
             Err(channel::TryRecvError::Empty) => Ok(None),
@@ -516,9 +527,7 @@ impl Forwarder {
     }
 
     pub fn wait_outbound(&self, timeout: Duration) -> Result<Packet, ForwardError> {
-        self.outbound
-            .recv_timeout(timeout)
-            .map_err(|_| ForwardError::Unavailable)?
+        wait_outbound_from(&self.priority, &self.outbound, timeout)
     }
 
     pub fn shutdown(mut self) -> Result<(), ForwardError> {
@@ -531,12 +540,16 @@ impl Forwarder {
     pub fn shutdown_hard(&mut self) -> Result<bool, ForwardError> {
         self.shutdown.store(true, Ordering::Release);
         self.cancel.take();
-        let mut abandoned = !self.commands.is_empty() || !self.outbound.is_empty();
+        let mut abandoned =
+            !self.commands.is_empty() || !self.priority.is_empty() || !self.outbound.is_empty();
         self.commands.shutdown();
         if let Some(worker) = self.worker.take() {
             worker.join().map_err(|_| ForwardError::Unavailable)?;
         }
         while self.outbound.try_recv().is_ok() {
+            abandoned = true;
+        }
+        while self.priority.try_recv().is_ok() {
             abandoned = true;
         }
         if !self.commands.is_empty() {
@@ -553,6 +566,62 @@ impl Forwarder {
             worker.join().map_err(|_| ForwardError::Unavailable)?;
         }
         Ok(())
+    }
+}
+
+fn wait_outbound_from(
+    priority: &channel::Receiver<Outbound>,
+    outbound: &channel::Receiver<Outbound>,
+    timeout: Duration,
+) -> Result<Packet, ForwardError> {
+    let deadline = Instant::now() + timeout;
+    let mut priority_open = true;
+    let mut outbound_open = true;
+    loop {
+        if priority_open {
+            match priority.try_recv() {
+                Ok(result) => return result,
+                Err(channel::TryRecvError::Empty) => {}
+                Err(channel::TryRecvError::Disconnected) => priority_open = false,
+            }
+        }
+        if outbound_open {
+            match outbound.try_recv() {
+                Ok(result) => return result,
+                Err(channel::TryRecvError::Empty) => {}
+                Err(channel::TryRecvError::Disconnected) => outbound_open = false,
+            }
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(ForwardError::Unavailable);
+        };
+        match (priority_open, outbound_open) {
+            (true, true) => {
+                let timeout = channel::after(remaining);
+                channel::select_biased! {
+                    recv(priority) -> result => match result {
+                        Ok(result) => return result,
+                        Err(_) => priority_open = false,
+                    },
+                    recv(outbound) -> result => match result {
+                        Ok(result) => return result,
+                        Err(_) => outbound_open = false,
+                    },
+                    recv(timeout) -> _ => return Err(ForwardError::Unavailable),
+                }
+            }
+            (true, false) => {
+                return priority
+                    .recv_timeout(remaining)
+                    .map_err(|_| ForwardError::Unavailable)?;
+            }
+            (false, true) => {
+                return outbound
+                    .recv_timeout(remaining)
+                    .map_err(|_| ForwardError::Unavailable)?;
+            }
+            (false, false) => return Err(ForwardError::Unavailable),
+        }
     }
 }
 
@@ -830,6 +899,24 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::sync::{Barrier, Condvar};
 
+    #[test]
+    fn disconnected_priority_does_not_mask_buffered_outbound_packet() {
+        let (priority_tx, priority_rx) = channel::bounded::<Outbound>(1);
+        let (outbound_tx, outbound_rx) = channel::bounded::<Outbound>(1);
+        outbound_tx
+            .send(Ok(Packet::new(
+                TerminalPacketType::PortForwardData as u8,
+                vec![1, 2, 3],
+            )))
+            .unwrap();
+        drop(priority_tx);
+
+        let packet =
+            wait_outbound_from(&priority_rx, &outbound_rx, Duration::from_secs(1)).unwrap();
+
+        assert_eq!(packet.payload(), &[1, 2, 3]);
+    }
+
     struct GatedResolver {
         started: mpsc::SyncSender<()>,
         completed: Option<mpsc::SyncSender<()>>,
@@ -1048,6 +1135,7 @@ mod tests {
                 PortForwardDestinationRequest {
                     destination: None,
                     fd: Some(fd),
+                    window: None,
                 }
                 .encode_to_vec(),
             );
@@ -1120,6 +1208,7 @@ mod tests {
                         buffer: None,
                         error: None,
                         closed: Some(true),
+                        window: None,
                     }
                     .encode_to_vec(),
                 );
@@ -1136,6 +1225,7 @@ mod tests {
                     buffer: None,
                     error: None,
                     closed: Some(true),
+                    window: None,
                 }
                 .encode_to_vec(),
             );

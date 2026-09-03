@@ -11,6 +11,7 @@
 //! Home/End, and function keys. Those keys are translated into the ANSI
 //! sequences a remote shell expects instead of being discarded.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
@@ -31,6 +32,7 @@ use crate::initial_connect::ReconnectOutcome;
 const MISSED_KEEPALIVES: u32 = 3;
 /// Console/socket cadence, matching upstream's 10ms `select()` timeout.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const FORWARD_BACKLOG_CAPACITY: usize = 257;
 
 pub fn pump<F>(
     connection: &mut Connection,
@@ -58,9 +60,7 @@ where
     if let Ok(path) = std::env::var("ET_SSH_READY") {
         let _ = std::fs::write(path, b"ready");
     }
-    // A forwarding packet the worker had no room for. While it is held, no
-    // further session packets are read so forwarding data stays ordered.
-    let mut pending_forward: Option<et_core::packet::Packet> = None;
+    let mut pending_forward = VecDeque::new();
     let mut pending_output: Option<et_core::packet::Packet> = None;
     loop {
         console_output
@@ -88,13 +88,14 @@ where
             }
         }
         let mut reconnect_needed = false;
-        // Retry the held packet first: draining the forwarder's outbound
-        // queue below is what frees worker capacity, so this makes progress
-        // every 10ms tick instead of deadlocking on a blocking send.
-        if let Some(packet) = pending_forward.take() {
-            pending_forward = forwarder
+        while let Some(packet) = pending_forward.pop_front() {
+            if let Some(packet) = forwarder
                 .try_receive(packet)
-                .map_err(|error| terminal_text(error.to_string()))?;
+                .map_err(|error| terminal_text(error.to_string()))?
+            {
+                pending_forward.push_front(packet);
+                break;
+            }
         }
         if let Some(packet) = pending_output.take() {
             match route_server_packet(packet, terminal_enabled, terminal_modes, &console_output)? {
@@ -188,7 +189,7 @@ where
         }
 
         // 2. Server packets.
-        while pending_forward.is_none() && pending_output.is_none() {
+        while pending_forward.len() < FORWARD_BACKLOG_CAPACITY && pending_output.is_none() {
             match connection.try_read_packet() {
                 Ok(Some(packet)) => {
                     last_received = Instant::now();
@@ -198,9 +199,12 @@ where
                         }
                     }
                     if is_forward_packet(packet.header()) {
-                        pending_forward = forwarder
+                        if let Some(packet) = forwarder
                             .try_receive(packet)
-                            .map_err(|error| terminal_text(error.to_string()))?;
+                            .map_err(|error| terminal_text(error.to_string()))?
+                        {
+                            pending_forward.push_back(packet);
+                        }
                     } else {
                         match route_server_packet(
                             packet,
@@ -334,13 +338,13 @@ where
 fn finish_remote_completion(
     mut output: crate::client_output::ConsoleOutput,
     pending_output: Option<et_core::packet::Packet>,
-    pending_forward: Option<et_core::packet::Packet>,
+    mut pending_forward: VecDeque<et_core::packet::Packet>,
     terminal_enabled: bool,
     terminal_modes: &mut TerminalModeState,
     forwarder: &mut Forwarder,
     current_outbound: Option<et_core::packet::Packet>,
 ) -> Result<(), ClientError> {
-    let mut retained = RetainedCompletion::new(pending_output, pending_forward);
+    let mut retained = RetainedCompletion::new(pending_output, pending_forward.pop_front());
     let mut output_progress = output
         .worker_progress()
         .map_err(|error| terminal_io("tracking retained terminal output", error))?;
@@ -360,6 +364,10 @@ fn finish_remote_completion(
                     .map_err(|error| terminal_text(error.to_string()))
             },
         )? {
+            if let Some(packet) = pending_forward.pop_front() {
+                retained = RetainedCompletion::new(None, Some(packet));
+                continue;
+            }
             let abandoned = forwarder
                 .shutdown_hard()
                 .map_err(|error| terminal_text(error.to_string()))?;

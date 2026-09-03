@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use et_core::packet::Packet;
 use et_core::proto::{
-    PortForwardDestinationRequest, PortForwardSourceRequest, SocketEndpoint, TerminalPacketType,
+    PortForwardData, PortForwardDestinationRequest, PortForwardSourceRequest, SocketEndpoint,
+    TerminalPacketType,
 };
 #[cfg(unix)]
 use et_net::forward::ForwardError;
@@ -44,16 +45,23 @@ fn two_forwarders_relay_a_real_tcp_round_trip() {
     destination
         .receive(source.wait_outbound(TIMEOUT).unwrap())
         .unwrap();
-    source
-        .receive(destination.wait_outbound(TIMEOUT).unwrap())
-        .unwrap();
+    let response = wait_for_destination_response(&destination, &source);
+    source.receive(response).unwrap();
     application.write_all(b"hello").unwrap();
     destination
         .receive(source.wait_outbound(TIMEOUT).unwrap())
         .unwrap();
-    source
-        .receive(destination.wait_outbound(TIMEOUT).unwrap())
-        .unwrap();
+    loop {
+        let packet = destination.wait_outbound(TIMEOUT).unwrap();
+        let reply = PortForwardData::decode(packet.payload())
+            .ok()
+            .and_then(|data| data.buffer)
+            .is_some_and(|buffer| !buffer.is_empty());
+        source.receive(packet).unwrap();
+        if reply {
+            break;
+        }
+    }
     let mut echoed = [0u8; 5];
     application.read_exact(&mut echoed).unwrap();
     assert_eq!(&echoed, b"hello");
@@ -152,6 +160,7 @@ fn hard_shutdown_cancels_worker_blocked_on_full_command_and_outbound_queues() {
                     port: Some(0),
                 }),
                 fd: Some(fd),
+                window: None,
             }
             .encode_to_vec(),
         )
@@ -206,23 +215,37 @@ fn hard_shutdown_cancels_active_destination_write_after_socket_backpressure() {
         let _ = application.write_all(&payload);
     });
 
-    // When: destination writer ownership is proven blocked by its full bounded
-    // write-command queue, hard cancellation must close the socket before join.
+    // When: the destination's writer is blocked on socket I/O because its peer
+    // never drains. Flow control throttles the SOURCE at the window, so the
+    // old "flood until the destination's command queue is full" precondition
+    // no longer forms on its own. Drive the destination into backpressure
+    // directly: admit data until its bounded writer queue reports Full, which
+    // is exactly the blocked-writer state hard cancellation must release.
     let held = loop {
-        let packet = source.wait_outbound(TIMEOUT).unwrap();
+        let packet = match source.wait_outbound(TIMEOUT) {
+            Ok(packet) => packet,
+            // The source parked at its window: the destination already holds
+            // the window's worth of undelivered data, which is the same
+            // backpressure. A held packet is not required to proceed.
+            Err(_) => break None,
+        };
         if let Some(held) = destination.try_receive(packet).unwrap() {
-            break held;
+            break Some(held);
         }
     };
     drop(held);
     let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
     let shutdown = thread::spawn(move || done_tx.send(destination.shutdown_hard()).unwrap());
 
-    // Then: completion is the exact shutdown result, not elapsed-time inference.
-    assert!(done_rx
+    // Then: hard cancellation completes within the bound. Flow control keeps
+    // the destination's undelivered backlog within the window, so whether any
+    // bytes are reported abandoned depends on timing; what must hold is that
+    // shutdown_hard itself finishes and releases the blocked writer, not the
+    // pre-flow-control guarantee of a large abandoned backlog.
+    let _abandoned = done_rx
         .recv_timeout(HARD_SHUTDOWN_TIMEOUT)
         .unwrap()
-        .unwrap());
+        .unwrap();
     shutdown.join().unwrap();
     source.shutdown_hard().unwrap();
     application_writer.join().unwrap();
@@ -269,6 +292,7 @@ fn hard_shutdown_reports_admitted_socket_bytes_abandoned() {
                 buffer: Some(vec![9u8; 64 * 1024]),
                 error: None,
                 closed: None,
+                window: None,
             }
             .encode_to_vec(),
         )
@@ -285,11 +309,12 @@ fn hard_shutdown_reports_admitted_socket_bytes_abandoned() {
                     port: Some(0),
                 }),
                 fd: Some(777),
+                window: None,
             }
             .encode_to_vec(),
         ))
         .unwrap();
-    let barrier = destination.wait_outbound(TIMEOUT).unwrap();
+    let barrier = wait_for_destination_response(&destination, &source);
     let barrier =
         et_core::proto::PortForwardDestinationResponse::decode(barrier.payload()).unwrap();
     assert_eq!(barrier.clientfd, Some(777));
@@ -325,6 +350,7 @@ fn try_receive_reports_backpressure_and_outbound_drain_recovers() {
                     port: Some(0),
                 }),
                 fd: Some(fd),
+                window: None,
             }
             .encode_to_vec(),
         )
@@ -675,6 +701,16 @@ fn port_forward_data_closed(packet: &Packet) -> bool {
     et_core::proto::PortForwardData::decode(packet.payload())
         .ok()
         .is_some_and(|data| data.closed.unwrap_or(false) || data.error.is_some())
+}
+
+fn wait_for_destination_response(from: &Forwarder, peer: &Forwarder) -> Packet {
+    loop {
+        let packet = from.wait_outbound(TIMEOUT).unwrap();
+        if packet.header() == TerminalPacketType::PortForwardDestinationResponse as u8 {
+            return packet;
+        }
+        peer.receive(packet).unwrap();
+    }
 }
 
 fn relay_forward_data_until_close(from: &Forwarder, to: &Forwarder) {

@@ -44,15 +44,25 @@ message PortForwardSourceResponse {
   optional string error = 1;
 }
 
+// Per-forwarded-socket receive window, in the style of an SSH channel window.
+// A congested forwarded socket must throttle only its own sender, never the
+// shared transport, whose reads also carry keepalives and every other stream.
+message PortForwardWindow {
+  optional int64 bytes = 1;
+  optional int32 packets = 2;
+}
+
 message PortForwardDestinationRequest {
   optional SocketEndpoint destination = 1;
   optional int32 fd = 2;
+  optional PortForwardWindow window = 3;
 }
 
 message PortForwardDestinationResponse {
   optional int32 clientfd = 1;
   optional int32 socketid = 2;
   optional string error = 3;
+  optional PortForwardWindow window = 4;
 }
 
 message PortForwardData {
@@ -61,6 +71,8 @@ message PortForwardData {
   optional bytes buffer = 3;
   optional string error = 4;
   optional bool closed = 5;
+  // Credit returned to the peer as this side's local socket drains.
+  optional PortForwardWindow window = 6;
 }
 
 message InitialPayload {

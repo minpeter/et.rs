@@ -318,6 +318,41 @@ fn partial_writes_report_progress_before_completion_and_drain_every_byte() {
     assert_eq!(shared.state.lock().unwrap().worker_progress, 2);
 }
 
+#[test]
+fn remote_session_end_drains_every_partial_write_before_returning() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct RecordingPartialWriter(Arc<Mutex<Vec<u8>>>);
+    impl Write for RecordingPartialWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().push(bytes[0]);
+            Ok(1)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_observer = Arc::clone(&cancelled);
+    let output = ConsoleOutput::new_with_cancel(
+        FlowControlMode::Backpressure,
+        Box::new(RecordingPartialWriter(Arc::clone(&written))),
+        Box::new(move || cancel_observer.store(true, Ordering::Release)),
+    )
+    .unwrap();
+    assert!(output
+        .try_write(b"partial", &TerminalModeState::default())
+        .unwrap());
+
+    output
+        .complete(ConsoleCompletion::RemoteSessionEnded)
+        .unwrap();
+    assert_eq!(*written.lock().unwrap(), b"partial");
+    assert!(!cancelled.load(Ordering::Acquire));
+}
+
 #[cfg(unix)]
 #[test]
 fn cancellable_stdout_fails_when_output_is_closed() {

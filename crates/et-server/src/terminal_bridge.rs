@@ -223,6 +223,10 @@ fn run_mode_poll(
                 if !read_packet {
                     break;
                 }
+                if pending_forward.is_some() || pending_outbound.is_some() {
+                    client_buffered = true;
+                    break;
+                }
                 if index + 1 == CLIENT_READ_BATCH {
                     // `try_read_packet` can leave complete packets in its
                     // userspace decoder after the kernel socket is drained.

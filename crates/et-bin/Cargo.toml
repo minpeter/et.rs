@@ -12,6 +12,13 @@ repository.workspace = true
 name = "et"
 path = "src/main.rs"
 
+# Test-only helper: binds a real UNIX socket for the fake ssh control master.
+[[bin]]
+name = "mksocket"
+path = "testbin/mksocket.rs"
+test = false
+doc = false
+
 [lints]
 workspace = true
 

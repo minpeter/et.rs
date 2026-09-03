@@ -307,6 +307,7 @@ pub struct SkippedForward {
 pub struct Forwarder {
     commands: CommandSender,
     outbound: channel::Receiver<Outbound>,
+    priority: channel::Receiver<Outbound>,
     cancel: Option<channel::Sender<()>>,
     /// Readiness channel for outbound packets. Unix callers poll it exactly
     /// like upstream's `select()`; Windows callers drain [`Forwarder::try_outbound`]
@@ -411,6 +412,11 @@ fn start_forwarder_hook(
     let session_user = owner;
     let (commands_tx, commands_rx) = command_channel(CHANNEL_CAPACITY);
     let (outbound_tx, outbound_rx) = channel::bounded(CHANNEL_CAPACITY);
+    // Credit returns are CONTROL messages for a flow they regulate, so they
+    // must not queue behind the very data they are meant to release. On a
+    // small transport window the data backlog is exactly what delays them,
+    // which parks both senders. Draining this lane first keeps credit moving.
+    let (priority_tx, priority_rx) = channel::bounded(CHANNEL_CAPACITY);
     let (cancel_tx, cancel_rx) = channel::bounded(1);
     let abandoned = Arc::new(AtomicBool::new(false));
     let worker_abandoned = abandoned.clone();
@@ -439,6 +445,7 @@ fn start_forwarder_hook(
                     receiver: commands_rx,
                     sender: worker_commands,
                     outbound: outbound_tx,
+                    priority: priority_tx,
                     cancel: cancel_rx,
                     abandoned: worker_abandoned,
                 },
@@ -455,6 +462,7 @@ fn start_forwarder_hook(
     let forwarder = Forwarder {
         commands: commands_tx,
         outbound: outbound_rx,
+        priority: priority_rx,
         cancel: Some(cancel_tx),
         #[cfg(unix)]
         wake,
@@ -508,6 +516,9 @@ impl Forwarder {
     pub fn try_outbound(&self) -> Result<Option<Packet>, ForwardError> {
         #[cfg(unix)]
         drain_wake(&self.wake)?;
+        if let Ok(result) = self.priority.try_recv() {
+            return result.map(Some);
+        }
         match self.outbound.try_recv() {
             Ok(result) => result.map(Some),
             Err(channel::TryRecvError::Empty) => Ok(None),
@@ -1048,6 +1059,7 @@ mod tests {
                 PortForwardDestinationRequest {
                     destination: None,
                     fd: Some(fd),
+                    window: None,
                 }
                 .encode_to_vec(),
             );
@@ -1120,6 +1132,7 @@ mod tests {
                         buffer: None,
                         error: None,
                         closed: Some(true),
+                        window: None,
                     }
                     .encode_to_vec(),
                 );
@@ -1136,6 +1149,7 @@ mod tests {
                     buffer: None,
                     error: None,
                     closed: Some(true),
+                    window: None,
                 }
                 .encode_to_vec(),
             );

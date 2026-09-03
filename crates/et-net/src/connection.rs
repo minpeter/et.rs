@@ -371,6 +371,23 @@ impl Connection {
         Ok(())
     }
 
+    /// Shrink BOTH transport directions to a tiny window.
+    ///
+    /// Loopback negotiates mss 65483 with a ~190 KB window, so a bounded
+    /// forwarding backlog never fills there and a default-buffer test cannot
+    /// reproduce the saturation seen on a real link (mss 1228, cwnd 64-99).
+    /// Tests use this to force the same pressure deterministically.
+    pub fn shrink_transport_window_for_tests(&self, bytes: usize) -> Result<(), ConnError> {
+        let socket = SockRef::from(&self.stream);
+        socket.set_send_buffer_size(bytes).map_err(ConnError::Io)?;
+        socket.set_recv_buffer_size(bytes).map_err(ConnError::Io)?;
+        #[cfg(target_os = "linux")]
+        socket
+            .set_tcp_notsent_lowat(bytes as u32)
+            .map_err(ConnError::Io)?;
+        Ok(())
+    }
+
     pub fn writer_sequence(&self) -> i64 {
         self.writer.sequence()
     }

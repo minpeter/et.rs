@@ -170,12 +170,17 @@ where
                 DisplayOutcome::Pending(packet) => pending_output = Some(packet),
             }
         }
-        let network_flags =
-            if pending_forward.len() < FORWARD_BACKLOG_CAPACITY && pending_output.is_none() {
-                PollFlags::IN | PollFlags::HUP | PollFlags::ERR
-            } else {
-                PollFlags::HUP | PollFlags::ERR
-            };
+        // The transport is shared by every forwarded socket AND the session
+        // keepalives, so forwarding congestion must never suppress its reads:
+        // that is what let two saturated endpoints wait on each other until
+        // the frame deadline elapsed. Per-socket credit throttles the peer's
+        // sender instead, and `pending_output` backpressure remains because it
+        // is ordered terminal output, not forwarding.
+        let network_flags = if pending_output.is_none() {
+            PollFlags::IN | PollFlags::HUP | PollFlags::ERR
+        } else {
+            PollFlags::HUP | PollFlags::ERR
+        };
         let deadline = if pending_output.is_some() {
             next_keepalive
         } else {

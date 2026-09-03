@@ -169,9 +169,11 @@ fn run_mode_poll(
             forwarder.wake().map_err(forward_error)?,
             client.as_ref(),
             terminal_flags,
-            pending_forward.len() >= FORWARD_BACKLOG_CAPACITY
-                || pending_local.is_some()
-                || !connected,
+            // Forwarding congestion must NOT suppress transport reads: the
+            // transport is shared with keepalives and every other stream, and
+            // suppressing it is what deadlocked two saturated endpoints.
+            // Per-socket credit throttles the peer's sender instead.
+            pending_local.is_some() || !connected,
             client_buffered,
         )?;
         let client_events_are_stale = wake_events.intersects(PollFlags::IN | PollFlags::HUP);
@@ -233,6 +235,9 @@ fn run_mode_poll(
             && pending_forward.len() < FORWARD_BACKLOG_CAPACITY
             && pending_local.is_none()
         {
+            if std::env::var_os("ET_CREDIT_DEBUG").is_some() {
+                eprintln!("BRIDGE-READ backlog={}", pending_forward.len());
+            }
             client_buffered = false;
             for index in 0..CLIENT_READ_BATCH {
                 let read_packet = match session.try_read_packet() {

@@ -1,6 +1,6 @@
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -31,6 +31,19 @@ pub(crate) struct ActiveIo {
     pub(crate) abandoned: Arc<AtomicBool>,
     pub(crate) read_closed: bool,
     pub(crate) write_closed: bool,
+    /// Bytes this side has sent on this socket that the peer has not yet
+    /// confirmed delivered. Window-sized flow control: the sender may send
+    /// only while `in_flight < window`, so there is no credit to leak or
+    /// double-count - a single counter moving in both directions.
+    pub(crate) in_flight: Arc<AtomicI64>,
+    /// The peer's advertised window, when it supports windowing. `None` means
+    /// the peer never advertised one, so both ends stay unwindowed.
+    pub(crate) window: Arc<AtomicI64>,
+    /// Signals the parked reader that `in_flight` dropped below the window.
+    pub(crate) in_flight_wake: channel::Sender<()>,
+    /// Bytes this side received but has not yet confirmed drained, batched so
+    /// a full window costs a bounded number of control packets.
+    pub(crate) credit_to_return: i64,
 }
 
 pub(crate) enum WriteCommand {
@@ -174,6 +187,15 @@ pub(crate) fn spawn_io(
     let (writer_tx, writer_rx) = channel::bounded(64);
     let reader_commands = commands.clone();
     let reader_cancel = cancel.clone();
+    // Credit this side may still send on THIS socket. The reader consumes it
+    // and parks when it runs out, which pauses only this source socket and
+    // lets the kernel apply TCP backpressure to the local application. The
+    // shared transport keeps draining, so keepalives and other streams live.
+    let in_flight = Arc::new(AtomicI64::new(0));
+    let window = Arc::new(AtomicI64::new(-1));
+    let (in_flight_wake_tx, in_flight_wake_rx) = channel::bounded::<()>(1);
+    let reader_in_flight = in_flight.clone();
+    let reader_window = window.clone();
     let reader_handle = thread::spawn(move || {
         let mut buffer = [0u8; READ_CHUNK];
         loop {
@@ -181,14 +203,50 @@ pub(crate) fn spawn_io(
             if cancellation_requested(&reader_cancel) {
                 return;
             }
+            // Charge the window BEFORE reading, so a chunk the reader is
+            // about to consume is already counted as in-flight. Charging after
+            // the read left a window between park-exit and the increment in
+            // which the data was uncounted, letting the reader overshoot the
+            // window and deadlock two saturated endpoints.
+            let window = reader_window.load(Ordering::Acquire);
+            let windowed = window >= 0;
+            if windowed {
+                while reader_in_flight.load(Ordering::Acquire) >= window {
+                    channel::select! {
+                        recv(in_flight_wake_rx) -> result => {
+                            if result.is_err() {
+                                return;
+                            }
+                        }
+                        recv(reader_cancel) -> _ => return,
+                    }
+                }
+                reader_in_flight.fetch_add(
+                    i64::try_from(READ_CHUNK).unwrap_or(i64::MAX),
+                    Ordering::AcqRel,
+                );
+            }
             match reader.read(&mut buffer) {
                 Ok(0) => {
+                    if windowed {
+                        reader_in_flight.fetch_sub(
+                            i64::try_from(READ_CHUNK).unwrap_or(i64::MAX),
+                            Ordering::AcqRel,
+                        );
+                    }
                     if !cancellation_requested(&reader_cancel) {
                         let _ = reader_commands.send(Command::Closed { role, socket_id });
                     }
                     return;
                 }
                 Ok(count) => {
+                    // Reconcile the pre-charged READ_CHUNK with what was
+                    // actually read, so the in-flight count stays exact.
+                    if windowed && count != READ_CHUNK {
+                        let charge = i64::try_from(READ_CHUNK).unwrap_or(i64::MAX);
+                        let actual = i64::try_from(count).unwrap_or(i64::MAX);
+                        reader_in_flight.fetch_sub(charge - actual, Ordering::AcqRel);
+                    }
                     if cancellation_requested(&reader_cancel)
                         || reader_commands
                             .send(Command::Read {
@@ -259,6 +317,13 @@ pub(crate) fn spawn_io(
                         break;
                     }
                     writer_pending_bytes.fetch_sub(buffer.len(), Ordering::AcqRel);
+                    // The local socket absorbed these bytes; only now may the
+                    // peer's window grow back.
+                    let _ = writer_commands.send(Command::Drained {
+                        role,
+                        socket_id,
+                        bytes: buffer.len(),
+                    });
                 }
                 WriteCommand::Stop => {
                     // Perform the final shutdown here so every Data command
@@ -281,6 +346,10 @@ pub(crate) fn spawn_io(
             abandoned,
             read_closed: false,
             write_closed: false,
+            in_flight,
+            window,
+            in_flight_wake: in_flight_wake_tx,
+            credit_to_return: 0,
         },
         [reader_handle, writer_handle],
     ))

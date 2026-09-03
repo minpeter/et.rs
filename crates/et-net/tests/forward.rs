@@ -152,6 +152,7 @@ fn hard_shutdown_cancels_worker_blocked_on_full_command_and_outbound_queues() {
                     port: Some(0),
                 }),
                 fd: Some(fd),
+                window: None,
             }
             .encode_to_vec(),
         )
@@ -269,6 +270,7 @@ fn hard_shutdown_reports_admitted_socket_bytes_abandoned() {
                 buffer: Some(vec![9u8; 64 * 1024]),
                 error: None,
                 closed: None,
+                window: None,
             }
             .encode_to_vec(),
         )
@@ -285,6 +287,7 @@ fn hard_shutdown_reports_admitted_socket_bytes_abandoned() {
                     port: Some(0),
                 }),
                 fd: Some(777),
+                window: None,
             }
             .encode_to_vec(),
         ))
@@ -325,6 +328,7 @@ fn try_receive_reports_backpressure_and_outbound_drain_recovers() {
                     port: Some(0),
                 }),
                 fd: Some(fd),
+                window: None,
             }
             .encode_to_vec(),
         )

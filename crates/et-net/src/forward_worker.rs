@@ -47,6 +47,16 @@ pub(crate) enum Command {
         socket_id: i32,
         buffer: Vec<u8>,
     },
+    /// A chunk was written to the local socket. Credit returns on DELIVERY,
+    /// not on receipt: returning on receipt makes each side's credit depend on
+    /// the peer still being able to send, which deadlocks two saturated
+    /// endpoints. Delivery is independent of the peer's credit, so it always
+    /// makes progress.
+    Drained {
+        role: Role,
+        socket_id: i32,
+        bytes: usize,
+    },
     Closed {
         role: Role,
         socket_id: i32,
@@ -238,6 +248,7 @@ pub(crate) struct WorkerChannels {
     pub(crate) receiver: CommandReceiver,
     pub(crate) sender: CommandSender,
     pub(crate) outbound: channel::Sender<Outbound>,
+    pub(crate) priority: channel::Sender<Outbound>,
     pub(crate) cancel: channel::Receiver<()>,
     pub(crate) abandoned: Arc<AtomicBool>,
 }
@@ -252,6 +263,7 @@ pub(crate) fn run(
         receiver: commands,
         sender: command_sender,
         outbound,
+        priority,
         cancel,
         abandoned,
     } = channels;
@@ -260,14 +272,21 @@ pub(crate) fn run(
     let result = Worker::new(
         command_sender,
         outbound.clone(),
+        priority.clone(),
         outbound_wake.try_clone().ok(),
         cancel.clone(),
         abandoned,
     )
     .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user));
     #[cfg(windows)]
-    let result = Worker::new(command_sender, outbound.clone(), cancel.clone(), abandoned)
-        .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user));
+    let result = Worker::new(
+        command_sender,
+        outbound.clone(),
+        priority.clone(),
+        cancel.clone(),
+        abandoned,
+    )
+    .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user));
     if let Err(error) = result {
         if !shutdown.load(Ordering::Acquire) {
             channel::select! {
@@ -283,6 +302,7 @@ pub(crate) fn run(
 struct Worker {
     commands: CommandSender,
     outbound: channel::Sender<Outbound>,
+    priority: channel::Sender<Outbound>,
     cancel: channel::Receiver<()>,
     abandoned: Arc<AtomicBool>,
     #[cfg(unix)]
@@ -291,6 +311,9 @@ struct Worker {
     connecting: HashSet<i32>,
     sources: HashMap<i32, ActiveIo>,
     destinations: HashMap<i32, ActiveIo>,
+    /// Window the peer advertised for a socket still being connected, held
+    /// until the socket becomes active and credit can be attached to it.
+    pending_windows: HashMap<i32, Option<i64>>,
     threads: Vec<JoinHandle<()>>,
     next_socket_id: i32,
     session_user: Option<(u32, u32)>,
@@ -300,6 +323,7 @@ impl Worker {
     fn new(
         commands: CommandSender,
         outbound: channel::Sender<Outbound>,
+        priority: channel::Sender<Outbound>,
         #[cfg(unix)] outbound_wake: Option<UnixStream>,
         cancel: channel::Receiver<()>,
         abandoned: Arc<AtomicBool>,
@@ -313,6 +337,7 @@ impl Worker {
         Ok(Self {
             commands,
             outbound,
+            priority,
             cancel,
             abandoned,
             #[cfg(unix)]
@@ -321,6 +346,7 @@ impl Worker {
             connecting: HashSet::new(),
             sources: HashMap::new(),
             destinations: HashMap::new(),
+            pending_windows: HashMap::new(),
             threads: Vec::new(),
             next_socket_id: 1,
             session_user: None,
@@ -364,12 +390,25 @@ impl Worker {
                     client_fd,
                     socket_id,
                     result,
-                } => self.connected(client_fd, socket_id, result),
+                } => {
+                    let advertised = self.pending_windows.remove(&socket_id).flatten();
+                    self.connected(client_fd, socket_id, result, advertised)
+                }
                 Command::Read {
                     role,
                     socket_id,
                     buffer,
                 } => self.send_data(role, socket_id, buffer, false, None),
+                Command::Drained {
+                    role,
+                    socket_id,
+                    bytes,
+                } => {
+                    if std::env::var_os("ET_CREDIT_DEBUG").is_some() {
+                        eprintln!("WORKER-GOT-DRAINED role={role:?} sid={socket_id} bytes={bytes}");
+                    }
+                    self.return_credit(role, socket_id, bytes)
+                }
                 Command::Closed { role, socket_id } => self.read_closed(role, socket_id),
                 Command::IoFailed {
                     role,
@@ -436,12 +475,15 @@ mod tests {
     ) {
         let (commands, command_receiver) = command_channel(MAX_ACTIVE_SOCKETS + 1);
         let (outbound, outbound_receiver) = channel::bounded(MAX_ACTIVE_SOCKETS + 1);
+        // Tests observe a single stream, so credit shares the same receiver.
+        let priority = outbound.clone();
         let (cancel, cancel_receiver) = channel::bounded(1);
         let (_wake_reader, wake_writer) = UnixStream::pair().unwrap();
         (
             Worker::new(
                 commands,
                 outbound,
+                priority,
                 Some(wake_writer),
                 cancel_receiver,
                 Arc::new(AtomicBool::new(false)),
@@ -478,6 +520,7 @@ mod tests {
                     port: None,
                 }),
                 fd: Some(fd),
+                window: None,
             }
             .encode_to_vec(),
         )
@@ -524,7 +567,9 @@ mod tests {
             panic!("connector emitted an unexpected command");
         };
         assert!(result.is_err());
-        worker.connected(client_fd, socket_id, result).unwrap();
+        worker
+            .connected(client_fd, socket_id, result, None)
+            .unwrap();
         assert_eq!(worker.total_sockets(), MAX_ACTIVE_SOCKETS - 1);
         let _ = outbound.recv_timeout(EVENT_TIMEOUT).unwrap().unwrap();
 
@@ -552,6 +597,7 @@ mod tests {
                     port: None,
                 }),
                 fd: Some(1),
+                window: None,
             }
             .encode_to_vec(),
         );
@@ -572,7 +618,9 @@ mod tests {
             result.as_ref().err()
         );
         let (peer, _) = listener.accept().unwrap();
-        worker.connected(client_fd, socket_id, result).unwrap();
+        worker
+            .connected(client_fd, socket_id, result, None)
+            .unwrap();
 
         assert_eq!(worker.total_sockets(), 1);
         assert_eq!(worker.destinations.len(), 1);

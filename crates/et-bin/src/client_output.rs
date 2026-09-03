@@ -109,9 +109,15 @@ impl ConsoleOutput {
             let child = Arc::new(Mutex::new(child));
             let cancel_child = Arc::clone(&child);
             let graceful_child = Arc::clone(&child);
-            Self::new_with_lifecycle(
+            Self::new_with_lifecycle_factory(
                 mode,
-                Box::new(WindowsHelperWriter { input, ack }),
+                move |shared| {
+                    Box::new(WindowsHelperWriter {
+                        input,
+                        ack,
+                        shared: Arc::clone(shared),
+                    })
+                },
                 Box::new(move || cancel_windows_helper(&cancel_child)),
                 Box::new(move || wait_windows_helper(&graceful_child)),
             )
@@ -134,10 +140,22 @@ impl ConsoleOutput {
 
     pub(crate) fn new_with_lifecycle(
         mode: FlowControlMode,
-        mut writer: Box<dyn Write + Send>,
+        writer: Box<dyn Write + Send>,
         cancel: Box<dyn FnOnce() + Send>,
         graceful_finish: Box<dyn FnOnce() -> io::Result<()> + Send>,
     ) -> io::Result<Self> {
+        Self::new_with_lifecycle_factory(mode, move |_| writer, cancel, graceful_finish)
+    }
+
+    fn new_with_lifecycle_factory<F>(
+        mode: FlowControlMode,
+        writer: F,
+        cancel: Box<dyn FnOnce() + Send>,
+        graceful_finish: Box<dyn FnOnce() -> io::Result<()> + Send>,
+    ) -> io::Result<Self>
+    where
+        F: FnOnce(&Arc<Shared>) -> Box<dyn Write + Send>,
+    {
         #[cfg(unix)]
         let (capacity_wake, mut capacity_signal) = {
             let (wake, signal) = et_net::local::wake_pair()?;
@@ -182,6 +200,7 @@ impl ConsoleOutput {
             }),
             wake: Condvar::new(),
         });
+        let mut writer = writer(&shared);
         let worker_shared = Arc::clone(&shared);
         let worker = thread::Builder::new()
             .name("et-console-output".to_owned())
@@ -474,17 +493,22 @@ fn write_all_with_progress(
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(count) => {
                 bytes = &bytes[count..];
-                let mut state = shared
-                    .state
-                    .lock()
-                    .map_err(|_| io::Error::other("console output worker unavailable"))?;
-                state.worker_progress = state.worker_progress.wrapping_add(1);
-                shared.wake.notify_all();
+                report_worker_progress(shared)?;
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
         }
     }
+    Ok(())
+}
+
+fn report_worker_progress(shared: &Shared) -> io::Result<()> {
+    let mut state = shared
+        .state
+        .lock()
+        .map_err(|_| io::Error::other("console output worker unavailable"))?;
+    state.worker_progress = state.worker_progress.wrapping_add(1);
+    shared.wake.notify_all();
     Ok(())
 }
 
@@ -519,6 +543,7 @@ fn wait_for_graceful_drain(shared: &Shared) -> io::Result<bool> {
 struct WindowsHelperWriter {
     input: ChildStdin,
     ack: ChildStderr,
+    shared: Arc<Shared>,
 }
 
 #[cfg(windows)]
@@ -529,13 +554,19 @@ impl Write for WindowsHelperWriter {
         self.input.write_all(&length.to_le_bytes())?;
         self.input.write_all(bytes)?;
         self.input.flush()?;
-        let mut ack = [0u8; 1];
-        std::io::Read::read_exact(&mut self.ack, &mut ack)?;
-        if ack != [1] {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "console helper acknowledgement is invalid",
-            ));
+        let mut acknowledged = 0usize;
+        while acknowledged < bytes.len() {
+            let mut ack = [0u8; 4];
+            std::io::Read::read_exact(&mut self.ack, &mut ack)?;
+            let count = u32::from_le_bytes(ack) as usize;
+            if count == 0 || count > bytes.len() - acknowledged {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "console helper acknowledgement is invalid",
+                ));
+            }
+            acknowledged += count;
+            report_worker_progress(&self.shared)?;
         }
         Ok(bytes.len())
     }
@@ -581,17 +612,27 @@ pub(crate) fn run_windows_helper() -> i32 {
             Err(_) => return 1,
         }
         let mut bytes = vec![0u8; u32::from_le_bytes(length) as usize];
-        if std::io::Read::read_exact(&mut input, &mut bytes).is_err()
-            || output
-                .write_all(&bytes)
-                .and_then(|()| output.flush())
-                .is_err()
-            || acknowledgements
-                .write_all(&[1])
-                .and_then(|()| acknowledgements.flush())
-                .is_err()
-        {
+        if bytes.is_empty() || std::io::Read::read_exact(&mut input, &mut bytes).is_err() {
             return 1;
+        }
+        let mut remaining = bytes.as_slice();
+        while !remaining.is_empty() {
+            let chunk = &remaining[..remaining.len().min(4096)];
+            let count = match output.write(chunk) {
+                Ok(0) => return 1,
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return 1,
+            };
+            remaining = &remaining[count..];
+            if (remaining.is_empty() && output.flush().is_err())
+                || acknowledgements
+                    .write_all(&(count as u32).to_le_bytes())
+                    .and_then(|()| acknowledgements.flush())
+                    .is_err()
+            {
+                return 1;
+            }
         }
     }
 }

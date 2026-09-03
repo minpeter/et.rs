@@ -15,6 +15,7 @@ use rustix::time::Timespec;
 use crate::session::{ActiveSession, SessionError, SessionWriteError};
 
 const READ_BUFFER: usize = 16 * 1024;
+const CLIENT_READ_BATCH: usize = 64;
 
 /// Which upstream server loop this bridge reproduces.
 ///
@@ -174,7 +175,10 @@ fn run_mode_poll(
         let client_data_ready =
             connected && (client_events_are_stale || client_events.contains(PollFlags::IN));
         if client_data_ready {
-            while pending_forward.is_none() && pending_outbound.is_none() {
+            for _ in 0..CLIENT_READ_BATCH {
+                if pending_forward.is_some() || pending_outbound.is_some() {
+                    break;
+                }
                 match session.try_read_packet() {
                     // Jumphost relays every packet verbatim to the jump
                     // terminal, which owns the destination connection.
@@ -319,7 +323,10 @@ fn run_mode_windows(
 
         // Client -> terminal / forwarder.
         if connected {
-            while pending_forward.is_none() && pending_outbound.is_none() {
+            for _ in 0..CLIENT_READ_BATCH {
+                if pending_forward.is_some() || pending_outbound.is_some() {
+                    break;
+                }
                 match session.try_read_packet() {
                     Ok(Some(packet)) => {
                         progress = true;

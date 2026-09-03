@@ -1,4 +1,5 @@
 use std::io::{self, Read, Write};
+use std::net::Shutdown;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -28,6 +29,8 @@ pub(crate) struct ActiveIo {
     pub(crate) cancel: channel::Receiver<()>,
     pub(crate) pending_bytes: Arc<AtomicUsize>,
     pub(crate) abandoned: Arc<AtomicBool>,
+    pub(crate) read_closed: bool,
+    pub(crate) write_closed: bool,
 }
 
 pub(crate) enum WriteCommand {
@@ -260,7 +263,7 @@ pub(crate) fn spawn_io(
                 WriteCommand::Stop => {
                     // Perform the final shutdown here so every Data command
                     // queued before Stop is flushed to the socket first.
-                    writer.shutdown();
+                    shutdown_write(&writer);
                     break;
                 }
             }
@@ -276,9 +279,19 @@ pub(crate) fn spawn_io(
             cancel,
             pending_bytes,
             abandoned,
+            read_closed: false,
+            write_closed: false,
         },
         [reader_handle, writer_handle],
     ))
+}
+
+fn shutdown_write(stream: &ForwardStream) {
+    let _ = match stream {
+        ForwardStream::Tcp(stream) => stream.shutdown(Shutdown::Write),
+        #[cfg(unix)]
+        ForwardStream::Unix(stream) => stream.shutdown(Shutdown::Write),
+    };
 }
 
 #[cfg(windows)]
@@ -310,14 +323,24 @@ fn cancellation_requested(cancel: &channel::Receiver<()>) -> bool {
     !matches!(cancel.try_recv(), Err(channel::TryRecvError::Empty))
 }
 
-pub(crate) fn stop_io(io: ActiveIo) {
-    // Keep the control socket alive while Stop waits for queue capacity so
-    // hard cancellation can still abort an in-flight write and release it.
-    let stop_admitted = channel::select! {
+pub(crate) fn close_write(io: &mut ActiveIo) -> bool {
+    if io.write_closed {
+        return true;
+    }
+    let admitted = channel::select! {
         send(io.writer, WriteCommand::Stop) -> result => result.is_ok(),
         recv(io.cancel) -> _ => false,
     };
-    if stop_admitted {
+    if admitted {
+        io.write_closed = true;
+    }
+    admitted
+}
+
+pub(crate) fn stop_io(mut io: ActiveIo) {
+    // Keep the control socket alive while Stop waits for queue capacity so
+    // hard cancellation can still abort an in-flight write and release it.
+    if close_write(&mut io) {
         io.control.shutdown_read();
     } else {
         if io.pending_bytes.load(Ordering::Acquire) != 0 {

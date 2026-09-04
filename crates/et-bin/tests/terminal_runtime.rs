@@ -30,10 +30,11 @@ const PROMPT_MARKER: &[u8] = b"ET-PROMPT> ";
 
 fn assert_motd_prompt_spacing(
     fixture_name: &str,
+    motd_contents: &[u8],
     shell_factory: fn(&Fixture) -> std::path::PathBuf,
 ) {
     let fixture = Fixture::new(fixture_name);
-    let motd = fixture.file("motd", b"ET-MOTD-MARKER\n");
+    let motd = fixture.file("motd", motd_contents);
     let shell = shell_factory(&fixture);
     let mut child = fixture.spawn_session(
         shell.to_str().unwrap(),
@@ -602,14 +603,28 @@ fn real_terminal_emits_motd_before_login_shell_output() {
 
 #[test]
 fn real_terminal_places_prompt_on_line_after_motd() {
-    assert_motd_prompt_spacing("motd-prompt-spacing", Fixture::prompt_probe_shell);
+    assert_motd_prompt_spacing(
+        "motd-prompt-spacing",
+        b"ET-MOTD-MARKER\n",
+        Fixture::prompt_probe_shell,
+    );
 }
 
 #[test]
 fn real_terminal_does_not_stack_motd_newline_with_shell_startup_newline() {
     assert_motd_prompt_spacing(
         "motd-leading-shell-newline",
+        b"ET-MOTD-MARKER\n",
         Fixture::leading_newline_prompt_shell,
+    );
+}
+
+#[test]
+fn real_terminal_removes_trailing_blank_lines_from_motd() {
+    assert_motd_prompt_spacing(
+        "motd-trailing-blank-lines",
+        b"ET-MOTD-MARKER\n\n\n",
+        Fixture::prompt_probe_shell,
     );
 }
 

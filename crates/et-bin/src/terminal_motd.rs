@@ -66,7 +66,7 @@ fn load_from(
         let mut output = Vec::new();
         let message = read_message(path)?;
         append_terminal_bytes(&mut output, &message);
-        return (!output.is_empty()).then_some(output);
+        return finish_output(output);
     }
     load_defaults_from(&[], files, directories, home)
 }
@@ -96,7 +96,7 @@ fn load_defaults_from(
             append_terminal_bytes(&mut output, &message);
         }
     }
-    (!output.is_empty()).then_some(output)
+    finish_output(output)
 }
 
 fn append_first_message(output: &mut Vec<u8>, paths: &[PathBuf]) {
@@ -192,6 +192,14 @@ fn append_terminal_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
     if output.len().saturating_add(2) <= MAX_MOTD_TOTAL {
         output.extend_from_slice(b"\r\n");
     }
+}
+
+/// Remove blank lines only after every MOTD source has been assembled.
+fn finish_output(mut output: Vec<u8>) -> Option<Vec<u8>> {
+    while output.ends_with(b"\r\n\r\n") {
+        output.truncate(output.len() - 2);
+    }
+    (!output.is_empty()).then_some(output)
 }
 
 #[cfg(test)]

@@ -1,21 +1,9 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Share SSH bootstrap connections under load\n\nShare SSH bootstrap transport connections across ET processes targeting the\nsame effective destination. ET first runs the configuration-only query, then\nchecks for a working user-configured ControlMaster without supplying a\nControlPath. A working user master remains preferred and ET's operational\ncommands use it unchanged.\n\nWhen no user master exists, ET hashes the effective SSH user, resolved host,\nresolved port, and jumphost into a stable 32-hex-character socket name under a\nmode-0700 per-user `et-ssh-<uid>` directory. Long Unix temporary-directory\npaths fall back to `/tmp`, keeping the complete socket path below a conservative\n90-byte `sockaddr_un` limit.\n\nAn atomic destination-specific `.lock` directory serializes master startup.\nThe lock holder checks the socket again before starting OpenSSH; contenders\ncheck that exact socket until the winner publishes it or releases the lock.\nThis converges concurrent ET processes on one master rather than allowing a\nControlMaster bind race. Master setup failures fall back to ordinary SSH\ninvocations.\n\nThe ET master uses `ControlPersist=15`. Sessions never send `ssh -O exit` and\nnever unlink the shared socket, so one ET process cannot tear down transport\nused by another. OpenSSH removes the socket after the persisted master becomes\nidle; the private parent directory is retained for later destination masters.\n\nUser `ControlMaster` and `ControlPath` command-line options remain filtered.\nIsolation remains forced with `ClearAllForwardings=yes`, `RemoteCommand=none`,\n`PermitLocalCommand=no`, and `SessionType=default`.\n\nLocal OpenSSH diagnosis against localhost showed configuration and `-O check`\noperations open no TCP connections. A master start emitted one `Connecting to`\nline and a mux listener; probe and bootstrap operations emitted\n`mux_client_request_session` without a new `Connecting to` line.\n"
-    filename: fix-bootstrap-ssh-fanout.md
-    v: 0.0.0
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Keep saturated full-duplex forwards moving\n\nKeep a saturated port forward moving in both directions at once. A large\nfull-duplex transfer through a local tunnel could wedge: each endpoint stopped\nreading its transport while it held a forwarding packet for a full worker\nqueue, so both ends waited for the other, keepalives stopped crossing, and the\nsession dropped into a recovery loop it could not finish. Both pump loops now\nkeep draining while a packet is held, so the transfer completes instead of\ndeadlocking.\n"
-    filename: fix-forwarding-deadlock.md
-    v: 0.0.0
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Preserve replies after a forwarding half-close\n\nPreserve forwarded TCP replies after a local client half-closes its write side.\nET now drains the reverse direction before closing the forwarded socket.\n"
-    filename: fix-forwarding-half-close.md
-    v: 0.0.0
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Return finished-session memory to the operating system\n\nOn Linux, `etserver` now uses an allocator with immediate dirty-page decay and\nreapplies that release policy after terminal session teardown. Bursts of large\nfinished sessions no longer leave the daemon at its allocator arena\nhigh-water mark while it is idle.\n"
-    filename: fix-idle-rss-highwater.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Remove blank lines before the login prompt\n\nCollapse trailing blank lines after assembling the server's complete MOTD so\nnew ET sessions place the shell prompt directly below the final login message.\nBlank lines within a message and between separate MOTD sources remain intact.\n"
+    filename: fix-motd-trailing-blank-lines.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - fix-bootstrap-ssh-fanout.md
-      - fix-forwarding-deadlock.md
-      - fix-forwarding-half-close.md
-      - fix-idle-rss-highwater.md
+      - fix-motd-trailing-blank-lines.md
     id: cargo:et
     updated: true

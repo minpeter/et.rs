@@ -1,25 +1,9 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Add opt-in terminal flow control\n\nClients can now select lossless backpressure or oldest-output discard when\nterminal output outruns the network, keeping Ctrl-C and prompt responses\nbounded without changing the default session behavior.\n"
-    filename: add-opt-in-flow-control.md
-    v: 0.0.0
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Align MOTD and shell prompt spacing\n\nAvoid an extra blank line between the MOTD and an interactive shell prompt\nwhen the login shell emits an initial newline.\n"
-    filename: fix-motd-prompt-spacing.md
-    v: 0.0.0
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Bound flow-control shutdown and recovery admission\n\nFlow-controlled clients now cancel stalled console drains instead of hanging\nduring shutdown, report closed output streams promptly, and keep client input\nmoving while terminal output is backpressured. Reconnects are also rejected\nwhen session teardown wins the recovery-admission race.\n"
-    filename: fix-release-blocker-races.md
-    v: 0.0.0
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Keep terminal startup reliable under heavy load\n\nTerminal startup now uses authenticated, bounded registration and structured\nstartup acknowledgements before reporting readiness. Initialization remains\nresponsive under load while forged identities, stalled peers, premature\nsuccess, leaked children, and unbounded admission are rejected or cleaned up.\n"
-    filename: fix-terminal-startup-under-load.md
-    v: 0.0.0
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Port EternalTerminal #798 accept-starvation fix\n\nA stuck client reconnect no longer starves `etserver` accept. Recovery\nalready ran off the session-table lock and refused a second in-flight\nreconnect for the same id; this port also refuses recover after full\nsession teardown (so a torn-down session cannot be resurrected) while\nstill allowing recover through terminal HUP so buffered output can\ndrain. It also raises the TCP `listen(2)` backlog from 32 to 128,\noverridable with `backlog` in the `[Networking]` section of the server\nconfig. Non-positive values fall back to 128. `PROTOCOL_VERSION` stays\n6. Upstream `#801` / `#803` / `#802` (HTM/Windows/coverage, TIOCGWINSZ,\nWindows build) are classified `skip` and not ported.\n"
-    filename: port-eternal-terminal-798.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Return finished-session memory to the operating system\n\nOn Linux, `etserver` now uses an allocator with immediate dirty-page decay and\nreapplies that release policy after terminal session teardown. Bursts of large\nfinished sessions no longer leave the daemon at its allocator arena\nhigh-water mark while it is idle.\n"
+    filename: fix-idle-rss-highwater.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - add-opt-in-flow-control.md
-      - fix-motd-prompt-spacing.md
-      - fix-release-blocker-races.md
-      - fix-terminal-startup-under-load.md
-      - port-eternal-terminal-798.md
+      - fix-idle-rss-highwater.md
     id: cargo:et
     updated: true

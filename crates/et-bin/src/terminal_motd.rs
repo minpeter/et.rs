@@ -164,17 +164,15 @@ fn try_read_message(path: &Path) -> Result<Option<Vec<u8>>, ()> {
     Ok(Some(bytes))
 }
 
-/// Preserve existing CRLF and make lone LF render from column zero.
+/// Preserve internal CRLF, normalize lone LF, and end with one CRLF.
 fn append_terminal_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
-    let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
-    let body = if bytes.ends_with(b"\r\n") {
-        body.strip_suffix(b"\r").unwrap_or(body)
-    } else {
-        body
-    };
+    let mut body = bytes;
+    while let Some(without_lf) = body.strip_suffix(b"\n") {
+        body = without_lf.strip_suffix(b"\r").unwrap_or(without_lf);
+    }
     let content_limit = MAX_MOTD_TOTAL.saturating_sub(2);
     let mut previous = 0u8;
     for byte in body {

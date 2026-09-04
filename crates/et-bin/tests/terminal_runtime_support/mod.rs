@@ -99,6 +99,7 @@ impl Fixture {
                 "--serverfifo",
             ])
             .arg(&self.socket)
+            .env("ET_LASTLOG_PATH", self.directory.join("lastlog"))
             .env("SHELL", shell)
             .env_remove("COLORTERM");
         for (name, value) in environment {

@@ -3,7 +3,10 @@
 #[path = "terminal_runtime_support/mod.rs"]
 mod terminal_runtime_support;
 
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::FileExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -25,6 +28,8 @@ const ID: &str = "abcdefghijklmnop";
 const KEY: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
 const TIMEOUT: Duration = Duration::from_secs(5);
 const LOGIN_TERM_COMPLETION: &[u8] = b"__ET_LOGIN_TERM_COMPLETE__\r\n";
+const LAST_LOGIN_MARKER: &[u8] = b"Last login:";
+const LASTLOG_RECORD_BYTES: usize = 292;
 const MOTD_MARKER: &[u8] = b"ET-MOTD-MARKER";
 const PROMPT_MARKER: &[u8] = b"ET-PROMPT> ";
 
@@ -76,6 +81,21 @@ fn assert_motd_prompt_spacing(
     );
     let status = child.wait_timeout(TIMEOUT).unwrap().unwrap();
     assert!(status.success());
+}
+
+fn write_lastlog_record(path: &Path, timestamp: u32, host: &[u8]) {
+    let mut record = [0u8; LASTLOG_RECORD_BYTES];
+    record[..4].copy_from_slice(&timestamp.to_ne_bytes());
+    let host = &host[..host.len().min(256)];
+    record[36..36 + host.len()].copy_from_slice(host);
+    let file = OpenOptions::new()
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .unwrap();
+    let offset =
+        u64::from(rustix::process::geteuid().as_raw()) * u64::try_from(record.len()).unwrap();
+    file.write_all_at(&record, offset).unwrap();
 }
 
 #[test]
@@ -629,10 +649,65 @@ fn real_terminal_removes_trailing_blank_lines_from_motd() {
 }
 
 #[test]
+fn real_terminal_emits_last_login_between_motd_and_prompt() {
+    let fixture = Fixture::new("last-login");
+    let motd = fixture.file("motd", b"ET-MOTD-MARKER\n\n\n");
+    let lastlog = fixture.file("lastlog", b"");
+    write_lastlog_record(&lastlog, 1_788_475_267, b"127.0.0.1");
+    let shell = fixture.prompt_probe_shell();
+    let mut child = fixture.spawn_session(
+        shell.to_str().unwrap(),
+        &[
+            ("ET_MOTD_PATH", motd.as_os_str()),
+            ("ET_LASTLOG_PATH", lastlog.as_os_str()),
+            ("TZ", std::ffi::OsStr::new("UTC")),
+        ],
+    );
+    write_credentials(&mut child);
+    let mut router = fixture.accept();
+    let _ = read_local_packet(&mut router).unwrap();
+    acknowledge_registration(&mut router);
+    fixture.wait_ready();
+
+    send(
+        &mut router,
+        TerminalPacketType::TerminalInit,
+        &TermInit {
+            environmentnames: Vec::new(),
+            environmentvalues: Vec::new(),
+            flowcontrol: None,
+        },
+    );
+    expect_startup(&mut router);
+    let output = collect_until(&mut router, |output| contains(output, PROMPT_MARKER));
+
+    let motd_at = find(&output, MOTD_MARKER).unwrap();
+    let prompt_at = find(&output, PROMPT_MARKER).unwrap();
+    assert_eq!(
+        &output[motd_at + MOTD_MARKER.len()..prompt_at],
+        b"\r\n\r\nLast login: Thu Sep  3 22:41:07 2026 from 127.0.0.1\r\n",
+        "expected SSH-compatible MOTD, blank line, last-login, and prompt order; got {:?}",
+        String::from_utf8_lossy(&output),
+    );
+
+    send(
+        &mut router,
+        TerminalPacketType::TerminalBuffer,
+        &TerminalBuffer {
+            buffer: Some(b"exit\n".to_vec()),
+        },
+    );
+    let status = child.wait_timeout(TIMEOUT).unwrap().unwrap();
+    assert!(status.success());
+}
+
+#[test]
 fn real_terminal_suppresses_motd_when_home_has_hushlogin() {
     // Given: a MOTD file plus a HOME containing .hushlogin.
     let fixture = Fixture::new("motd-hushlogin");
     let motd = fixture.file("motd", b"ET-MOTD-MARKER\n");
+    let lastlog = fixture.file("lastlog", b"");
+    write_lastlog_record(&lastlog, 1_788_475_267, b"127.0.0.1");
     let home = fixture.file(".hushlogin", b"");
     let home = home.parent().unwrap().to_owned();
     let shell = fixture.login_probe_shell();
@@ -675,6 +750,11 @@ fn real_terminal_suppresses_motd_when_home_has_hushlogin() {
     assert!(
         !contains(&output, MOTD_MARKER),
         "expected .hushlogin to suppress the MOTD; got {:?}",
+        String::from_utf8_lossy(&output),
+    );
+    assert!(
+        !contains(&output, LAST_LOGIN_MARKER),
+        "expected .hushlogin to suppress last-login output; got {:?}",
         String::from_utf8_lossy(&output),
     );
 }

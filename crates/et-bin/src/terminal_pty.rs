@@ -62,7 +62,7 @@ where
             .map_err(|error| format!("could not bound terminal output buffering: {error}"))?;
     }
     #[cfg(unix)]
-    let motd = crate::terminal_motd::load();
+    let motd = crate::terminal_motd::load_startup_prefix();
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,

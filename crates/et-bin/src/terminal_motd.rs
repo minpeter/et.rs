@@ -28,11 +28,38 @@ const DEFAULT_FILES: [&str; 3] = ["/etc/motd", "/run/motd", "/usr/lib/motd"];
 /// `pam_motd(8)`'s default directories, highest priority first.
 const DEFAULT_DIRS: [&str; 3] = ["/etc/motd.d", "/run/motd.d", "/usr/lib/motd.d"];
 
-/// Load the message of the day, if there is one to show.
+/// Load the complete new-session greeting before the login shell starts.
 ///
 /// File-level failures are advisory and never fail the session.
-pub fn load() -> Option<Vec<u8>> {
+pub fn load_startup_prefix() -> Option<Vec<u8>> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
+    if home.is_some_and(|home| home.join(".hushlogin").exists()) {
+        return None;
+    }
+
+    let mut output = load_with_home(None).unwrap_or_default();
+    #[cfg(all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    let last_login = crate::terminal_last_login::load();
+    #[cfg(not(all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    let last_login: Option<Vec<u8>> = None;
+    if let Some(last_login) = last_login {
+        if !output.is_empty() {
+            output.extend_from_slice(b"\r\n");
+        }
+        output.extend_from_slice(&last_login);
+    }
+    (!output.is_empty()).then_some(output)
+}
+
+fn load_with_home(home: Option<&Path>) -> Option<Vec<u8>> {
     let override_path = std::env::var_os(OVERRIDE_VARIABLE)
         .filter(|path| !path.is_empty())
         .map(PathBuf::from);
@@ -40,14 +67,9 @@ pub fn load() -> Option<Vec<u8>> {
     let directories: Vec<PathBuf> = DEFAULT_DIRS.iter().map(PathBuf::from).collect();
     let dynamic_files: Vec<PathBuf> = DYNAMIC_FILES.iter().map(PathBuf::from).collect();
     let text = if override_path.is_some() {
-        load_from(
-            &files,
-            &directories,
-            override_path.as_deref(),
-            home.as_deref(),
-        )
+        load_from(&files, &directories, override_path.as_deref(), home)
     } else {
-        load_defaults_from(&dynamic_files, &files, &directories, home.as_deref())
+        load_defaults_from(&dynamic_files, &files, &directories, home)
     };
     text
 }

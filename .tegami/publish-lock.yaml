@@ -1,9 +1,9 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Remove blank lines before the login prompt\n\nCollapse trailing blank lines after assembling the server's complete MOTD so\nnew ET sessions place the shell prompt directly below the final login message.\nBlank lines within a message and between separate MOTD sources remain intact.\n"
-    filename: fix-motd-trailing-blank-lines.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Show the previous login before the shell prompt\n\nNew Linux terminal sessions now show the authenticated user's previous login\ntime and remote host after the MOTD, matching SSH's login details. Missing or\nunreadable accounting data remains advisory, and `.hushlogin` suppresses the\ncomplete greeting.\n"
+    filename: fix-last-login-output.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - fix-motd-trailing-blank-lines.md
+      - fix-last-login-output.md
     id: cargo:et
     updated: true

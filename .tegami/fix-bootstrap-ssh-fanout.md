@@ -1,6 +1,10 @@
 ---
-et: patch
+packages:
+  et:
+    type: patch
 ---
+
+## Share SSH bootstrap connections under load
 
 Share SSH bootstrap transport connections across ET processes targeting the
 same effective destination. ET first runs the configuration-only query, then

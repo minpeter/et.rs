@@ -4,6 +4,13 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing et release tag whose binary assets should be rebuilt
+        required: true
+        default: et@0.0.21
+        type: string
 
 permissions:
   contents: write
@@ -24,18 +31,22 @@ jobs:
           fetch-depth: 0
 
       - uses: actions/setup-node@v4
+        if: github.event_name == 'push'
         with:
           node-version: 24
           cache: npm
 
       # Needed for `cargo update --workspace` after version bumps.
       - uses: dtolnay/rust-toolchain@stable
+        if: github.event_name == 'push'
 
-      - run: npm ci
+      - if: github.event_name == 'push'
+        run: npm ci
 
       # With pending changelogs: bump versions and open a "Version Packages" PR.
       # After that PR merges: create the `et@x.y.z` git tag and GitHub release.
       - name: Version & release
+        if: github.event_name == 'push'
         run: node scripts/tegami.mts ci
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -43,13 +54,25 @@ jobs:
       - name: Detect released tag
         id: tag
         run: |
-          tag="$(git tag --points-at HEAD 'et@*' | head -n 1)"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            tag="$INPUT_TAG"
+            if [[ ! "$tag" =~ ^et@[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+              echo "Invalid release tag: $tag" >&2
+              exit 1
+            fi
+            gh release view "$tag" >/dev/null
+          else
+            tag="$(git tag --points-at HEAD 'et@*' | head -n 1)"
+          fi
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           if [ -n "$tag" ]; then
             echo "Released: $tag"
           else
             echo "No release tag on HEAD, skipping binary build."
           fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
 
   binaries:
     needs: release
@@ -99,6 +122,10 @@ jobs:
 
       - name: Build
         run: cargo build --release --locked -p et --target ${{ matrix.target }}
+        env:
+          # Ubuntu aarch64's musl GCC otherwise emits libgcc outlined atomics
+          # that reference glibc-only __getauxval (jemalloc issue #2782).
+          CFLAGS_aarch64_unknown_linux_musl: ${{ matrix.target == 'aarch64-unknown-linux-musl' && '-mno-outline-atomics' || '' }}
 
       - name: Package
         id: package
@@ -142,7 +169,7 @@ jobs:
 
   homebrew:
     needs: [release, binaries]
-    if: needs.release.outputs.tag != ''
+    if: needs.release.outputs.tag != '' && github.event_name == 'push'
     runs-on: ubuntu-latest
     env:
       TAG: ${{ needs.release.outputs.tag }}
@@ -169,7 +196,7 @@ jobs:
 
   aur:
     needs: [release, binaries]
-    if: needs.release.outputs.tag != ''
+    if: needs.release.outputs.tag != '' && github.event_name == 'push'
     runs-on: ubuntu-latest
     # AUR publishing must not block a release (e.g. AUR maintenance windows).
     continue-on-error: true

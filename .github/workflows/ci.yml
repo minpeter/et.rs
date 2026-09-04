@@ -98,3 +98,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - run: cargo build -p et
+
+  # The release matrix builds jemalloc on native ARM against musl. Ubuntu's
+  # aarch64 musl GCC needs outlined atomics disabled so libgcc does not retain
+  # a glibc-only __getauxval reference (jemalloc issue #2782).
+  build-linux-musl:
+    name: build (aarch64-unknown-linux-musl)
+    runs-on: ubuntu-24.04-arm
+    env:
+      CFLAGS_aarch64_unknown_linux_musl: -mno-outline-atomics
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ github.token }}
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-unknown-linux-musl
+
+      - run: cargo build --release --locked -p et --target aarch64-unknown-linux-musl

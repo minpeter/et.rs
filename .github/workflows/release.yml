@@ -169,7 +169,7 @@ jobs:
 
   homebrew:
     needs: [release, binaries]
-    if: needs.release.outputs.tag != '' && github.event_name == 'push'
+    if: needs.release.outputs.tag != ''
     runs-on: ubuntu-latest
     env:
       TAG: ${{ needs.release.outputs.tag }}
@@ -196,7 +196,7 @@ jobs:
 
   aur:
     needs: [release, binaries]
-    if: needs.release.outputs.tag != '' && github.event_name == 'push'
+    if: needs.release.outputs.tag != ''
     runs-on: ubuntu-latest
     # AUR publishing must not block a release (e.g. AUR maintenance windows).
     continue-on-error: true

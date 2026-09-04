@@ -3,12 +3,28 @@
 #[path = "terminal_runtime_support/mod.rs"]
 mod terminal_runtime_support;
 
-use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::FileExt;
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+#[cfg(all(
+    target_os = "linux",
+    target_env = "gnu",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use std::fs::OpenOptions;
+#[cfg(all(
+    target_os = "linux",
+    target_env = "gnu",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use std::os::unix::fs::FileExt;
+#[cfg(all(
+    target_os = "linux",
+    target_env = "gnu",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use std::path::Path;
 
 use et_core::packet::Packet;
 use et_core::proto::{
@@ -29,6 +45,11 @@ const KEY: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
 const TIMEOUT: Duration = Duration::from_secs(5);
 const LOGIN_TERM_COMPLETION: &[u8] = b"__ET_LOGIN_TERM_COMPLETE__\r\n";
 const LAST_LOGIN_MARKER: &[u8] = b"Last login:";
+#[cfg(all(
+    target_os = "linux",
+    target_env = "gnu",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 const LASTLOG_RECORD_BYTES: usize = 292;
 const MOTD_MARKER: &[u8] = b"ET-MOTD-MARKER";
 const PROMPT_MARKER: &[u8] = b"ET-PROMPT> ";
@@ -83,6 +104,11 @@ fn assert_motd_prompt_spacing(
     assert!(status.success());
 }
 
+#[cfg(all(
+    target_os = "linux",
+    target_env = "gnu",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn write_lastlog_record(path: &Path, timestamp: u32, host: &[u8]) {
     let mut record = [0u8; LASTLOG_RECORD_BYTES];
     record[..4].copy_from_slice(&timestamp.to_ne_bytes());
@@ -649,6 +675,11 @@ fn real_terminal_removes_trailing_blank_lines_from_motd() {
 }
 
 #[test]
+#[cfg(all(
+    target_os = "linux",
+    target_env = "gnu",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn real_terminal_emits_last_login_between_motd_and_prompt() {
     let fixture = Fixture::new("last-login");
     let motd = fixture.file("motd", b"ET-MOTD-MARKER\n\n\n");
@@ -706,7 +737,17 @@ fn real_terminal_suppresses_motd_when_home_has_hushlogin() {
     // Given: a MOTD file plus a HOME containing .hushlogin.
     let fixture = Fixture::new("motd-hushlogin");
     let motd = fixture.file("motd", b"ET-MOTD-MARKER\n");
+    #[cfg(all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     let lastlog = fixture.file("lastlog", b"");
+    #[cfg(all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     write_lastlog_record(&lastlog, 1_788_475_267, b"127.0.0.1");
     let home = fixture.file(".hushlogin", b"");
     let home = home.parent().unwrap().to_owned();

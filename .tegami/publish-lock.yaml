@@ -1,25 +1,21 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Add opt-in terminal flow control\n\nClients can now select lossless backpressure or oldest-output discard when\nterminal output outruns the network, keeping Ctrl-C and prompt responses\nbounded without changing the default session behavior.\n"
-    filename: add-opt-in-flow-control.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Share SSH bootstrap connections under load\n\nShare SSH bootstrap transport connections across ET processes targeting the\nsame effective destination. ET first runs the configuration-only query, then\nchecks for a working user-configured ControlMaster without supplying a\nControlPath. A working user master remains preferred and ET's operational\ncommands use it unchanged.\n\nWhen no user master exists, ET hashes the effective SSH user, resolved host,\nresolved port, and jumphost into a stable 32-hex-character socket name under a\nmode-0700 per-user `et-ssh-<uid>` directory. Long Unix temporary-directory\npaths fall back to `/tmp`, keeping the complete socket path below a conservative\n90-byte `sockaddr_un` limit.\n\nAn atomic destination-specific `.lock` directory serializes master startup.\nThe lock holder checks the socket again before starting OpenSSH; contenders\ncheck that exact socket until the winner publishes it or releases the lock.\nThis converges concurrent ET processes on one master rather than allowing a\nControlMaster bind race. Master setup failures fall back to ordinary SSH\ninvocations.\n\nThe ET master uses `ControlPersist=15`. Sessions never send `ssh -O exit` and\nnever unlink the shared socket, so one ET process cannot tear down transport\nused by another. OpenSSH removes the socket after the persisted master becomes\nidle; the private parent directory is retained for later destination masters.\n\nUser `ControlMaster` and `ControlPath` command-line options remain filtered.\nIsolation remains forced with `ClearAllForwardings=yes`, `RemoteCommand=none`,\n`PermitLocalCommand=no`, and `SessionType=default`.\n\nLocal OpenSSH diagnosis against localhost showed configuration and `-O check`\noperations open no TCP connections. A master start emitted one `Connecting to`\nline and a mux listener; probe and bootstrap operations emitted\n`mux_client_request_session` without a new `Connecting to` line.\n"
+    filename: fix-bootstrap-ssh-fanout.md
     v: 0.0.0
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Align MOTD and shell prompt spacing\n\nAvoid an extra blank line between the MOTD and an interactive shell prompt\nwhen the login shell emits an initial newline.\n"
-    filename: fix-motd-prompt-spacing.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Keep saturated full-duplex forwards moving\n\nKeep a saturated port forward moving in both directions at once. A large\nfull-duplex transfer through a local tunnel could wedge: each endpoint stopped\nreading its transport while it held a forwarding packet for a full worker\nqueue, so both ends waited for the other, keepalives stopped crossing, and the\nsession dropped into a recovery loop it could not finish. Both pump loops now\nkeep draining while a packet is held, so the transfer completes instead of\ndeadlocking.\n"
+    filename: fix-forwarding-deadlock.md
     v: 0.0.0
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Bound flow-control shutdown and recovery admission\n\nFlow-controlled clients now cancel stalled console drains instead of hanging\nduring shutdown, report closed output streams promptly, and keep client input\nmoving while terminal output is backpressured. Reconnects are also rejected\nwhen session teardown wins the recovery-admission race.\n"
-    filename: fix-release-blocker-races.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Preserve replies after a forwarding half-close\n\nPreserve forwarded TCP replies after a local client half-closes its write side.\nET now drains the reverse direction before closing the forwarded socket.\n"
+    filename: fix-forwarding-half-close.md
     v: 0.0.0
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Keep terminal startup reliable under heavy load\n\nTerminal startup now uses authenticated, bounded registration and structured\nstartup acknowledgements before reporting readiness. Initialization remains\nresponsive under load while forged identities, stalled peers, premature\nsuccess, leaked children, and unbounded admission are rejected or cleaned up.\n"
-    filename: fix-terminal-startup-under-load.md
-    v: 0.0.0
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Port EternalTerminal #798 accept-starvation fix\n\nA stuck client reconnect no longer starves `etserver` accept. Recovery\nalready ran off the session-table lock and refused a second in-flight\nreconnect for the same id; this port also refuses recover after full\nsession teardown (so a torn-down session cannot be resurrected) while\nstill allowing recover through terminal HUP so buffered output can\ndrain. It also raises the TCP `listen(2)` backlog from 32 to 128,\noverridable with `backlog` in the `[Networking]` section of the server\nconfig. Non-positive values fall back to 128. `PROTOCOL_VERSION` stays\n6. Upstream `#801` / `#803` / `#802` (HTM/Windows/coverage, TIOCGWINSZ,\nWindows build) are classified `skip` and not ported.\n"
-    filename: port-eternal-terminal-798.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Return finished-session memory to the operating system\n\nOn Linux, `etserver` now uses an allocator with immediate dirty-page decay and\nreapplies that release policy after terminal session teardown. Bursts of large\nfinished sessions no longer leave the daemon at its allocator arena\nhigh-water mark while it is idle.\n"
+    filename: fix-idle-rss-highwater.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - add-opt-in-flow-control.md
-      - fix-motd-prompt-spacing.md
-      - fix-release-blocker-races.md
-      - fix-terminal-startup-under-load.md
-      - port-eternal-terminal-798.md
+      - fix-bootstrap-ssh-fanout.md
+      - fix-forwarding-deadlock.md
+      - fix-forwarding-half-close.md
+      - fix-idle-rss-highwater.md
     id: cargo:et
     updated: true

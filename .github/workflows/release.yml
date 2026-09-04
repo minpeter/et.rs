@@ -37,8 +37,10 @@ jobs:
           cache: npm
 
       # Needed for `cargo update --workspace` after version bumps.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         if: github.event_name == 'push'
+        with:
+          toolchain: 1.97.1
 
       - if: github.event_name == 'push'
         run: npm ci
@@ -103,8 +105,9 @@ jobs:
         with:
           ref: ${{ needs.release.outputs.tag }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.97.1
           targets: ${{ matrix.target }}
 
       # prost-build (et-core) requires protoc.

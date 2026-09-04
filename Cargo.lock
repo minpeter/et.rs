@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "et"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "clap",
  "crossterm",
@@ -401,7 +401,7 @@ dependencies = [
 
 [[package]]
 name = "et-cli"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "clap",
  "et-core",
@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "et-core"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "crypto_secretbox",
  "hex",
@@ -421,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "et-htm"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "base64",
  "portable-pty",
@@ -432,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "et-net"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "crossbeam-channel",
  "et-core",
@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "et-server"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "et-core",
  "et-net",

@@ -140,6 +140,24 @@ fn load_shows_dynamic_message_before_static_defaults() {
 }
 
 #[test]
+fn load_preserves_source_spacing_and_trims_only_final_blank_lines() {
+    let sandbox = Sandbox::new("source-spacing");
+    let dynamic = sandbox.file("motd.dynamic", b"dynamic\n\n");
+    let static_message = sandbox.file("motd", b"static\n\n\n");
+
+    assert_eq!(
+        load_defaults_from(
+            std::slice::from_ref(&dynamic),
+            std::slice::from_ref(&static_message),
+            &[],
+            None,
+        )
+        .unwrap(),
+        b"dynamic\r\n\r\nstatic\r\n"
+    );
+}
+
+#[test]
 fn load_orders_directory_union_and_honors_priority_overrides() {
     let sandbox = Sandbox::new("directories");
     let high = sandbox.directory("etc");

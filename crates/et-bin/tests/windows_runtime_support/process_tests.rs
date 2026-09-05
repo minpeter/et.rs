@@ -27,3 +27,21 @@ fn run_cleanup_probe(scenario: &str) {
         "native cleanup probe failed: {scenario}"
     );
 }
+
+#[test]
+fn probe_fallback_processes_remaining_targets_after_a_cleanup_error() {
+    let script = format!(
+        "$ErrorActionPreference='Stop';\n{PROCESS_CLEANUP}\n{}\n{}",
+        include_str!("process_cleanup_probe.ps1"),
+        include_str!("fallback_probe.ps1")
+    );
+    let mut command = Command::new(powershell());
+    command
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdin(Stdio::null());
+    let mut child = OwnedChild::spawn(&mut command);
+    assert!(
+        child.wait().success(),
+        "native probe fallback abandoned a target"
+    );
+}

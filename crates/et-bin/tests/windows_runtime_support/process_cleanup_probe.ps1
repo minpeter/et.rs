@@ -54,10 +54,17 @@ function Test-ProcessCleanup {
         }
         Write-Output ('CLEANUP_PROBE_PASS scenario=' + $Scenario)
     } finally {
+        $cleanupFailures = [Collections.Generic.List[string]]::new()
         foreach ($process in $targets) {
-            if (!$process.HasExited) { Stop-ObservedProcess $process }
-            if (!$process.WaitForExit(10000)) { throw 'Probe fallback cleanup failed' }
-            $process.Dispose()
+            try {
+                if (!$process.HasExited) { Stop-ObservedProcess $process }
+                if (!$process.WaitForExit(10000)) { throw 'Probe fallback cleanup failed' }
+            } catch {
+                $cleanupFailures.Add($_.Exception.Message)
+            } finally {
+                $process.Dispose()
+            }
         }
+        if ($cleanupFailures.Count -ne 0) { throw ($cleanupFailures -join '; ') }
     }
 }

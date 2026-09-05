@@ -24,8 +24,9 @@ This is a hybrid of three real rewrite factories — not a fourth invention:
 ## Release
 
 [`release.yml`](../.github/workflows/release.yml) runs on push to `main` and
-opens a Version Packages PR when changelog has an unreleased `## et@x.y.z`
-heading. Merges by the Cursor GitHub App do not enqueue Actions; a
+opens a Version Packages PR from pending `.tegami/*.md` entries with package
+frontmatter, for example `packages: { et: { type: patch } }`. The crate
+`CHANGELOG.md` is generated output, not a version request. Merges by the Cursor GitHub App do not enqueue Actions; a
 `minpeter`-path push to `main` is required to kick tegami.
 
 ## Shape

@@ -329,7 +329,10 @@ fn control_directory_root(temp: &Path) -> PathBuf {
     let suffix = format!("et-ssh-{}", rustix::process::getuid().as_raw());
     #[cfg(not(unix))]
     let suffix = "et-ssh";
+    #[cfg(unix)]
     let path = temp.join(&suffix);
+    #[cfg(not(unix))]
+    let path = temp.join(suffix);
     #[cfg(unix)]
     if control_path_len(&path.join("0".repeat(32))) > MAX_CONTROL_PATH_BYTES {
         return PathBuf::from("/tmp").join(suffix);

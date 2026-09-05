@@ -11,7 +11,7 @@ Wire-compatible with upstream protocol version 6: an et.rs client can talk to a 
 C++ `et` client can talk to an et.rs server, in both terminal and port-forwarding modes.
 How we track upstream (Rust rewrite, not a C++ git fork): [docs/upstream-factory.md](docs/upstream-factory.md).
 
-Windows is a first-class target. Upstream builds only its client there, so hosting a session on
+Windows is a first-class target. Upstream has no native server there, so hosting a session on
 Windows meant running the POSIX server inside WSL and landing in a WSL shell. et.rs runs the server
 and the per-session terminal natively on Windows using ConPTY, so `et` gives you a real `cmd.exe` or
 PowerShell — no WSL involved.

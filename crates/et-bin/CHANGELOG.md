@@ -1,3 +1,11 @@
+## et@0.0.24
+
+### Match SSH login greeting spacing
+
+Preserve the MOTD's original trailing blank lines without inserting an extra
+separator before the previous-login details. Internal SSH control-master
+checks no longer print status messages during ET startup.
+
 ## et@0.0.23
 
 ### Show the previous login before the shell prompt

@@ -2,7 +2,7 @@ use et_net::local::LocalStream;
 use std::io;
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use et_core::backed_writer::{
@@ -23,6 +23,9 @@ use et_net::connection::{ConnError, Connection};
 const RECOVERY_LOCK_TIMEOUT: Duration = et_net::connection::DEFAULT_RECOVERY_TIMEOUT;
 const FLOW_CONTROL_BUFFER_BYTES: usize = 64 * 1024;
 
+#[cfg(test)]
+#[path = "session_output_interrupt_test.rs"]
+mod output_interrupt_tests;
 #[path = "session_flow.rs"]
 mod session_flow;
 #[cfg(test)]
@@ -65,6 +68,7 @@ pub(crate) struct ActiveSession {
     >,
     connection_generation: AtomicU64,
     flow_control: Option<Arc<FlowControl>>,
+    default_output: OnceLock<Arc<FlowControl>>,
     flow_writer: Mutex<Option<std::thread::JoinHandle<()>>>,
     bridge_generation: Mutex<u64>,
     bridge_changed: Condvar,
@@ -130,11 +134,9 @@ impl ActiveSession {
         flow_control: Option<i32>,
     ) -> Result<Self, SessionError> {
         let queue_mode = queue_mode(flow_control);
-        if queue_mode.is_some() {
-            connection
-                .minimize_output_buffering()
-                .map_err(SessionError::Connection)?;
-        }
+        connection
+            .minimize_output_buffering()
+            .map_err(SessionError::Connection)?;
         let control = connection
             .try_clone_stream()
             .map_err(SessionError::Connection)?;
@@ -156,6 +158,7 @@ impl ActiveSession {
             recover_admission_hook: Mutex::new(None),
             connection_generation: AtomicU64::new(0),
             flow_control: queue_mode.map(|mode| Arc::new(FlowControl::new(mode))),
+            default_output: OnceLock::new(),
             flow_writer: Mutex::new(None),
             bridge_generation: Mutex::new(0),
             bridge_changed: Condvar::new(),
@@ -163,14 +166,23 @@ impl ActiveSession {
     }
 
     pub(crate) fn start_flow_writer(self: &Arc<Self>) {
-        let Some(state) = self.flow_control.clone() else {
-            return;
-        };
+        // Bootstrap/control handshakes remain synchronous. Once the terminal
+        // bridge starts, even default sessions stage output before replay.
+        let state = Arc::clone(self.flow_control.as_ref().unwrap_or_else(|| {
+            self.default_output
+                .get_or_init(|| Arc::new(FlowControl::new_default()))
+        }));
         let session = Arc::downgrade(self);
         let handle = std::thread::spawn(move || session_flow::run_writer(session, state));
         if let Ok(mut writer) = self.flow_writer.lock() {
             *writer = Some(handle);
         }
+    }
+
+    fn output_flow(&self) -> Option<&Arc<FlowControl>> {
+        self.flow_control
+            .as_ref()
+            .or_else(|| self.default_output.get())
     }
 
     #[cfg(test)]
@@ -224,7 +236,10 @@ impl ActiveSession {
     where
         W: FnMut(&mut Connection, u8, &[u8]) -> Result<(), et_net::connection::WritePacketError>,
     {
-        if let Some(state) = &self.flow_control {
+        if let Some(state) = self.output_flow().filter(|_| {
+            self.flow_control.is_some()
+                || header == et_core::proto::TerminalPacketType::TerminalBuffer as u8
+        }) {
             return state
                 .enqueue(Packet::new(header, payload))
                 .map_err(SessionWriteError::BeforeReplay);
@@ -367,7 +382,7 @@ impl ActiveSession {
     }
 
     fn join_flow_writer(&self, graceful: bool) -> Result<(), SessionError> {
-        if let Some(state) = &self.flow_control {
+        if let Some(state) = self.output_flow() {
             if graceful {
                 state.stop_gracefully();
             } else {
@@ -384,8 +399,7 @@ impl ActiveSession {
         }
         if graceful
             && self
-                .flow_control
-                .as_ref()
+                .output_flow()
                 .is_some_and(|state| state.unrecoverable())
         {
             return Err(SessionError::Connection(ConnError::Io(io::Error::new(
@@ -397,7 +411,7 @@ impl ActiveSession {
     }
 
     fn stop_flow_writer(&self) {
-        if let Some(state) = &self.flow_control {
+        if let Some(state) = self.output_flow() {
             state.stop_hard();
         }
     }

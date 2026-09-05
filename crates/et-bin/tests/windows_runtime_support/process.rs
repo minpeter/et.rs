@@ -6,6 +6,8 @@ use wait_timeout::ChildExt;
 
 use super::{observe, Shell, TIMEOUT};
 
+const PROCESS_CLEANUP: &str = include_str!("process_cleanup.ps1");
+
 pub fn powershell() -> PathBuf {
     PathBuf::from(std::env::var_os("SystemRoot").unwrap())
         .join("System32/WindowsPowerShell/v1.0/powershell.exe")
@@ -56,21 +58,13 @@ impl ProcessExitObserver {
         // WaitForExit subscribes to process completion without process polling.
         // The observer also owns failure cleanup if a mutant leaves children.
         let script = format!(
-            "$ErrorActionPreference='Stop'; \
+            "{PROCESS_CLEANUP}\n$ErrorActionPreference='Stop'; \
              $targets=@({},{}) | ForEach-Object {{ \
                $p=[Diagnostics.Process]::GetProcessById($_); $null=$p.Handle; $p \
              }}; \
              [Console]::WriteLine('READY'); \
              $mode=[Console]::ReadLine(); \
-             $failed=$false; \
-             foreach($p in $targets) {{ \
-               if ($mode -ne 'WAIT' -and !$p.HasExited) {{ $p.Kill() }}; \
-               if (!$p.WaitForExit(10000)) {{ \
-                 $p.Kill(); $failed=$true; \
-                 if (!$p.WaitForExit(10000)) {{ throw 'fallback process cleanup timed out' }} \
-               }} \
-             }}; \
-             if ($failed) {{ throw 'native process cleanup timed out' }}",
+             Complete-ObservedProcesses -Targets $targets -Mode $mode",
             shell.pid, shell.descendant
         );
         let mut command = Command::new(powershell());
@@ -116,3 +110,6 @@ impl Drop for ProcessExitObserver {
         }
     }
 }
+
+#[path = "process_tests.rs"]
+mod tests;

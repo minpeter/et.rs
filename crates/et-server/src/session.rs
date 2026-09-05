@@ -39,6 +39,15 @@ use session_flow::FlowControl;
 
 pub(crate) struct ActiveSession {
     connection: Mutex<Connection>,
+    // Always acquire before connection when assigning/sending output frames.
+    write_serial: Mutex<()>,
+    #[cfg(test)]
+    prepared_write_hook: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     control: Mutex<TcpStream>,
     terminal_control: Mutex<LocalStream>,
     wake_writer: Mutex<LocalStream>,
@@ -144,6 +153,9 @@ impl ActiveSession {
         let (wake_reader, wake_writer) = et_net::local::wake_pair().map_err(SessionError::Io)?;
         Ok(Self {
             connection: Mutex::new(connection),
+            write_serial: Mutex::new(()),
+            #[cfg(test)]
+            prepared_write_hook: Mutex::new(None),
             control: Mutex::new(control),
             terminal_control: Mutex::new(terminal_control),
             wake_writer: Mutex::new(wake_writer),
@@ -253,6 +265,10 @@ impl ActiveSession {
         {
             return Ok(());
         }
+        let _write_serial = self
+            .write_serial
+            .lock()
+            .map_err(|_| SessionWriteError::BeforeReplay(SessionError::Unavailable))?;
         let mut connection = self
             .connection
             .lock()

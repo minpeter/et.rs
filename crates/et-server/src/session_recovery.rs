@@ -97,6 +97,7 @@ impl ActiveSession {
         // Phase 3: install under a short lock.
         {
             let mut control = lock_timeout(&self.control, RECOVERY_LOCK_TIMEOUT)?;
+            let _write_serial = lock_timeout(&self.write_serial, RECOVERY_LOCK_TIMEOUT)?;
             let mut connection = lock_timeout(&self.connection, RECOVERY_LOCK_TIMEOUT)?;
             if self.torn_down.load(Ordering::Acquire) {
                 drop(connection);
@@ -137,6 +138,7 @@ impl ActiveSession {
                 }
                 std::mem::take(&mut *hold)
             };
+            let _write_serial = lock_timeout(&self.write_serial, RECOVERY_LOCK_TIMEOUT)?;
             let mut connection = lock_timeout(&self.connection, RECOVERY_LOCK_TIMEOUT)?;
             let mut remaining = batch.into_iter();
             while let Some((header, payload)) = remaining.next() {

@@ -14,6 +14,70 @@ use super::ActiveSession;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
 
+#[test]
+fn prepared_terminal_and_synchronous_control_preserve_encrypted_frame_order() {
+    // Given a real terminal frame paused after encryption but before socket send.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    let mut client = Connection::new_client(client, &[7; 32]);
+    client.set_io_timeout(Some(TIMEOUT)).unwrap();
+    let (terminal_socket, _peer) = et_net::local::wake_pair().unwrap();
+    let session = Arc::new(
+        ActiveSession::new(
+            Connection::new_server(server, &[7; 32]),
+            &terminal_socket,
+            None,
+        )
+        .unwrap(),
+    );
+    let (prepared_tx, prepared_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    *session.prepared_write_hook.lock().unwrap() = Some((prepared_tx, release_rx));
+    session.start_flow_writer();
+    let terminal = terminal(b"terminal-first\n");
+    session
+        .send_packet(terminal.header(), terminal.payload())
+        .unwrap();
+    prepared_rx.recv_timeout(TIMEOUT).unwrap();
+
+    // When synchronous control traffic arrives at that exact physical-write gap.
+    // The lock probe only chooses a deterministic schedule, never the assertion:
+    // before the fix the control send completes before releasing the first frame;
+    // after the fix it must wait behind the physical writer.
+    let writer_owned = match session.write_serial.try_lock() {
+        Ok(guard) => {
+            drop(guard);
+            false
+        }
+        Err(std::sync::TryLockError::WouldBlock) => true,
+        Err(error) => panic!("write lock poisoned: {error}"),
+    };
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let sending = Arc::clone(&session);
+    let control = control();
+    let expected_control = control.clone();
+    let sender = std::thread::spawn(move || {
+        done_tx
+            .send(sending.send_packet(control.header(), control.payload()))
+            .unwrap();
+    });
+    if !writer_owned {
+        done_rx.recv_timeout(TIMEOUT).unwrap().unwrap();
+    }
+    release_tx.send(()).unwrap();
+    let first = client.read_packet();
+    let second = client.read_packet();
+    if writer_owned {
+        done_rx.recv_timeout(TIMEOUT).unwrap().unwrap();
+    }
+    sender.join().unwrap();
+    session.shutdown().unwrap();
+    // Then the actual peer decrypts whole frames in their assigned nonce order.
+    assert_eq!(first.unwrap(), terminal);
+    assert_eq!(second.unwrap(), expected_control);
+}
+
 fn terminal(bytes: &[u8]) -> Packet {
     Packet::new(
         TerminalPacketType::TerminalBuffer as u8,

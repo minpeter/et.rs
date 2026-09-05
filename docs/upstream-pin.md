@@ -10,7 +10,7 @@ Canonical machine files:
 - Ledger (every `master` commit after baseline):
   [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml)
 
-Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-04.
+Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-05.
 `#784` marked `ported` after et.rs [#31](https://github.com/minpeter/et.rs/pull/31) / `906a7ca86691f00a82f88b99b21d7afceb07bf97`.
 `#798` marked `ported` after et.rs [#77](https://github.com/minpeter/et.rs/pull/77).
 
@@ -20,13 +20,13 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-04.
 | Baseline / latest release tag | [`et-v7.0.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.0.0) |
 | Baseline / release commit | [`7656a32a5bc15c6746726a27a5a4ba1e468fab6e`](https://github.com/MisterTea/EternalTerminal/commit/7656a32a5bc15c6746726a27a5a4ba1e468fab6e) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`584a68b4b54c74de7035e6108f49151ebce6a191`](https://github.com/MisterTea/EternalTerminal/commit/584a68b4b54c74de7035e6108f49151ebce6a191) (`#792`, 2026-09-03; reviewed 2026-09-04) |
+| Pin tip (last classified) | [`cd7319020edce131fbd6f21b1a87e07f4ac41cdb`](https://github.com/MisterTea/EternalTerminal/commit/cd7319020edce131fbd6f21b1a87e07f4ac41cdb) (`#804`, 2026-09-05) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
 | ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.0.0` and `master`) |
 
-`7656a32...master` is `ahead_by` 16. All 16 are classified. Unclassified would be drift.
+The reviewed `7656a32...cd731902` range contains 17 classified commits. Unclassified commits would be drift.
 
-## Ledger (classified 2026-09-04)
+## Ledger (classified 2026-09-05)
 
 | sha | date | kind | status | note |
 | --- | --- | --- | --- | --- |
@@ -48,6 +48,14 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-04.
 | [`584a68b`](https://github.com/MisterTea/EternalTerminal/commit/584a68b4b54c74de7035e6108f49151ebce6a191) | 2026-09-03 | security | skip | #792 disable SO_LINGER. et.rs never sets SO_LINGER and has no globalMutex-on-close; default linger-off already matches. |
 
 ## Ported and residual
+
+[`cd731902`](https://github.com/MisterTea/EternalTerminal/commit/cd7319020edce131fbd6f21b1a87e07f4ac41cdb)
+(`#804`) is `status: porting` pending final review. Rust stages terminal output
+before assigning replay sequences, flushes unsent floods at the 64 KiB threshold,
+preserves small output and tmux response/control lines, and prioritizes tmux
+responses ahead of queued pane output. Native socket buffers remain small.
+The implementation reuses Rust's existing bounded queues and cancellation rather
+than copying the C++ event loop. Protocol v6 and generated wire fixtures are unchanged.
 
 [`69b3353`](https://github.com/MisterTea/EternalTerminal/commit/69b33537ab12f324cf619aca04dc483728dc30c3) (`#784`) is `status: ported`.
 It landed in et.rs via [#31](https://github.com/minpeter/et.rs/pull/31) /
@@ -81,7 +89,7 @@ this pin as a green light to bump `PROTOCOL_VERSION` or land a v7 port.
 default linger-off already matches the C++ fix).
 
 et.rs still claims **protocol v6**. EternalTerminal’s latest product release is
-**v7.0.0**, and `master` is sixteen classified commits past that tag.
+**v7.0.0**, and the reviewed tip is seventeen classified commits past that tag.
 
 Review ports against the conflict policy in
 [`docs/upstream-factory.md`](upstream-factory.md). Gate any later port with

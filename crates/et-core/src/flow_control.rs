@@ -32,6 +32,10 @@ pub struct OutputQueue {
     terminal: VecDeque<Packet>,
     control: VecDeque<Packet>,
     prefer_terminal: bool,
+    stream: crate::output_interrupt::TerminalStream,
+    before_take: Option<crate::output_interrupt::TerminalStream>,
+    skip_until_newline: bool,
+    promotion_pending: bool,
 }
 
 impl OutputQueue {
@@ -46,6 +50,10 @@ impl OutputQueue {
             terminal: VecDeque::new(),
             control: VecDeque::new(),
             prefer_terminal: true,
+            stream: crate::output_interrupt::TerminalStream::default(),
+            before_take: None,
+            skip_until_newline: false,
+            promotion_pending: false,
         }
     }
 
@@ -58,6 +66,21 @@ impl OutputQueue {
     }
 
     fn push_terminal(&mut self, mut packet: Packet) -> Result<(), QueuePushError> {
+        if self.skip_until_newline {
+            if let Ok(mut message) = TerminalBuffer::decode(packet.payload()) {
+                if let Some(bytes) = &mut message.buffer {
+                    let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') else {
+                        return Ok(());
+                    };
+                    self.skip_until_newline = false;
+                    bytes.drain(..=newline);
+                    if bytes.is_empty() {
+                        return Ok(());
+                    }
+                    packet = Packet::new(packet.header(), message.encode_to_vec());
+                }
+            }
+        }
         if packet_cost(&packet) > self.limit {
             if self.mode == FlowControlMode::Backpressure {
                 return Err(QueuePushError::Oversized(packet));
@@ -83,6 +106,7 @@ impl OutputQueue {
         self.terminal_bytes += wanted;
         self.terminal_packets += 1;
         self.terminal.push_back(packet);
+        self.promotion_pending = true;
         Ok(())
     }
 
@@ -103,6 +127,7 @@ impl OutputQueue {
     }
 
     pub fn take(&mut self) -> Option<Packet> {
+        self.promote_terminal_control();
         let packet = if self.prefer_terminal {
             self.terminal
                 .pop_front()
@@ -113,6 +138,13 @@ impl OutputQueue {
                 .or_else(|| self.terminal.pop_front())
         }?;
         self.prefer_terminal = !self.prefer_terminal;
+        if is_terminal_output(&packet) {
+            self.before_take = Some(self.stream.clone());
+            if let Ok(message) = TerminalBuffer::decode(packet.payload()) {
+                self.stream
+                    .observe(message.buffer.as_deref().unwrap_or_default());
+            }
+        }
         Some(packet)
     }
 
@@ -128,6 +160,9 @@ impl OutputQueue {
 
     pub fn restore_front(&mut self, packet: Packet) {
         if is_terminal_output(&packet) {
+            if let Some(stream) = self.before_take.take() {
+                self.stream = stream;
+            }
             self.terminal.push_front(packet);
         } else {
             self.control.push_front(packet);
@@ -157,6 +192,86 @@ impl OutputQueue {
 
     pub fn bytes(&self) -> usize {
         self.terminal_bytes + self.control_bytes
+    }
+
+    /// Drop only unsequenced terminal bytes. In-flight reservations and the
+    /// independent control lane are untouched, so replay stays contiguous.
+    pub fn flush_terminal_on_interrupt(&mut self) -> usize {
+        let mut bytes = Vec::new();
+        let mut lengths = Vec::new();
+        for packet in &self.terminal {
+            // An opaque/malformed packet is not permission to discard data.
+            let Ok(message) = TerminalBuffer::decode(packet.payload()) else {
+                return 0;
+            };
+            let Some(body) = message.buffer else { return 0 };
+            lengths.push(body.len());
+            bytes.extend(body);
+        }
+        if bytes.len() < crate::output_interrupt::FLUSH_THRESHOLD {
+            return 0;
+        }
+        let result = self.stream.filter(&bytes);
+        self.skip_until_newline |= result.skip_until_newline;
+        let mut remaining = result.kept.as_slice();
+        let mut retained = VecDeque::new();
+        for length in lengths {
+            let Some(packet) = self.terminal.pop_front() else {
+                break;
+            };
+            self.terminal_bytes -= packet_cost(&packet);
+            self.terminal_packets -= 1;
+            let count = remaining.len().min(length);
+            if count == 0 {
+                continue;
+            }
+            let body = TerminalBuffer {
+                buffer: Some(remaining[..count].to_vec()),
+            };
+            let packet = Packet::new(packet.header(), body.encode_to_vec());
+            self.terminal_bytes += packet_cost(&packet);
+            self.terminal_packets += 1;
+            retained.push_back(packet);
+            remaining = &remaining[count..];
+        }
+        self.terminal = retained;
+        result.dropped
+    }
+
+    fn promote_terminal_control(&mut self) {
+        if !self.promotion_pending || self.terminal_bytes < crate::output_interrupt::FLUSH_THRESHOLD
+        {
+            return;
+        }
+        self.promotion_pending = false;
+        let mut bytes = Vec::new();
+        let mut lengths = Vec::new();
+        for packet in &self.terminal {
+            let Ok(message) = TerminalBuffer::decode(packet.payload()) else {
+                return;
+            };
+            let Some(body) = message.buffer else { return };
+            lengths.push(body.len());
+            bytes.extend(body);
+        }
+        let Some(promoted) = self.stream.promote_control(&bytes) else {
+            return;
+        };
+        let mut remaining = promoted.as_slice();
+        for (packet, length) in self.terminal.iter_mut().zip(lengths) {
+            self.terminal_bytes -= packet_cost(packet);
+            let body = TerminalBuffer {
+                buffer: Some(remaining[..length].to_vec()),
+            };
+            *packet = Packet::new(packet.header(), body.encode_to_vec());
+            self.terminal_bytes += packet_cost(packet);
+            remaining = &remaining[length..];
+        }
+    }
+
+    /// Adjust admission after a connection state change without evicting data.
+    pub fn set_limit(&mut self, limit: usize) {
+        self.limit = limit;
     }
 }
 

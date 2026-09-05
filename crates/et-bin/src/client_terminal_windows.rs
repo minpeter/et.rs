@@ -62,6 +62,7 @@ where
     }
     let mut pending_forward = VecDeque::new();
     let mut pending_output: Option<et_core::packet::Packet> = None;
+    let mut interrupt_input = et_core::output_interrupt::InterruptInput::default();
     loop {
         console_output
             .check_error()
@@ -134,6 +135,11 @@ where
                         let bytes = key_bytes(&key);
                         if bytes.is_empty() {
                             continue;
+                        }
+                        if interrupt_input.feed(&bytes) {
+                            console_output.interrupt().map_err(|error| {
+                                terminal_io("interrupting console output", error)
+                            })?;
                         }
                         let payload = encoded_buffer(&bytes);
                         match write_owned_recovering(

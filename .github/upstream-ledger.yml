@@ -10,10 +10,10 @@
 #   note: short string
 #   et_pr: optional upstream PR number
 #
-# Classified 2026-09-04. #798 marked ported in this et.rs PR.
+# Classified 2026-09-05. #804 is undergoing final port review.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-09-04"
+classified: "2026-09-05"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -107,3 +107,9 @@ commits:
     status: skip
     note: "#792 disable SO_LINGER. et.rs never sets SO_LINGER and has no globalMutex-on-close; default linger-off already matches."
     et_pr: 792
+  - sha: cd7319020edce131fbd6f21b1a87e07f4ac41cdb
+    date: "2026-09-05"
+    kind: product
+    status: porting
+    note: "#804 interruptible unsent terminal output, tmux control preservation and priority, bounded socket buffers. Rust implementation under final review; protocol remains 6."
+    et_pr: 804

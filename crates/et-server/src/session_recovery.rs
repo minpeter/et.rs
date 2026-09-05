@@ -40,7 +40,7 @@ impl ActiveSession {
                 return Err(SessionError::RecoverBusy);
             }
         }
-        if let Some(flow) = &self.flow_control {
+        if let Some(flow) = self.output_flow() {
             if let Err(error) = flow.pause() {
                 self.recovering.store(false, Ordering::Release);
                 return Err(error);
@@ -81,7 +81,7 @@ impl ActiveSession {
         candidate
             .authenticate_peer(DEFAULT_RECOVERY_TIMEOUT)
             .map_err(SessionError::Connection)?;
-        if self.flow_control.is_some() {
+        if self.output_flow().is_some() {
             candidate
                 .minimize_output_buffering()
                 .map_err(SessionError::Connection)?;
@@ -201,7 +201,7 @@ impl Drop for RecoverPermit<'_> {
         // Catch anything that observed `recovering` and queued after the first
         // flush but before the flag cleared (re-check is under the hold lock).
         let _ = self.session.flush_recover_hold();
-        if let Some(state) = &self.session.flow_control {
+        if let Some(state) = self.session.output_flow() {
             let connected = self
                 .session
                 .connection

@@ -66,15 +66,11 @@ where
         .flowcontrol
         .and_then(|value| FlowControlMode::try_from(value).ok())
         .unwrap_or(FlowControlMode::None);
-    let bounded_output = match flow_control {
-        FlowControlMode::None => false,
-        FlowControlMode::Backpressure | FlowControlMode::Discard => true,
-    };
-    if bounded_output {
-        // Destination output enters the jumphost router through this terminal-
-        // side sender. Keep pressure in the server's bounded application lanes.
-        et_net::local::minimize_terminal_output_buffering(&router)
-            .map_err(|error| format!("could not bound jumphost output buffering: {error}"))?;
+    match flow_control {
+        FlowControlMode::None | FlowControlMode::Backpressure | FlowControlMode::Discard => {
+            et_net::local::minimize_terminal_output_buffering(&router)
+                .map_err(|error| format!("could not bound jumphost output buffering: {error}"))?
+        }
     }
     // The destination runs a real terminal, so the relayed payload must not
     // ask it to start another jumphost.
@@ -218,10 +214,11 @@ where
         .and_then(|value| FlowControlMode::try_from(value).ok())
         .unwrap_or(FlowControlMode::None)
     {
-        FlowControlMode::None => {}
-        FlowControlMode::Backpressure | FlowControlMode::Discard => connection
-            .minimize_output_buffering()
-            .map_err(|error| format!("could not bound destination output buffering: {error}"))?,
+        FlowControlMode::None | FlowControlMode::Backpressure | FlowControlMode::Discard => {
+            connection
+                .minimize_output_buffering()
+                .map_err(|error| format!("could not bound destination output buffering: {error}"))?
+        }
     }
     observe_before_payload(&connection)?;
     connection

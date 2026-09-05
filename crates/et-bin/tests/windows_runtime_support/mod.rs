@@ -34,24 +34,19 @@ pub struct Stack {
 
 impl Stack {
     pub fn start() -> Self {
+        Self::start_with_setup(|_| {})
+    }
+
+    fn start_with_setup(before_config: impl FnOnce(&std::path::Path)) -> Self {
         let (id, key) = gen_id_passkey();
         let directory = std::env::temp_dir().join(format!("et-win-{}-{id}", std::process::id()));
-        fs::create_dir(&directory).unwrap();
         let router = directory.join("router");
         // The CLI deliberately rejects port zero. Reserve an ephemeral port and
         // fail on bind collision rather than retrying or using a fleet endpoint.
         let reserved = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = reserved.local_addr().unwrap();
         let config = directory.join("et.cfg");
-        fs::write(
-            &config,
-            format!(
-                "[Networking]\nport={}\nbind_ip=127.0.0.1\n[Debug]\nserverfifo={}\n",
-                address.port(),
-                router.display()
-            ),
-        )
-        .unwrap();
+        fs::create_dir(&directory).unwrap();
         let mut stack = Self {
             directory,
             address,
@@ -61,6 +56,16 @@ impl Stack {
             terminal: None,
             cleaned: false,
         };
+        before_config(&stack.directory);
+        fs::write(
+            &config,
+            format!(
+                "[Networking]\nport={}\nbind_ip=127.0.0.1\n[Debug]\nserverfifo={}\n",
+                address.port(),
+                router.display()
+            ),
+        )
+        .unwrap();
         drop(reserved);
         let mut command = binary();
         command
@@ -171,6 +176,9 @@ impl Stack {
         println!("FIXTURE_REMOVED {}", self.directory.display());
     }
 }
+
+#[path = "setup_tests.rs"]
+mod setup_tests;
 
 impl Drop for Stack {
     fn drop(&mut self) {

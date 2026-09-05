@@ -84,11 +84,11 @@ jobs:
           --test terminal_tty_qa
           -- --test-threads=1
 
-  # Windows build is release-critical; the test harnesses are POSIX-only,
-  # so compile the shipped binary crate (like the release pipeline) and
-  # grow into `cargo test` later.
+  # Exercise native server recovery, process cleanup, and HTM ConPTY roles.
+  # Keep the existing check name for branch protection.
   build-windows:
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -102,7 +102,42 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - run: cargo build -p et
+      - name: Build relocatable native runtime QA artifacts
+        shell: pwsh
+        run: |
+          cargo build --locked -p et --bin et
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $messages = cargo test --locked -p et --test windows_runtime --no-run --message-format=json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tests = @($messages | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object {
+            $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'windows_runtime' -and $_.executable
+          })
+          if ($tests.Count -ne 1) { throw 'Expected exactly one Windows runtime test executable' }
+          New-Item -ItemType Directory windows-runtime-artifact | Out-Null
+          Copy-Item target/debug/et.exe windows-runtime-artifact/et.exe
+          Copy-Item $tests[0].executable windows-runtime-artifact/windows_runtime.exe
+          Copy-Item crates/et-bin/tests/windows_runtime_support/Run-WindowsRuntime.ps1 windows-runtime-artifact/
+
+      - name: Exercise native server and ConPTY runtime
+        shell: pwsh
+        run: |
+          cargo test -p et --test windows_runtime -- --test-threads=1 --nocapture 2>&1 | Tee-Object windows-runtime-artifact/native-runtime.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload native QA executables and transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-runtime-${{ github.sha }}
+          path: windows-runtime-artifact/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Exercise native HTM transport and panes
+        run: cargo test -p et-htm -- --test-threads=1 --nocapture
+
+      - name: Exercise HTM role startup, resize and reattach
+        run: cargo test -p et --test htm_runtime -- --test-threads=1 --nocapture
 
   # The release matrix builds jemalloc on native ARM against musl. Ubuntu's
   # aarch64 musl GCC needs outlined atomics disabled so libgcc does not retain

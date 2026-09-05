@@ -100,7 +100,16 @@ impl MultiplexerState {
         let mut root = serde_json::Map::new();
         root.insert(
             "shell".to_owned(),
-            serde_json::Value::String(std::env::var("SHELL").unwrap_or_default()),
+            serde_json::Value::String({
+                #[cfg(unix)]
+                {
+                    std::env::var("SHELL").unwrap_or_default()
+                }
+                #[cfg(windows)]
+                {
+                    crate::terminal_handler::default_shell()
+                }
+            }),
         );
         let mut tabs = serde_json::Map::new();
         for (id, tab) in &self.tabs {

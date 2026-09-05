@@ -1,6 +1,8 @@
 //! Real HTM process/PTY contract, shared by Unix and native Windows QA.
 #![forbid(unsafe_code)]
 
+#[path = "htm_support/attached.rs"]
+mod attached;
 mod htm_support;
 
 use et_htm::{codes, framing};

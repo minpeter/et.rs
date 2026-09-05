@@ -32,12 +32,15 @@ impl HtmServer {
 
     pub fn run(&mut self) -> io::Result<()> {
         while self.running {
+            // A new authenticated UI (including htm -x) must be serviced even
+            // while the previous UI remains attached. poll_accept closes the
+            // old endpoint only after accepting the replacement.
+            if let Err(error) = self.poll_accept() {
+                self.close_endpoint();
+                eprintln!("htmd: accepting UI client: {error}");
+            }
             if self.endpoint.is_none() {
                 std::thread::sleep(Duration::from_millis(200));
-                if let Err(error) = self.poll_accept() {
-                    self.close_endpoint();
-                    eprintln!("htmd: accepting UI client: {error}");
-                }
                 continue;
             }
             if let Err(error) = self.step() {

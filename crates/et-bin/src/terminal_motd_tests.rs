@@ -140,7 +140,7 @@ fn load_shows_dynamic_message_before_static_defaults() {
 }
 
 #[test]
-fn load_preserves_source_spacing_and_trims_only_final_blank_lines() {
+fn load_preserves_source_spacing_including_final_blank_lines() {
     let sandbox = Sandbox::new("source-spacing");
     let dynamic = sandbox.file("motd.dynamic", b"dynamic\n\n");
     let static_message = sandbox.file("motd", b"static\n\n\n");
@@ -153,7 +153,7 @@ fn load_preserves_source_spacing_and_trims_only_final_blank_lines() {
             None,
         )
         .unwrap(),
-        b"dynamic\r\n\r\nstatic\r\n"
+        b"dynamic\r\n\r\nstatic\r\n\r\n\r\n"
     );
 }
 

@@ -89,6 +89,7 @@ if [ -n "$ET_FAKE_CLIENT_PIDS" ]; then
   echo "$PPID" >> "$ET_FAKE_CLIENT_PIDS"
 fi
 if [ "$1" = "-O" ] && [ "$2" = "check" ]; then
+  printf "%s" "$ET_FAKE_MASTER_STDERR" >&2
   if [ -n "$control_path" ]; then
     [ -e "$control_path" ] && exit 0
     exit 255
@@ -587,6 +588,26 @@ fn bootstrap_ssh_invocations_share_a_private_session_control_path() {
     assert!(
         path.exists(),
         "ControlPersist socket did not survive the session"
+    );
+}
+
+#[test]
+fn control_master_status_is_not_forwarded_to_client_stderr() {
+    let (port, server) = initial_payload_server();
+    let fake = FakeSsh::new();
+    let output = fake
+        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
+        .env("ET_FAKE_MASTER_STDERR", "Master running (pid=1234)\n")
+        .args(["-N", &format!("server-alias:{port}")])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        !stderr(&output).contains("Master running"),
+        "control-master status leaked to the user: {}",
+        stderr(&output),
     );
 }
 

@@ -2,52 +2,28 @@
 //! plus `IpcPairServer`.
 
 use std::io::{self, Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
-use rustix::event::{poll, PollFd, PollFlags};
+pub use crate::transport::pipe_name;
+use crate::transport::{self, Listener, Stream};
 
 use crate::codes;
 use crate::framing;
 use crate::state::MultiplexerState;
 
-/// 10ms poll interval, matching upstream's select() timeout.
-const POLL_TIMEOUT: rustix::event::Timespec = rustix::event::Timespec {
-    tv_sec: 0,
-    tv_nsec: 10_000_000,
-};
-
-/// Default IPC socket path: `<tmp>/htm.<uid>.ipc`, like upstream
-/// `HtmServer::getPipeName`.
-pub fn pipe_name() -> PathBuf {
-    std::env::temp_dir().join(format!("htm.{}.ipc", rustix::process::getuid().as_raw()))
-}
-
 pub struct HtmServer {
-    listener: UnixListener,
-    path: PathBuf,
-    endpoint: Option<UnixStream>,
+    listener: Listener,
+    endpoint: Option<Stream>,
     state: MultiplexerState,
     running: bool,
 }
 
 impl HtmServer {
     pub fn bind(path: &Path) -> io::Result<Self> {
-        // A stale socket from a crashed daemon must not block startup.
-        if path.exists() && UnixStream::connect(path).is_err() {
-            let _ = std::fs::remove_file(path);
-        }
-        let listener = UnixListener::bind(path)?;
-        listener.set_nonblocking(true)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        let listener = Listener::bind(path)?;
         Ok(Self {
             listener,
-            path: path.to_path_buf(),
             endpoint: None,
             state: MultiplexerState::new().map_err(io::Error::other)?,
             running: true,
@@ -58,7 +34,10 @@ impl HtmServer {
         while self.running {
             if self.endpoint.is_none() {
                 std::thread::sleep(Duration::from_millis(200));
-                self.poll_accept()?;
+                if let Err(error) = self.poll_accept() {
+                    self.close_endpoint();
+                    eprintln!("htmd: accepting UI client: {error}");
+                }
                 continue;
             }
             if let Err(error) = self.step() {
@@ -70,20 +49,21 @@ impl HtmServer {
                 self.close_endpoint();
             }
         }
-        self.close_endpoint();
         self.state.stop_all();
-        let _ = std::fs::remove_file(&self.path);
+        self.listener.retire()?;
+        self.close_endpoint();
         Ok(())
     }
 
     /// Accept a new UI client, replacing any existing one, then resend state.
     fn poll_accept(&mut self) -> io::Result<()> {
         match self.listener.accept() {
-            Ok((stream, _)) => {
+            Ok(stream) => {
                 if self.endpoint.is_some() {
                     self.close_endpoint();
                 }
-                stream.set_nonblocking(true)?;
+                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(5)))?;
                 self.endpoint = Some(stream);
                 self.recover()
             }
@@ -115,17 +95,7 @@ impl HtmServer {
         let Some(endpoint) = self.endpoint.as_ref() else {
             return Ok(());
         };
-        let mut descriptors = [PollFd::new(
-            endpoint,
-            PollFlags::IN | PollFlags::HUP | PollFlags::ERR,
-        )];
-        poll(&mut descriptors, Some(&POLL_TIMEOUT)).map_err(io::Error::from)?;
-        let events = descriptors[0].revents();
-        if events.intersects(PollFlags::HUP | PollFlags::ERR) {
-            self.close_endpoint();
-            return Ok(());
-        }
-        if events.contains(PollFlags::IN) {
+        if transport::readable(endpoint)? {
             self.handle_message()?;
         }
         if let Some(mut endpoint) = self.endpoint.as_ref().and_then(|s| s.try_clone().ok()) {
@@ -140,19 +110,18 @@ impl HtmServer {
         };
         // Message bodies are read to completion, so block for the remainder
         // once the header byte is available.
-        stream.set_nonblocking(false)?;
         let mut reader = stream;
         let mut header = [0u8; 1];
         if reader.read_exact(&mut header).is_err() {
             self.close_endpoint();
             return Ok(());
         }
-        let length = framing::read_length(&mut reader)?;
-        let result = self.dispatch(header[0], length, &mut reader);
-        if let Some(endpoint) = self.endpoint.as_ref() {
-            endpoint.set_nonblocking(true)?;
+        if header[0] == codes::SESSION_END {
+            self.close_endpoint();
+            return Ok(());
         }
-        result
+        let length = framing::read_length(&mut reader)?;
+        self.dispatch(header[0], length, &mut reader)
     }
 
     fn dispatch(&mut self, header: u8, length: i32, reader: &mut impl Read) -> io::Result<()> {
@@ -234,17 +203,16 @@ impl HtmServer {
 impl Drop for HtmServer {
     fn drop(&mut self) {
         self.state.stop_all();
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
     #[test]
     fn pipe_name_matches_upstream_shape() {
-        let path = pipe_name();
+        let path = pipe_name().unwrap();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.starts_with("htm."));
         assert!(name.ends_with(".ipc"));

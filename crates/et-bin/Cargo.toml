@@ -27,6 +27,7 @@ et-cli = { path = "../et-cli" }
 et-core = { path = "../et-core" }
 et-net = { path = "../et-net" }
 et-server = { path = "../et-server" }
+et-htm = { path = "../et-htm" }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29.0"
 # ConPTY on Windows, forkpty on Unix.
@@ -35,9 +36,7 @@ prost = "0.13"
 sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
 wait-timeout = "0.2.1"
 
-# The headless multiplexer follows upstream and stays POSIX-only.
 [target.'cfg(unix)'.dependencies]
-et-htm = { path = "../et-htm" }
 nix = { version = "0.31.3", default-features = false, features = ["signal"] }
 rustix = { version = "1.1.4", features = ["event", "fs", "process", "time"] }
 signal-hook = "0.3.18"
@@ -55,6 +54,7 @@ tikv-jemallocator = "0.7.0"
 jiff = { version = "0.2.35", default-features = false, features = ["tz-system", "tzdb-zoneinfo"] }
 
 [dev-dependencies]
+serde_json = "1"
 socket2 = "0.6.1"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

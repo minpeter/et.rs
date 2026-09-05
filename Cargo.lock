@@ -423,6 +423,7 @@ dependencies = [
  "portable-pty",
  "prost",
  "rustix",
+ "serde_json",
  "signal-hook",
  "socket2",
  "sysinfo",
@@ -456,6 +457,8 @@ name = "et-htm"
 version = "0.0.24"
 dependencies = [
  "base64",
+ "et-net",
+ "filedescriptor",
  "portable-pty",
  "rustix",
  "serde_json",

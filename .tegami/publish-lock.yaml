@@ -1,9 +1,9 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Show the previous login before the shell prompt\n\nNew Linux terminal sessions now show the authenticated user's previous login\ntime and remote host after the MOTD, matching SSH's login details. Missing or\nunreadable accounting data remains advisory, and `.hushlogin` suppresses the\ncomplete greeting.\n"
-    filename: fix-last-login-output.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Match SSH login greeting spacing\n\nPreserve the MOTD's original trailing blank lines without inserting an extra\nseparator before the previous-login details. Internal SSH control-master\nchecks no longer print status messages during ET startup.\n"
+    filename: fix-motd-ssh-parity.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - fix-last-login-output.md
+      - fix-motd-ssh-parity.md
     id: cargo:et
     updated: true

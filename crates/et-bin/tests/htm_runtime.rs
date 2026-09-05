@@ -99,6 +99,11 @@ fn auto_start_and_kill_other_sessions_replace_only_the_selected_daemon() {
     let before = first.state();
     framing::write_debug_keys(&mut first.input, &[27]).unwrap();
     first.finish();
+    // The auto-started daemon must outlive the htm process that launched it.
+    let mut reattached = Relay::start(&endpoint.path);
+    assert_eq!(reattached.state()["panes"], before["panes"]);
+    framing::write_debug_keys(&mut reattached.input, &[27]).unwrap();
+    reattached.finish();
     let mut replacement = Relay::restart(&endpoint.path);
     let after = replacement.state();
 
@@ -112,4 +117,54 @@ fn auto_start_and_kill_other_sessions_replace_only_the_selected_daemon() {
     other_relay.finish();
     other.finish();
     println!("HTM_AUTOSTART_PASS ready detach -x replacement unrelated-daemon-survived shutdown");
+}
+
+#[cfg(windows)]
+#[test]
+fn autostart_survives_client_exit_inside_a_nonbreakaway_host_job() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use windows_spawn::{Command, DropPolicy, Job, SpawnOptions, Stdio};
+
+    // Given a real supervisor job that does not permit child breakaway.
+    // Kill-on-close preserves the host's authority to end this entire tree.
+    let job = Job::create().unwrap();
+    job.set_kill_on_close(true).unwrap();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "auto_start_and_kill_other_sessions_replace_only_the_selected_daemon",
+            "--exact",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Assignment is atomic with process creation, not a race after spawning.
+    let child = command
+        .spawn_with(
+            SpawnOptions::new()
+                .job(&job)
+                .drop_policy(DropPolicy::Detach),
+        )
+        .unwrap();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let _ = sender.send(child.wait_with_output());
+    });
+
+    // When the real role scenario starts, exits/reconnects, and replaces clients.
+    let result = receiver.recv_timeout(Duration::from_secs(45));
+    if result.is_err() {
+        job.terminate(1).unwrap();
+    }
+    worker.join().unwrap();
+    let output = result.expect("host-job role scenario completion").unwrap();
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+
+    // Then HTM survives client exit inside that still-living supervisor job.
+    // No assertion claims survival after the supervising job itself is killed.
+    assert!(output.status.success(), "host-job HTM role scenario failed");
 }

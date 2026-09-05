@@ -33,7 +33,28 @@ pub fn spawn(path: &Path) -> io::Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     crate::detach::configure(&mut command);
-    let mut child = crate::detach::spawn(&mut command)?;
+    let child = crate::detach::spawn(&mut command);
+    #[cfg(windows)]
+    let child = match child {
+        Err(error) if error.raw_os_error() == Some(5) => {
+            use windows_spawn::{CreationFlags, DropPolicy, SpawnOptions};
+            // ERROR_ACCESS_DENIED can mean that a supervising job forbids
+            // breakaway. HTM needs to outlive its UI, not override that host's
+            // job lifetime. Keep the allowlisted spawn and console detachment;
+            // never relax the shared SSH-bootstrap detach::spawn contract.
+            let child = command.spawn_with(
+                SpawnOptions::new()
+                    .creation_flags(
+                        CreationFlags::DETACHED_PROCESS | CreationFlags::NEW_PROCESS_GROUP,
+                    )
+                    .drop_policy(DropPolicy::Detach),
+            )?;
+            eprintln!("htm: independent daemon startup was denied; htmd remains supervised by the host job and cannot survive that job's termination");
+            Ok(child)
+        }
+        result => result,
+    };
+    let mut child = child?;
     let mut output = child
         .stdout
         .take()

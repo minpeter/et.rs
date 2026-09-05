@@ -173,6 +173,10 @@ terminal types are forwarded unchanged.
   below that user's `LOCALAPPDATA` tree, without junctions or parent traversal.
   Do not grant other users access to this directory or its token files.
   `htm -x` shuts down only the selected authenticated daemon, not named fleet processes.
+- HTM first requests Windows job breakaway. If the host denies it, HTM reports the
+  restriction and starts a detached, handle-isolated daemon within the host job.
+  It survives the launching `htm` client, but **not termination of that host job**.
+  The stricter `etserver`/`etterminal` SSH-bootstrap breakaway policy is unchanged.
 - Unix-socket tunnels remain POSIX-only.
 - Inbound connections need a firewall rule; the server does not modify firewall state itself.
 

@@ -46,11 +46,13 @@ The reviewed `7656a32...cd731902` range contains 17 classified commits. Unclassi
 | [`3e8db00`](https://github.com/MisterTea/EternalTerminal/commit/3e8db00cdccba4906ca1b995d3fd7c0650a9fac9) | 2026-09-01 | product | skip | #803 TIOCGWINSZ; Unix terminal-size observation only |
 | [`342c0df`](https://github.com/MisterTea/EternalTerminal/commit/342c0dfb32882c94df6aa18092fc897015222c0b) | 2026-09-02 | ci | skip | #802 Windows build/test parity; not a wire or server-lock change |
 | [`584a68b`](https://github.com/MisterTea/EternalTerminal/commit/584a68b4b54c74de7035e6108f49151ebce6a191) | 2026-09-03 | security | skip | #792 disable SO_LINGER. et.rs never sets SO_LINGER and has no globalMutex-on-close; default linger-off already matches. |
+| [`cd731902`](https://github.com/MisterTea/EternalTerminal/commit/cd7319020edce131fbd6f21b1a87e07f4ac41cdb) | 2026-09-05 | product | **ported** | #804 interruptible unsent output and tmux control preservation; et.rs #100. |
 
 ## Ported and residual
 
 [`cd731902`](https://github.com/MisterTea/EternalTerminal/commit/cd7319020edce131fbd6f21b1a87e07f4ac41cdb)
-(`#804`) is `status: porting` pending final review. Rust stages terminal output
+(`#804`) is `status: ported` after independent review of
+[et.rs #100](https://github.com/minpeter/et.rs/pull/100). Rust stages terminal output
 before assigning replay sequences, flushes unsent floods at the 64 KiB threshold,
 preserves small output and tmux response/control lines, and prioritizes tmux
 responses ahead of queued pane output. Native socket buffers remain small.

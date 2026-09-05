@@ -53,6 +53,8 @@ fn main() {
 }
 
 fn dispatch(prog: &str, args: &[OsString]) -> Result<i32, clap::Error> {
+    #[cfg(windows)]
+    let prog = prog.strip_suffix(".exe").unwrap_or(prog);
     match prog {
         "etserver" => return role("etserver", args),
         "etterminal" => return role("etterminal", args),
@@ -77,17 +79,8 @@ fn role(name: &str, args: &[OsString]) -> Result<i32, clap::Error> {
     match name {
         "etserver" => crate::server::run(args),
         "etterminal" => crate::terminal::run(args),
-        #[cfg(unix)]
         "htm" => crate::htm::run_client(args),
-        #[cfg(unix)]
         "htmd" => crate::htm::run_daemon(args),
-        // Upstream's htm/htmd are POSIX-only, and their multiplexer state model
-        // has no Windows counterpart yet.
-        #[cfg(windows)]
-        "htm" | "htmd" => Err(clap::Error::raw(
-            clap::error::ErrorKind::InvalidSubcommand,
-            format!("{name} is not available on Windows yet\n"),
-        )),
         _ => crate::client::run(args),
     }
 }
@@ -130,7 +123,6 @@ mod terminal_motd;
 mod terminal_protocol;
 mod terminal_pty;
 
-// The headless multiplexer still needs the Unix-only pieces of upstream's htm.
-#[cfg(unix)]
 mod htm;
+mod htm_daemon;
 mod terminal_jump;

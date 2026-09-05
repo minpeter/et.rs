@@ -84,8 +84,8 @@ jobs:
           --test terminal_tty_qa
           -- --test-threads=1
 
-  # Real foreground server, native ConPTY output, same-session recovery and
-  # process-tree cleanup. Keep the existing check name for branch protection.
+  # Exercise native server recovery, process cleanup, and HTM ConPTY roles.
+  # Keep the existing check name for branch protection.
   build-windows:
     runs-on: windows-latest
     timeout-minutes: 20
@@ -132,6 +132,12 @@ jobs:
           path: windows-runtime-artifact/
           if-no-files-found: error
           retention-days: 14
+
+      - name: Exercise native HTM transport and panes
+        run: cargo test -p et-htm -- --test-threads=1 --nocapture
+
+      - name: Exercise HTM role startup, resize and reattach
+        run: cargo test -p et --test htm_runtime -- --test-threads=1 --nocapture
 
   # The release matrix builds jemalloc on native ARM against musl. Ubuntu's
   # aarch64 musl GCC needs outlined atomics disabled so libgcc does not retain

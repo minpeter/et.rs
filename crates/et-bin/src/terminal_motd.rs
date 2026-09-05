@@ -51,9 +51,6 @@ pub fn load_startup_prefix() -> Option<Vec<u8>> {
     )))]
     let last_login: Option<Vec<u8>> = None;
     if let Some(last_login) = last_login {
-        if !output.is_empty() {
-            output.extend_from_slice(b"\r\n");
-        }
         output.extend_from_slice(&last_login);
     }
     (!output.is_empty()).then_some(output)
@@ -216,11 +213,8 @@ fn append_terminal_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
     }
 }
 
-/// Remove blank lines only after every MOTD source has been assembled.
-fn finish_output(mut output: Vec<u8>) -> Option<Vec<u8>> {
-    while output.ends_with(b"\r\n\r\n") {
-        output.truncate(output.len() - 2);
-    }
+/// Preserve source blank lines, matching the greeting displayed by SSH.
+fn finish_output(output: Vec<u8>) -> Option<Vec<u8>> {
     (!output.is_empty()).then_some(output)
 }
 

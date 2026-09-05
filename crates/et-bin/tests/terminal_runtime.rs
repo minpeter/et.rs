@@ -57,6 +57,7 @@ const PROMPT_MARKER: &[u8] = b"ET-PROMPT> ";
 fn assert_motd_prompt_spacing(
     fixture_name: &str,
     motd_contents: &[u8],
+    expected_spacing: &[u8],
     shell_factory: fn(&Fixture) -> std::path::PathBuf,
 ) {
     let fixture = Fixture::new(fixture_name);
@@ -88,8 +89,8 @@ fn assert_motd_prompt_spacing(
     let prompt_at = find(&output, PROMPT_MARKER).unwrap();
     assert_eq!(
         &output[motd_at + MOTD_MARKER.len()..prompt_at],
-        b"\r\n",
-        "expected prompt directly below MOTD; got {:?}",
+        expected_spacing,
+        "expected original MOTD spacing before prompt; got {:?}",
         String::from_utf8_lossy(&output),
     );
 
@@ -652,6 +653,7 @@ fn real_terminal_places_prompt_on_line_after_motd() {
     assert_motd_prompt_spacing(
         "motd-prompt-spacing",
         b"ET-MOTD-MARKER\n",
+        b"\r\n",
         Fixture::prompt_probe_shell,
     );
 }
@@ -661,15 +663,17 @@ fn real_terminal_does_not_stack_motd_newline_with_shell_startup_newline() {
     assert_motd_prompt_spacing(
         "motd-leading-shell-newline",
         b"ET-MOTD-MARKER\n",
+        b"\r\n",
         Fixture::leading_newline_prompt_shell,
     );
 }
 
 #[test]
-fn real_terminal_removes_trailing_blank_lines_from_motd() {
+fn real_terminal_preserves_trailing_blank_lines_from_motd() {
     assert_motd_prompt_spacing(
         "motd-trailing-blank-lines",
         b"ET-MOTD-MARKER\n\n\n",
+        b"\r\n\r\n\r\n",
         Fixture::prompt_probe_shell,
     );
 }
@@ -716,8 +720,8 @@ fn real_terminal_emits_last_login_between_motd_and_prompt() {
     let prompt_at = find(&output, PROMPT_MARKER).unwrap();
     assert_eq!(
         &output[motd_at + MOTD_MARKER.len()..prompt_at],
-        b"\r\n\r\nLast login: Thu Sep  3 22:41:07 2026 from 127.0.0.1\r\n",
-        "expected SSH-compatible MOTD, blank line, last-login, and prompt order; got {:?}",
+        b"\r\n\r\n\r\nLast login: Thu Sep  3 22:41:07 2026 from 127.0.0.1\r\n",
+        "expected SSH-compatible MOTD, last-login, and prompt order; got {:?}",
         String::from_utf8_lossy(&output),
     );
 

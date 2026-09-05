@@ -424,11 +424,23 @@ impl SshRunner for SystemSsh {
             return Err(ClientError::SshTimeout(invocation.operation));
         }
         let mut command = Command::new(&invocation.program);
+        let checks_control_master = invocation
+            .args
+            .first()
+            .is_some_and(|argument| argument == "-O")
+            && invocation
+                .args
+                .get(1)
+                .is_some_and(|argument| argument == "check");
         command
             .args(&invocation.args)
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(if checks_control_master {
+                Stdio::null()
+            } else {
+                Stdio::inherit()
+            });
         // ssh stays in our process group so it can prompt on the controlling
         // terminal (password, passphrase, host-key confirmation), matching
         // upstream `SubprocessToStringInteractive`. Moving it to its own group

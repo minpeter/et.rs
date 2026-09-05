@@ -341,6 +341,8 @@ fn partial_writes_report_progress_before_completion_and_drain_every_byte() {
             cursor_reports: 0,
             worker_done: false,
             worker_progress: 0,
+            stream: et_core::output_interrupt::TerminalStream::default(),
+            skip_until_newline: false,
         }),
         wake: Condvar::new(),
     });

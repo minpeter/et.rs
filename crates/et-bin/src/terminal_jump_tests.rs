@@ -29,6 +29,16 @@ fn malformed_downstream_initial_response_fails_closed() {
 
 #[test]
 fn jumphost_clamps_destination_before_typed_initial_payload() {
+    for flow_control in [
+        None,
+        Some(FlowControlMode::Backpressure as i32),
+        Some(FlowControlMode::Discard as i32),
+    ] {
+        assert_destination_clamped(flow_control);
+    }
+}
+
+fn assert_destination_clamped(flow_control: Option<i32>) {
     // Given: a destination requiring proof of the clamp before it accepts
     // INITIAL_PAYLOAD and starts terminal output.
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -58,10 +68,7 @@ fn jumphost_clamps_destination_before_typed_initial_payload() {
         let packet = connection.read_packet().unwrap();
         assert_eq!(packet.header(), EtPacketType::InitialPayload as u8);
         let payload = InitialPayload::decode(packet.payload()).unwrap();
-        assert_eq!(
-            payload.flowcontrol,
-            Some(FlowControlMode::Backpressure as i32)
-        );
+        assert_eq!(payload.flowcontrol, flow_control);
         assert_eq!(payload.jumphost, Some(false));
         connection
             .write_packet(
@@ -72,7 +79,7 @@ fn jumphost_clamps_destination_before_typed_initial_payload() {
     });
     let payload = InitialPayload {
         jumphost: Some(false),
-        flowcontrol: Some(FlowControlMode::Backpressure as i32),
+        flowcontrol: flow_control,
         ..Default::default()
     };
 

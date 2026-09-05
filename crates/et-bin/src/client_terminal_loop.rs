@@ -128,6 +128,7 @@ where
     // queue. Keep exact ownership and stop reading the ordered server stream,
     // while stdin, outbound forwarding, keepalive, and recovery stay live.
     let mut pending_output: Option<et_core::packet::Packet> = None;
+    let mut interrupt_input = et_core::output_interrupt::InterruptInput::default();
     let forward_wake = forwarder
         .wake()
         .map_err(|error| terminal_text(error.to_string()))?;
@@ -310,7 +311,12 @@ where
                 }
             }
         }
-        while pending_forward.len() < FORWARD_BACKLOG_CAPACITY && pending_output.is_none() {
+        // Ready input gets the interrupt onto the wire before another flood
+        // batch is read. Output remains bounded even with --flow-control none.
+        while !input.contains(PollFlags::IN)
+            && pending_forward.len() < FORWARD_BACKLOG_CAPACITY
+            && pending_output.is_none()
+        {
             match connection.try_read_packet() {
                 Ok(Some(packet)) => {
                     last_received = Instant::now();
@@ -428,6 +434,11 @@ where
                 return console_output
                     .complete(ConsoleCompletion::LocalInputClosed)
                     .map_err(|error| terminal_io("stopping terminal output", error));
+            }
+            if interrupt_input.feed(&bytes[..count]) {
+                console_output
+                    .interrupt()
+                    .map_err(|error| terminal_io("interrupting console output", error))?;
             }
             let payload = encoded_buffer(&bytes[..count]);
             match write_owned(

@@ -33,17 +33,35 @@ impl ActiveSession {
     }
 
     pub(crate) fn try_read_packet(&self) -> Result<Option<et_core::packet::Packet>, SessionError> {
-        if let Some(flow) = &self.flow_control {
+        if let Some(flow) = self.output_flow() {
             flow.set_reader_waiting(true);
         }
         let result = (|| {
-            self.connection
+            let packet = self
+                .connection
                 .lock()
                 .map_err(|_| SessionError::Unavailable)?
                 .try_read_packet()
-                .map_err(SessionError::Connection)
+                .map_err(SessionError::Connection)?;
+            if let (Some(flow), Some(packet)) = (self.output_flow(), packet.as_ref()) {
+                if packet.header() == et_core::proto::TerminalPacketType::TerminalBuffer as u8 {
+                    use prost::Message;
+                    let input = et_core::proto::TerminalBuffer::decode(packet.payload()).map_err(
+                        |error| {
+                            SessionError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                error,
+                            ))
+                        },
+                    )?;
+                    if let Some(bytes) = input.buffer {
+                        flow.observe_input(&bytes)?;
+                    }
+                }
+            }
+            Ok(packet)
         })();
-        if let Some(flow) = &self.flow_control {
+        if let Some(flow) = self.output_flow() {
             flow.set_reader_waiting(false);
         }
         result
@@ -117,7 +135,7 @@ impl ActiveSession {
             return Ok(false);
         }
         connection.disconnect();
-        if let Some(state) = &self.flow_control {
+        if let Some(state) = self.output_flow() {
             state.disconnected();
         }
         Ok(true)
@@ -144,7 +162,7 @@ impl ActiveSession {
     }
 
     pub(crate) fn can_buffer_write(&self, bytes: i64) -> Result<bool, SessionError> {
-        if let Some(state) = &self.flow_control {
+        if let Some(state) = self.output_flow() {
             let bytes = usize::try_from(bytes).map_err(|_| SessionError::Unavailable)?;
             return state.can_accept_terminal(bytes);
         }

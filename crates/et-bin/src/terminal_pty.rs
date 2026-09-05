@@ -55,11 +55,12 @@ where
     F: FnOnce(&mut LocalStream) -> Result<(), String>,
 {
     let initialization = read_initialization(&mut router)?;
-    if initialization.flow_control != FlowControlMode::None {
-        // Keep terminal output in the server's bounded application queue,
-        // rather than a large opaque local-socket queue (upstream PR #730).
-        et_net::local::minimize_terminal_output_buffering(&router)
-            .map_err(|error| format!("could not bound terminal output buffering: {error}"))?;
+    // Default sessions now also retain interruptible output in userspace.
+    match initialization.flow_control {
+        FlowControlMode::None | FlowControlMode::Backpressure | FlowControlMode::Discard => {
+            et_net::local::minimize_terminal_output_buffering(&router)
+                .map_err(|error| format!("could not bound terminal output buffering: {error}"))?
+        }
     }
     #[cfg(unix)]
     let motd = crate::terminal_motd::load_startup_prefix();

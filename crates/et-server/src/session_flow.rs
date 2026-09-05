@@ -6,6 +6,9 @@ use et_net::connection::ConnError;
 
 use super::{ActiveSession, SessionError, FLOW_CONTROL_BUFFER_BYTES};
 
+const CONNECTED_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const DISCONNECTED_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
 #[cfg(test)]
 #[path = "session_flow_hook.rs"]
 mod test_hook;
@@ -29,6 +32,21 @@ struct WriterState {
     reader_waiting: bool,
     stop: StopMode,
     unrecoverable: bool,
+    default_buffering: bool,
+    input: et_core::output_interrupt::InterruptInput,
+}
+
+impl WriterState {
+    fn set_connected(&mut self, connected: bool) {
+        self.connected = connected;
+        if self.default_buffering {
+            self.queue.set_limit(if connected {
+                CONNECTED_OUTPUT_BYTES
+            } else {
+                DISCONNECTED_OUTPUT_BYTES
+            });
+        }
+    }
 }
 
 pub(super) struct FlowControl {
@@ -40,15 +58,25 @@ pub(super) struct FlowControl {
 
 impl FlowControl {
     pub(super) fn new(mode: FlowControlMode) -> Self {
+        Self::with_limit(mode, FLOW_CONTROL_BUFFER_BYTES)
+    }
+
+    pub(super) fn new_default() -> Self {
+        Self::with_limit(FlowControlMode::Backpressure, CONNECTED_OUTPUT_BYTES)
+    }
+
+    fn with_limit(mode: FlowControlMode, limit: usize) -> Self {
         Self {
             state: Mutex::new(WriterState {
-                queue: OutputQueue::new(mode, FLOW_CONTROL_BUFFER_BYTES),
+                queue: OutputQueue::new(mode, limit),
                 connected: true,
                 paused: false,
                 in_flight: false,
                 reader_waiting: false,
                 stop: StopMode::Running,
                 unrecoverable: false,
+                default_buffering: limit == CONNECTED_OUTPUT_BYTES,
+                input: et_core::output_interrupt::InterruptInput::default(),
             }),
             wake: Condvar::new(),
             #[cfg(test)]
@@ -78,6 +106,17 @@ impl FlowControl {
         }
     }
 
+    pub(super) fn observe_input(&self, bytes: &[u8]) -> Result<usize, SessionError> {
+        let mut state = self.state.lock().map_err(|_| SessionError::Unavailable)?;
+        let dropped = if state.input.feed(bytes) {
+            state.queue.flush_terminal_on_interrupt()
+        } else {
+            0
+        };
+        self.wake.notify_all();
+        Ok(dropped)
+    }
+
     pub(super) fn can_accept_terminal(&self, bytes: usize) -> Result<bool, SessionError> {
         let state = self.state.lock().map_err(|_| SessionError::Unavailable)?;
         Ok(state.stop == StopMode::Running && state.queue.can_accept_terminal(bytes))
@@ -100,7 +139,7 @@ impl FlowControl {
 
     pub(super) fn resume(&self, connected: bool) {
         if let Ok(mut state) = self.state.lock() {
-            state.connected = connected;
+            state.set_connected(connected);
             state.paused = false;
             if !connected && state.stop == StopMode::Graceful {
                 state.unrecoverable = true;
@@ -112,7 +151,7 @@ impl FlowControl {
 
     pub(super) fn disconnected(&self) {
         if let Ok(mut state) = self.state.lock() {
-            state.connected = false;
+            state.set_connected(false);
             self.wake.notify_all();
         }
     }
@@ -234,7 +273,7 @@ impl FlowControl {
             return false;
         };
         state.in_flight = false;
-        state.connected = connected;
+        state.set_connected(connected);
         match result {
             writer::FlowWriteResult::Delivered => {
                 state.queue.complete(&packet);
@@ -245,7 +284,7 @@ impl FlowControl {
             }
             writer::FlowWriteResult::BeforeReplay(_error) => {
                 state.queue.restore_front(packet);
-                state.connected = false;
+                state.set_connected(false);
                 if state.stop == StopMode::Graceful {
                     state.unrecoverable = true;
                     state.stop = StopMode::Hard;
@@ -253,7 +292,7 @@ impl FlowControl {
             }
             writer::FlowWriteResult::ReplayOwned(_error) => {
                 state.queue.complete(&packet);
-                state.connected = false;
+                state.set_connected(false);
                 if state.stop == StopMode::Graceful {
                     state.unrecoverable = true;
                     state.stop = StopMode::Hard;

@@ -35,6 +35,10 @@ where
         &Packet,
     ) -> Result<et_net::connection::PreparedWrite, WritePacketError>,
 {
+    let _write_serial = match session.write_serial.lock() {
+        Ok(guard) => guard,
+        Err(_) => return (FlowWriteResult::Fatal(SessionError::Unavailable), false),
+    };
     let prepared = match session.connection.lock() {
         Ok(_connection) if flow.is_hard_stopped() => {
             return (FlowWriteResult::Fatal(SessionError::Unavailable), false);
@@ -42,6 +46,13 @@ where
         Ok(mut connection) => prepare(&mut connection, packet),
         Err(_) => return (FlowWriteResult::Fatal(SessionError::Unavailable), false),
     };
+    #[cfg(test)]
+    if let Some((reached, release)) = session.prepared_write_hook.lock().unwrap().take() {
+        reached.send(()).unwrap();
+        release
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+    }
     let result = match prepared.and_then(et_net::connection::PreparedWrite::send) {
         Ok(()) => FlowWriteResult::Delivered,
         Err(WritePacketError::BeforeReplay(ConnError::Io(error))) => {
@@ -74,6 +85,10 @@ pub(crate) fn write_packet(
     flow: &FlowControl,
     packet: &Packet,
 ) -> (FlowWriteResult, bool) {
+    let _write_serial = match session.write_serial.lock() {
+        Ok(guard) => guard,
+        Err(_) => return (FlowWriteResult::Fatal(SessionError::Unavailable), false),
+    };
     match session.connection.lock() {
         Ok(_) if flow.is_hard_stopped() => {
             (FlowWriteResult::Fatal(SessionError::Unavailable), false)

@@ -40,7 +40,7 @@ impl ActiveSession {
                 return Err(SessionError::RecoverBusy);
             }
         }
-        if let Some(flow) = &self.flow_control {
+        if let Some(flow) = self.output_flow() {
             if let Err(error) = flow.pause() {
                 self.recovering.store(false, Ordering::Release);
                 return Err(error);
@@ -81,7 +81,7 @@ impl ActiveSession {
         candidate
             .authenticate_peer(DEFAULT_RECOVERY_TIMEOUT)
             .map_err(SessionError::Connection)?;
-        if self.flow_control.is_some() {
+        if self.output_flow().is_some() {
             candidate
                 .minimize_output_buffering()
                 .map_err(SessionError::Connection)?;
@@ -97,6 +97,7 @@ impl ActiveSession {
         // Phase 3: install under a short lock.
         {
             let mut control = lock_timeout(&self.control, RECOVERY_LOCK_TIMEOUT)?;
+            let _write_serial = lock_timeout(&self.write_serial, RECOVERY_LOCK_TIMEOUT)?;
             let mut connection = lock_timeout(&self.connection, RECOVERY_LOCK_TIMEOUT)?;
             if self.torn_down.load(Ordering::Acquire) {
                 drop(connection);
@@ -137,6 +138,7 @@ impl ActiveSession {
                 }
                 std::mem::take(&mut *hold)
             };
+            let _write_serial = lock_timeout(&self.write_serial, RECOVERY_LOCK_TIMEOUT)?;
             let mut connection = lock_timeout(&self.connection, RECOVERY_LOCK_TIMEOUT)?;
             let mut remaining = batch.into_iter();
             while let Some((header, payload)) = remaining.next() {
@@ -201,7 +203,7 @@ impl Drop for RecoverPermit<'_> {
         // Catch anything that observed `recovering` and queued after the first
         // flush but before the flag cleared (re-check is under the hold lock).
         let _ = self.session.flush_recover_hold();
-        if let Some(state) = &self.session.flow_control {
+        if let Some(state) = self.session.output_flow() {
             let connected = self
                 .session
                 .connection

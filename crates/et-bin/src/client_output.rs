@@ -1,4 +1,7 @@
-//! Bounded, nonblocking local console-output worker for opt-in flow control.
+//! Bounded, interruptible local console output, including default sessions.
+
+#[path = "client_output_interrupt.rs"]
+mod output_interrupt;
 
 use std::collections::VecDeque;
 #[cfg(unix)]
@@ -35,6 +38,8 @@ struct State {
     cursor_reports: usize,
     worker_done: bool,
     worker_progress: usize,
+    stream: et_core::output_interrupt::TerminalStream,
+    skip_until_newline: bool,
 }
 
 struct Shared {
@@ -56,8 +61,6 @@ pub(crate) struct ConsoleOutput {
     capacity_wake: LocalStream,
     #[cfg(unix)]
     status_wake: LocalStream,
-    #[cfg(unix)]
-    _idle_signals: Option<(LocalStream, LocalStream)>,
     cancel: Option<Box<dyn FnOnce() + Send>>,
     graceful_finish: Option<Box<dyn FnOnce() -> io::Result<()> + Send>>,
     worker: Option<thread::JoinHandle<()>>,
@@ -65,14 +68,6 @@ pub(crate) struct ConsoleOutput {
 
 impl ConsoleOutput {
     pub(crate) fn stdout(mode: FlowControlMode) -> io::Result<Self> {
-        if mode == FlowControlMode::None {
-            return Self::new_with_lifecycle(
-                mode,
-                Box::new(io::stdout()),
-                Box::new(|| {}),
-                Box::new(|| Ok(())),
-            );
-        }
         #[cfg(unix)]
         {
             let file = File::from(rustix::io::dup(io::stdout().lock().as_fd())?);
@@ -170,24 +165,6 @@ impl ConsoleOutput {
             signal.set_nonblocking(true)?;
             (wake, signal)
         };
-        match mode {
-            FlowControlMode::None => {
-                return Ok(Self {
-                    mode,
-                    shared: None,
-                    #[cfg(unix)]
-                    capacity_wake,
-                    #[cfg(unix)]
-                    status_wake,
-                    #[cfg(unix)]
-                    _idle_signals: Some((capacity_signal, status_signal)),
-                    cancel: None,
-                    graceful_finish: None,
-                    worker: None,
-                });
-            }
-            FlowControlMode::Backpressure | FlowControlMode::Discard => {}
-        }
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 queue: VecDeque::new(),
@@ -197,6 +174,8 @@ impl ConsoleOutput {
                 cursor_reports: 0,
                 worker_done: false,
                 worker_progress: 0,
+                stream: et_core::output_interrupt::TerminalStream::default(),
+                skip_until_newline: false,
             }),
             wake: Condvar::new(),
         });
@@ -221,8 +200,6 @@ impl ConsoleOutput {
             capacity_wake,
             #[cfg(unix)]
             status_wake,
-            #[cfg(unix)]
-            _idle_signals: None,
             cancel: Some(cancel),
             graceful_finish: Some(graceful_finish),
             worker: Some(worker),
@@ -246,13 +223,13 @@ impl ConsoleOutput {
             terminal_modes.observe(bytes);
             return Ok(true);
         };
-        if self.mode == FlowControlMode::Backpressure && bytes.len() > OUTPUT_BYTES {
+        if self.mode != FlowControlMode::Discard && bytes.len() > OUTPUT_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "terminal output packet exceeds console queue capacity",
             ));
         }
-        let retained = if bytes.len() > OUTPUT_BYTES {
+        let mut retained = if bytes.len() > OUTPUT_BYTES {
             &bytes[bytes.len() - OUTPUT_BYTES..]
         } else {
             bytes
@@ -270,15 +247,20 @@ impl ConsoleOutput {
                 "console output stopped",
             ));
         }
+        if state.skip_until_newline {
+            let Some(newline) = retained.iter().position(|byte| *byte == b'\n') else {
+                return Ok(true);
+            };
+            retained = &retained[newline + 1..];
+        }
         match self.mode {
-            FlowControlMode::None => unreachable!("none has no shared output queue"),
-            FlowControlMode::Backpressure
+            FlowControlMode::None | FlowControlMode::Backpressure
                 if state.bytes.saturating_add(retained.len()) > OUTPUT_BYTES
                     || state.queue.len() >= OUTPUT_PACKETS =>
             {
                 return Ok(false);
             }
-            FlowControlMode::Backpressure => {}
+            FlowControlMode::None | FlowControlMode::Backpressure => {}
             FlowControlMode::Discard => {
                 while state.bytes.saturating_add(retained.len()) > OUTPUT_BYTES
                     || state.queue.len() >= OUTPUT_PACKETS
@@ -290,6 +272,9 @@ impl ConsoleOutput {
                 }
             }
         }
+        // Only commit the terminator after admission; a held packet must
+        // retry with the same skip state when the queue is still full.
+        state.skip_until_newline = false;
         state.bytes += retained.len();
         state.queue.push_back(OutputEntry {
             bytes: retained.to_vec(),
@@ -493,6 +478,7 @@ fn run_writer(
                 return;
             };
             state.bytes -= bytes.bytes.len();
+            state.stream.observe(&bytes.bytes);
             bytes
         };
         #[cfg(unix)]
@@ -773,3 +759,7 @@ fn signal_capacity(signal: &mut LocalStream) {
 #[cfg(test)]
 #[path = "client_output_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "client_output_interrupt_tests.rs"]
+mod interrupt_tests;

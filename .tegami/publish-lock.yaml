@@ -1,9 +1,9 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Match SSH login greeting spacing\n\nPreserve the MOTD's original trailing blank lines without inserting an extra\nseparator before the previous-login details. Internal SSH control-master\nchecks no longer print status messages during ET startup.\n"
-    filename: fix-motd-ssh-parity.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Interrupt large terminal output without losing session state\n\nKeep unsent terminal output in interruptible queues. Ctrl+C drops large pending\nfloods while preserving small output, replay-owned frames, and control traffic.\nTmux responses can bypass queued pane floods without splitting incomplete control\nrecords. Default nonterminal packet ordering remains unchanged during recovery.\n\n## Run native Windows HTM sessions\n\nEnable `et.exe htm` and `et.exe htmd` with ConPTY panes, authenticated local IPC,\nresize, and retained-state reattachment. Restarting with `-x` replaces only the\nselected daemon, including when its UI remains attached.\n\nWhen Windows forbids job breakaway, HTM reports that its daemon remains inside\nthe supervising job. It survives the launching UI, not termination of that job.\nThe existing ET server and terminal breakaway policy remains unchanged.\n\n## Exercise Windows runtime behavior in CI\n\nRun native server, ConPTY, same-session recovery, HTM, and process cleanup tests\non Windows. Downloadable test artifacts run without a compiler on the QA host.\nFailure cleanup covers early setup errors and concurrent process exits.\n"
+    filename: release-0.0.25.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - fix-motd-ssh-parity.md
+      - release-0.0.25.md
     id: cargo:et
     updated: true

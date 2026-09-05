@@ -89,8 +89,8 @@ subcommand:
 | `et`            | `et <host>` / `et client <host>` | yes     |
 | `etserver`      | `etserver` / `et server`         | yes     |
 | `etterminal`    | `etterminal` / `et terminal`     | yes     |
-| `htm`           | `htm` / `et htm`                 | no      |
-| `htmd`          | `htmd` / `et htmd`               | no      |
+| `htm`           | `htm` / `et htm`                 | yes     |
+| `htmd`          | `htmd` / `et htmd`               | yes     |
 
 ```sh
 ln -s et etserver && ln -s et etterminal && ln -s et htm && ln -s et htmd
@@ -164,7 +164,20 @@ terminal types are forwarded unchanged.
 
 - The router is a loopback TCP listener; its address and a CSPRNG token live in the `--serverfifo`
   endpoint file under `%LOCALAPPDATA%\etserver`, which takes the place of Unix socket permissions.
-- Unix-socket tunnels and the `htm` multiplexer stay POSIX-only, like upstream.
+- HTM runs native ConPTY panes on Windows 10 1809+; use `et.exe htm` from an
+  HTM-capable terminal emulator. It is a protocol relay, not a standalone pane UI.
+  The pane shell is `SHELL`, then `COMSPEC`, then `cmd.exe`; its home is `USERPROFILE`.
+- HTM IPC uses an authenticated loopback endpoint at `%LOCALAPPDATA%\et-htm\htm.ipc`.
+  The endpoint inherits the user-private application directory ACL, like the router.
+  `--socket` on both HTM roles selects an isolated endpoint; on Windows it must remain
+  below that user's `LOCALAPPDATA` tree, without junctions or parent traversal.
+  Do not grant other users access to this directory or its token files.
+  `htm -x` shuts down only the selected authenticated daemon, not named fleet processes.
+- HTM first requests Windows job breakaway. If the host denies it, HTM reports the
+  restriction and starts a detached, handle-isolated daemon within the host job.
+  It survives the launching `htm` client, but **not termination of that host job**.
+  The stricter `etserver`/`etterminal` SSH-bootstrap breakaway policy is unchanged.
+- Unix-socket tunnels remain POSIX-only.
 - Inbound connections need a firewall rule; the server does not modify firewall state itself.
 
 ## Tests

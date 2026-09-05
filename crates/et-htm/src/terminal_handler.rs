@@ -35,8 +35,9 @@ impl TerminalHandler {
                 pixel_height: 0,
             })
             .map_err(std::io::Error::other)?;
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
+        let shell = default_shell();
         let mut command = CommandBuilder::new(&shell);
+        #[cfg(unix)]
         command.arg("-l");
         if let Some(home) = home_directory() {
             command.cwd(home);
@@ -163,8 +164,38 @@ impl TerminalHandler {
     }
 }
 
+/// Shell selection follows reviewed upstream HTM on each platform.
+pub(crate) fn default_shell() -> String {
+    if let Some(shell) = std::env::var("SHELL").ok().filter(|s| !s.is_empty()) {
+        return shell;
+    }
+    #[cfg(unix)]
+    {
+        "/bin/sh".to_owned()
+    }
+    #[cfg(windows)]
+    {
+        std::env::var("COMSPEC")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "cmd.exe".to_owned())
+    }
+}
+
+impl Drop for TerminalHandler {
+    fn drop(&mut self) {
+        if self.running {
+            self.stop();
+        }
+    }
+}
+
 fn home_directory() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME")
+    #[cfg(unix)]
+    let name = "HOME";
+    #[cfg(windows)]
+    let name = "USERPROFILE";
+    std::env::var_os(name)
         .map(std::path::PathBuf::from)
         .filter(|path| path.is_dir())
 }
@@ -209,7 +240,14 @@ mod tests {
         let pty = portable_pty::native_pty_system()
             .openpty(PtySize::default())
             .unwrap();
+        #[cfg(unix)]
         let mut command = CommandBuilder::new("true");
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = CommandBuilder::new("cmd.exe");
+            command.args(["/C", "exit 0"]);
+            command
+        };
         command.env("HTM_TEST", "1");
         pty.slave.spawn_command(command).unwrap()
     }

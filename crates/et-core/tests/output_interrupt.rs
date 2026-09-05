@@ -208,3 +208,23 @@ fn tmux_responses_precede_queued_pane_flood_without_dropping_bytes() {
     assert_eq!(bytes, [response.as_slice(), pane.as_bytes()].concat());
     assert_eq!(queue.bytes(), 0);
 }
+
+#[test]
+fn incomplete_tmux_records_remain_ordering_barriers_during_promotion() {
+    for (fragment, ending) in [
+        (b"%window-add @".as_slice(), b"2\n".as_slice()),
+        (b"%begin 1 2\nreply\n".as_slice(), b"%end 1 2\n".as_slice()),
+    ] {
+        // Given a complete pane record followed by incomplete control output.
+        let mut queue = queue();
+        let pane = format!("%output %0 {}\n", "x".repeat(70 * 1024));
+        queue.push(terminal(pane.as_bytes())).unwrap();
+        queue.push(terminal(fragment)).unwrap();
+        // When the writer drains before the control terminator arrives.
+        let mut actual = drain(&mut queue);
+        queue.push(terminal(ending)).unwrap();
+        actual.extend(drain(&mut queue));
+        // Then earlier pane bytes never become part of the incomplete record.
+        assert_eq!(actual, [pane.as_bytes(), fragment, ending].concat());
+    }
+}

@@ -129,11 +129,24 @@ impl TerminalStream {
         {
             return None;
         }
-        let mut result = self.partition(bytes, true);
+        // The incomplete suffix is an ordering barrier, including response
+        // blocks whose lines are complete but whose %end has not arrived yet.
+        let mut observed = self.clone();
+        let mut offset = 0;
+        let mut complete = 0;
+        for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+            observed.observe(line);
+            offset += line.len();
+            if line.ends_with(b"\n") && !observed.block {
+                complete = offset;
+            }
+        }
+        let mut result = self.partition(&bytes[..complete], true);
         if result.kept.is_empty() || result.droppable.is_empty() {
             return None;
         }
         result.kept.extend(result.droppable);
+        result.kept.extend_from_slice(&bytes[complete..]);
         Some(result.kept)
     }
 

@@ -18,7 +18,7 @@ permissions:
 
 concurrency:
   group: benchmark-artifacts-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   native:
@@ -55,6 +55,13 @@ jobs:
           repo-token: ${{ github.token }}
       - uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
+      - name: Prepare ephemeral macOS build tools
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+        run: brew install autoconf autoconf-archive automake libtool
       - name: Checkout pinned external C++ oracle
         shell: bash
         run: |

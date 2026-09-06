@@ -55,6 +55,14 @@ jobs:
           repo-token: ${{ github.token }}
       - uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
+      - name: Select the native MSVC linker explicitly
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $linker = Join-Path $env:VCToolsInstallDir 'bin/Hostx64/x64/link.exe'
+          if (!(Test-Path $linker)) { throw "MSVC linker missing: $linker" }
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Output "Selected native linker: $linker"
       - name: Prepare ephemeral macOS build tools
         if: runner.os == 'macOS'
         shell: bash
@@ -62,22 +70,6 @@ jobs:
           HOMEBREW_NO_AUTO_UPDATE: 1
           HOMEBREW_NO_INSTALL_CLEANUP: 1
         run: brew install autoconf autoconf-archive automake libtool
-      - name: Checkout pinned external C++ oracle
-        shell: bash
-        run: |
-          set -euo pipefail
-          git clone --filter=blob:none --no-checkout https://github.com/MisterTea/EternalTerminal.git "$RUNNER_TEMP/et-cpp"
-          git -C "$RUNNER_TEMP/et-cpp" checkout --detach "$UPSTREAM_SHA"
-          git -C "$RUNNER_TEMP/et-cpp" submodule update --init --recursive
-      - name: Build release C++ common roles
-        shell: bash
-        run: |
-          set -euo pipefail
-          cmake -S "$RUNNER_TEMP/et-cpp" -B "$RUNNER_TEMP/et-cpp-build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DDISABLE_TELEMETRY=ON -DDISABLE_CRASH_LOG=ON
-          cmake --build "$RUNNER_TEMP/et-cpp-build" --config Release --parallel 2 --target et htm htmd
-          if [[ "$RUNNER_OS" != Windows ]]; then
-            cmake --build "$RUNNER_TEMP/et-cpp-build" --config Release --parallel 2 --target etserver etterminal
-          fi
       - name: Build matched Rust release arms
         shell: bash
         run: |
@@ -99,6 +91,22 @@ jobs:
           fi
           cargo test --release --locked -p et-htm --lib -- --test-threads=1 --nocapture
           cargo test --release --locked -p et --test htm_runtime -- --test-threads=1 --nocapture
+      - name: Checkout pinned external C++ oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/MisterTea/EternalTerminal.git "$RUNNER_TEMP/et-cpp"
+          git -C "$RUNNER_TEMP/et-cpp" checkout --detach "$UPSTREAM_SHA"
+          git -C "$RUNNER_TEMP/et-cpp" submodule update --init --recursive
+      - name: Build release C++ common roles
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S "$RUNNER_TEMP/et-cpp" -B "$RUNNER_TEMP/et-cpp-build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DDISABLE_TELEMETRY=ON -DDISABLE_CRASH_LOG=ON
+          cmake --build "$RUNNER_TEMP/et-cpp-build" --config Release --parallel 2 --target et htm htmd
+          if [[ "$RUNNER_OS" != Windows ]]; then
+            cmake --build "$RUNNER_TEMP/et-cpp-build" --config Release --parallel 2 --target etserver etterminal
+          fi
       - name: Collect immutable artifact manifest
         shell: bash
         run: |

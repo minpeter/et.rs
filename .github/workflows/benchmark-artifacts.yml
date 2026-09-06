@@ -1,0 +1,140 @@
+name: Native Benchmark Artifacts
+
+on:
+  push:
+    branches: [test/native-benchmark-artifacts]
+  pull_request:
+    paths:
+      - .github/workflows/benchmark-artifacts.yml
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Full candidate commit SHA to build without publishing
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-artifacts-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            lane: windows-x86_64
+          - os: macos-15-intel
+            lane: macos-x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      UPSTREAM_SHA: cd7319020edce131fbd6f21b1a87e07f4ac41cdb
+      BASELINE_SHA: 10cd1aca6ee3059f005e4d57b19c3fb032e521d5
+      CARGO_INCREMENTAL: 0
+      VCPKG_DISABLE_METRICS: 1
+      VCPKG_MAX_CONCURRENCY: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASELINE_SHA }}
+          path: baseline
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha || github.event.pull_request.head.sha || github.sha }}
+          path: candidate
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ github.token }}
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - name: Checkout pinned external C++ oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/MisterTea/EternalTerminal.git "$RUNNER_TEMP/et-cpp"
+          git -C "$RUNNER_TEMP/et-cpp" checkout --detach "$UPSTREAM_SHA"
+          git -C "$RUNNER_TEMP/et-cpp" submodule update --init --recursive
+      - name: Build release C++ common roles
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S "$RUNNER_TEMP/et-cpp" -B "$RUNNER_TEMP/et-cpp-build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DDISABLE_TELEMETRY=ON -DDISABLE_CRASH_LOG=ON
+          cmake --build "$RUNNER_TEMP/et-cpp-build" --config Release --parallel 2 --target et htm htmd
+          if [[ "$RUNNER_OS" != Windows ]]; then
+            cmake --build "$RUNNER_TEMP/et-cpp-build" --config Release --parallel 2 --target etserver etterminal
+          fi
+      - name: Build matched Rust release arms
+        shell: bash
+        run: |
+          set -euo pipefail
+          for arm in baseline candidate; do
+            (cd "$GITHUB_WORKSPACE/$arm" && RUSTFLAGS="--remap-path-prefix=$PWD=/et.rs" cargo build --release --locked -p et --bin et -j 2)
+          done
+      - name: Run native candidate behavior QA
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd candidate
+          export RUSTFLAGS="--remap-path-prefix=$PWD=/et.rs"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            cargo test --release --locked -p et --test windows_runtime -- --test-threads=1 --nocapture
+          else
+            cargo build --release --locked -p et-net --bin et-user-socket-helper
+            cargo test --release --locked -p et --test terminal_tty_qa --test reconnect_end_to_end --test reconnect_outage_end_to_end -- --test-threads=1 --nocapture
+          fi
+          cargo test --release --locked -p et-htm --lib -- --test-threads=1 --nocapture
+          cargo test --release --locked -p et --test htm_runtime -- --test-threads=1 --nocapture
+      - name: Collect immutable artifact manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/benchmark-artifacts"
+          mkdir -p "$out/cpp" "$out/rs-base" "$out/rs-candidate" "$out/qa"
+          ext=""
+          if [[ "$RUNNER_OS" == Windows ]]; then ext=.exe; fi
+          for role in et htm htmd; do cp "$RUNNER_TEMP/et-cpp-build/$role$ext" "$out/cpp/"; done
+          if [[ "$RUNNER_OS" != Windows ]]; then
+            cp "$RUNNER_TEMP/et-cpp-build/etserver" "$RUNNER_TEMP/et-cpp-build/etterminal" "$out/cpp/"
+          fi
+          cp "baseline/target/release/et$ext" "$out/rs-base/"
+          cp "candidate/target/release/et$ext" "$out/rs-candidate/"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            files=(candidate/target/release/deps/windows_runtime-*.exe)
+            [[ ${#files[@]} -eq 1 ]]
+            cp "${files[0]}" "$out/qa/windows_runtime.exe"
+            files=(candidate/target/release/deps/htm_runtime-*.exe)
+            [[ ${#files[@]} -eq 1 ]]
+            cp "${files[0]}" "$out/qa/htm_runtime.exe"
+            cp candidate/crates/et-bin/tests/windows_runtime_support/Run-WindowsRuntime.ps1 "$out/qa/"
+            cp candidate/target/release/et.exe "$out/qa/"
+          fi
+          cp "$RUNNER_TEMP/et-cpp-build/CMakeCache.txt" "$out/CMakeCache.txt"
+          for compiler in "$RUNNER_TEMP"/et-cpp-build/CMakeFiles/*/CMakeCXXCompiler.cmake; do cp "$compiler" "$out/CMakeCXXCompiler.cmake"; done
+          "$out/cpp/et$ext" --help
+          "$out/rs-base/et$ext" --version
+          "$out/rs-candidate/et$ext" --version
+          {
+            printf 'lane=%s\n' '${{ matrix.lane }}'
+            printf 'baseline_sha=%s\n' "$BASELINE_SHA"
+            printf 'candidate_sha='; git -C candidate rev-parse HEAD
+            printf 'upstream_sha='; git -C "$RUNNER_TEMP/et-cpp" rev-parse HEAD
+            git -C "$RUNNER_TEMP/et-cpp" submodule status --recursive
+            rustc -Vv
+            cmake --version
+            printf 'profile=release; timings not collected in CI\n'
+          } > "$out/provenance.txt"
+          (cd "$out" && if command -v sha256sum >/dev/null 2>&1; then find . -type f ! -name SHA256SUMS -exec sha256sum {} + > SHA256SUMS; else find . -type f ! -name SHA256SUMS -exec shasum -a 256 {} + > SHA256SUMS; fi)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-benchmark-${{ matrix.lane }}-${{ github.sha }}
+          path: benchmark-artifacts/
+          if-no-files-found: error
+          retention-days: 14

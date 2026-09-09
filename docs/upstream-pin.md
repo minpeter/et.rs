@@ -10,7 +10,7 @@ Canonical machine files:
 - Ledger (every `master` commit after baseline):
   [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml)
 
-Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-05.
+Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-09.
 `#784` marked `ported` after et.rs [#31](https://github.com/minpeter/et.rs/pull/31) / `906a7ca86691f00a82f88b99b21d7afceb07bf97`.
 `#798` marked `ported` after et.rs [#77](https://github.com/minpeter/et.rs/pull/77).
 
@@ -20,13 +20,13 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-05.
 | Baseline / latest release tag | [`et-v7.0.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.0.0) |
 | Baseline / release commit | [`7656a32a5bc15c6746726a27a5a4ba1e468fab6e`](https://github.com/MisterTea/EternalTerminal/commit/7656a32a5bc15c6746726a27a5a4ba1e468fab6e) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`cd7319020edce131fbd6f21b1a87e07f4ac41cdb`](https://github.com/MisterTea/EternalTerminal/commit/cd7319020edce131fbd6f21b1a87e07f4ac41cdb) (`#804`, 2026-09-05) |
+| Pin tip (last classified) | [`be28bd6de304093edee6efad55a93086fe9befd0`](https://github.com/MisterTea/EternalTerminal/commit/be28bd6de304093edee6efad55a93086fe9befd0) (`#805`, 2026-09-08; reviewed 2026-09-09) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
 | ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.0.0` and `master`) |
 
-The reviewed `7656a32...cd731902` range contains 17 classified commits. Unclassified commits would be drift.
+The reviewed `7656a32...be28bd6` range contains 18 classified commits. Unclassified commits would be drift.
 
-## Ledger (classified 2026-09-05)
+## Ledger (classified 2026-09-09)
 
 | sha | date | kind | status | note |
 | --- | --- | --- | --- | --- |
@@ -47,6 +47,7 @@ The reviewed `7656a32...cd731902` range contains 17 classified commits. Unclassi
 | [`342c0df`](https://github.com/MisterTea/EternalTerminal/commit/342c0dfb32882c94df6aa18092fc897015222c0b) | 2026-09-02 | ci | skip | #802 Windows build/test parity; not a wire or server-lock change |
 | [`584a68b`](https://github.com/MisterTea/EternalTerminal/commit/584a68b4b54c74de7035e6108f49151ebce6a191) | 2026-09-03 | security | skip | #792 disable SO_LINGER. et.rs never sets SO_LINGER and has no globalMutex-on-close; default linger-off already matches. |
 | [`cd731902`](https://github.com/MisterTea/EternalTerminal/commit/cd7319020edce131fbd6f21b1a87e07f4ac41cdb) | 2026-09-05 | product | **ported** | #804 interruptible unsent output and tmux control preservation; et.rs #100. |
+| [`be28bd6`](https://github.com/MisterTea/EternalTerminal/commit/be28bd6de304093edee6efad55a93086fe9befd0) | 2026-09-08 | product | skip | #805/#806 HTM tmux -CC; out of et.rs scope (no HTM). PROTOCOL_VERSION stays 6. |
 
 ## Ported and residual
 
@@ -89,9 +90,13 @@ this pin as a green light to bump `PROTOCOL_VERSION` or land a v7 port.
 [`584a68b`](https://github.com/MisterTea/EternalTerminal/commit/584a68b4b54c74de7035e6108f49151ebce6a191) (`#792`) stays `status: skip`
 (et.rs never sets `SO_LINGER` and has no process-wide mutex around close;
 default linger-off already matches the C++ fix).
+[`be28bd6`](https://github.com/MisterTea/EternalTerminal/commit/be28bd6de304093edee6efad55a93086fe9befd0)
+(`#805` / `#806`) stays `status: skip`. HTM tmux `-CC` so stock terminals can
+attach is out of et.rs scope (no HTM multiplexer), same class as `#801`.
+`PROTOCOL_VERSION` stays 6.
 
 et.rs still claims **protocol v6**. EternalTerminal’s latest product release is
-**v7.0.0**, and the reviewed tip is seventeen classified commits past that tag.
+**v7.0.0**, and the reviewed tip is eighteen classified commits past that tag.
 
 Review ports against the conflict policy in
 [`docs/upstream-factory.md`](upstream-factory.md). Gate any later port with

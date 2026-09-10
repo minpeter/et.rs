@@ -10,8 +10,8 @@ upstream_repo: EternalTerminal
 reviewed_release_tag: et-v7.0.0
 reviewed_release_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
 reviewed_default_branch: master
-reviewed_default_branch_sha: cd7319020edce131fbd6f21b1a87e07f4ac41cdb
-reviewed_date: "2026-09-05"
+reviewed_default_branch_sha: be28bd6de304093edee6efad55a93086fe9befd0
+reviewed_date: "2026-09-09"
 
 # et.rs still claims protocol v6. ET product is v7.0.0; ET wire is still v6.
 et_rs_protocol_version: 6

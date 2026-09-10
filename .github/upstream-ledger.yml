@@ -10,10 +10,10 @@
 #   note: short string
 #   et_pr: optional upstream PR number
 #
-# Classified 2026-09-05. #804 passed independent review in et.rs #100.
+# Classified 2026-09-09. #804 passed independent review in et.rs #100.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-09-05"
+classified: "2026-09-09"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -113,3 +113,9 @@ commits:
     status: ported
     note: "#804 interruptible unsent terminal output, tmux control preservation and priority, bounded socket buffers. Independently reviewed in et.rs #100; protocol remains 6."
     et_pr: 804
+  - sha: be28bd6de304093edee6efad55a93086fe9befd0
+    date: "2026-09-08"
+    kind: product
+    status: skip
+    note: "#805/#806 HTM tmux -CC; out of et.rs scope (no HTM multiplexer). PROTOCOL_VERSION stays 6."
+    et_pr: 805

@@ -10,10 +10,10 @@
 #   note: short string
 #   et_pr: optional upstream PR number
 #
-# Classified 2026-09-09. #804 passed independent review in et.rs #100.
+# Classified 2026-09-11. #804 passed independent review in et.rs #100.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-09-09"
+classified: "2026-09-11"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -119,3 +119,9 @@ commits:
     status: skip
     note: "#805/#806 HTM tmux -CC; out of et.rs scope (no HTM multiplexer). PROTOCOL_VERSION stays 6."
     et_pr: 805
+  - sha: 15256c50903f936bfbd3e90de2b03ffa0184f82d
+    date: "2026-09-10"
+    kind: security
+    status: skip
+    note: "#809 replace select() with epoll/kqueue/poll to avoid FD_SETSIZE fd_set stack corruption on high fds / many port forwards. et.rs is Rust (forbid unsafe), uses socket2/nix and its own nonblocking/connection workers — no C select()/fd_set/FD_SETSIZE path, so the overflow bug does not apply. Same skip pattern as #792. PROTOCOL_VERSION stays 6."
+    et_pr: 809

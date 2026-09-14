@@ -10,7 +10,7 @@ Canonical machine files:
 - Ledger (every `master` commit after baseline):
   [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml)
 
-Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-11.
+Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-14.
 `#784` marked `ported` after et.rs [#31](https://github.com/minpeter/et.rs/pull/31) / `906a7ca86691f00a82f88b99b21d7afceb07bf97`.
 `#798` marked `ported` after et.rs [#77](https://github.com/minpeter/et.rs/pull/77).
 
@@ -20,13 +20,13 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-11.
 | Baseline / latest release tag | [`et-v7.0.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.0.0) |
 | Baseline / release commit | [`7656a32a5bc15c6746726a27a5a4ba1e468fab6e`](https://github.com/MisterTea/EternalTerminal/commit/7656a32a5bc15c6746726a27a5a4ba1e468fab6e) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`15256c50903f936bfbd3e90de2b03ffa0184f82d`](https://github.com/MisterTea/EternalTerminal/commit/15256c50903f936bfbd3e90de2b03ffa0184f82d) (`#809`, 2026-09-10; reviewed 2026-09-11) |
+| Pin tip (last classified) | [`59cee86068bea79090b57a96c366243fc73d6130`](https://github.com/MisterTea/EternalTerminal/commit/59cee86068bea79090b57a96c366243fc73d6130) (HTM PaneScreen comment, 2026-09-11; reviewed 2026-09-14) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
 | ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.0.0` and `master`) |
 
-The reviewed `7656a32...15256c5` range contains 19 classified commits. Unclassified commits would be drift.
+The reviewed `7656a32...59cee86` range contains 20 classified commits. Unclassified commits would be drift.
 
-## Ledger (classified 2026-09-11)
+## Ledger (classified 2026-09-14)
 
 | sha | date | kind | status | note |
 | --- | --- | --- | --- | --- |
@@ -49,6 +49,7 @@ The reviewed `7656a32...15256c5` range contains 19 classified commits. Unclassif
 | [`cd731902`](https://github.com/MisterTea/EternalTerminal/commit/cd7319020edce131fbd6f21b1a87e07f4ac41cdb) | 2026-09-05 | product | **ported** | #804 interruptible unsent output and tmux control preservation; et.rs #100. |
 | [`be28bd6`](https://github.com/MisterTea/EternalTerminal/commit/be28bd6de304093edee6efad55a93086fe9befd0) | 2026-09-08 | product | skip | #805/#806 HTM tmux -CC; out of et.rs scope (no HTM). PROTOCOL_VERSION stays 6. |
 | [`15256c5`](https://github.com/MisterTea/EternalTerminal/commit/15256c50903f936bfbd3e90de2b03ffa0184f82d) | 2026-09-10 | security | skip | #809 replace select() with epoll/kqueue/poll to avoid FD_SETSIZE fd_set stack corruption. et.rs has no C select()/fd_set path (socket2/nix, forbid unsafe). Same skip as #792. PROTOCOL_VERSION stays 6. |
+| [`59cee86`](https://github.com/MisterTea/EternalTerminal/commit/59cee86068bea79090b57a96c366243fc73d6130) | 2026-09-11 | docs | skip | HTM PaneScreen comment-only; out of et.rs scope (no HTM multiplexer). PROTOCOL_VERSION stays 6. |
 
 ## Ported and residual
 
@@ -100,10 +101,13 @@ to avoid `FD_SETSIZE` `fd_set` stack corruption on high fds / many port forwards
 et.rs is Rust (`forbid(unsafe)`), uses socket2/nix and its own nonblocking
 connection workers, and has no C `select()`/`fd_set`/`FD_SETSIZE` path, so the
 overflow bug does not apply (same skip pattern as `#792` `SO_LINGER`).
+[`59cee86`](https://github.com/MisterTea/EternalTerminal/commit/59cee86068bea79090b57a96c366243fc73d6130)
+stays `status: skip`. HTM `PaneScreen` comment-only (ESC k filter vs tmux `-CC`
+/ xterm clients). et.rs has no HTM multiplexer, same class as `#805` / `#801`.
 `PROTOCOL_VERSION` stays 6.
 
 et.rs still claims **protocol v6**. EternalTerminal’s latest product release is
-**v7.0.0**, and the reviewed tip is nineteen classified commits past that tag.
+**v7.0.0**, and the reviewed tip is twenty classified commits past that tag.
 
 Review ports against the conflict policy in
 [`docs/upstream-factory.md`](upstream-factory.md). Gate any later port with

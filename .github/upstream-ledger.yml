@@ -10,10 +10,10 @@
 #   note: short string
 #   et_pr: optional upstream PR number
 #
-# Classified 2026-09-14. #804 passed independent review in et.rs #100.
+# Classified 2026-09-15. #804 passed independent review in et.rs #100.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-09-14"
+classified: "2026-09-15"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -130,3 +130,9 @@ commits:
     kind: docs
     status: skip
     note: "HTM PaneScreen comment-only; out of et.rs scope (no HTM multiplexer). PROTOCOL_VERSION stays 6."
+  - sha: ea2c2ed170b6f0a106a7eee324b14395345a6671
+    date: "2026-09-14"
+    kind: product
+    status: skip
+    note: "#812 optional RAW_STACKTRACE for C++ logger; et.rs has no easylogging/ust path; PROTOCOL_VERSION stays 6."
+    et_pr: 812

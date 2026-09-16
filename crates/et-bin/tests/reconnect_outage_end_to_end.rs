@@ -4,7 +4,8 @@
 //! unreachable while the client tries to reconnect (e.g. a MacBook waking
 //! before Wi-Fi is back), every attempt fails with a transient error. The
 //! client used to exit with "could not reach the ET server" after the first
-//! failed attempt; it must instead keep retrying until the link returns.
+//! failed attempt; it must instead keep retrying until the link returns,
+//! without writing client-local reconnect status into the terminal.
 
 // The shared stack helper exports more than this test needs.
 #[allow(dead_code)]
@@ -41,6 +42,8 @@ fn client_retries_reconnect_through_network_outage() {
         stack.terminal.to_str().unwrap(),
         "--serverfifo",
         stack.router.to_str().unwrap(),
+        "--logdir",
+        stack.directory.to_str().unwrap(),
         "--keepalive=1",
         "-p",
         &proxy.port.to_string(),
@@ -86,9 +89,6 @@ fn client_retries_reconnect_through_network_outage() {
     proxy.wait_for_refused(2);
     proxy.restore();
 
-    // The client announces the retry loop on the first failed attempt.
-    output = receive_until(&output_rx, output, b"connection lost, reconnecting");
-
     // Input typed while the link is down is dropped, so keep asking until
     // the recovered session answers.
     let mut after_pid = None;
@@ -129,10 +129,33 @@ fn client_retries_reconnect_through_network_outage() {
         !text.contains("could not reach the ET server"),
         "client gave up during the outage: {text}"
     );
+    assert!(
+        !text.contains("connection lost, reconnecting"),
+        "client wrote reconnect status text into the terminal: {text}"
+    );
+    for control in [b"\x1b[22;2t".as_slice(), b"\x1b[23;2t", b"\x1b]2;et:"] {
+        assert!(
+            !output
+                .windows(control.len())
+                .any(|window| window == control),
+            "client wrote reconnect status control bytes into the terminal: {output:?}"
+        );
+    }
     let refused = proxy.join();
     assert!(
         refused >= 2,
         "expected multiple retried reconnect attempts, saw {refused}"
+    );
+    let client_log = fs::read_dir(&stack.directory)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("etclient-"))
+        .expect("client log file")
+        .path();
+    let client_log = fs::read_to_string(client_log).unwrap();
+    assert!(
+        client_log.contains("reconnect attempt failed, retrying:"),
+        "retry failure missing from client log: {client_log}"
     );
     stack.shutdown();
 }
@@ -254,23 +277,6 @@ fn join_relays((first, second): Relays) -> io::Result<()> {
         }
     }
     Ok(())
-}
-
-fn receive_until(
-    receiver: &mpsc::Receiver<Vec<u8>>,
-    mut output: Vec<u8>,
-    marker: &[u8],
-) -> Vec<u8> {
-    while !output.windows(marker.len()).any(|window| window == marker) {
-        output.extend(receiver.recv_timeout(TIMEOUT).unwrap_or_else(|error| {
-            panic!(
-                "timed out waiting for {}: {error}; output={}",
-                String::from_utf8_lossy(marker),
-                String::from_utf8_lossy(&output)
-            )
-        }));
-    }
-    output
 }
 
 fn receive_number(

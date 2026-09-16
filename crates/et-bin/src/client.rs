@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::io::IsTerminal;
 use std::time::Duration;
 
 use clap::Parser;
@@ -377,7 +378,6 @@ fn reconnect_with_retry(
     credentials: &Credentials,
     resolver: &dyn EndpointResolver,
 ) -> Result<ReconnectOutcome, ClientError> {
-    let mut announced = false;
     retry_transient(
         || {
             reconnect(
@@ -389,11 +389,6 @@ fn reconnect_with_retry(
             )
         },
         |error| {
-            if !announced {
-                announced = true;
-                // Raw mode is active: lines need explicit carriage returns.
-                eprint!("\r\net: connection lost, reconnecting... (press Ctrl-C to give up)\r\n");
-            }
             et_cli::logging::info(format!("reconnect attempt failed, retrying: {error}"));
             reconnect_wait_aborted(RECONNECT_RETRY_DELAY)
         },
@@ -427,7 +422,7 @@ fn retry_transient<T>(
 /// which is also what a dead TCP connection would have done with it.
 #[cfg(unix)]
 fn reconnect_wait_aborted(delay: Duration) -> bool {
-    use std::io::{IsTerminal, Read};
+    use std::io::Read;
 
     use rustix::event::{poll, PollFd, PollFlags};
     use rustix::time::Timespec;

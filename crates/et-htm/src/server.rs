@@ -39,23 +39,20 @@ pub fn dump_panes(path: &Path) -> io::Result<String> {
 }
 
 fn read_diagnostic(stream: &mut Stream, mut bytes: &mut [u8], deadline: Instant) -> io::Result<()> {
+    stream.set_nonblocking(true)?;
     while !bytes.is_empty() {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .filter(|duration| !duration.is_zero())
             .ok_or(io::ErrorKind::TimedOut)?;
-        stream.set_read_timeout(Some(remaining))?;
         match stream.read(bytes) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => bytes = &mut bytes[n..],
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Err(io::ErrorKind::TimedOut.into())
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                // Do not reset socket timeouts between header/body reads: the
+                // one-shot peer may already have closed with data buffered.
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
             }
             Err(error) => return Err(error),
         }
@@ -303,6 +300,20 @@ impl HtmServer {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostic_reads_buffered_response_after_peer_close() {
+        let (mut reader, mut writer) = Stream::pair().unwrap();
+        writer.write_all(b"\0\0\0\0\x04dump").unwrap();
+        drop(writer);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut header = [0; 5];
+        read_diagnostic(&mut reader, &mut header, deadline).unwrap();
+        assert_eq!(header, [0, 0, 0, 0, 4]);
+        let mut body = [0; 4];
+        read_diagnostic(&mut reader, &mut body, deadline).unwrap();
+        assert_eq!(&body, b"dump");
+    }
+
     #[test]
     fn diagnostic_deadline_is_absolute_despite_fragmented_progress() {
         let (mut reader, mut writer) = Stream::pair().unwrap();

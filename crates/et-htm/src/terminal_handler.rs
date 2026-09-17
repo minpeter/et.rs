@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::{Duration, Instant};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 
@@ -21,6 +22,7 @@ pub struct TerminalHandler {
     output: Receiver<Vec<u8>>,
     initial_cwd: PathBuf,
     running: bool,
+    exit_deadline: Option<Instant>,
     buffer: VecDeque<String>,
     buffer_length: i64,
 }
@@ -105,6 +107,7 @@ impl TerminalHandler {
             output,
             initial_cwd,
             running: true,
+            exit_deadline: None,
             buffer: VecDeque::new(),
             buffer_length: 0,
         })
@@ -116,15 +119,26 @@ impl TerminalHandler {
             return Vec::new();
         }
         let mut collected = Vec::new();
+        let mut eof = false;
         while collected.len() < READ_BUFFER {
             match self.output.try_recv() {
                 Ok(chunk) => collected.extend_from_slice(&chunk),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    // The shell exited and closed the PTY.
-                    self.running = self.child.try_wait().ok().flatten().is_none();
+                    eof = true;
                     break;
                 }
+            }
+        }
+        // ConPTY can keep its output pipe open after the child exits. Reap
+        // independently of EOF, allowing a bounded final drain before dropping
+        // the master (which closes the pseudo-console and unblocks its reader).
+        if self.exit_deadline.is_none() && self.child.try_wait().ok().flatten().is_some() {
+            self.exit_deadline = Some(Instant::now() + Duration::from_millis(250));
+        }
+        if let Some(deadline) = self.exit_deadline {
+            if eof || Instant::now() >= deadline {
+                self.running = false;
             }
         }
         if !collected.is_empty() {
@@ -357,6 +371,9 @@ impl Drop for TerminalHandler {
         if self.running {
             self.stop();
         }
+        // Release a reader blocked on our bounded channel before the master
+        // closes ConPTY, whose shutdown may otherwise wait for that reader.
+        self.output = mpsc::channel().1;
     }
 }
 
@@ -375,6 +392,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exited_child_drains_output_without_waiting_for_pty_eof() {
+        let mut handler = TerminalHandler::start().unwrap();
+        let (sender, output) = mpsc::sync_channel(2);
+        handler.output = output;
+        handler.child.kill().unwrap();
+        handler.child.wait().unwrap();
+        sender.send(b"final output".to_vec()).unwrap();
+        assert_eq!(handler.poll_user_terminal(), b"final output");
+        assert!(handler.is_running(), "allow late output during final drain");
+        sender.send(b"late output".to_vec()).unwrap();
+        assert_eq!(handler.poll_user_terminal(), b"late output");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while handler.is_running() && std::time::Instant::now() < deadline {
+            handler.poll_user_terminal();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            !handler.is_running(),
+            "child exit must not depend on PTY EOF"
+        );
+        drop(sender);
+    }
+
+    #[test]
     fn pty_is_created_at_client_dimensions() {
         let handler = TerminalHandler::start_in_size(None, 117, 31).unwrap();
         let size = handler.master.get_size().unwrap();
@@ -390,6 +431,7 @@ mod tests {
             output: mpsc::channel().1,
             initial_cwd: PathBuf::from("/"),
             running: true,
+            exit_deadline: None,
             buffer: VecDeque::new(),
             buffer_length: 0,
         };

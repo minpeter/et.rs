@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -93,6 +95,7 @@ pub struct Relay {
     process: Child,
     pub input: ChildStdin,
     messages: Receiver<Vec<u8>>,
+    output: RefCell<BTreeMap<String, Vec<u8>>>,
 }
 
 impl Relay {
@@ -141,6 +144,7 @@ impl Relay {
             process,
             input,
             messages,
+            output: RefCell::default(),
         }
     }
 
@@ -154,7 +158,13 @@ impl Relay {
     }
 
     pub fn reply(&self) -> Vec<u8> {
-        while !self.line().starts_with(b"%begin ") {}
+        loop {
+            let line = self.line();
+            if line.starts_with(b"%begin ") {
+                break;
+            }
+            self.remember_output(&line);
+        }
         let mut out = Vec::new();
         loop {
             let line = self.line();
@@ -189,18 +199,41 @@ impl Relay {
 
     pub fn output_contains(&self, pane: &str, expected: &[u8]) {
         let deadline = std::time::Instant::now() + LIMIT;
-        let mut output = Vec::new();
         loop {
-            let body = self
-                .messages
-                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-                .expect("pane output event");
-            if let Some(data) = body.strip_prefix(format!("%output {pane} ").as_bytes()) {
-                output.extend(unescape(data));
-                if output.windows(expected.len()).any(|part| part == expected) {
+            {
+                let mut panes = self.output.borrow_mut();
+                let output = panes.entry(pane.into()).or_default();
+                if let Some(at) = output
+                    .windows(expected.len())
+                    .position(|part| part == expected)
+                {
+                    output.drain(..at + expected.len());
                     return;
                 }
             }
+            let body = self
+                .messages
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "waiting for {pane} {:?}: {error}; output: {:?}",
+                        String::from_utf8_lossy(expected),
+                        self.output.borrow()
+                    )
+                });
+            self.remember_output(&body);
+        }
+    }
+
+    fn remember_output(&self, line: &[u8]) {
+        if let Some(body) = line.strip_prefix(b"%output ") {
+            let space = body.iter().position(|b| *b == b' ').unwrap();
+            let pane = String::from_utf8(body[..space].to_vec()).unwrap();
+            self.output
+                .borrow_mut()
+                .entry(pane)
+                .or_default()
+                .extend(unescape(body[space + 1..].strip_suffix(b"\n").unwrap()));
         }
     }
 
@@ -220,6 +253,37 @@ impl Drop for Relay {
         let _ = self.process.kill();
         let _ = self.process.wait();
     }
+}
+
+#[test]
+fn output_before_reply_and_interleaved_panes_are_retained() {
+    let mut process = Command::new(executable())
+        .arg("--version")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let input = process.stdin.take().unwrap();
+    let (sender, messages) = mpsc::channel();
+    let relay = Relay {
+        process,
+        input,
+        messages,
+        output: RefCell::default(),
+    };
+    for line in [
+        "%output %1 hel\n",
+        "%begin 1 1 1\n",
+        "%end 1 1 1\n",
+        "%output %2 other\n",
+        "%output %1 lo\\040world\n",
+    ] {
+        sender.send(line.as_bytes().to_vec()).unwrap();
+    }
+    assert!(relay.reply().is_empty());
+    relay.output_contains("%1", b"hello world");
+    relay.output_contains("%2", b"other");
+    assert!(relay.output.borrow().values().all(Vec::is_empty));
 }
 
 /// Owns the namespace and shutdown capability of an automatically started daemon.

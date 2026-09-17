@@ -1,5 +1,4 @@
 use std::ffi::OsString;
-use std::io::IsTerminal;
 use std::time::Duration;
 
 use clap::Parser;
@@ -422,7 +421,7 @@ fn retry_transient<T>(
 /// which is also what a dead TCP connection would have done with it.
 #[cfg(unix)]
 fn reconnect_wait_aborted(delay: Duration) -> bool {
-    use std::io::Read;
+    use std::io::{IsTerminal, Read};
 
     use rustix::event::{poll, PollFd, PollFlags};
     use rustix::time::Timespec;

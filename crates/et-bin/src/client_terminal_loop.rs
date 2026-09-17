@@ -293,7 +293,7 @@ where
         if resize.intersects(PollFlags::IN | PollFlags::HUP) {
             drain(wake)?;
             if terminal_enabled {
-                if let Some(payload) = terminal_size_payload()? {
+                if let Some(payload) = terminal_size_payload() {
                     if matches!(
                         write_terminal_size(connection, &payload, &mut reconnect, &mut stream)?,
                         OwnedWriteOutcome::SessionEnded

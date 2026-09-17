@@ -84,7 +84,7 @@ where
     // failed before replay ownership; after admission, recover and let the
     // buffered packet replay instead of duplicating a `--command`.
     if terminal_enabled {
-        if let Some(initial_size) = terminal_size_payload()? {
+        if let Some(initial_size) = terminal_size_payload() {
             if matches!(
                 write_terminal_size_recovering(&mut connection, &initial_size, &mut reconnect)?,
                 OwnedWriteOutcome::SessionEnded
@@ -436,11 +436,24 @@ where
     )
 }
 
-pub(crate) fn terminal_size_payload() -> Result<Option<Vec<u8>>, ClientError> {
-    if !io::stdout().is_terminal() {
-        return Ok(None);
+pub(crate) fn terminal_size_payload() -> Option<Vec<u8>> {
+    #[cfg(test)]
+    if let Some(query) = tests::SIZE_QUERY.get() {
+        return terminal_size_payload_with(true, query);
     }
-    let (columns, rows) = size().map_err(|error| terminal_io("reading terminal size", error))?;
+    terminal_size_payload_with(io::stdout().is_terminal(), size)
+}
+
+fn terminal_size_payload_with(
+    is_terminal: bool,
+    query: impl FnOnce() -> io::Result<(u16, u16)>,
+) -> Option<Vec<u8>> {
+    if !is_terminal {
+        return None;
+    }
+    // Upstream #803: an unavailable size is no new observation, not a zero
+    // size or a session failure. Transport errors still belong to the caller.
+    let (columns, rows) = query().ok()?;
     let message = TerminalInfo {
         id: None,
         row: Some(i32::from(rows)),
@@ -448,7 +461,7 @@ pub(crate) fn terminal_size_payload() -> Result<Option<Vec<u8>>, ClientError> {
         width: Some(0),
         height: Some(0),
     };
-    Ok(Some(message.encode_to_vec()))
+    Some(message.encode_to_vec())
 }
 
 /// Finish an initial client write without losing a session to a race between
@@ -482,8 +495,8 @@ where
 /// The latter race is common after laptop wake: Wi-Fi can become routable long
 /// enough for TCP recovery and then lose the first application packet.  Keep
 /// recovery inside the reconnect loop until a live terminal-size update has
-/// been sent, just as upstream reconnects after every socket read/write
-/// error.
+/// been sent or no size can be observed. An unavailable local size does not
+/// invalidate a successfully recovered transport.
 pub(crate) fn recover_transport<F>(
     connection: &mut Connection,
     reconnect: &mut F,
@@ -500,7 +513,7 @@ where
                 return Ok(true);
             }
             ReconnectOutcome::Recovered => {
-                let Some(payload) = terminal_size_payload()? else {
+                let Some(payload) = terminal_size_payload() else {
                     return Ok(true);
                 };
                 match connection

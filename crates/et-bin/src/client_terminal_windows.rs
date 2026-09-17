@@ -165,7 +165,7 @@ where
                         }
                     }
                     Event::Resize(_, _) if terminal_enabled => {
-                        if let Some(payload) = terminal_size_payload()? {
+                        if let Some(payload) = terminal_size_payload() {
                             match write_terminal_size_recovering(
                                 connection,
                                 &payload,

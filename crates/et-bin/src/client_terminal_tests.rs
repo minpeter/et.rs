@@ -16,6 +16,152 @@ use crate::client_terminal::{connection_ended, RemoteLines};
 use crate::error::ClientError;
 use crate::initial_connect::ReconnectOutcome;
 
+type SizeQuery = fn() -> std::io::Result<(u16, u16)>;
+thread_local! {
+    pub(super) static SIZE_QUERY: std::cell::Cell<Option<SizeQuery>> = const { std::cell::Cell::new(None) };
+    static SIZE_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct UnavailableSize;
+
+impl UnavailableSize {
+    fn enter() -> Self {
+        SIZE_QUERIES.set(0);
+        SIZE_QUERY.set(Some(|| {
+            SIZE_QUERIES.set(SIZE_QUERIES.get() + 1);
+            Err(std::io::ErrorKind::Other.into())
+        }));
+        Self
+    }
+}
+
+impl Drop for UnavailableSize {
+    fn drop(&mut self) {
+        SIZE_QUERY.set(None);
+    }
+}
+
+#[test]
+fn terminal_size_failure_is_no_observation_and_later_sizes_remain_exact() {
+    assert!(super::terminal_size_payload_with(false, || panic!("not a terminal")).is_none());
+    for dimensions in [(113, 37), (91, 52)] {
+        let payload = super::terminal_size_payload_with(true, || Ok(dimensions)).unwrap();
+        let info = TerminalInfo::decode(payload.as_slice()).unwrap();
+        assert_eq!(info.column, Some(i32::from(dimensions.0)));
+        assert_eq!(info.row, Some(i32::from(dimensions.1)));
+        assert_eq!((info.width, info.height), (Some(0), Some(0)));
+        assert!(super::terminal_size_payload_with(true, || {
+            Err(std::io::ErrorKind::Interrupted.into())
+        })
+        .is_none());
+    }
+}
+
+#[test]
+fn unavailable_initial_terminal_size_does_not_skip_command_validation() {
+    let _size = UnavailableSize::enter();
+    let (stream, _peer) = tcp_pair();
+    let connection = Connection::new_client(stream, &[7u8; KEY_LEN]);
+    let result = super::run(
+        connection,
+        super::TerminalOptions {
+            command: Some("bad\0command"),
+            no_exit: false,
+            keepalive: 1,
+            flow_control: et_cli::client::FlowControlMode::Backpressure,
+            terminal_enabled: true,
+            lines: RemoteLines::Posix,
+            connection_name: "test",
+        },
+        et_net::forward::Forwarder::start(Vec::new()).unwrap(),
+        |_| panic!("a size observation must not reconnect"),
+    );
+    assert!(
+        matches!(result, Err(ClientError::Terminal(message)) if message == "remote command is invalid or too large")
+    );
+    assert_eq!(SIZE_QUERIES.get(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn unavailable_live_terminal_size_keeps_the_pump_alive() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let _size = UnavailableSize::enter();
+    let (stream, peer) = tcp_pair();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let server = std::thread::spawn(move || {
+        let mut receiver = Connection::new_server(peer, &[7u8; KEY_LEN]);
+        // A keepalive, not a fabricated zero-size packet, proves the pump
+        // continued beyond the failed resize observation.
+        let packet = receiver.read_packet().unwrap();
+        assert_eq!(packet.header(), TerminalPacketType::KeepAlive as u8);
+    });
+    let mut connection = Connection::new_client(stream, &[7u8; KEY_LEN]);
+    let (mut wake, mut writer) = UnixStream::pair().unwrap();
+    wake.set_nonblocking(true).unwrap();
+    writer.write_all(&[1]).unwrap();
+    let mut modes = TerminalModeState::default();
+    let mut ended = 0;
+    crate::client_terminal_loop::pump(
+        &mut connection,
+        &mut wake,
+        crate::client_terminal_loop::PumpOptions {
+            read_stdin: false,
+            keepalive_seconds: 1,
+            flow_control: et_cli::client::FlowControlMode::Backpressure,
+            terminal_enabled: true,
+            auto_cursor_report: false,
+            terminal_modes: &mut modes,
+        },
+        &mut et_net::forward::Forwarder::start(Vec::new()).unwrap(),
+        |_| {
+            ended += 1;
+            Ok(ReconnectOutcome::SessionEnded)
+        },
+    )
+    .unwrap();
+    server.join().unwrap();
+    assert_eq!(SIZE_QUERIES.get(), 1);
+    assert_eq!(ended, 1);
+}
+
+#[test]
+fn unavailable_post_recovery_terminal_size_preserves_the_recovered_transport() {
+    let _size = UnavailableSize::enter();
+    let (stream, peer) = tcp_pair();
+    let mut connection = Connection::new_client(stream, &[7u8; KEY_LEN]);
+    let mut receiver = Connection::new_server(peer, &[7u8; KEY_LEN]);
+    let mut attempts = 0;
+    assert!(recover_transport(
+        &mut connection,
+        &mut |_| {
+            attempts += 1;
+            Ok(ReconnectOutcome::Recovered)
+        },
+        true,
+    )
+    .unwrap());
+    assert_eq!(attempts, 1);
+    assert_eq!(SIZE_QUERIES.get(), 1);
+    super::send_buffer(&mut connection, b"after recovery").unwrap();
+    let packet = receiver.read_packet().unwrap();
+    assert_eq!(packet.header(), TerminalPacketType::TerminalBuffer as u8);
+    assert_eq!(
+        TerminalBuffer::decode(packet.payload()).unwrap().buffer,
+        Some(b"after recovery".to_vec())
+    );
+    let result = recover_transport(
+        &mut connection,
+        &mut |_| Err(ClientError::Terminal("reconnect failed".into())),
+        true,
+    );
+    assert!(matches!(result, Err(ClientError::Terminal(message)) if message == "reconnect failed"));
+    assert_eq!(SIZE_QUERIES.get(), 1);
+}
+
 #[test]
 fn outbound_forwarding_prevents_successful_remote_completion() {
     let current = Packet::new(

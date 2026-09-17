@@ -1,0 +1,177 @@
+# Probe formats, missing flags, targets and success-only commands.
+ls
+lsw
+lsp
+display -p '#{version}|#{socket_path}|#{pid}|#{pane-border-status}|#{session_id}|#{window_id}|#{pane_id}'
+display -pt%999 '#{session_id}|#{window_id}|#{pane_id}'
+display -pt@999 '#{session_id}|#{window_id}|#{pane_id}'
+display -pt$999 '#{session_id}|#{window_id}|#{pane_id}'
+lsp -a -t%invalid
+lsp -t%999
+lsw -t$0
+resizep -t%999
+killp -t%999
+killw -t@999
+unlinkw -t@999
+swapp -s%999 -t%0
+joinp -s%0 -t%999
+movew -s@999 -t$1
+breakp -s%999 -P
+capturep -pt%999
+capturep -pPC
+copy-mode -t%invalid
+clear-history
+list-keys
+list-clients
+phony-command
+linkw -s@999 -t$999
+lscm
+# iTerm2 bootstrap and affinities; WezTerm version/refresh probe.
+show -vq -t$1 @iterm2_id; refresh-client -C 80,25; list-windows -F '#{window_id} #{?window_active,1,0}'
+set -t$1 @iterm2_id native
+set -t$1 @affinities a_312c332032
+show -vt$1 @affinities
+detach
+show -gv @affinities
+set -go @probe first
+set -ga @probe second
+show -gv @probe
+set -gu @probe
+show -gv @probe
+set -s @scope server
+show -sv @scope
+setw -t@0 @scope window
+showw -vt@0 @scope
+set -pwt%0 @scope pane
+show -pvt%0 @scope
+set -pt%999 @scope ignored
+show -pvt%999 @scope
+set -t$999 @scope ignored
+show -vt$999 @scope
+set -g status off
+show -gv status
+setb -btest payload
+showb -btest
+set-buffer default
+show-buffer
+refresh -f wait-exit,pause-after=0,no-output -A%123:continue -A%124:pause -A%125:off -A%126:unknown
+refresh -f '!wait-exit,!pause-after,!no-output' -A%124:on -A%125:continue
+# Geometry, select/zoom, same-axis n-ary split, split-of-split.
+splitw -hP
+splitw -hP -t%0
+splitw -vP -t%0
+lsp -a -F '#{pane_id} #{pane_left},#{pane_top} #{pane_width}x#{pane_height} #{pane_active}'
+resizep -t%0 -x17
+resizep -t%0 -x17
+resizep -t%0 -y7
+resizep -t%0 -y7
+resizep -t%0 -x0 -y0
+resizep -t%0 -L 3
+resizep -t%0 -R 4
+resizep -t%0 -U 2
+resizep -t%0 -D 1
+resizep -t%0 -Z
+lsw
+resizep -t%2 -Z
+resizep -t%2 -x21
+resizep -t%2 -R 3
+resizep -t%2 -Z
+resizew -t@0 -x124 -y33
+selectp -t%0 -T pane-title
+display -pt%0 '#{pane_title}|#{pane_index}|#{cursor_flag}|#{alternate_on}|#{scroll_region_lower}|#{mouse_sgr_flag}|#{pane_tabs}|#{cursor_colour}'
+selectl -t@0 even-horizontal
+selectl -t@0 even-vertical
+selectl -t@0 tiled
+selectl -t@0 unsupported-layout
+selectp -t%1
+swapp -s%0 -t%2
+lsp -F '#{pane_id} #{pane_left},#{pane_top} #{pane_width}x#{pane_height}'
+joinp -s%3 -t%2 -bh
+breakp -s%0 -P -F '#{window_id} #{pane_id}'
+lsw -F '#{window_id} #{window_index} #{window_raw_flags} #{window_layout}'
+swapp -s%0 -t%1
+movep -s%2 -t%0 -v
+movep -s%3 -t%0 -h
+lsp -a -F '#{window_id} #{pane_id} #{pane_left},#{pane_top} #{pane_width}x#{pane_height}'
+neww -adkP -n named -c /tmp ignored-shell
+selectw -t@0
+display -pt$1 '#{?#{window_active},#{?pane_active,yes,no},inactive}'
+new -ds second
+ls
+attach -tsecond
+display -pt%0 '#{session_id} #{window_id} #{pane_id}'
+rename -t$2 renamed
+renamew -t@2 fixed
+movew -s@2 -t$2
+lsw -t$1
+lsw -t$2
+attach -t$1
+killp -t%2
+killw -t@0
+kill-session -t$2
+ls
+neww -P
+resizep -x 30 -y 9
+selectl
+capturep -peC
+capturep -paC
+display -p '#{?missing,yes,no}|#{q:window_id}|unclosed#{missing'
+ls -F '#{unknown}'
+lsp -F '#{unknown}'
+lsw -F '#{unknown}'
+oracle-keys hex 61 FF 100 0xd invalid -1 +41 ' 42' 0x 0xno 100000041 -10000000000000000 10000000000000000 -ffffffffffffffff
+oracle-keys named Enter C-m KPEnter Escape C-[ Esc Space Tab C-i BSpace Bspace C-a C-Z 0xd 0X20 0xno 0x 0x-1 Up
+oracle-keys literal Enter Space hello
+list-session -F '#{session_name}'
+list-sessions -F '#{?session_id,#{session_id},missing}'
+display -p '#{?#{unknown},yes,#{?window_active,active,inactive}}'
+display -p -- '-dash'
+display -p trailing\
+display -p "unterminated
+display -p "a\ b"; display -p 'semi;colon'
+show-option -gv @missing
+show-options -gv @missing
+set-option -go @default one
+set-window-option -t @4 @name value
+show-window-options -vt @4 @name
+refresh-client -C@0:80x24 -F no-output -f '!no-output'
+refresh-client -C@4:90x28
+refresh-client -A invalid -B ignored
+new-session -ds third
+move-window -s@4 -tthird
+move-window -s@4 -tthird
+attach-session -tthird
+rename-session -tthird THIRD
+new-window -P -F '#{window_id} #{pane_id}'
+swap-pane -s%6 -t%7
+split-window -hP
+join-pane -s%6 -t%8 -v
+move-pane -s%8 -t%6 -hb
+break-pane -s%8 -P
+select-window -t@5
+select-pane -t%6
+select-layout -t@5 main-horizontal
+select-layout -t@5 main-vertical
+resize-pane -t%6 -L 0
+resize-pane -t%6 -L -- -3
+resize-pane -t%6 -x1 -y1
+resize-pane -t%6 -x1 -y1
+resize-window -t@5 -x1 -y1
+list-panes -a -F '#{window_id} #{pane_id} #{pane_width}x#{pane_height} #{pane_left},#{pane_top}'
+capture-pane -pt%6 -S-2147483648 -E2147483647
+send-keys -t%999 hi
+send -t%999 -H 61
+kill-session -t$999
+kill-pane -t%999
+kill-window -t@999
+unlink-window -t@999
+link-window -t@999
+clearhist
+lsk
+lsc
+not-a-command; neww
+list-windows -F '#{window_id}'
+refresh -C
+refresh -C@:
+refresh -C10,15x40
+resizew -x' 20' -y' 9suffix'

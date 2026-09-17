@@ -3,8 +3,8 @@
 //! Headless terminal multiplexer (`htm` / `htmd`), ported from upstream
 //! `src/htm/`.
 //!
-//! - [`codes`] and [`framing`] reproduce the HTM wire protocol byte for byte.
-//! - [`state`] is the tabs/splits/panes model with upstream's JSON shape.
+//! - [`codes`] and [`framing`] implement tmux extended control-mode framing.
+//! - [`state`] owns server-assigned IDs, windows and pane screens.
 //! - [`server`] is `htmd` (multiplexer daemon), [`client`] is `htm` (relay).
 
 #[cfg(unix)]
@@ -13,7 +13,11 @@ pub mod client;
 #[path = "client_windows.rs"]
 pub mod client;
 pub mod codes;
+pub mod control;
+pub mod formats;
 pub mod framing;
+pub mod layout;
+pub mod screen;
 pub mod server;
 pub mod state;
 pub mod terminal_handler;

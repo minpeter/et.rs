@@ -1,78 +1,124 @@
-//! Windows HTM is a byte relay, including when stdin/stdout are redirected by
-//! the HTM-capable terminal emulator. Console input cannot be polled with a
-//! Winsock socket, so one process-lifetime thread owns the blocking stdin read.
-//! The role's main thread returns on daemon EOF even if stdin remains open;
-//! process exit releases that reader, without waiting for another keystroke.
-
+//! Bounded Windows bridge. The console gateway preserves tmux DCS through
+//! ConPTY, while redirected output remains the ordinary control byte stream.
+use crate::transport::Stream;
 use std::io::{self, Read, Write};
-use std::net::Shutdown;
-use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::transport::{self, Stream};
-
 pub struct Stdin(pub std::io::Stdin);
-
 impl Read for Stdin {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         self.0.lock().read(buffer)
     }
 }
 
-pub fn connect(path: &Path) -> io::Result<Stream> {
-    let mut last_error = io::Error::from(io::ErrorKind::NotFound);
-    for attempt in 0..5 {
-        match transport::connect(path) {
-            Ok(stream) => return Ok(stream),
-            Err(error) => last_error = error,
+fn emit(writer: &mut impl Write, bytes: &[u8], console: bool) -> io::Result<()> {
+    if console {
+        for chunk in bytes.chunks(15) {
+            writer.write_all(b"\x1b[?777")?;
+            for byte in chunk {
+                write!(writer, ";{byte}")?;
+            }
+            writer.write_all(b"q")?;
         }
-        if attempt < 4 {
-            std::thread::sleep(Duration::from_secs(1));
-        }
+    } else {
+        writer.write_all(bytes)?;
     }
-    Err(last_error)
+    writer.flush()
 }
 
 pub fn run(
     stream: &mut Stream,
     mut input: impl Read + Send + 'static,
-    output: &mut impl Write,
+    mut output: impl Write + Send + 'static,
+    console: bool,
 ) -> io::Result<()> {
     let mut writer = stream.try_clone()?;
-    let (errors, input_error) = mpsc::channel();
+    writer.set_write_timeout(Some(Duration::from_secs(1)))?;
     std::thread::Builder::new()
-        .name("htm-stdin".to_owned())
+        .name("htm-stdin".into())
         .spawn(move || {
-            let error = match io::copy(&mut input, &mut writer) {
-                Ok(_) => io::Error::new(io::ErrorKind::UnexpectedEof, "stdin has closed abruptly"),
-                Err(error) => error,
-            };
-            if errors.send(error).is_ok() {
-                // Wake the output reader so an input error is reported promptly.
-                if let Err(error) = writer.shutdown(Shutdown::Both) {
-                    eprintln!("htm: closing input stream: {error}");
+            let result = (|| -> io::Result<()> {
+                let mut lines = crate::framing::Lines::default();
+                let mut buffer = [0; 4096];
+                loop {
+                    let n = input.read(&mut buffer)?;
+                    if n == 0 {
+                        break;
+                    }
+                    for line in lines.feed(&buffer[..n])? {
+                        writeln!(writer, "{line}")?;
+                        if line.trim().is_empty()
+                            || crate::framing::parse(&line).is_ok_and(|commands| {
+                                commands.iter().any(|words| {
+                                    matches!(
+                                        words.first().map(String::as_str),
+                                        None | Some("detach-client" | "detach" | "exit")
+                                    )
+                                })
+                            })
+                        {
+                            return Ok(());
+                        }
+                    }
                 }
-            }
+                Ok(())
+            })();
+            let _ = writer.shutdown(if result.is_ok() {
+                std::net::Shutdown::Write
+            } else {
+                std::net::Shutdown::Both
+            });
         })?;
-    let result = (|| {
+    // At most 16 * 16KiB, plus the writer's one in-flight chunk. A blocked
+    // console must not stop the main thread observing daemon EOF.
+    let (send, receive) = mpsc::sync_channel::<Vec<u8>>(16);
+    let (done, completion) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("htm-stdout".into())
+        .spawn(move || {
+            let result = (|| -> io::Result<()> {
+                emit(&mut output, crate::codes::ENTER_HTM_MODE, console)?;
+                while let Ok(bytes) = receive.recv() {
+                    emit(&mut output, &bytes, console)?;
+                }
+                emit(&mut output, crate::codes::LEAVE_HTM_MODE, console)
+            })();
+            let _ = done.send(result);
+        })?;
+    let result = (|| -> io::Result<()> {
         let mut buffer = [0; 16 * 1024];
         loop {
             match stream.read(&mut buffer) {
                 Ok(0) => return Ok(()),
-                Ok(count) => {
-                    // Do not guess frame boundaries from read() chunk sizes.
-                    // SESSION_END is relayed too; htmd follows it with EOF.
-                    output.write_all(&buffer[..count])?;
-                    output.flush()?;
+                Ok(n) => {
+                    if send.try_send(buffer[..n].to_vec()).is_err() {
+                        return Ok(());
+                    }
                 }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
             }
         }
     })();
-    match input_error.try_recv() {
-        Ok(error) => Err(error),
+    drop(send);
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    match completion.recv_timeout(Duration::from_millis(250)) {
+        Ok(write) => result.and(write),
         Err(_) => result,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn console_gateway_and_redirected_output_differ() {
+        let mut bytes = Vec::new();
+        emit(&mut bytes, crate::codes::ENTER_HTM_MODE, true).unwrap();
+        assert_eq!(bytes, b"\x1b[?777;27;80;49;48;48;48;112q");
+        bytes.clear();
+        emit(&mut bytes, crate::codes::ENTER_HTM_MODE, false).unwrap();
+        assert_eq!(bytes, b"\x1bP1000p");
     }
 }

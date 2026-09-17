@@ -10,10 +10,10 @@
 #   note: short string
 #   et_pr: optional upstream PR number
 #
-# Classified 2026-09-15. #804 passed independent review in et.rs #100.
+# Classified 2026-09-17. #804 passed independent review in et.rs #100.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-09-15"
+classified: "2026-09-17"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -116,8 +116,8 @@ commits:
   - sha: be28bd6de304093edee6efad55a93086fe9befd0
     date: "2026-09-08"
     kind: product
-    status: skip
-    note: "#805/#806 HTM tmux -CC; out of et.rs scope (no HTM multiplexer). PROTOCOL_VERSION stays 6."
+    status: ported
+    note: "#805/#806 HTM control mode synchronized to #813, not the intermediate merge. Command/state/screen/lifecycle matrix and native C++ transcript oracle are in docs/htm-parity-matrix.md. Authenticated IPC, bounded resources and scoped shutdown retained. PROTOCOL_VERSION stays 6."
     et_pr: 805
   - sha: 15256c50903f936bfbd3e90de2b03ffa0184f82d
     date: "2026-09-10"
@@ -129,10 +129,16 @@ commits:
     date: "2026-09-11"
     kind: docs
     status: skip
-    note: "HTM PaneScreen comment-only; out of et.rs scope (no HTM multiplexer). PROTOCOL_VERSION stays 6."
+    note: "HTM PaneScreen comment-only. et.rs uses sandboxed canonical libvterm behind a Rust screen API and a legacy ESC-k filter; no C++ comment to copy. PROTOCOL_VERSION stays 6."
   - sha: ea2c2ed170b6f0a106a7eee324b14395345a6671
     date: "2026-09-14"
     kind: product
     status: skip
     note: "#812 optional RAW_STACKTRACE for C++ logger; et.rs has no easylogging/ust path; PROTOCOL_VERSION stays 6."
     et_pr: 812
+  - sha: 8a306f6d3580886f77357864fc010a4e8b78c3a6
+    date: "2026-09-17"
+    kind: product
+    status: ported
+    note: "#813 command/target/layout/affinity/capture/lifecycle semantics audited against current canonical C++; sandboxed canonical libvterm and authenticated pane diagnostics implemented. No canonical command deferrals; native Windows/macOS and actual GUI verification limits remain explicit in docs/htm-control-mode.md."
+    et_pr: 813

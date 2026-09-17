@@ -12,13 +12,15 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-base64 = "0.22"
 portable-pty = "0.9.0"
-serde_json = "1"
-uuid = { version = "1", features = ["v4"] }
+wasmi = { version = "=2.0.0", default-features = false, features = ["stable", "std", "validate", "portable-dispatch"] }
+wasmi_core = { version = "=2.0.0", default-features = false, features = ["std"] }
+
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1.4", features = ["event", "process"] }
+rustix = { version = "1.1.4", features = ["event", "process", "fs", "termios"] }
 
 [target.'cfg(windows)'.dependencies]
 et-net = { path = "../et-net" }

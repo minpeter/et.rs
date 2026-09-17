@@ -108,7 +108,7 @@ pub fn stop(path: &Path) -> io::Result<()> {
     };
     stream.set_read_timeout(Some(Duration::from_secs(15)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    et_htm::framing::write_debug_keys(&mut stream, b"x")?;
+    std::io::Write::write_all(&mut stream, b"kill-server\n")?;
     // EOF acknowledges shutdown only after the daemon retires its endpoint.
     io::copy(&mut stream, &mut io::sink())?;
     Ok(())

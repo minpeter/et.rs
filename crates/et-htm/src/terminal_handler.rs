@@ -1,10 +1,11 @@
 //! Per-pane PTY handler, mirroring upstream `htm/TerminalHandler.cpp`.
 //!
-//! Each pane owns a login shell on a PTY. Output is returned to the caller and
-//! also retained in a line buffer that is replayed when a client reconnects.
+//! Each pane owns an interactive shell on a PTY. Bounded channels isolate blocking
+//! platform PTY I/O from the daemon's control loop. The screen owns recovery.
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
@@ -15,45 +16,73 @@ const READ_BUFFER: usize = 16 * 1024;
 
 pub struct TerminalHandler {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    writer: mpsc::SyncSender<Vec<u8>>,
     child: Box<dyn Child + Send + Sync>,
     output: Receiver<Vec<u8>>,
+    initial_cwd: PathBuf,
     running: bool,
     buffer: VecDeque<String>,
     buffer_length: i64,
 }
 
 impl TerminalHandler {
-    /// Spawn a login shell on a fresh PTY, like upstream's
-    /// `forkpty` + `execl(shell, shell, "-l")` in the user's home directory.
+    /// Spawn a non-login shell on a fresh PTY, as canonical control mode does.
     pub fn start() -> std::io::Result<Self> {
+        Self::start_in(None)
+    }
+
+    pub fn start_in(cwd: Option<PathBuf>) -> std::io::Result<Self> {
+        Self::start_in_size(cwd, 80, 24)
+    }
+
+    pub(crate) fn start_in_size(
+        cwd: Option<PathBuf>,
+        cols: u16,
+        rows: u16,
+    ) -> std::io::Result<Self> {
         let pty = portable_pty::native_pty_system()
             .openpty(PtySize {
-                rows: 24,
-                cols: 80,
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
             .map_err(std::io::Error::other)?;
         let shell = default_shell();
         let mut command = CommandBuilder::new(&shell);
-        #[cfg(unix)]
-        command.arg("-l");
-        if let Some(home) = home_directory() {
-            command.cwd(home);
-        }
+        let initial_cwd = cwd
+            .or_else(|| std::env::var_os("HTM_INITIAL_CWD").map(PathBuf::from))
+            .or_else(home_directory)
+            .unwrap_or_else(|| PathBuf::from("/"));
+        command.cwd(&initial_cwd);
         command.env("HTM_VERSION", env!("CARGO_PKG_VERSION"));
+        command.env("TERM", "screen");
+        command.env("PROMPT_EOL_MARK", "");
         let child = pty
             .slave
             .spawn_command(command)
             .map_err(std::io::Error::other)?;
         drop(pty.slave);
-        let writer = pty.master.take_writer().map_err(std::io::Error::other)?;
+        let mut writer = pty.master.take_writer().map_err(std::io::Error::other)?;
+        let (input, receive) = mpsc::sync_channel::<Vec<u8>>(16);
+        std::thread::Builder::new()
+            .name("htm-pane-input".into())
+            .spawn(move || {
+                while let Ok(data) = receive.recv() {
+                    if writer
+                        .write_all(&data)
+                        .and_then(|()| writer.flush())
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })?;
         let mut reader = pty
             .master
             .try_clone_reader()
             .map_err(std::io::Error::other)?;
-        let (sender, output) = mpsc::channel();
+        let (sender, output) = mpsc::sync_channel(16);
         std::thread::Builder::new()
             .name("htm-pane".to_owned())
             .spawn(move || {
@@ -71,30 +100,29 @@ impl TerminalHandler {
             })?;
         Ok(Self {
             master: pty.master,
-            writer,
+            writer: input,
             child,
             output,
+            initial_cwd,
             running: true,
             buffer: VecDeque::new(),
             buffer_length: 0,
         })
     }
 
-    /// Drain whatever the PTY produced, updating the replay buffer and
-    /// returning the raw bytes just read.
+    /// Drain a bounded batch of PTY output, retaining diagnostic history.
     pub fn poll_user_terminal(&mut self) -> Vec<u8> {
         if !self.running {
             return Vec::new();
         }
         let mut collected = Vec::new();
-        loop {
+        while collected.len() < READ_BUFFER {
             match self.output.try_recv() {
                 Ok(chunk) => collected.extend_from_slice(&chunk),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     // The shell exited and closed the PTY.
-                    let _ = self.child.wait();
-                    self.running = false;
+                    self.running = self.child.try_wait().ok().flatten().is_none();
                     break;
                 }
             }
@@ -134,10 +162,148 @@ impl TerminalHandler {
     }
 
     pub fn append_data(&mut self, data: &[u8]) -> std::io::Result<()> {
-        self.writer.write_all(data)?;
-        self.writer.flush()
+        if data.len() > 64 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "pane input too large",
+            ));
+        }
+        self.writer
+            .try_send(data.to_vec())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::WouldBlock, error.to_string()))
     }
 
+    pub fn cwd(&self) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        if let Some(pid) = self.child.process_id() {
+            if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
+                return cwd;
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(pid) = self.child.process_id() {
+            use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+            let pid = Pid::from_u32(pid);
+            let mut system = System::new();
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[pid]),
+                false,
+                ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
+            );
+            if let Some(cwd) = system.process(pid).and_then(|p| p.cwd()) {
+                return cwd.to_owned();
+            }
+        }
+        self.initial_cwd.clone()
+    }
+
+    pub fn foreground_command(&self) -> String {
+        #[cfg(unix)]
+        {
+            let name = |pid: u32| -> String {
+                #[cfg(target_os = "macos")]
+                let value = {
+                    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+                    let pid = Pid::from_u32(pid);
+                    let mut system = System::new();
+                    system.refresh_processes_specifics(
+                        ProcessesToUpdate::Some(&[pid]),
+                        false,
+                        ProcessRefreshKind::nothing(),
+                    );
+                    system
+                        .process(pid)
+                        .map(|p| p.name().to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                };
+                #[cfg(not(target_os = "macos"))]
+                let value = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                    .unwrap_or_default()
+                    .trim_end_matches('\n')
+                    .to_owned();
+                if matches!(value.as_str(), "pgrep" | "pkill" | "htmd" | "htm") {
+                    String::new()
+                } else {
+                    value
+                }
+            };
+            if let Some(pid) = self.master.process_group_leader().filter(|&p| p > 0) {
+                let comm = name(pid as u32);
+                if !comm.is_empty() {
+                    return comm;
+                }
+            }
+            self.child.process_id().map(name).unwrap_or_default()
+        }
+        #[cfg(windows)]
+        {
+            use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+            let Some(pid) = self.child.process_id() else {
+                return String::new();
+            };
+            let root = Pid::from_u32(pid);
+            let mut system = System::new();
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                false,
+                ProcessRefreshKind::nothing(),
+            );
+            let name = |pid| {
+                system
+                    .process(pid)
+                    .map(|p| {
+                        let name = p.name().to_string_lossy().to_lowercase();
+                        name.strip_suffix(".exe").unwrap_or(&name).to_owned()
+                    })
+                    .unwrap_or_default()
+            };
+            let mut stack = vec![root];
+            let mut seen = std::collections::HashSet::new();
+            let mut best = String::new();
+            while let Some(pid) = stack.pop() {
+                if !seen.insert(pid) {
+                    continue;
+                }
+                let mut children: Vec<_> = system
+                    .processes()
+                    .iter()
+                    .filter(|(_, p)| p.parent() == Some(pid))
+                    .map(|(&pid, _)| pid)
+                    .collect();
+                children.sort();
+                if children.is_empty() {
+                    let comm = name(pid);
+                    if !matches!(
+                        comm.as_str(),
+                        "" | "cmd"
+                            | "powershell"
+                            | "pwsh"
+                            | "powershell_ise"
+                            | "conhost"
+                            | "openconsole"
+                            | "wt"
+                            | "windowsterminal"
+                            | "htmd"
+                            | "htm"
+                    ) || (best.is_empty() && pid == root)
+                    {
+                        best = comm;
+                    }
+                } else {
+                    stack.extend(children);
+                }
+            }
+            if best.is_empty() {
+                name(root)
+            } else {
+                best
+            }
+        }
+    }
+
+    pub fn process_id(&self) -> Option<u32> {
+        self.child.process_id()
+    }
     pub fn update_terminal_size(&self, cols: i32, rows: i32) {
         // Upstream assigns straight into `winsize` without validation.
         let _ = self.master.resize(PtySize {
@@ -154,11 +320,15 @@ impl TerminalHandler {
 
     pub fn stop(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while self.child.try_wait().ok().flatten().is_none() && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         self.running = false;
     }
 
-    /// Buffered output replayed to reconnecting clients.
+    /// Bounded diagnostic history, not a control-mode replay stream.
     pub fn buffer(&self) -> &VecDeque<String> {
         &self.buffer
     }
@@ -205,12 +375,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pty_is_created_at_client_dimensions() {
+        let handler = TerminalHandler::start_in_size(None, 117, 31).unwrap();
+        let size = handler.master.get_size().unwrap();
+        assert_eq!((size.cols, size.rows), (117, 31));
+    }
+
+    #[test]
     fn buffer_appends_partial_lines_and_bounds_growth() {
         let mut handler = TerminalHandler {
             master: dummy_master(),
-            writer: Box::new(Vec::new()),
+            writer: mpsc::sync_channel(1).0,
             child: dummy_child(),
             output: mpsc::channel().1,
+            initial_cwd: PathBuf::from("/"),
             running: true,
             buffer: VecDeque::new(),
             buffer_length: 0,

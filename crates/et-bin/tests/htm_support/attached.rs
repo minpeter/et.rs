@@ -1,7 +1,7 @@
 //! Real-role takeover while the previous UI is still attached.
 
 use super::htm_support::{Daemon, Relay};
-use et_htm::framing;
+use std::io::Write;
 
 #[test]
 fn kill_replaces_an_attached_session_without_stopping_an_unrelated_daemon() {
@@ -21,13 +21,13 @@ fn kill_replaces_an_attached_session_without_stopping_an_unrelated_daemon() {
     old_ui.finish();
     assert_ne!(fresh_state["panes"], old_state["panes"]);
     // The unrelated UI remains responsive and its daemon preserves pane state.
-    framing::write_debug_keys(&mut other_ui.input, &[27]).unwrap();
+    writeln!(other_ui.input, "detach-client").unwrap();
     other_ui.finish();
     let mut other_ui = Relay::start(&other.path);
     assert_eq!(other_ui.state()["panes"], other_state["panes"]);
-    framing::write_debug_keys(&mut replacement.input, b"x").unwrap();
+    writeln!(replacement.input, "kill-server").unwrap();
     replacement.finish();
-    framing::write_debug_keys(&mut other_ui.input, b"x").unwrap();
+    writeln!(other_ui.input, "kill-server").unwrap();
     other_ui.finish();
     other.finish();
     println!("HTM_ATTACHED_RESTART_PASS old-ui-closed fresh-daemon unrelated-daemon-survived");
@@ -47,7 +47,7 @@ fn new_ui_takes_over_an_attached_daemon_and_preserves_its_panes() {
     // Then only the old UI closes; the daemon and pane identities survive.
     old_ui.finish();
     assert_eq!(recovered["panes"], original["panes"]);
-    framing::write_debug_keys(&mut new_ui.input, b"x").unwrap();
+    writeln!(new_ui.input, "kill-server").unwrap();
     new_ui.finish();
     daemon.finish();
 }

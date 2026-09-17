@@ -7,6 +7,7 @@ use std::io;
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 pub use std::net::TcpStream as Stream;
@@ -93,6 +94,7 @@ pub fn connect(path: &Path) -> io::Result<Stream> {
 pub struct Listener {
     listener: TcpListener,
     token: String,
+    pending: Mutex<Vec<super::auth::Pending>>,
     path: Option<PathBuf>,
     lock: Option<File>,
 }
@@ -120,6 +122,7 @@ impl Listener {
         let result = Self {
             listener,
             token: et_net::local::new_token(),
+            pending: Mutex::new(Vec::new()),
             path: Some(path.to_path_buf()),
             lock: Some(lock),
         };
@@ -133,22 +136,18 @@ impl Listener {
     }
 
     pub fn accept(&self) -> io::Result<Stream> {
-        let (mut stream, peer) = self.listener.accept()?;
-        // Winsock accepts inherit FIONBIO from the listener. Token and frame
-        // bodies use bounded blocking read_exact, including fragmented writes.
-        stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-        if !peer.ip().is_loopback()
-            || et_net::local::accept_token(&mut stream, &self.token).is_err()
-        {
-            // No state, escape sequence, or pane output precedes authentication.
-            return Err(io::Error::from(io::ErrorKind::WouldBlock));
-        }
-        stream.set_nodelay(true)?;
-        Ok(stream)
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| io::Error::other("HTM admission lock poisoned"))?;
+        super::auth::accept(&self.listener, &mut pending, &self.token)
     }
 
     pub fn retire(&mut self) -> io::Result<()> {
+        self.pending
+            .get_mut()
+            .map_err(|_| io::Error::other("HTM admission lock poisoned"))?
+            .clear();
         if let Some(path) = self.path.take() {
             std::fs::remove_file(path)?;
         }

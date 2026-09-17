@@ -18,6 +18,9 @@ struct HtmArgs {
         help = "stop the user's daemon before starting a new session"
     )]
     kill_other_sessions: bool,
+    /// Print the running daemon's pane/affinity snapshot without attaching.
+    #[arg(long, conflicts_with = "kill_other_sessions")]
+    dump_panes: bool,
     /// Select an isolated IPC endpoint (Windows: beneath LOCALAPPDATA).
     #[arg(long)]
     socket: Option<PathBuf>,
@@ -78,6 +81,15 @@ pub fn run_client(args: &[OsString]) -> Result<i32, clap::Error> {
         .map(Ok)
         .unwrap_or_else(pipe_name)
         .map_err(|error| clap_io("selecting HTM endpoint", error))?;
+    if parsed.dump_panes {
+        let dump = et_htm::server::dump_panes(&path)
+            .map_err(|error| clap_io("reading HTM pane diagnostic", error))?;
+        std::io::stdout()
+            .lock()
+            .write_all(dump.as_bytes())
+            .map_err(|error| clap_io("writing HTM pane diagnostic", error))?;
+        return Ok(0);
+    }
     if parsed.kill_other_sessions {
         crate::htm_daemon::stop(&path).map_err(|error| clap_io("stopping htmd", error))?;
     }
@@ -99,7 +111,13 @@ pub fn run_client(args: &[OsString]) -> Result<i32, clap::Error> {
         Err(error) => return Err(clap_io("could not connect to htmd", error)),
     };
     let raw = RawTerminal::enter();
-    let mut stdout = std::io::stdout();
+    // Avoid Rust's global line-buffered stdout: its process-exit flush could
+    // block after the bridge's bounded final drain has already expired.
+    #[cfg(unix)]
+    let mut stdout = std::fs::File::from(
+        rustix::io::dup(std::io::stdout())
+            .map_err(|error| clap_io("duplicating HTM stdout", error))?,
+    );
     #[cfg(unix)]
     let result = et_htm::client::run(
         &mut stream,
@@ -107,18 +125,24 @@ pub fn run_client(args: &[OsString]) -> Result<i32, clap::Error> {
         &mut stdout,
     );
     #[cfg(windows)]
+    let stdout = {
+        use std::os::windows::io::AsHandle;
+        std::fs::File::from(
+            std::io::stdout()
+                .as_handle()
+                .try_clone_to_owned()
+                .map_err(|error| clap_io("duplicating HTM stdout", error))?,
+        )
+    };
+    #[cfg(windows)]
     let result = et_htm::client::run(
         &mut stream,
         et_htm::client::Stdin(std::io::stdin()),
-        &mut stdout,
+        stdout,
+        std::io::IsTerminal::is_terminal(&std::io::stdout()),
     );
-    let leave = stdout
-        .write_all(et_htm::codes::LEAVE_HTM_MODE)
-        .and_then(|()| stdout.flush());
     drop(raw);
-    result
-        .and(leave)
-        .map_err(|error| clap_io("htm session ended with an error", error))?;
+    result.map_err(|error| clap_io("htm session ended with an error", error))?;
     Ok(0)
 }
 

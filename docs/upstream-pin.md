@@ -10,7 +10,7 @@ Canonical machine files:
 - Ledger (every `master` commit after baseline):
   [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml)
 
-Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-15.
+Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-17.
 `#784` marked `ported` after et.rs [#31](https://github.com/minpeter/et.rs/pull/31) / `906a7ca86691f00a82f88b99b21d7afceb07bf97`.
 `#798` marked `ported` after et.rs [#77](https://github.com/minpeter/et.rs/pull/77).
 
@@ -20,13 +20,13 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-15.
 | Baseline / latest release tag | [`et-v7.0.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.0.0) |
 | Baseline / release commit | [`7656a32a5bc15c6746726a27a5a4ba1e468fab6e`](https://github.com/MisterTea/EternalTerminal/commit/7656a32a5bc15c6746726a27a5a4ba1e468fab6e) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`ea2c2ed170b6f0a106a7eee324b14395345a6671`](https://github.com/MisterTea/EternalTerminal/commit/ea2c2ed170b6f0a106a7eee324b14395345a6671) (#812 optional RAW_STACKTRACE, 2026-09-14; reviewed 2026-09-15) |
+| Pin tip (last classified) | [`8a306f6`](https://github.com/MisterTea/EternalTerminal/commit/8a306f6d3580886f77357864fc010a4e8b78c3a6) (#813 HTM control-mode parity, reviewed 2026-09-17) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
 | ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.0.0` and `master`) |
 
-The reviewed `7656a32...ea2c2ed` range contains 21 classified commits. Unclassified commits would be drift.
+The reviewed baseline-to-#813 range contains 22 classified commits. Unclassified commits would be drift.
 
-## Ledger (classified 2026-09-15)
+## Ledger (classified 2026-09-17)
 
 | sha | date | kind | status | note |
 | --- | --- | --- | --- | --- |
@@ -47,10 +47,11 @@ The reviewed `7656a32...ea2c2ed` range contains 21 classified commits. Unclassif
 | [`342c0df`](https://github.com/MisterTea/EternalTerminal/commit/342c0dfb32882c94df6aa18092fc897015222c0b) | 2026-09-02 | ci | skip | #802 Windows build/test parity; not a wire or server-lock change |
 | [`584a68b`](https://github.com/MisterTea/EternalTerminal/commit/584a68b4b54c74de7035e6108f49151ebce6a191) | 2026-09-03 | security | skip | #792 disable SO_LINGER. et.rs never sets SO_LINGER and has no globalMutex-on-close; default linger-off already matches. |
 | [`cd731902`](https://github.com/MisterTea/EternalTerminal/commit/cd7319020edce131fbd6f21b1a87e07f4ac41cdb) | 2026-09-05 | product | **ported** | #804 interruptible unsent output and tmux control preservation; et.rs #100. |
-| [`be28bd6`](https://github.com/MisterTea/EternalTerminal/commit/be28bd6de304093edee6efad55a93086fe9befd0) | 2026-09-08 | product | skip | #805/#806 HTM tmux -CC; out of et.rs scope (no HTM). PROTOCOL_VERSION stays 6. |
+| [`be28bd6`](https://github.com/MisterTea/EternalTerminal/commit/be28bd6de304093edee6efad55a93086fe9befd0) | 2026-09-08 | product | **ported** | #805/#806 synchronized to #813; [command/state/screen/lifecycle matrix](htm-parity-matrix.md). PROTOCOL_VERSION stays 6. |
 | [`15256c5`](https://github.com/MisterTea/EternalTerminal/commit/15256c50903f936bfbd3e90de2b03ffa0184f82d) | 2026-09-10 | security | skip | #809 replace select() with epoll/kqueue/poll to avoid FD_SETSIZE fd_set stack corruption. et.rs has no C select()/fd_set path (socket2/nix, forbid unsafe). Same skip as #792. PROTOCOL_VERSION stays 6. |
-| [`59cee86`](https://github.com/MisterTea/EternalTerminal/commit/59cee86068bea79090b57a96c366243fc73d6130) | 2026-09-11 | docs | skip | HTM PaneScreen comment-only; out of et.rs scope (no HTM multiplexer). PROTOCOL_VERSION stays 6. |
+| [`59cee86`](https://github.com/MisterTea/EternalTerminal/commit/59cee86068bea79090b57a96c366243fc73d6130) | 2026-09-11 | docs | skip | C++ comment-only; Rust has its own screen model and ESC-k filter. |
 | [`ea2c2ed`](https://github.com/MisterTea/EternalTerminal/commit/ea2c2ed170b6f0a106a7eee324b14395345a6671) | 2026-09-14 | product | skip | #812 optional RAW_STACKTRACE for C++ logger; et.rs has no easylogging/ust path. PROTOCOL_VERSION stays 6. |
+| [`8a306f6`](https://github.com/MisterTea/EternalTerminal/commit/8a306f6d3580886f77357864fc010a4e8b78c3a6) | 2026-09-17 | product | **ported** | Canonical command/state parity, sandboxed libvterm, authenticated diagnostics, bounded bridges and lifecycle. [Native-platform/GUI verification limits](htm-control-mode.md) remain explicit. |
 
 ## Ported and residual
 
@@ -94,8 +95,14 @@ this pin as a green light to bump `PROTOCOL_VERSION` or land a v7 port.
 (et.rs never sets `SO_LINGER` and has no process-wide mutex around close;
 default linger-off already matches the C++ fix).
 [`be28bd6`](https://github.com/MisterTea/EternalTerminal/commit/be28bd6de304093edee6efad55a93086fe9befd0)
-(`#805` / `#806`) stays `status: skip`. HTM tmux `-CC` so stock terminals can
-attach is out of et.rs scope (no HTM multiplexer), same class as `#801`.
+(`#805` / `#806`) and [#813](https://github.com/MisterTea/EternalTerminal/pull/813)
+are `status: ported`. et.rs already had an HTM multiplexer; the old claim that
+HTM was absent was incorrect. Its UUID/JSON/base64 protocol has been replaced by
+a bounded tmux control-mode implementation synchronized to #813, not the
+intermediate #805 state. The [compatibility record](htm-control-mode.md) and
+[production matrix](htm-parity-matrix.md) document source-backed quirks,
+preserved security policies, native C++ differential tests, and platform-only
+verification limitations. No canonical command family is intentionally deferred.
 [`15256c5`](https://github.com/MisterTea/EternalTerminal/commit/15256c50903f936bfbd3e90de2b03ffa0184f82d)
 (`#809`) stays `status: skip`. Upstream replaced `select()` with epoll/kqueue/poll
 to avoid `FD_SETSIZE` `fd_set` stack corruption on high fds / many port forwards.
@@ -103,8 +110,8 @@ et.rs is Rust (`forbid(unsafe)`), uses socket2/nix and its own nonblocking
 connection workers, and has no C `select()`/`fd_set`/`FD_SETSIZE` path, so the
 overflow bug does not apply (same skip pattern as `#792` `SO_LINGER`).
 [`59cee86`](https://github.com/MisterTea/EternalTerminal/commit/59cee86068bea79090b57a96c366243fc73d6130)
-stays `status: skip`. HTM `PaneScreen` comment-only (ESC k filter vs tmux `-CC`
-/ xterm clients). et.rs has no HTM multiplexer, same class as `#805` / `#801`.
+stays `status: skip`: this is a C++ comment-only change. The Rust screen model
+has its own legacy ESC-k filter; live output remains byte-exact.
 [`ea2c2ed`](https://github.com/MisterTea/EternalTerminal/commit/ea2c2ed170b6f0a106a7eee324b14395345a6671)
 (`#812`) stays `status: skip`. Optional `RAW_STACKTRACE` (default OFF) so C++
 crash logs can emit PCs without synchronous symbolization that held the logger
@@ -112,7 +119,7 @@ mutex. et.rs has no easylogging/ust/`ET_RAW_STACKTRACE` path (`forbid(unsafe)`),
 so the C++ stacktrace helpers are not ported. `PROTOCOL_VERSION` stays 6.
 
 et.rs still claims **protocol v6**. EternalTerminal’s latest product release is
-**v7.0.0**, and the reviewed tip is twenty-one classified commits past that tag.
+**v7.0.0**, and the reviewed tip is twenty-two classified commits past that tag.
 
 Review ports against the conflict policy in
 [`docs/upstream-factory.md`](upstream-factory.md). Gate any later port with

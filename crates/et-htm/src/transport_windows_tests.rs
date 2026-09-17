@@ -6,7 +6,7 @@ impl Directory {
     fn new() -> Self {
         let path = private_base()
             .unwrap()
-            .join(format!("et-htm-test-{}", uuid::Uuid::new_v4()));
+            .join(format!("et-htm-test-{}", et_net::local::new_token()));
         std::fs::create_dir(&path).unwrap();
         Self(path)
     }

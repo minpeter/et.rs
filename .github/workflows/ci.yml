@@ -74,11 +74,16 @@ jobs:
       - if: runner.os == 'macOS'
         run: cargo test --workspace --lib --bins -- --test-threads=1
 
+      - name: Exercise HTM protocol and state on macOS
+        if: runner.os == 'macOS'
+        run: cargo test -p et-htm --test '*' -- --test-threads=1
+
       # Issue #4 and the adjacent PTY/process coverage run explicitly on
       # hosted macOS without pulling in unrelated flaky network harnesses.
       - if: runner.os == 'macOS'
         run: >-
           cargo test -p et
+          --test htm_runtime
           --test reconnect_end_to_end
           --test reconnect_outage_end_to_end
           --test server_runtime

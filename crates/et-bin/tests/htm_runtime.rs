@@ -154,6 +154,14 @@ fn command_lists_zero_targets_layout_and_final_pane_exit() {
     let mut daemon = Daemon::start();
     let mut relay = Relay::start(&daemon.path);
     relay.state();
+    #[cfg(windows)]
+    {
+        // ConPTY waits for the frontend's cursor-position response before
+        // starting cmd.exe. Its startup query may already have been drained
+        // while detached or by state(), so supply the known initial position
+        // as the frontend-bootstrap test does rather than awaiting a replay.
+        send(&mut relay, "%0", b"\x1b[1;1R");
+    }
     relay
         .input
         .write_all(b"display -p '#{version}'; split-window -h -t %0 -P -F '#{pane_id}'\r\n")

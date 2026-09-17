@@ -132,18 +132,38 @@ mod tests {
         let token = "ab".repeat(32);
         let mut pending = Vec::new();
         let mut wrong = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        wrong.write_all(b"wrong\n").unwrap();
+        wrong.write_all(b"wr").unwrap();
         assert!(accept(&listener, &mut pending, &token).is_err());
+        assert_eq!(pending.len(), 1, "partial tokens must stay pending");
+        wrong.write_all(b"ong\n").unwrap();
         // Also reject a full-length incorrect token without leaking output.
         let mut bad = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         bad.write_all(format!("{}\n", "cd".repeat(32)).as_bytes())
             .unwrap();
         assert!(accept(&listener, &mut pending, &token).is_err());
         for stream in [&mut wrong, &mut bad] {
-            stream
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .unwrap();
-            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+            stream.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                // A write completing does not guarantee that a single server
+                // poll has received it (notably on Darwin). Keep driving the
+                // same admission loop the daemon uses while awaiting EOF.
+                assert_eq!(
+                    accept(&listener, &mut pending, &token).unwrap_err().kind(),
+                    io::ErrorKind::WouldBlock
+                );
+                match stream.read(&mut [0]) {
+                    Ok(0) => break,
+                    Ok(_) => panic!("unauthenticated peer received output"),
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(1))
+                    }
+                    Err(error) => panic!("invalid token was not disconnected: {error}"),
+                }
+            }
         }
         let mut held = Vec::new();
         for _ in 0..17 {

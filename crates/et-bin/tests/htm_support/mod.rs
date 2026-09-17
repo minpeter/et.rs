@@ -22,7 +22,11 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn start() -> Self {
-        #[cfg(unix)]
+        // Darwin's long per-user TMPDIR plus the diagnostic suffix can exceed
+        // sockaddr_un. Keep the owned 0700 test namespace under short /tmp.
+        #[cfg(target_os = "macos")]
+        let base = PathBuf::from("/tmp");
+        #[cfg(all(unix, not(target_os = "macos")))]
         let base = std::env::temp_dir();
         #[cfg(windows)]
         let base = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
@@ -227,7 +231,9 @@ pub struct Endpoint {
 
 impl Endpoint {
     pub fn new() -> Self {
-        #[cfg(unix)]
+        #[cfg(target_os = "macos")]
+        let base = PathBuf::from("/tmp");
+        #[cfg(all(unix, not(target_os = "macos")))]
         let base = std::env::temp_dir();
         #[cfg(windows)]
         let base = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());

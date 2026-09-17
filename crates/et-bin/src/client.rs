@@ -69,7 +69,7 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
     parsed.silent = et_cli::logging::effective_silent(parsed.silent);
     // `--telemetry` is accepted for upstream compatibility and ignored:
     // et.rs never collects telemetry, and upstream prints nothing here.
-    init_logging(&parsed);
+    init_logging(&parsed).map_err(|error| clap::Error::raw(clap::error::ErrorKind::Io, error))?;
     let runner = SystemSsh::default();
     let resolver = SystemResolver;
     let deadline = runner.deadline();
@@ -478,7 +478,7 @@ fn reconnect_wait_aborted(delay: Duration) -> bool {
 /// Configure logging like upstream `TerminalClientMain`: files land in
 /// `--logdir` (default temp dir) under an `etclient-<user>` prefix unless
 /// `--silent` is given.
-fn init_logging(args: &ClientArgs) {
+fn init_logging(args: &ClientArgs) -> std::io::Result<()> {
     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_owned());
     et_cli::logging::init(et_cli::logging::LogOptions {
         directory: et_cli::logging::effective_log_directory(
@@ -490,7 +490,7 @@ fn init_logging(args: &ClientArgs) {
         append_pid: true,
         verbose: args.verbose,
         max_size: et_cli::logging::DEFAULT_MAX_LOG_SIZE,
-    });
+    })
 }
 
 fn bootstrap_log_message(request: &BootstrapRequest) -> String {

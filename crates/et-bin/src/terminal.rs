@@ -85,7 +85,8 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
         append_pid: true,
         verbose: parsed.verbose,
         max_size: et_cli::logging::DEFAULT_MAX_LOG_SIZE,
-    });
+    })
+    .map_err(|error| clap_error(error.to_string()))?;
     let router_path = select_router_path(parsed.serverfifo.as_deref())
         .map_err(|error| clap_error(error.to_string()))?;
     #[cfg(unix)]

@@ -42,7 +42,8 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
         append_pid: true,
         verbose: config.verbose,
         max_size: config.log_size,
-    });
+    })
+    .map_err(|error| clap::Error::raw(ErrorKind::Io, error))?;
     // Forward server runtime diagnostics into the same file logger.
     et_server::diag::init(|level, message| {
         if level == 0 {

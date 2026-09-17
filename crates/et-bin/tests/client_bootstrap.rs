@@ -43,6 +43,66 @@ impl Drop for TestDir {
     }
 }
 
+#[test]
+fn logging_initialization_errors_reach_each_role_cli_boundary() {
+    let directory = TestDir::new("logging-errors");
+    let blocker = directory.0.join("blocker");
+    fs::write(&blocker, "untouched").unwrap();
+    let config = directory.0.join("et.cfg");
+    fs::write(&config, "").unwrap();
+    for role in ["client", "server", "terminal"] {
+        for mirror in [false, true] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_et"));
+            command
+                .env_remove("ET_DEBUG")
+                .arg(role)
+                .arg("--logdir")
+                .arg(blocker.join("logs"));
+            if mirror {
+                command.arg("--logtostdout");
+            }
+            match role {
+                "client" => {
+                    command.arg("example.invalid");
+                }
+                "server" => {
+                    command.arg("--cfgfile").arg(&config);
+                }
+                "terminal" => {
+                    command.args([
+                        "--idpasskey",
+                        "abcdefghijklmnop/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef_xterm",
+                    ]);
+                }
+                _ => unreachable!(),
+            }
+            let output = command.output().unwrap();
+            assert!(!output.status.success(), "{role}: {output:?}");
+            assert!(output.stdout.is_empty(), "{role}: {output:?}");
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                stderr.contains("could not create directory log"),
+                "{role}: {stderr}"
+            );
+        }
+    }
+    // SSH configuration may be resolved before bootstrap option validation.
+    // Keep this logging test independent of that ordering and the host's SSH.
+    let fake = FakeSsh::new();
+    let output = fake
+        .command(RESOLVED_CONFIG, "", 0, "")
+        .args(["--silent", "--logtostdout", "--no-exit", "--logdir"])
+        .arg(blocker.join("logs"))
+        .arg("example.invalid")
+        .output()
+        .unwrap();
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--no-exit requires --command"), "{stderr}");
+    assert!(!stderr.contains("log"), "{stderr}");
+    assert_eq!(fs::read_to_string(blocker).unwrap(), "untouched");
+}
+
 struct FakeSsh {
     dir: TestDir,
     argv: PathBuf,

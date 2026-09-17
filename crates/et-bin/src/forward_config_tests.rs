@@ -63,6 +63,7 @@ fn applying_ssh_config_preserves_agent_forwarding() {
         port: 22,
         exit_on_forward_failure: false,
         local_forwards: Vec::new(),
+        ..Default::default()
     };
 
     // When
@@ -110,6 +111,7 @@ fn exit_on_forward_failure_selects_local_bind_policy() {
                 port: 22,
                 exit_on_forward_failure: strict,
                 local_forwards: vec![request.clone()],
+                ..Default::default()
             })
             .unwrap();
 
@@ -159,6 +161,7 @@ fn ssh_config_forwards_are_cumulative_stable_and_exactly_deduplicated() {
                 environmentvariable: None,
             },
         ],
+        ..Default::default()
     };
 
     // When

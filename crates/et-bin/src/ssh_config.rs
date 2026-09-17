@@ -25,13 +25,17 @@ struct ForwardPolicies {
     stream_local_bind: StreamLocalBindPolicy,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ResolvedSshConfig {
     pub hostname: String,
     pub user: Option<String>,
     pub port: u16,
     pub exit_on_forward_failure: bool,
     pub local_forwards: Vec<PortForwardSourceRequest>,
+    pub set_env: Vec<(String, String)>,
+    pub proxy_jump: Option<String>,
+    pub forward_agent: bool,
+    pub identity_agent: Option<String>,
 }
 
 enum ForwardRecord {
@@ -98,10 +102,56 @@ pub fn resolve_ssh_config_on_port(
         completion: InvocationCompletion::Exit,
         control_path: None,
     };
-    parse_ssh_config(
-        &run_checked(runner, &invocation, deadline)?,
-        parse_local_forwards,
-    )
+    let stdout = run_checked(runner, &invocation, deadline)?;
+    if stdout
+        .split(|byte| *byte == b'\n')
+        .any(|line| line.starts_with(b"setenv "))
+    {
+        // ssh -G emits SetEnv values unescaped. A newline in a value must
+        // never become a hostname, ProxyJump, or forwarding directive. The
+        // first nonempty SetEnv option suppresses the entire configured list.
+        let mut baseline = invocation.clone();
+        baseline
+            .args
+            .insert(2, "-oSetEnv=ET_RS_CONFIG_SENTINEL=1".to_owned());
+        verify_setenv_block(&stdout, &run_checked(runner, &baseline, deadline)?)?;
+    }
+    parse_ssh_config(&stdout, parse_local_forwards)
+}
+
+fn verify_setenv_block(original: &[u8], baseline: &[u8]) -> Result<(), ClientError> {
+    let malformed = || ClientError::SshConfigMalformed("ambiguous or changed SetEnv output");
+    let original = std::str::from_utf8(original).map_err(|_| malformed())?;
+    let baseline = std::str::from_utf8(baseline).map_err(|_| malformed())?;
+    let mut offset = 0;
+    let mut block = None;
+    for line in baseline.split_inclusive('\n') {
+        if line.starts_with("setenv ") {
+            if block.is_some()
+                || !matches!(
+                    line,
+                    "setenv ET_RS_CONFIG_SENTINEL=1\n" | "setenv ET_RS_CONFIG_SENTINEL=1\r\n"
+                )
+            {
+                return Err(malformed());
+            }
+            block = Some(offset..offset + line.len());
+        }
+        offset += line.len();
+    }
+    let block = block.ok_or_else(malformed)?;
+    let environment = original
+        .strip_prefix(&baseline[..block.start])
+        .and_then(|rest| rest.strip_suffix(&baseline[block.end..]))
+        .ok_or_else(malformed)?;
+    if !environment.ends_with('\n')
+        || !environment
+            .lines()
+            .all(|line| line.starts_with("setenv ") && !line.contains('\r'))
+    {
+        return Err(malformed());
+    }
+    Ok(())
 }
 
 fn parse_ssh_config(
@@ -144,6 +194,8 @@ fn parse_ssh_config(
     let mut user = None;
     let mut port = None;
     let mut local_forwards = Vec::new();
+    let mut extra = ResolvedSshConfig::default();
+    let mut environment_names = std::collections::BTreeSet::new();
     if parse_local_forwards {
         for _ in unsupported_dynamic_forwards(text) {
             et_cli::logging::warn(
@@ -153,7 +205,39 @@ fn parse_ssh_config(
     }
     for line in text.lines() {
         let mut fields = line.split_whitespace();
+        // OpenSSH prints the value verbatim, without shell quoting. In
+        // particular, SetEnv is one assignment per output line.
+        let value = line
+            .trim_start()
+            .split_once(char::is_whitespace)
+            .map(|(_, value)| value)
+            .unwrap_or("");
         match fields.next() {
+            // Jumphost-only lookups resolve address/user/port; they must not
+            // import or reject session options belonging to the relay host.
+            Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("setenv") => {
+                let (name, value) = value
+                    .split_once('=')
+                    .ok_or(ClientError::SshConfigMalformed("setenv"))?;
+                if !crate::terminal_protocol::valid_environment_name(name)
+                    || value.len() > crate::terminal_protocol::MAX_ENV_VALUE
+                    || value.contains(['\0', '\r'])
+                {
+                    return Err(ClientError::SshConfigMalformed("setenv"));
+                }
+                if environment_names.insert(name) {
+                    extra.set_env.push((name.to_owned(), value.to_owned()));
+                }
+            }
+            Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("proxyjump") => {
+                extra.proxy_jump = (value != "none").then(|| value.to_owned());
+            }
+            Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("forwardagent") => {
+                extra.forward_agent = parse_yes_no(value)?;
+            }
+            Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("identityagent") => {
+                extra.identity_agent = Some(value.to_owned());
+            }
             Some(key) if key.eq_ignore_ascii_case("hostname") => {
                 hostname = fields.next().map(str::to_string);
             }
@@ -186,6 +270,7 @@ fn parse_ssh_config(
         port: port.unwrap_or(22),
         exit_on_forward_failure,
         local_forwards,
+        ..extra
     })
 }
 
@@ -469,8 +554,343 @@ mod tests {
                 port: 22,
                 exit_on_forward_failure: false,
                 local_forwards: Vec::new(),
+                ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn effective_environment_rows_are_not_shell_words() {
+        let config = parse_ssh_config(b"hostname host\nsetenv A=two words  \nsetenv B=a=b\nsetenv EMPTY=\nsetenv Q=\"quote\"\\literal\nsetenv A=ignored\nforwardagent yes\nidentityagent /tmp/agent space\nproxyjump user@[::1]:2222\n", true).unwrap();
+        assert_eq!(
+            config.set_env,
+            [
+                ("A".into(), "two words  ".into()),
+                ("B".into(), "a=b".into()),
+                ("EMPTY".into(), "".into()),
+                ("Q".into(), "\"quote\"\\literal".into()),
+            ]
+        );
+        assert!(config.forward_agent);
+        assert_eq!(config.identity_agent.as_deref(), Some("/tmp/agent space"));
+        assert_eq!(config.proxy_jump.as_deref(), Some("user@[::1]:2222"));
+        let disabled = parse_ssh_config(
+            b"hostname host\nforwardagent no\nidentityagent none\nproxyjump none\n",
+            true,
+        )
+        .unwrap();
+        assert!(!disabled.forward_agent);
+        assert_eq!(disabled.identity_agent.as_deref(), Some("none"));
+        assert_eq!(disabled.proxy_jump, None);
+        let spaced = parse_ssh_config(
+            b"hostname host\nidentityagent  /tmp/agent \nsetenv A= leading and trailing \n",
+            true,
+        )
+        .unwrap();
+        assert_eq!(spaced.identity_agent.as_deref(), Some(" /tmp/agent "));
+        assert_eq!(
+            spaced.set_env,
+            [("A".into(), " leading and trailing ".into())]
+        );
+    }
+
+    #[test]
+    fn effective_environment_rejects_invalid_names_values_and_agent_modes() {
+        for row in [
+            "setenv NO_EQUALS",
+            "setenv =empty",
+            "setenv BAD-NAME=x",
+            "setenv 1NAME=x",
+            "setenv A=nul\0value",
+            "forwardagent /tmp/agent",
+            "forwardagent yes extra",
+        ] {
+            assert!(
+                parse_ssh_config(format!("hostname host\n{row}\n").as_bytes(), true).is_err(),
+                "{row:?}"
+            );
+        }
+        for (length, accepted) in [(4096, true), (4097, false)] {
+            let output = format!("hostname host\nsetenv A={}\n", "x".repeat(length));
+            assert_eq!(parse_ssh_config(output.as_bytes(), true).is_ok(), accepted);
+        }
+    }
+
+    #[test]
+    fn jump_address_lookup_does_not_import_relay_session_settings() {
+        let relay = parse_ssh_config(b"hostname relay\nuser relay-user\nport 2222\nforwardagent /tmp/relay-agent\nidentityagent $RELAY_AGENT\nsetenv BAD-NAME=relay-only\nproxyjump nested\n", false).unwrap();
+        assert_eq!(relay.hostname, "relay");
+        assert_eq!(relay.port, 2222);
+        assert_eq!(relay.user.as_deref(), Some("relay-user"));
+        assert!(!relay.forward_agent);
+        assert!(relay.set_env.is_empty());
+        assert!(relay.proxy_jump.is_none());
+        assert!(relay.identity_agent.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_openssh_effective_output_matches_parser_contract() {
+        let output = Command::new("ssh")
+            .args([
+                "-G",
+                "-T",
+                "-F",
+                "/dev/null",
+                "-o",
+                "SetEnv=A=first A=ignored \"B=two words\" EMPTY= EQ=a=b",
+                "-o",
+                "ForwardAgent=yes",
+                "-o",
+                "IdentityAgent=\"/tmp/agent space\"",
+                "-o",
+                "ProxyJump=ssh://user@jump:2200",
+                "example.test",
+            ])
+            .output()
+            .expect("OpenSSH is required for this contract test");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let resolved = parse_ssh_config(&output.stdout, true).unwrap();
+        assert_eq!(
+            resolved.set_env,
+            [
+                ("A".into(), "first".into()),
+                ("B".into(), "two words".into()),
+                ("EMPTY".into(), "".into()),
+                ("EQ".into(), "a=b".into()),
+            ]
+        );
+        assert!(resolved.forward_agent);
+        assert_eq!(resolved.identity_agent.as_deref(), Some("/tmp/agent space"));
+        assert_eq!(resolved.proxy_jump.as_deref(), Some("user@jump:2200"));
+    }
+
+    #[test]
+    fn setenv_block_cannot_change_other_config_and_preserves_framing() {
+        let baseline = b"hostname real\nsetenv ET_RS_CONFIG_SENTINEL=1\nforwardagent no\n";
+        for injected in [
+            "hostname evil\n",
+            "proxyjump evil\n",
+            "forwardagent yes\n",
+            "unknown value\n",
+            "\n",
+            "setenv A=x\nforwardagent no\nsetenv B=y\n",
+        ] {
+            let original = format!("hostname real\nsetenv A=hello\n{injected}forwardagent no\n");
+            assert!(
+                verify_setenv_block(original.as_bytes(), baseline).is_err(),
+                "{injected:?}"
+            );
+        }
+        for newline in ["\n", "\r\n"] {
+            let original = format!("hostname real{newline}setenv A= hello ={newline}setenv EMPTY={newline}forwardagent no{newline}");
+            let baseline = String::from_utf8(baseline.to_vec())
+                .unwrap()
+                .replace('\n', newline);
+            verify_setenv_block(original.as_bytes(), baseline.as_bytes()).unwrap();
+            assert!(verify_setenv_block(
+                original
+                    .replace("hostname real", "hostname changed")
+                    .as_bytes(),
+                baseline.as_bytes()
+            )
+            .is_err());
+        }
+        assert!(
+            verify_setenv_block(b"hostname real\nsetenv A=x\ny\nforwardagent no\n", baseline)
+                .is_err()
+        );
+        // Raw ssh -G cannot distinguish two assignments from a newline that
+        // spells another SetEnv row. Such output is confined to environment.
+        verify_setenv_block(
+            b"hostname real\nsetenv A=x\nsetenv B=y\nforwardagent no\n",
+            baseline,
+        )
+        .unwrap();
+        assert!(verify_setenv_block(baseline, b"hostname real\n").is_err());
+        assert!(verify_setenv_block(
+            baseline,
+            b"setenv ET_RS_CONFIG_SENTINEL=1\nsetenv EXTRA=2\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn setenv_verification_uses_original_deadline_and_prepends_override() {
+        struct Runner {
+            calls: std::sync::Mutex<usize>,
+            deadline: Deadline,
+        }
+        impl SshRunner for Runner {
+            fn run(
+                &self,
+                invocation: &SshInvocation,
+                deadline: Deadline,
+            ) -> Result<SshOutput, ClientError> {
+                assert_eq!(deadline.expires_at(), self.deadline.expires_at());
+                let mut calls = self.calls.lock().unwrap();
+                let output = if *calls == 0 {
+                    assert_eq!(invocation.args, ["-G", "-T", "-oSetEnv=A=user", "host"]);
+                    "hostname host\nsetenv A=user\n"
+                } else {
+                    assert_eq!(
+                        invocation.args,
+                        [
+                            "-G",
+                            "-T",
+                            "-oSetEnv=ET_RS_CONFIG_SENTINEL=1",
+                            "-oSetEnv=A=user",
+                            "host"
+                        ]
+                    );
+                    "hostname host\nsetenv ET_RS_CONFIG_SENTINEL=1\n"
+                };
+                *calls += 1;
+                Ok(SshOutput {
+                    status: Some(success_status()),
+                    stdout: output.as_bytes().to_vec(),
+                })
+            }
+        }
+        let deadline = Deadline::after(Duration::from_secs(3));
+        let runner = Runner {
+            calls: std::sync::Mutex::new(0),
+            deadline,
+        };
+        let resolved = resolve_ssh_config(
+            &runner,
+            "host",
+            None,
+            &["SetEnv=A=user".into()],
+            true,
+            deadline,
+        )
+        .unwrap();
+        assert_eq!(*runner.calls.lock().unwrap(), 2);
+        assert_eq!(resolved.set_env, [("A".into(), "user".into())]);
+    }
+
+    #[cfg(unix)]
+    struct CleanSsh<'a>(&'a str);
+
+    #[cfg(unix)]
+    impl SshRunner for CleanSsh<'_> {
+        fn run(
+            &self,
+            invocation: &SshInvocation,
+            deadline: Deadline,
+        ) -> Result<SshOutput, ClientError> {
+            let mut invocation = invocation.clone();
+            invocation.args.splice(2..2, ["-F".into(), self.0.into()]);
+            crate::ssh_process::SystemSsh::default().run(&invocation, deadline)
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_openssh_multiline_setenv_cannot_inject_routing() {
+        for value in [
+            "hello\nhostname injected.example",
+            "hello\nproxyjump evil",
+            "hello\nforwardagent yes",
+            "hello\nunknown value",
+            "hello\rvalue",
+        ] {
+            let error = resolve_ssh_config(
+                &CleanSsh("/dev/null"),
+                "example.test",
+                None,
+                &[format!("SetEnv=\"A={value}\"")],
+                true,
+                Deadline::after(Duration::from_secs(3)),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, ClientError::SshConfigMalformed(_)),
+                "{error}"
+            );
+        }
+        let resolved = resolve_ssh_config(
+            &CleanSsh("/dev/null"),
+            "example.test",
+            None,
+            &["SetEnv=A=one ET_RS_CONFIG_SENTINEL=user".into()],
+            true,
+            Deadline::after(Duration::from_secs(3)),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.set_env,
+            [
+                ("A".into(), "one".into()),
+                ("ET_RS_CONFIG_SENTINEL".into(), "user".into())
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_openssh_host_include_match_and_cli_precedence() {
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory =
+            Directory(std::env::temp_dir().join(format!("et-ssh-match-{}", std::process::id())));
+        std::fs::create_dir(&directory.0).unwrap();
+        let included = directory.0.join("included");
+        let root = directory.0.join("config");
+        std::fs::write(&included, "Host alias\n  HostName 127.0.0.8\n  User config-user\n  IdentityAgent /tmp/config-agent\nMatch originalhost alias user cli-user\n  SetEnv SOURCE=matched EMPTY=\n  ForwardAgent yes\nHost *\n").unwrap();
+        std::fs::write(&root, format!("Host other\n  SetEnv SOURCE=wrong-host\nHost alias\n  Include {}\nMatch final originalhost alias\n  ProxyJump jump-alias:2200\nHost *\n  SetEnv SOURCE=fallback\n  ForwardAgent no\n", included.display())).unwrap();
+        let runner = CleanSsh(root.to_str().unwrap());
+        let resolved = resolve_ssh_config(
+            &runner,
+            "alias",
+            Some("cli-user"),
+            &[],
+            true,
+            Deadline::after(Duration::from_secs(3)),
+        )
+        .unwrap();
+        assert_eq!(resolved.hostname, "127.0.0.8");
+        assert_eq!(resolved.user.as_deref(), Some("cli-user"));
+        assert!(resolved.forward_agent);
+        assert_eq!(
+            resolved.identity_agent.as_deref(),
+            Some("/tmp/config-agent")
+        );
+        assert_eq!(resolved.proxy_jump.as_deref(), Some("jump-alias:2200"));
+        assert_eq!(
+            resolved.set_env,
+            [
+                ("SOURCE".into(), "matched".into()),
+                ("EMPTY".into(), "".into())
+            ]
+        );
+        let overridden = resolve_ssh_config(
+            &runner,
+            "alias",
+            Some("cli-user"),
+            &[
+                "SetEnv=SOURCE=cli".into(),
+                "ForwardAgent=no".into(),
+                "IdentityAgent=none".into(),
+                "ProxyJump=cli-jump:2300".into(),
+            ],
+            true,
+            Deadline::after(Duration::from_secs(3)),
+        )
+        .unwrap();
+        assert_eq!(overridden.set_env, [("SOURCE".into(), "cli".into())]);
+        assert!(!overridden.forward_agent);
+        assert_eq!(overridden.identity_agent.as_deref(), Some("none"));
+        assert_eq!(overridden.proxy_jump.as_deref(), Some("cli-jump:2300"));
     }
 
     struct PortCapturingRunner {

@@ -88,13 +88,33 @@ fn run_client(
     deadline: Deadline,
 ) -> Result<(), ClientError> {
     let destination = parse_positional_host(&args.host, args.port)?;
+    let requested_user = command_user(destination.user, args.username.clone());
+    validate_ssh_destination(&destination.host, requested_user.as_deref())?;
+    let mut query_options = args.ssh_option.clone();
+    if let Some(jumphost) = args.jumphost.as_deref() {
+        validate_jumphost(jumphost)?;
+        query_options.insert(0, format!("ProxyJump={jumphost}"));
+    }
+    // The destination port is ET's port, not SSH's. Resolve configuration
+    // before choosing forwarding, environment budgets, or the native relay.
+    let resolved = resolve_ssh_config(
+        runner,
+        &destination.host,
+        requested_user.as_deref(),
+        &query_options,
+        true,
+        deadline,
+    )?;
+    let effective = effective_ssh_args(args, &resolved)?;
+    let args = &effective;
     validate_bootstrap_mode(args)?;
     let mut forward_config =
         crate::forward_config::build(args, std::env::var("SSH_AUTH_SOCK").ok().as_deref())?;
+    forward_config.apply_ssh_config(&resolved)?;
     let local_term = std::env::var("TERM").ok();
     let local_colorterm = std::env::var("COLORTERM").ok();
     let term = normalize_terminal_type(local_term.as_deref());
-    // Explicit non-POSIX modes never transmit locale or COLORTERM. A bare
+    // Non-POSIX modes never inherit local locale or COLORTERM. A bare
     // destination remains potentially POSIX until the credential-free probe.
     let may_send_posix_environment = !args.remote_is_windows();
     let colorterm = may_send_posix_environment
@@ -121,8 +141,15 @@ fn run_client(
             .into(),
         );
     }
+    // ET owns TERM and its Ghostty COLORTERM hint. Forwarding owns its
+    // exported names. Explicit SetEnv otherwise wins over inherited locale.
     let mut locale_environment = bounded_locale_environment(
-        ssh_locale_environment(),
+        resolved
+            .set_env
+            .iter()
+            .filter(|(name, _)| name != "TERM")
+            .cloned()
+            .chain(ssh_locale_environment()),
         &reserved_environment,
         forward_config.initial_payload.flowcontrol,
     )
@@ -136,19 +163,6 @@ fn run_client(
         .map_err(crate::forward_config::ForwardConfigError::JumphostPacketTooLarge)?;
     }
 
-    let requested_user = command_user(destination.user, args.username.clone());
-    validate_ssh_destination(&destination.host, requested_user.as_deref())?;
-    // The positional `host:port` is the ET server port, not an SSH port, so it
-    // must not be forwarded to the config query. Only the jumphost grammar
-    // below carries an explicit SSH port.
-    let resolved = resolve_ssh_config(
-        runner,
-        &destination.host,
-        requested_user.as_deref(),
-        &args.ssh_option,
-        true,
-        deadline,
-    )?;
     let user = requested_user.or_else(|| resolved.user.clone());
     let ssh_session = SshSession::start(
         runner,
@@ -162,15 +176,6 @@ fn run_client(
         &args.ssh_option,
         deadline,
     );
-    forward_config.apply_ssh_config(&resolved)?;
-    if args.jumphost.is_some() {
-        bound_jumphost_locale_environment(
-            &forward_config.initial_payload,
-            &mut locale_environment,
-            colorterm,
-        )
-        .map_err(crate::forward_config::ForwardConfigError::JumphostPacketTooLarge)?;
-    }
     let has_forwarding = !forward_config.local_sources.is_empty()
         || !forward_config.initial_payload.reversetunnels.is_empty();
     // Bind local sources only after the encrypted session exists so accepted
@@ -198,6 +203,39 @@ fn run_client(
         Some(run_shell_probe(&ssh_session, &probe, deadline)?)
     };
     let remote_mode = resolve_remote_mode(args, detected_shell);
+    if remote_mode.terminal_shell != RemoteShellKind::Posix {
+        // Explicit SetEnv applies to every session shell. Re-budget without
+        // inherited locale or a provisional Ghostty hint after shell detection.
+        let reserved = reserved_environment_value_lengths(
+            std::iter::empty(),
+            None,
+            initial_payload
+                .reversetunnels
+                .iter()
+                .filter_map(|request| request.environmentvariable.as_deref()),
+        );
+        let mut windows_names = std::collections::BTreeSet::new();
+        locale_environment = bounded_locale_environment(
+            resolved
+                .set_env
+                .iter()
+                .filter(|(name, _)| {
+                    !name.eq_ignore_ascii_case("TERM")
+                        && !reserved
+                            .keys()
+                            .any(|reserved| reserved.eq_ignore_ascii_case(name))
+                        && windows_names.insert(name.to_ascii_uppercase())
+                })
+                .cloned(),
+            &reserved,
+            initial_payload.flowcontrol,
+        )
+        .map_err(crate::forward_config::ForwardConfigError::EnvironmentPacketTooLarge)?;
+        if args.jumphost.is_some() {
+            bound_jumphost_locale_environment(&initial_payload, &mut locale_environment, None)
+                .map_err(crate::forward_config::ForwardConfigError::JumphostPacketTooLarge)?;
+        }
+    }
     let provisional = provisional_credentials()?;
 
     let request = BootstrapRequest {
@@ -307,10 +345,10 @@ fn run_client(
         // to the jump terminal instead of starting a shell.
         initial_payload.jumphost = Some(true);
     }
+    initial_payload
+        .environmentvariables
+        .extend(locale_environment);
     if remote_mode.terminal_shell == RemoteShellKind::Posix {
-        initial_payload
-            .environmentvariables
-            .extend(locale_environment);
         if let Some(value) = colorterm {
             initial_payload
                 .environmentvariables
@@ -532,29 +570,93 @@ fn validate_bootstrap_mode(args: &ClientArgs) -> Result<(), ClientError> {
     Ok(())
 }
 
+fn effective_ssh_args(
+    args: &ClientArgs,
+    config: &crate::ssh_config::ResolvedSshConfig,
+) -> Result<ClientArgs, ClientError> {
+    let mut args = args.clone();
+    if args.jumphost.is_none() {
+        args.jumphost.clone_from(&config.proxy_jump);
+    }
+    args.forward_ssh_agent |= config.forward_agent;
+    if args.forward_ssh_agent && args.ssh_socket.is_none() {
+        match config.identity_agent.as_deref() {
+            Some("none") => args.forward_ssh_agent = false,
+            None | Some("SSH_AUTH_SOCK") => {}
+            Some(socket) => {
+                // ssh -G expands ~ but leaves runtime substitutions intact.
+                // Do not silently forward to a literal unresolved expression.
+                if socket.is_empty() || socket.chars().any(|c| c.is_control() || "$%~".contains(c))
+                {
+                    return Err(ClientError::SshConfigMalformed("unsupported identityagent"));
+                }
+                args.ssh_socket = Some(socket.to_owned());
+            }
+        }
+    }
+    Ok(args)
+}
+
 /// Validate `--jumphost` as an SSH ProxyJump target (OpenSSH `-J` argument).
 ///
 /// Rejects empty values and option-injection shapes (`-o...`) that would be
 /// interpreted as extra `ssh` flags rather than a hop host.
 fn validate_jumphost(jumphost: &str) -> Result<(), ClientError> {
-    let jumphost = jumphost.trim();
-    if jumphost.is_empty() {
+    if jumphost.trim().is_empty() {
         return Err(ClientError::Unsupported("empty --jumphost value"));
     }
-    // Comma-separated multi-hop jumps are allowed by OpenSSH; validate each hop.
-    for hop in jumphost.split(',') {
-        let hop = hop.trim();
-        if hop.is_empty() {
-            return Err(ClientError::Unsupported("empty hop in --jumphost"));
-        }
-        let parsed = et_cli::host::parse_host_string(hop);
-        let host = parsed.host.trim_matches(|c| c == '[' || c == ']');
-        if host.is_empty() {
-            return Err(ClientError::Unsupported("empty hop in --jumphost"));
-        }
-        if host.starts_with('-') || (!parsed.user.is_empty() && parsed.user.starts_with('-')) {
-            return Err(ClientError::InvalidSshComponent("jumphost"));
-        }
+    // ET starts one native jump terminal, not a chain of native relays.
+    if jumphost.contains(',') {
+        return Err(ClientError::Unsupported(
+            "multi-hop jumphost is unsupported",
+        ));
+    }
+    if !jumphost
+        .bytes()
+        .all(|c| c.is_ascii_alphanumeric() || b"._-@[]:%".contains(&c))
+    {
+        return Err(ClientError::InvalidSshComponent("jumphost"));
+    }
+    let parsed = et_cli::host::parse_host_string(jumphost);
+    let host = parsed
+        .host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(&parsed.host);
+    let valid_host = if parsed.host.starts_with('[') {
+        let (address, zone) = host
+            .split_once('%')
+            .map_or((host, None), |(address, zone)| (address, Some(zone)));
+        address.parse::<std::net::Ipv6Addr>().is_ok()
+            && zone.is_none_or(|zone| {
+                !zone.is_empty()
+                    && zone
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+            })
+    } else {
+        host.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+    };
+    let rebuilt = format!(
+        "{}{}{}{}",
+        parsed.user,
+        if parsed.user.is_empty() { "" } else { "@" },
+        parsed.host,
+        parsed.port_suffix
+    );
+    if rebuilt != jumphost
+        || host.is_empty()
+        || !valid_host
+        || parsed.user.contains(['[', ']', ':', '%'])
+        || host.starts_with('-')
+        || parsed.user.starts_with('-')
+        || (!parsed.port_suffix.is_empty()
+            && !parsed.port_suffix[1..]
+                .parse::<u16>()
+                .is_ok_and(|port| port != 0))
+    {
+        return Err(ClientError::InvalidSshComponent("jumphost"));
     }
     Ok(())
 }
@@ -665,7 +767,29 @@ mod tests {
     fn jumphost_validation_rejects_injection_and_empty_hops() {
         assert!(validate_jumphost("jump.example").is_ok());
         assert!(validate_jumphost("user@jump.example:22").is_ok());
-        assert!(validate_jumphost("jump1,user@jump2").is_ok());
+        assert!(validate_jumphost("user@[::1]:2222").is_ok());
+        assert!(validate_jumphost("admin@[fe80::1%eth0]:2222").is_ok());
+        for invalid in [
+            "jump1,user@jump2",
+            "good,-evil",
+            "good,",
+            "[::1]extra",
+            "[::1",
+            "[[::1]]",
+            "[hostname]",
+            "host%h",
+            "jump:0",
+            "jump:65536",
+            "jump:abc",
+            "a@b@c",
+            "@host",
+            "jump host",
+            "$(command)",
+            "ssh://host",
+            "jump\n",
+        ] {
+            assert!(validate_jumphost(invalid).is_err(), "{invalid:?}");
+        }
         assert!(matches!(
             validate_jumphost(""),
             Err(ClientError::Unsupported("empty --jumphost value"))
@@ -678,14 +802,67 @@ mod tests {
             validate_jumphost("-oProxyCommand=bad"),
             Err(ClientError::InvalidSshComponent("jumphost"))
         ));
-        assert!(matches!(
-            validate_jumphost("good,-evil"),
-            Err(ClientError::InvalidSshComponent("jumphost"))
-        ));
-        assert!(matches!(
-            validate_jumphost("good,"),
-            Err(ClientError::Unsupported("empty hop in --jumphost"))
-        ));
+    }
+
+    #[test]
+    fn effective_ssh_precedence_and_disabled_agent_socket() {
+        let base = ClientArgs::try_parse_from(["et", "host"]).unwrap();
+        let mut config = crate::ssh_config::ResolvedSshConfig {
+            proxy_jump: Some("config-jump".into()),
+            forward_agent: true,
+            identity_agent: Some("/tmp/config agent".into()),
+            ..Default::default()
+        };
+        let selected = effective_ssh_args(&base, &config).unwrap();
+        assert_eq!(selected.jumphost.as_deref(), Some("config-jump"));
+        assert!(selected.forward_ssh_agent);
+        let forward = crate::forward_config::build(&selected, Some("/tmp/env-agent")).unwrap();
+        assert_eq!(
+            forward.initial_payload.reversetunnels[0]
+                .destination
+                .as_ref()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("/tmp/config agent")
+        );
+        let explicit = ClientArgs::try_parse_from([
+            "et",
+            "host",
+            "--jumphost=cli-jump",
+            "--ssh-socket=/tmp/cli-agent",
+            "-f",
+        ])
+        .unwrap();
+        config.proxy_jump = Some("invalid,multi-hop".into());
+        config.identity_agent = Some("none".into());
+        config.forward_agent = false;
+        let selected = effective_ssh_args(&explicit, &config).unwrap();
+        assert_eq!(selected.jumphost.as_deref(), Some("cli-jump"));
+        assert_eq!(selected.ssh_socket.as_deref(), Some("/tmp/cli-agent"));
+        assert!(selected.forward_ssh_agent);
+        config.forward_agent = true;
+        assert!(
+            !effective_ssh_args(&base, &config)
+                .unwrap()
+                .forward_ssh_agent
+        );
+        config.identity_agent = Some("SSH_AUTH_SOCK".into());
+        let selected = effective_ssh_args(&base, &config).unwrap();
+        assert!(selected.forward_ssh_agent);
+        assert_eq!(selected.ssh_socket, None);
+        assert!(crate::forward_config::build(&selected, None).is_err());
+        for unsupported in ["$AGENT", "${AGENT}", "%d/agent", "", "/tmp/a\0b"] {
+            config.identity_agent = Some(unsupported.into());
+            assert!(effective_ssh_args(&base, &config).is_err());
+            assert!(effective_ssh_args(&explicit, &config).is_ok());
+        }
+        config.forward_agent = false;
+        assert!(
+            !effective_ssh_args(&base, &config)
+                .unwrap()
+                .forward_ssh_agent
+        );
     }
 
     #[test]

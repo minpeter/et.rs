@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use et_cli::tunnel::MAX_UNIX_SOCKET_PATH;
 use et_core::packet::Packet;
@@ -106,8 +106,10 @@ pub(crate) fn bounded_locale_environment(
 
     let capacity = locale_environment_capacity(reserved.len());
     let mut selected = Vec::with_capacity(capacity);
+    let mut seen = BTreeSet::new();
     for (name, value) in candidates {
-        if reserved.contains_key(&name) || selected.len() == capacity {
+        if !seen.insert(name.clone()) || reserved.contains_key(&name) || selected.len() == capacity
+        {
             continue;
         }
         let addition = encoded_string_field_len(name.len()) + encoded_string_field_len(value.len());
@@ -178,6 +180,23 @@ mod tests {
     };
     use et_net::local_packet::MAX_LOCAL_PACKET_LEN;
     use prost::Message;
+
+    #[test]
+    fn first_environment_value_wins_even_when_it_does_not_fit() {
+        let selected = super::bounded_locale_environment(
+            [
+                ("LANG".into(), "x".repeat(MAX_LOCAL_PACKET_LEN)),
+                ("LANG".into(), "fallback-must-not-win".into()),
+                ("APP".into(), "first".into()),
+                ("APP".into(), "last".into()),
+                ("SSH_AUTH_SOCK".into(), "forged".into()),
+            ],
+            &std::collections::BTreeMap::from([("SSH_AUTH_SOCK".into(), 321)]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(selected, [("APP".into(), "first".into())]);
+    }
 
     #[test]
     fn effective_locale_controls_precede_other_categories() {

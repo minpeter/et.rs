@@ -131,6 +131,41 @@ etserver --daemon --pidfile /var/run/etserver.pid
 htm                                            # headless terminal multiplexer
 ```
 
+### SSH configuration
+
+ET reads effective configuration through bounded, deadline-limited `ssh -G -T`,
+including OpenSSH's Host/Match/Include and command-line `-o` precedence.
+When SetEnv is present, ET performs a second query with a SetEnv override and
+requires every byte outside the environment block to match. This prevents an
+embedded newline from becoming a routing/forwarding directive. Both queries share
+the original deadline. `Match exec` may consequently run again; changing config
+or nondeterministic Match results fail closed rather than using inconsistent data.
+
+- `ProxyJump` supplies the ET-native jumphost unless `--jumphost` is given.
+  Only one `[user@]host[:sshport]` hop is supported, including bracketed IPv6;
+  multi-hop and malformed/injection-shaped targets are rejected before bootstrap.
+  The SSH port does not replace the ET `--jport`.
+- `-f` or `ForwardAgent yes` enables agent forwarding. Socket selection is
+  `--ssh-socket` → `IdentityAgent` → `SSH_AUTH_SOCK`. `IdentityAgent none`
+  disables forwarding unless a CLI socket overrides it; `IdentityAgent SSH_AUTH_SOCK`
+  selects the environment socket. A socket option alone does not enable forwarding.
+  Literal paths (including spaces and OpenSSH-expanded `~`) are supported;
+  unresolved `$`/`%` substitutions and path-valued `ForwardAgent` are rejected.
+- Effective `SetEnv` assignments enter the initial payload for every session shell.
+  Values retain spaces, quotes, backslashes, empty strings, and additional `=` signs.
+  OpenSSH's effective first value wins for duplicate names. `SetEnv` takes precedence
+  over inherited `LANG`/`LC_*`; ET's TERM, active Ghostty COLORTERM hint, and
+  forwarding-generated environment names take precedence over `SetEnv`.
+  Names must be POSIX identifiers; supported values are single-line, NUL-free,
+  and at most 4096 bytes. OpenSSH's unescaped dump cannot distinguish a newline
+  followed by another `setenv NAME=value` row from a separate assignment, so
+  multiline values are not a supported lossless representation.
+  Entries share the 128-name and 64-KiB terminal/jumphost packet budgets: explicit
+  entries are considered before inherited locale, and entries that do not fit are
+  omitted. Non-POSIX sessions receive only explicit assignments, not inherited
+  locale or the local Ghostty COLORTERM hint, with first-wins case-insensitive
+  name deduplication and reserved-name checks.
+
 ### Connecting to a Windows host
 
 ```powershell

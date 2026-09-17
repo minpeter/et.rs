@@ -167,6 +167,12 @@ if [ "$1" = "-MNf" ]; then
   fi
 fi
 if [ "$1" = "-G" ]; then
+  for arg in "$@"; do
+    if [ "$arg" = "-oSetEnv=ET_RS_CONFIG_SENTINEL=1" ]; then
+      printf "%s" "$ET_FAKE_BASELINE_CONFIG"
+      exit 0
+    fi
+  done
   printf "%s" "$ET_FAKE_CONFIG"
   exit 0
 fi
@@ -199,6 +205,18 @@ exit "$ET_FAKE_EXIT"
     }
 
     fn command(&self, config: &str, stdout: &str, exit: i32, stderr: &str) -> Command {
+        let mut baseline = String::new();
+        let mut inserted = false;
+        for line in config.split_inclusive('\n') {
+            if line.starts_with("setenv ") {
+                if !inserted {
+                    baseline.push_str("setenv ET_RS_CONFIG_SENTINEL=1\n");
+                    inserted = true;
+                }
+            } else {
+                baseline.push_str(line);
+            }
+        }
         let mut command = Command::new(env!("CARGO_BIN_EXE_et"));
         command
             .env_clear()
@@ -207,6 +225,7 @@ exit "$ET_FAKE_EXIT"
             .env("ET_FAKE_ARGV", &self.argv)
             .env("ET_FAKE_STDIN", &self.stdin)
             .env("ET_FAKE_CONFIG", config)
+            .env("ET_FAKE_BASELINE_CONFIG", baseline)
             .env("ET_FAKE_STDOUT", stdout)
             .env("ET_FAKE_STDERR", stderr)
             .env("ET_FAKE_EXIT", exit.to_string())
@@ -242,6 +261,11 @@ exit "$ET_FAKE_EXIT"
         self.invocations()
             .into_iter()
             .filter(|argv| argv.first().is_some_and(|arg| arg != "-MNf" && arg != "-O"))
+            .filter(|argv| {
+                !argv
+                    .iter()
+                    .any(|arg| arg == "-oSetEnv=ET_RS_CONFIG_SENTINEL=1")
+            })
             .map(|argv| {
                 argv.into_iter()
                     .filter(|arg| arg != "-oControlMaster=no" && !arg.starts_with("-oControlPath="))
@@ -980,6 +1004,256 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
 }
 
 #[test]
+fn effective_ssh_config_drives_native_jump_agent_and_environment() {
+    for cli_override in [false, true] {
+        let (port, server) = initial_payload_server_with_error(Some("captured config payload"));
+        let fake = FakeSsh::new();
+        let config = format!("{RESOLVED_CONFIG}proxyjump config-user@jump-alias:2200\nforwardagent yes\nidentityagent /tmp/config agent\nsetenv APP=two words=a=b  \nsetenv EMPTY=\nsetenv LANG=config-locale\nsetenv TERM=bad-term\nsetenv COLORTERM=bad-color\nsetenv SSH_AUTH_SOCK=bad-agent\nsetenv ET_PIPE=bad-pipe\n");
+        let mut command = fake.command(&config, VALID_MARKER, 0, "");
+        command
+            .env("TERM", "xterm-ghostty")
+            .env("COLORTERM", "truecolor")
+            .env("LANG", "inherited-locale")
+            .env("SSH_AUTH_SOCK", "/tmp/env-agent")
+            .args([
+                "-N",
+                "--jport",
+                &port.to_string(),
+                "--jserverfifo=/tmp/jump.fifo",
+                "-r",
+                "ET_PIPE:remote-pipe",
+            ]);
+        if cli_override {
+            command.args([
+                "--jumphost=cli-user@cli-jump:2300",
+                "--ssh-socket=/tmp/cli-agent",
+            ]);
+        }
+        let output = command.arg("destination:2022").output().unwrap();
+        let payload = server.join().unwrap();
+        assert!(
+            stderr(&output).contains("captured config payload"),
+            "{}",
+            stderr(&output)
+        );
+        assert_eq!(payload.jumphost, Some(true));
+        assert_eq!(payload.environmentvariables.len(), 4);
+        for (name, value) in [
+            ("APP", "two words=a=b  "),
+            ("EMPTY", ""),
+            ("LANG", "config-locale"),
+            ("COLORTERM", "truecolor"),
+        ] {
+            assert_eq!(payload.environmentvariables[name], value);
+        }
+        let agent = payload
+            .reversetunnels
+            .iter()
+            .find(|row| row.environmentvariable.as_deref() == Some("SSH_AUTH_SOCK"))
+            .unwrap();
+        assert!(agent.source.is_none());
+        assert_eq!(
+            agent.destination.as_ref().unwrap().name.as_deref(),
+            Some(if cli_override {
+                "/tmp/cli-agent"
+            } else {
+                "/tmp/config agent"
+            })
+        );
+        let work = fake.work_invocations();
+        assert_eq!(
+            fake.invocations()
+                .iter()
+                .filter(|args| args
+                    .iter()
+                    .any(|arg| arg == "-oSetEnv=ET_RS_CONFIG_SENTINEL=1"))
+                .count(),
+            2
+        );
+        let (jump, user_host, ssh_port) = if cli_override {
+            ("cli-user@cli-jump:2300", "cli-user@cli-jump", "2300")
+        } else {
+            (
+                "config-user@jump-alias:2200",
+                "config-user@jump-alias",
+                "2200",
+            )
+        };
+        if cli_override {
+            assert_eq!(
+                work[0],
+                [
+                    "-G",
+                    "-T",
+                    "-oProxyJump=cli-user@cli-jump:2300",
+                    "destination"
+                ]
+            );
+        }
+        assert_eq!(&work[1][..2], ["-J", jump]);
+        assert_eq!(&work[2][..2], ["-J", jump]);
+        assert_eq!(work[3], ["-G", "-T", "-p", ssh_port, user_host]);
+        assert_eq!(&work[4][..2], ["-p", ssh_port]);
+        assert!(work[4].contains(&user_host.to_owned()));
+        assert!(work[4]
+            .last()
+            .unwrap()
+            .contains("'--jump' '--dsthost=127.0.0.1' '--dstport=2022'"));
+    }
+}
+
+#[test]
+fn effective_setenv_shares_terminal_and_jumphost_packet_budgets() {
+    for jump in [false, true] {
+        for (count, value_length, expected_count) in [(140, 1, 128), (20, 4096, 15)] {
+            let (port, server) = initial_payload_server();
+            let fake = FakeSsh::new();
+            let mut config = RESOLVED_CONFIG.to_owned();
+            if jump {
+                config.push_str("proxyjump jump-alias\n");
+            }
+            for index in 0..count {
+                config.push_str(&format!(
+                    "setenv APP_{index:03}={}\n",
+                    "x".repeat(value_length)
+                ));
+            }
+            let output = fake
+                .command(&config, VALID_MARKER, 0, "")
+                .args([
+                    "-N",
+                    "--jport",
+                    &port.to_string(),
+                    &format!("destination:{port}"),
+                ])
+                .output()
+                .unwrap();
+            let payload = server.join().unwrap();
+            assert!(output.status.success(), "{}", stderr(&output));
+            assert_eq!(payload.environmentvariables.len(), expected_count);
+            assert_eq!(
+                payload.environmentvariables["APP_000"],
+                "x".repeat(value_length)
+            );
+            assert!(!payload
+                .environmentvariables
+                .contains_key(&format!("APP_{expected_count:03}")));
+            let term = TermInit {
+                environmentnames: payload.environmentvariables.keys().cloned().collect(),
+                environmentvalues: payload.environmentvariables.values().cloned().collect(),
+                flowcontrol: payload.flowcontrol,
+            };
+            assert!(
+                Packet::new(TerminalPacketType::TerminalInit as u8, term.encode_to_vec())
+                    .wire_len()
+                    <= MAX_LOCAL_PACKET_LEN
+            );
+            if jump {
+                assert_eq!(payload.jumphost, Some(true));
+                assert!(
+                    Packet::new(
+                        TerminalPacketType::JumphostInit as u8,
+                        payload.encode_to_vec()
+                    )
+                    .wire_len()
+                        <= MAX_LOCAL_PACKET_LEN
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn windows_sessions_receive_explicit_setenv_without_inherited_locale() {
+    for explicit in [false, true] {
+        let (port, server) = initial_payload_server_with_error(Some("captured Windows payload"));
+        let fake = FakeSsh::new();
+        let config = format!("{RESOLVED_CONFIG}proxyjump jump-alias\nsetenv APP=literal & value\nsetenv app=wrong-case-duplicate\nsetenv COLORTERM=explicit-color\nsetenv LANG=explicit-locale\nsetenv term=do-not-override\nsetenv et_pipe=do-not-override\n");
+        let mut command = fake.command(&config, VALID_MARKER, 0, "");
+        command
+            .env("TERM", "xterm-ghostty")
+            .env("COLORTERM", "truecolor")
+            .env("LANG", "inherited")
+            .env("LC_ALL", "inherited")
+            .env(
+                "ET_FAKE_PROBE_STDOUT",
+                "__ET_COMSPEC__C:\\Windows\\cmd.exe\r\n",
+            )
+            .args([
+                "-N",
+                "--jport",
+                &port.to_string(),
+                "-r",
+                "ET_PIPE:remote-pipe",
+            ]);
+        if explicit {
+            command.arg("--winserver");
+        }
+        let output = command.arg("destination:2022").output().unwrap();
+        let payload = server.join().unwrap();
+        assert!(
+            stderr(&output).contains("captured Windows payload"),
+            "{}",
+            stderr(&output)
+        );
+        assert_eq!(payload.environmentvariables.len(), 3);
+        for (name, value) in [
+            ("APP", "literal & value"),
+            ("COLORTERM", "explicit-color"),
+            ("LANG", "explicit-locale"),
+        ] {
+            assert_eq!(payload.environmentvariables[name], value);
+        }
+        assert_eq!(payload.jumphost, Some(true));
+        assert!(!fake
+            .work_invocations()
+            .iter()
+            .any(|args| args.iter().any(|arg| arg.contains("literal & value"))));
+    }
+}
+
+#[test]
+fn disabled_agent_config_never_falls_back_to_environment_socket() {
+    for options in [
+        "forwardagent yes\nidentityagent none\n",
+        "forwardagent no\nidentityagent /tmp/config-agent\n",
+    ] {
+        let (port, server) = initial_payload_server();
+        let fake = FakeSsh::new();
+        let output = fake
+            .command(&format!("{RESOLVED_CONFIG}{options}"), VALID_MARKER, 0, "")
+            .env("SSH_AUTH_SOCK", "/tmp/env-agent")
+            .args(["-N", &format!("destination:{port}")])
+            .output()
+            .unwrap();
+        let payload = server.join().unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert!(payload.reversetunnels.is_empty());
+    }
+}
+
+#[test]
+fn unsupported_effective_config_fails_before_bootstrap() {
+    for row in [
+        "proxyjump first,second",
+        "proxyjump user@jump:0",
+        "proxyjump [::1]trailing",
+        "proxyjump $(bad)",
+        "setenv BAD-NAME=value",
+        "forwardagent yes\nidentityagent $UNRESOLVED",
+    ] {
+        let fake = FakeSsh::new();
+        let output = fake
+            .command(&format!("{RESOLVED_CONFIG}{row}\n"), VALID_MARKER, 0, "")
+            .args(["-N", "destination"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{row}");
+        assert_eq!(fake.work_invocations(), [vec!["-G", "-T", "destination"]]);
+    }
+}
+
+#[test]
 fn posix_client_forwards_only_ssh_locale_environment() {
     let (port, server) = initial_payload_server();
     let fake = FakeSsh::new();
@@ -1426,7 +1700,7 @@ fn leading_hyphen_destination_components_are_rejected_before_spawn() {
 
 #[test]
 fn invalid_client_modes_fail_before_ssh_bootstrap() {
-    let no_ssh = TestDir::new("honest");
+    let fake = FakeSsh::new();
     for (args, message) in [
         (
             vec!["-N", "-t", "0:80", "example.test"],
@@ -1441,19 +1715,20 @@ fn invalid_client_modes_fail_before_ssh_bootstrap() {
             "invalid reverse-tunnel environment variable name",
         ),
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_et"))
-            .env("PATH", &no_ssh.0)
+        let output = fake
+            .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
             .args(args)
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(2));
         assert!(stderr(&output).contains(message), "{}", stderr(&output));
     }
+    assert!(fake.invocations().iter().all(|args| args[0] == "-G"));
 }
 
 #[test]
 fn excessive_unique_tunnel_environment_names_fail_before_ssh_bootstrap() {
-    let no_ssh = TestDir::new("honest");
+    let fake = FakeSsh::new();
     let mut arguments = vec!["-N".to_owned()];
     for index in 0..129 {
         arguments.extend([
@@ -1462,8 +1737,8 @@ fn excessive_unique_tunnel_environment_names_fail_before_ssh_bootstrap() {
         ]);
     }
     arguments.push("example.test".to_owned());
-    let output = Command::new(env!("CARGO_BIN_EXE_et"))
-        .env("PATH", &no_ssh.0)
+    let output = fake
+        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
         .args(arguments)
         .output()
         .unwrap();
@@ -1473,11 +1748,12 @@ fn excessive_unique_tunnel_environment_names_fail_before_ssh_bootstrap() {
         "{}",
         stderr(&output)
     );
+    assert_eq!(fake.invocations().len(), 1);
 }
 
 #[test]
 fn colorterm_counts_toward_the_tunnel_environment_limit() {
-    let no_ssh = TestDir::new("honest");
+    let fake = FakeSsh::new();
     let mut arguments = vec!["-N".to_owned()];
     for index in 0..128 {
         arguments.extend([
@@ -1486,8 +1762,8 @@ fn colorterm_counts_toward_the_tunnel_environment_limit() {
         ]);
     }
     arguments.push("server-alias:1".to_owned());
-    let output = Command::new(env!("CARGO_BIN_EXE_et"))
-        .env("PATH", &no_ssh.0)
+    let output = fake
+        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
         .env("TERM", "xterm-ghostty")
         .env("COLORTERM", "truecolor")
         .args(arguments)
@@ -1499,6 +1775,7 @@ fn colorterm_counts_toward_the_tunnel_environment_limit() {
         "{}",
         stderr(&output)
     );
+    assert_eq!(fake.invocations().len(), 1);
 }
 
 #[test]
@@ -1536,10 +1813,10 @@ fn non_posix_colorterm_does_not_reserve_an_unsent_environment_name() {
 
 #[test]
 fn oversized_tunnel_environment_name_exceeds_local_packet_limit() {
-    let no_ssh = TestDir::new("honest");
+    let fake = FakeSsh::new();
     let environment_name = format!("E{}", "T".repeat(MAX_LOCAL_PACKET_LEN));
-    let output = Command::new(env!("CARGO_BIN_EXE_et"))
-        .env("PATH", &no_ssh.0)
+    let output = fake
+        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
         .env("TERM", "xterm-256color")
         .args([
             "-N",
@@ -1555,23 +1832,24 @@ fn oversized_tunnel_environment_name_exceeds_local_packet_limit() {
         "{}",
         stderr(&output)
     );
+    assert_eq!(fake.invocations().len(), 1);
 }
 
 #[test]
 fn oversized_jumphost_initialization_fails_before_ssh_bootstrap() {
-    let no_ssh = TestDir::new("honest");
+    let fake = FakeSsh::new();
     let mut arguments = vec![
         "-N".to_owned(),
         "--jumphost".to_owned(),
         "jump-alias".to_owned(),
     ];
     let destination = format!("remote-{}", "x".repeat(500));
-    for _ in 0..128 {
-        arguments.extend(["-r".to_owned(), format!("ET_PIPE:{destination}")]);
+    for index in 0..128 {
+        arguments.extend(["-r".to_owned(), format!("ET_PIPE:{destination}{index}")]);
     }
     arguments.push("example.test".to_owned());
-    let output = Command::new(env!("CARGO_BIN_EXE_et"))
-        .env("PATH", &no_ssh.0)
+    let output = fake
+        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
         .env("TERM", "xterm-256color")
         .args(arguments)
         .output()
@@ -1582,6 +1860,7 @@ fn oversized_jumphost_initialization_fails_before_ssh_bootstrap() {
         "{}",
         stderr(&output)
     );
+    assert_eq!(fake.invocations().len(), 1);
 }
 
 #[test]
@@ -1671,7 +1950,15 @@ fn jumphost_starts_a_jump_terminal_and_connects_to_the_jumphost() {
     // -G dst, login-shell probe, dst bootstrap through -J, -G jumphost,
     // jump bootstrap.
     assert_eq!(invocations.len(), 5, "{invocations:?}");
-    assert_eq!(invocations[0], ["-G", "-T", "test-user@server-alias"]);
+    assert_eq!(
+        invocations[0],
+        [
+            "-G",
+            "-T",
+            "-oProxyJump=jump.example",
+            "test-user@server-alias"
+        ]
+    );
     assert!(invocations[1].last().unwrap().contains("__ET_COMSPEC__"));
     let destination = &invocations[2];
     assert_eq!(destination[0], "-J");
@@ -1740,8 +2027,8 @@ fn jumphost_starts_a_jump_terminal_and_connects_to_the_jumphost() {
 }
 
 #[test]
-fn malformed_jumphost_and_jserverfifo_fail_before_ssh() {
-    let no_ssh = TestDir::new("jump-fail");
+fn malformed_jumphost_and_jserverfifo_fail_before_ssh_bootstrap() {
+    let fake = FakeSsh::new();
     // Use `--jumphost=value` form so values starting with `-` reach validation.
     let cases: &[(&[&str], &str)] = &[
         (
@@ -1754,7 +2041,7 @@ fn malformed_jumphost_and_jserverfifo_fail_before_ssh() {
         ),
         (
             &["-N", "--jumphost=good,-evil", "example.test"],
-            "must not begin with a hyphen",
+            "multi-hop jumphost is unsupported",
         ),
         (
             // `--jserverfifo` only makes sense together with `--jumphost`.
@@ -1763,8 +2050,8 @@ fn malformed_jumphost_and_jserverfifo_fail_before_ssh() {
         ),
     ];
     for (args, message) in cases {
-        let output = Command::new(env!("CARGO_BIN_EXE_et"))
-            .env("PATH", &no_ssh.0)
+        let output = fake
+            .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
             .args(*args)
             .output()
             .unwrap();
@@ -1775,4 +2062,5 @@ fn malformed_jumphost_and_jserverfifo_fail_before_ssh() {
             "args={args:?} expected `{message}` in stderr={err}"
         );
     }
+    assert!(fake.invocations().iter().all(|args| args[0] == "-G"));
 }

@@ -1,0 +1,11 @@
+[Unit]
+Description=Eternal Terminal (et.rs)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/etserver --cfgfile=/etc/et.cfg --logtostdout
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

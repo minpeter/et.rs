@@ -188,3 +188,36 @@ impl ShutdownSignal {
 fn clap_io(message: &str, error: impl std::fmt::Display) -> clap::Error {
     clap::Error::raw(ErrorKind::Io, format!("{message}: {error}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_loading_requires_explicit_files_and_propagates_read_errors() {
+        let directory =
+            std::env::temp_dir().join(format!("et-config-loading-{}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        let mut parsed = ServerArgs::try_parse_from(["etserver"]).unwrap();
+        // Substitute an isolated path rather than depending on host /etc files.
+        parsed.cfgfile = directory.join("et.cfg");
+        assert_eq!(load_config(&[], &parsed).unwrap(), None);
+        for args in [
+            vec![OsString::from("--cfgfile"), parsed.cfgfile.clone().into()],
+            vec![OsString::from(format!(
+                "--cfgfile={}",
+                parsed.cfgfile.display()
+            ))],
+        ] {
+            assert!(load_config(&args, &parsed).is_err());
+            fs::write(&parsed.cfgfile, "[Networking]\nport=4321\n").unwrap();
+            let ini = load_config(&args, &parsed).unwrap().unwrap();
+            assert_eq!(resolve_config(&parsed, Some(&ini)).unwrap().port, 4321);
+            fs::remove_file(&parsed.cfgfile).unwrap();
+        }
+        // A present but unreadable config must not silently select defaults.
+        parsed.cfgfile = directory.clone();
+        assert!(load_config(&[], &parsed).is_err());
+        fs::remove_dir(directory).unwrap();
+    }
+}

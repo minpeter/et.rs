@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 pub const DEFAULT_PORT: u16 = 2022;
-pub const DEFAULT_CONFIG_PATH: &str = "/etc/et/config";
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/et.cfg";
 /// Kernel accept-queue depth (`listen(2)` backlog). Matches ET #798.
 pub const DEFAULT_LISTEN_BACKLOG: i32 = 128;
 

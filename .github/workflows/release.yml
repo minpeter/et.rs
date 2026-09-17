@@ -105,6 +105,17 @@ jobs:
         with:
           ref: ${{ needs.release.outputs.tag }}
 
+      # Historical tags may predate the packaging scripts/templates. Rebuild
+      # their binary with packaging tooling from this workflow's revision.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: release-tools
+          sparse-checkout: |
+            scripts
+            etc
+            systemctl
+
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.1
@@ -133,32 +144,13 @@ jobs:
       - name: Package
         id: package
         shell: bash
+        working-directory: release-tools
         run: |
           version="${TAG#et@}"
-          name="et-${version}-${{ matrix.target }}"
-          mkdir "$name"
-          case "${{ matrix.target }}" in
-            *windows*)
-              cp "target/${{ matrix.target }}/release/et.exe" "$name/"
-              archive="$name.zip"
-              7z a "$archive" "./$name/*"
-              ;;
-            *)
-              cp "target/${{ matrix.target }}/release/et" "$name/"
-              # Busybox-style role dispatch: symlinks select the role by argv[0].
-              for role in etserver etterminal htm htmd; do
-                ln -s et "$name/$role"
-              done
-              archive="$name.tar.gz"
-              tar -czf "$archive" "$name"
-              ;;
-          esac
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "$archive" > "$archive.sha256"
-          else
-            shasum -a 256 "$archive" > "$archive.sha256"
-          fi
-          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          binary="../target/${{ matrix.target }}/release/et"
+          [[ "${{ matrix.target }}" != *windows* ]] || binary="$binary.exe"
+          archive="$(bash scripts/package-release.sh "$version" "${{ matrix.target }}" "$binary")"
+          echo "archive=release-tools/$archive" >> "$GITHUB_OUTPUT"
 
       - name: Upload release assets
         shell: bash

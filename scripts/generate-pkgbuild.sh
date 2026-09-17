@@ -28,6 +28,7 @@ provides=('et-rs')
 # Drop-in replacement for EternalTerminal: both install et/etserver/etterminal.
 conflicts=('et-rs' 'eternal-terminal' 'eternal-terminal-git')
 options=('!strip' '!debug')
+backup=('etc/et.cfg')
 source_x86_64=("\$pkgname-\$pkgver-x86_64.tar.gz::\$url/releases/download/et@\$pkgver/et-\$pkgver-x86_64-unknown-linux-gnu.tar.gz")
 source_aarch64=("\$pkgname-\$pkgver-aarch64.tar.gz::\$url/releases/download/et@\$pkgver/et-\$pkgver-aarch64-unknown-linux-gnu.tar.gz")
 sha256sums_x86_64=('${x86}')
@@ -47,5 +48,7 @@ package() {
   for role in etserver etterminal htm htmd; do
     ln -s et "\$pkgdir/usr/bin/\$role"
   done
+  install -Dm644 etc/et.cfg "\$pkgdir/etc/et.cfg"
+  install -Dm644 systemctl/et.service "\$pkgdir/usr/lib/systemd/system/et.service"
 }
 EOF

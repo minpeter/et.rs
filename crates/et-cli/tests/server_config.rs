@@ -9,11 +9,31 @@ use et_cli::server::{resolve_config, ConfigError, ServerArgs, DEFAULT_PORT};
 #[test]
 fn defaults_are_typed_and_do_not_force_an_insecure_router_path() {
     let args = ServerArgs::try_parse_from(["etserver"]).unwrap();
+    assert_eq!(args.cfgfile, PathBuf::from("/etc/et.cfg"));
     let cfg = resolve_config(&args, None).unwrap();
     assert_eq!(cfg.port, DEFAULT_PORT);
     assert_eq!(cfg.bind_ip, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     assert_eq!(cfg.server_fifo, None);
     assert_eq!(cfg.listen_backlog, et_cli::server::DEFAULT_LISTEN_BACKLOG);
+}
+
+#[test]
+fn packaged_config_and_service_flags_preserve_defaults_and_cli_precedence() {
+    let ini = include_str!("../../../etc/et.cfg");
+    let args =
+        ServerArgs::try_parse_from(["etserver", "--cfgfile=/etc/et.cfg", "--logtostdout"]).unwrap();
+    assert!(args.logtostdout);
+    assert!(!args.daemon);
+    let cfg = resolve_config(&args, Some(ini)).unwrap();
+    assert_eq!(cfg.port, 2022);
+    assert_eq!(cfg.log_size, 20_971_520);
+    assert!(!cfg.telemetry);
+
+    let args =
+        ServerArgs::try_parse_from(["etserver", "--cfgfile", "/etc/et/config", "--port=4321"])
+            .unwrap();
+    assert_eq!(args.cfgfile, PathBuf::from("/etc/et/config"));
+    assert_eq!(resolve_config(&args, Some(ini)).unwrap().port, 4321);
 }
 
 #[test]

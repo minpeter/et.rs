@@ -61,6 +61,10 @@ jobs:
       - if: runner.os == 'Linux'
         run: cargo test --workspace -- --test-threads=1
 
+      - name: Verify release archive and AUR staging
+        if: runner.os == 'Linux'
+        run: bash scripts/test-release-package.sh "$PWD/target/debug/et"
+
       # Library unit tests exercise the real SCM_RIGHTS helper. Unlike the
       # Linux workspace test command, `--lib --bins` does not produce Cargo's
       # un-hashed executable, so build the shipped helper explicitly.

@@ -18,6 +18,17 @@ PowerShell — no WSL involved.
 
 ## Install
 
+**Upgrading an existing server:** the default config path is now `/etc/et.cfg`,
+not `/etc/et/config`. Save your old settings before upgrading. After installing,
+copy/merge them into `/etc/et.cfg` before starting/restarting the new server (do not
+overwrite an existing customized file), or explicitly keep
+`--cfgfile=/etc/et/config` in your own unit. There is no automatic migration
+or legacy-path fallback. An existing `/etc/systemd/system/et.service` overrides
+the AUR package's unit: update it to use the intended config and `--logtostdout`,
+or deliberately remove it to use the packaged unit. After updating a unit, run
+`sudo systemctl daemon-reload`; use `sudo systemctl restart et` to apply changes
+to an already running server (`enable --now` alone does not restart it).
+
 ### Homebrew (macOS, Linux)
 
 ```sh
@@ -38,37 +49,48 @@ paru -S et-rs-bin
 
 Installs the prebuilt release binary (x86_64, aarch64) with the role symlinks. Conflicts with the
 `eternal-terminal` package for the same drop-in-replacement reason.
+Also installs `/etc/et.cfg` (preserving local edits on upgrades) and `et.service`.
+Enable the server explicitly with `sudo systemctl enable --now et`.
 
 ### Prebuilt binaries
 
 Every [release](https://github.com/minpeter/et.rs/releases) ships archives (with `.sha256`
 checksums) for Linux (gnu/musl, x86_64/aarch64), macOS (x86_64/aarch64), and Windows (x86_64).
-The tarballs already contain the role symlinks:
+The tarballs already contain the role symlinks. Linux tarballs also contain
+`etc/et.cfg` and `systemctl/et.service`; extract first rather than unpacking all files into `bin`:
 
 ```sh
 curl -LO "https://github.com/minpeter/et.rs/releases/latest/download/et-VERSION-TARGET.tar.gz"
-sudo tar -xzf et-VERSION-TARGET.tar.gz -C /usr/local/bin --strip-components=1
+tar -xzf et-VERSION-TARGET.tar.gz
+cd et-VERSION-TARGET
+sudo install -m755 et /usr/local/bin/et
+for role in etserver etterminal htm htmd; do
+  sudo ln -sf et "/usr/local/bin/$role"
+done
 ```
 
-To run the server on boot (Linux):
-
-```ini
-# /etc/systemd/system/et.service
-[Unit]
-Description=EternalTerminal server (et.rs)
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/etserver
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-```
+To run the server on boot (Linux), install the bundled templates. Keep an existing
+`/etc/et.cfg`; edit it as needed before enabling the service:
 
 ```sh
+if ! sudo test -e /etc/et.cfg; then
+  sudo install -m644 etc/et.cfg /etc/et.cfg
+fi
+# The package unit uses /usr/bin; manual installs use /usr/local/bin.
+sed 's|/usr/bin/etserver|/usr/local/bin/etserver|' systemctl/et.service |
+  sudo tee /etc/systemd/system/et.service >/dev/null
+sudo systemctl daemon-reload
 sudo systemctl enable --now et    # and open 2022/tcp in your firewall
 ```
+
+The resulting unit runs
+`ExecStart=/usr/local/bin/etserver --cfgfile=/etc/et.cfg --logtostdout` in the foreground,
+with logs also available through `journalctl -u et` (normal file logging remains enabled).
+
+A missing default `/etc/et.cfg` is allowed for direct CLI use;
+an explicitly selected file (including the service's `/etc/et.cfg`) must be readable.
+CLI options override values in the selected INI file. Homebrew still installs only
+the binary and role symlinks; these systemd instructions are for Linux tarballs/AUR.
 
 ### Build from source
 

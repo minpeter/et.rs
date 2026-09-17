@@ -1,0 +1,2 @@
+# Release packaging runs these scripts through Git Bash on Windows too.
+*.sh text eol=lf

@@ -2,6 +2,382 @@ use super::*;
 use crate::client_terminal::TerminalModeState;
 use std::sync::mpsc;
 
+struct BatchWriter {
+    writes: mpsc::Sender<Vec<u8>>,
+    results: mpsc::Receiver<io::Result<usize>>,
+    flushes: Arc<Mutex<usize>>,
+}
+
+impl Write for BatchWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.writes.send(bytes.to_vec()).unwrap();
+        self.results.recv_timeout(Duration::from_secs(3)).unwrap()
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        *self.flushes.lock().unwrap() += 1;
+        Ok(())
+    }
+}
+
+#[test]
+fn adjacent_admitted_packets_render_once_and_keep_packet_accounting() {
+    for mode in [
+        FlowControlMode::None,
+        FlowControlMode::Backpressure,
+        FlowControlMode::Discard,
+    ] {
+        let (writes, written) = mpsc::channel();
+        let (results, responses) = mpsc::channel();
+        let flushes = Arc::new(Mutex::new(0));
+        let mut output = ConsoleOutput::new(
+            mode,
+            Box::new(BatchWriter {
+                writes,
+                results: responses,
+                flushes: Arc::clone(&flushes),
+            }),
+        )
+        .unwrap();
+        let modes = TerminalModeState::default();
+        let other_modes = TerminalModeState::default();
+        assert!(output.try_write(b"gate", &modes).unwrap());
+        assert_eq!(written.recv().unwrap(), b"gate");
+        // Distinct trackers and a split mode sequence must retain their owners.
+        for (packet, tracker) in [
+            (b"\x1b[2J\x1b[H\x1b[?1049".as_slice(), &modes),
+            (b"hpaint\x1b[6n", &modes),
+            (b"\x1b[?1049l\x1b[6n\x1b[6n", &other_modes),
+            (b"\x1b[", &modes),
+            (b"6n", &modes),
+        ] {
+            assert!(output.try_write(packet, tracker).unwrap());
+        }
+        results.send(Ok(4)).unwrap();
+        let batch = written.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(
+            batch,
+            b"\x1b[2J\x1b[H\x1b[?1049hpaint\x1b[6n\x1b[?1049l\x1b[6n\x1b[6n\x1b[6n"
+        );
+        assert!(!modes.alternate_screen());
+        assert_eq!(output.take_cursor_reports().unwrap(), 0);
+        assert_eq!(*flushes.lock().unwrap(), 1);
+        // Stop admission without losing access to completion accounting.
+        output
+            .shared
+            .as_ref()
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .stopping = true;
+        results.send(Ok(batch.len())).unwrap();
+        output.wait_worker_done();
+        assert!(modes.alternate_screen());
+        assert!(!other_modes.alternate_screen());
+        // Existing semantics: one report per packet containing a full request,
+        // not per sequence, and no new report assembled across packet edges.
+        assert_eq!(output.take_cursor_reports().unwrap(), 2);
+        assert_eq!(output.take_cursor_reports().unwrap(), 0);
+        assert_eq!(*flushes.lock().unwrap(), 2);
+        assert_eq!(output.worker_progress().unwrap(), 2);
+        assert!(written.try_recv().is_err());
+        output.finish_gracefully().unwrap();
+    }
+}
+
+#[test]
+fn batched_partial_writes_retry_exact_suffix_and_report_progress() {
+    let (writes, written) = mpsc::channel();
+    let (results, responses) = mpsc::channel();
+    let flushes = Arc::new(Mutex::new(0));
+    let mut output = ConsoleOutput::new(
+        FlowControlMode::Backpressure,
+        Box::new(BatchWriter {
+            writes,
+            results: responses,
+            flushes: Arc::clone(&flushes),
+        }),
+    )
+    .unwrap();
+    let modes = TerminalModeState::default();
+    assert!(output.try_write(b"gate", &modes).unwrap());
+    assert_eq!(written.recv().unwrap(), b"gate");
+    assert!(output.try_write(b"ab\x1b[?1049", &modes).unwrap());
+    assert!(output.try_write(b"hXYZ\x1b[6n", &modes).unwrap());
+    results.send(Ok(4)).unwrap();
+    assert_eq!(written.recv().unwrap(), b"ab\x1b[?1049hXYZ\x1b[6n");
+    results.send(Ok(3)).unwrap();
+    assert_eq!(written.recv().unwrap(), b"[?1049hXYZ\x1b[6n");
+    assert_eq!(output.worker_progress().unwrap(), 2);
+    results
+        .send(Err(io::ErrorKind::Interrupted.into()))
+        .unwrap();
+    assert_eq!(written.recv().unwrap(), b"[?1049hXYZ\x1b[6n");
+    assert_eq!(output.worker_progress().unwrap(), 2);
+    results.send(Ok(9)).unwrap();
+    assert_eq!(written.recv().unwrap(), b"Z\x1b[6n");
+    assert_eq!(output.worker_progress().unwrap(), 3);
+    assert!(!modes.alternate_screen());
+    assert_eq!(output.take_cursor_reports().unwrap(), 0);
+    assert_eq!(*flushes.lock().unwrap(), 3);
+    output
+        .shared
+        .as_ref()
+        .unwrap()
+        .state
+        .lock()
+        .unwrap()
+        .stopping = true;
+    results.send(Ok(5)).unwrap();
+    output.wait_worker_done();
+    assert_eq!(output.worker_progress().unwrap(), 4);
+    assert!(modes.alternate_screen());
+    assert_eq!(output.take_cursor_reports().unwrap(), 1);
+    assert_eq!(*flushes.lock().unwrap(), 4);
+    output.finish_gracefully().unwrap();
+}
+
+#[test]
+fn delivered_packet_is_confirmed_before_batched_suffix_fails() {
+    let (writes, written) = mpsc::channel();
+    let (results, responses) = mpsc::channel();
+    let flushes = Arc::new(Mutex::new(0));
+    let mut output = ConsoleOutput::new(
+        FlowControlMode::None,
+        Box::new(BatchWriter {
+            writes,
+            results: responses,
+            flushes: Arc::clone(&flushes),
+        }),
+    )
+    .unwrap();
+    let modes = TerminalModeState::default();
+    assert!(output.try_write(b"gate", &modes).unwrap());
+    assert_eq!(written.recv().unwrap(), b"gate");
+    assert!(output.try_write(b"\x1b[?1049h\x1b[6n", &modes).unwrap());
+    assert!(output.try_write(b"\x1b[?1049l\x1b[6n", &modes).unwrap());
+    results.send(Ok(4)).unwrap();
+    assert_eq!(
+        written.recv().unwrap(),
+        b"\x1b[?1049h\x1b[6n\x1b[?1049l\x1b[6n"
+    );
+    results.send(Ok(12)).unwrap();
+    assert_eq!(written.recv().unwrap(), b"\x1b[?1049l\x1b[6n");
+    // The suffix is still blocked. Cleanup and cursor replies must already
+    // know that the first original packet crossed the flush boundary.
+    assert!(modes.alternate_screen());
+    assert_eq!(output.take_cursor_reports().unwrap(), 1);
+    assert_eq!(output.worker_progress().unwrap(), 2);
+    results.send(Err(io::ErrorKind::BrokenPipe.into())).unwrap();
+    output.wait_worker_done();
+    assert!(modes.alternate_screen());
+    assert_eq!(output.take_cursor_reports().unwrap(), 0);
+    assert_eq!(*flushes.lock().unwrap(), 2);
+    assert_eq!(
+        output.finish_gracefully().unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+}
+
+#[test]
+fn flush_retry_never_rewrites_accepted_bytes_or_confirms_failed_flush() {
+    struct FlushWriter {
+        bytes: Vec<u8>,
+        failure: Option<io::ErrorKind>,
+    }
+    impl Write for FlushWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.failure.take().map_or(Ok(()), |kind| Err(kind.into()))
+        }
+    }
+    for failure in [io::ErrorKind::Interrupted, io::ErrorKind::BrokenPipe] {
+        let output = ConsoleOutput::new(FlowControlMode::None, Box::new(Vec::<u8>::new())).unwrap();
+        let mut writer = FlushWriter {
+            bytes: Vec::new(),
+            failure: Some(failure),
+        };
+        let mut delivered = Vec::new();
+        let result = write_all_with_progress(
+            output.shared.as_ref().unwrap(),
+            &mut writer,
+            b"unique",
+            &mut |count| delivered.push(count),
+        );
+        assert_eq!(writer.bytes, b"unique");
+        assert_eq!(output.worker_progress().unwrap(), 1);
+        if failure == io::ErrorKind::Interrupted {
+            result.unwrap();
+            assert_eq!(delivered, [6]);
+        } else {
+            assert_eq!(result.unwrap_err().kind(), failure);
+            assert!(delivered.is_empty());
+        }
+    }
+}
+
+#[test]
+fn windows_helper_acknowledgements_confirm_prefix_before_later_failure() {
+    for final_ack in [0u32, 7, 8] {
+        let output = ConsoleOutput::new(FlowControlMode::None, Box::new(Vec::<u8>::new())).unwrap();
+        let acks = [
+            3u32.to_le_bytes(),
+            final_ack.to_le_bytes(),
+            0u32.to_le_bytes(),
+        ]
+        .concat();
+        let mut writer = WindowsHelperWriter {
+            input: Vec::new(),
+            ack: io::Cursor::new(acks),
+        };
+        let mut delivered = Vec::new();
+        let result = write_all_with_progress(
+            output.shared.as_ref().unwrap(),
+            &mut writer,
+            b"0123456789",
+            &mut |count| delivered.push(count),
+        );
+        assert_eq!(
+            writer.input,
+            [10u32.to_le_bytes().as_slice(), b"0123456789"].concat()
+        );
+        if final_ack == 7 {
+            result.unwrap();
+            assert_eq!(delivered, [3, 7]);
+            assert_eq!(output.worker_progress().unwrap(), 2);
+        } else {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert_eq!(delivered, [3]);
+            assert_eq!(output.worker_progress().unwrap(), 1);
+        }
+    }
+}
+
+#[test]
+fn windows_helper_flushes_before_ack_and_never_acknowledges_failed_flush() {
+    struct Sink {
+        events: Arc<Mutex<Vec<String>>>,
+        limit: usize,
+        fail_flush: bool,
+    }
+    impl Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let count = bytes.len().min(self.limit);
+            self.events.lock().unwrap().push(format!(
+                "write:{}",
+                String::from_utf8_lossy(&bytes[..count])
+            ));
+            Ok(count)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.events.lock().unwrap().push("flush".into());
+            if self.fail_flush {
+                Err(io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    struct Acks(Arc<Mutex<Vec<String>>>);
+    impl Write for Acks {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let count = u32::from_le_bytes(bytes.try_into().unwrap());
+            self.0.lock().unwrap().push(format!("ack:{count}"));
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    for (limit, fail_flush, expected) in [
+        (10, false, vec!["write:abcde", "flush", "ack:5", "ack:0"]),
+        (
+            3,
+            false,
+            vec![
+                "write:abc",
+                "flush",
+                "ack:3",
+                "write:de",
+                "flush",
+                "ack:2",
+                "ack:0",
+            ],
+        ),
+        (3, true, vec!["write:abc", "flush"]),
+    ] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let input = [5u32.to_le_bytes().as_slice(), b"abcde"].concat();
+        let status = copy_windows_helper_output(
+            io::Cursor::new(input),
+            Sink {
+                events: Arc::clone(&events),
+                limit,
+                fail_flush,
+            },
+            Acks(Arc::clone(&events)),
+        );
+        assert_eq!(status, i32::from(fail_flush));
+        assert_eq!(*events.lock().unwrap(), expected);
+    }
+}
+
+#[test]
+fn interrupt_preserves_writer_owned_batch_and_filters_next_tmux_queue() {
+    let (writes, written) = mpsc::channel();
+    let (results, responses) = mpsc::channel();
+    let mut output = ConsoleOutput::new(
+        FlowControlMode::None,
+        Box::new(BatchWriter {
+            writes,
+            results: responses,
+            flushes: Arc::new(Mutex::new(0)),
+        }),
+    )
+    .unwrap();
+    let modes = TerminalModeState::default();
+    assert!(output.try_write(b"gate\n", &modes).unwrap());
+    assert_eq!(written.recv().unwrap(), b"gate\n");
+    assert!(output
+        .try_write(b"%session-changed $1 test\n", &modes)
+        .unwrap());
+    assert!(output
+        .try_write(b"%extended-output %0 0 : ", &modes)
+        .unwrap());
+    results.send(Ok(5)).unwrap();
+    let batch = written.recv().unwrap();
+    assert_eq!(batch, b"%session-changed $1 test\n%extended-output %0 0 : ");
+    // Removing the batch releases the full queue capacity, even while blocked.
+    let pending = format!(
+        "tail\n%output %0 {}\n%layout-change @1 layout\n",
+        "x".repeat(OUTPUT_BYTES - b"tail\n%output %0 \n%layout-change @1 layout\n".len())
+    );
+    assert!(output.try_write(pending.as_bytes(), &modes).unwrap());
+    assert!(!output.try_write(b"held", &modes).unwrap());
+    assert_eq!(output.interrupt().unwrap(), OUTPUT_BYTES - 30);
+    assert!(output.try_write(b"prompt", &modes).unwrap());
+    results.send(Ok(batch.len())).unwrap();
+    assert_eq!(
+        written.recv().unwrap(),
+        b"tail\n%layout-change @1 layout\nprompt"
+    );
+    output
+        .shared
+        .as_ref()
+        .unwrap()
+        .state
+        .lock()
+        .unwrap()
+        .stopping = true;
+    results.send(Ok(36)).unwrap();
+    output.wait_worker_done();
+    output.finish_gracefully().unwrap();
+}
+
 struct GatedWriter {
     entered: mpsc::SyncSender<usize>,
     release: mpsc::Receiver<()>,
@@ -358,7 +734,7 @@ fn partial_writes_report_progress_before_completion_and_drain_every_byte() {
             second_entered: second_entered_tx,
             release_second: release_second_rx,
         };
-        write_all_with_progress(&worker_shared, &mut writer, b"ok")
+        write_all_with_progress(&worker_shared, &mut writer, b"ok", &mut |_| {})
     });
 
     second_entered_rx.recv().unwrap();

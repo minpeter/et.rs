@@ -6,13 +6,12 @@ mod output_interrupt;
 use std::collections::VecDeque;
 #[cfg(unix)]
 use std::fs::File;
-#[cfg(unix)]
 use std::io::Read;
 use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::fd::AsFd;
 #[cfg(windows)]
-use std::process::{ChildStderr, ChildStdin, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -24,6 +23,39 @@ use et_net::local::LocalStream;
 const OUTPUT_BYTES: usize = 64 * 1024;
 const OUTPUT_PACKETS: usize = 4096;
 pub(crate) const GRACEFUL_DRAIN_STALL_TIMEOUT: Duration = Duration::from_secs(1);
+
+// Delivery is distinct from progress: a buffered sink must flush before a
+// completed packet can affect terminal cleanup or cursor-report accounting.
+trait ConsoleWriter: Send {
+    fn write_with_delivery(
+        &mut self,
+        bytes: &[u8],
+        shared: &Shared,
+        delivered: &mut dyn FnMut(usize),
+    ) -> io::Result<usize>;
+}
+
+impl<T: Write + Send> ConsoleWriter for T {
+    fn write_with_delivery(
+        &mut self,
+        bytes: &[u8],
+        shared: &Shared,
+        delivered: &mut dyn FnMut(usize),
+    ) -> io::Result<usize> {
+        let count = self.write(bytes)?;
+        if count != 0 {
+            report_worker_progress(shared)?;
+            loop {
+                match self.flush() {
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    result => break result?,
+                }
+            }
+            delivered(count);
+        }
+        Ok(count)
+    }
+}
 
 struct OutputEntry {
     bytes: Vec<u8>,
@@ -106,13 +138,7 @@ impl ConsoleOutput {
             let graceful_child = Arc::clone(&child);
             Self::new_with_lifecycle_factory(
                 mode,
-                move |shared| {
-                    Box::new(WindowsHelperWriter {
-                        input,
-                        ack,
-                        shared: Arc::clone(shared),
-                    })
-                },
+                move |_| Box::new(WindowsHelperWriter { input, ack }),
                 Box::new(move || cancel_windows_helper(&cancel_child)),
                 Box::new(move || wait_windows_helper(&graceful_child)),
             )
@@ -133,13 +159,14 @@ impl ConsoleOutput {
         Self::new_with_lifecycle(mode, writer, cancel, Box::new(|| Ok(())))
     }
 
+    #[cfg(any(unix, test))]
     pub(crate) fn new_with_lifecycle(
         mode: FlowControlMode,
         writer: Box<dyn Write + Send>,
         cancel: Box<dyn FnOnce() + Send>,
         graceful_finish: Box<dyn FnOnce() -> io::Result<()> + Send>,
     ) -> io::Result<Self> {
-        Self::new_with_lifecycle_factory(mode, move |_| writer, cancel, graceful_finish)
+        Self::new_with_lifecycle_factory(mode, move |_| Box::new(writer), cancel, graceful_finish)
     }
 
     fn new_with_lifecycle_factory<F>(
@@ -149,7 +176,7 @@ impl ConsoleOutput {
         graceful_finish: Box<dyn FnOnce() -> io::Result<()> + Send>,
     ) -> io::Result<Self>
     where
-        F: FnOnce(&Arc<Shared>) -> Box<dyn Write + Send>,
+        F: FnOnce(&Arc<Shared>) -> Box<dyn ConsoleWriter>,
     {
         #[cfg(unix)]
         let (capacity_wake, mut capacity_signal) = {
@@ -186,7 +213,7 @@ impl ConsoleOutput {
             .spawn(move || {
                 run_writer(
                     &worker_shared,
-                    &mut writer,
+                    &mut *writer,
                     #[cfg(unix)]
                     &mut capacity_signal,
                     #[cfg(unix)]
@@ -458,13 +485,13 @@ impl Drop for WorkerDone<'_> {
 
 fn run_writer(
     shared: &Shared,
-    writer: &mut dyn Write,
+    writer: &mut dyn ConsoleWriter,
     #[cfg(unix)] capacity_signal: &mut LocalStream,
     #[cfg(unix)] status_signal: &mut LocalStream,
 ) {
     let _done = WorkerDone(shared);
     loop {
-        let bytes = {
+        let entries = {
             let Ok(state) = shared.state.lock() else {
                 return;
             };
@@ -474,18 +501,50 @@ fn run_writer(
             else {
                 return;
             };
-            let Some(bytes) = state.queue.pop_front() else {
+            if state.queue.is_empty() {
                 return;
-            };
-            state.bytes -= bytes.bytes.len();
-            state.stream.observe(&bytes.bytes);
-            bytes
+            }
+            // Snapshot only admitted output: no delay or unbounded network drain.
+            // Like a single packet, this bounded batch is writer-owned and must
+            // be observed before interrupt filtering can inspect the next queue.
+            let entries: Vec<_> = state.queue.drain(..).collect();
+            state.bytes = 0;
+            for entry in &entries {
+                state.stream.observe(&entry.bytes);
+            }
+            entries
         };
         #[cfg(unix)]
         signal_capacity(capacity_signal);
-        if let Err(error) =
-            write_all_with_progress(shared, writer, &bytes.bytes).and_then(|()| writer.flush())
-        {
+        let bytes: Vec<u8> = entries
+            .iter()
+            .flat_map(|entry| entry.bytes.iter().copied())
+            .collect();
+        let mut entries = entries.into_iter().peekable();
+        let mut confirmed = 0;
+        let result = write_all_with_progress(shared, writer, &bytes, &mut |count| {
+            confirmed += count;
+            let mut cursor_reports = 0;
+            while entries
+                .peek()
+                .is_some_and(|entry| entry.bytes.len() <= confirmed)
+            {
+                let entry = entries.next().unwrap();
+                confirmed -= entry.bytes.len();
+                entry.terminal_modes.observe(&entry.bytes);
+                cursor_reports += usize::from(
+                    crate::client_terminal::contains_cursor_report_request(&entry.bytes),
+                );
+            }
+            if cursor_reports != 0 {
+                if let Ok(mut state) = shared.state.lock() {
+                    state.cursor_reports += cursor_reports;
+                }
+                #[cfg(unix)]
+                signal_capacity(capacity_signal);
+            }
+        });
+        if let Err(error) = result {
             if let Ok(mut state) = shared.state.lock() {
                 state.error = Some(error);
                 state.stopping = true;
@@ -496,28 +555,20 @@ fn run_writer(
             signal_capacity(status_signal);
             return;
         }
-        bytes.terminal_modes.observe(&bytes.bytes);
-        if crate::client_terminal::contains_cursor_report_request(&bytes.bytes) {
-            if let Ok(mut state) = shared.state.lock() {
-                state.cursor_reports += 1;
-            }
-            #[cfg(unix)]
-            signal_capacity(capacity_signal);
-        }
     }
 }
 
 fn write_all_with_progress(
     shared: &Shared,
-    writer: &mut dyn Write,
+    writer: &mut dyn ConsoleWriter,
     mut bytes: &[u8],
+    delivered: &mut dyn FnMut(usize),
 ) -> io::Result<()> {
     while !bytes.is_empty() {
-        match writer.write(bytes) {
+        match writer.write_with_delivery(bytes, shared, delivered) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(count) => {
                 bytes = &bytes[count..];
-                report_worker_progress(shared)?;
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
@@ -563,16 +614,20 @@ fn wait_for_graceful_drain(shared: &Shared) -> io::Result<bool> {
     Ok(false)
 }
 
-#[cfg(windows)]
-struct WindowsHelperWriter {
-    input: ChildStdin,
-    ack: ChildStderr,
-    shared: Arc<Shared>,
+#[cfg(any(windows, test))]
+struct WindowsHelperWriter<I, A> {
+    input: I,
+    ack: A,
 }
 
-#[cfg(windows)]
-impl Write for WindowsHelperWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+#[cfg(any(windows, test))]
+impl<I: Write + Send, A: Read + Send> ConsoleWriter for WindowsHelperWriter<I, A> {
+    fn write_with_delivery(
+        &mut self,
+        bytes: &[u8],
+        shared: &Shared,
+        delivered: &mut dyn FnMut(usize),
+    ) -> io::Result<usize> {
         let length = u32::try_from(bytes.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "console packet too large"))?;
         self.input.write_all(&length.to_le_bytes())?;
@@ -599,13 +654,10 @@ impl Write for WindowsHelperWriter {
                 ));
             }
             acknowledged += count;
-            report_worker_progress(&self.shared)?;
+            report_worker_progress(shared)?;
+            delivered(count);
         }
         Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
     }
 }
 
@@ -634,9 +686,19 @@ fn cancel_windows_helper(child: &Mutex<std::process::Child>) {
 
 #[cfg(windows)]
 pub(crate) fn run_windows_helper() -> i32 {
-    let mut input = io::stdin().lock();
-    let mut output = io::stdout().lock();
-    let mut acknowledgements = io::stderr().lock();
+    copy_windows_helper_output(
+        &mut io::stdin().lock(),
+        &mut io::stdout().lock(),
+        &mut io::stderr().lock(),
+    )
+}
+
+#[cfg(any(windows, test))]
+fn copy_windows_helper_output(
+    mut input: impl Read,
+    mut output: impl Write,
+    mut acknowledgements: impl Write,
+) -> i32 {
     loop {
         let mut length = [0u8; 4];
         match std::io::Read::read_exact(&mut input, &mut length) {
@@ -658,6 +720,11 @@ pub(crate) fn run_windows_helper() -> i32 {
                 Err(_) => return 1,
             };
             remaining = &remaining[count..];
+            // ACKs confirm delivery, not merely acceptance by StdoutLock's
+            // buffer. Publish each prefix before another write can block.
+            if output.flush().is_err() {
+                return 1;
+            }
             if acknowledgements
                 .write_all(&(count as u32).to_le_bytes())
                 .and_then(|()| acknowledgements.flush())
@@ -666,11 +733,10 @@ pub(crate) fn run_windows_helper() -> i32 {
                 return 1;
             }
         }
-        if output.flush().is_err()
-            || acknowledgements
-                .write_all(&0u32.to_le_bytes())
-                .and_then(|()| acknowledgements.flush())
-                .is_err()
+        if acknowledgements
+            .write_all(&0u32.to_le_bytes())
+            .and_then(|()| acknowledgements.flush())
+            .is_err()
         {
             return 1;
         }

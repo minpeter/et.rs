@@ -17,6 +17,10 @@ use signal_hook::iterator::Signals;
 use crate::error::ClientError;
 use crate::initial_connect::ReconnectOutcome;
 
+#[cfg(any(windows, test))]
+#[path = "client_console_mode.rs"]
+mod console_mode;
+
 /// Line grammar of the shell on the far side of the session.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum RemoteLines {
@@ -74,6 +78,8 @@ where
         RawMode {
             enabled: false,
             reset: TerminalReset::LeaveAlternate,
+            #[cfg(windows)]
+            output: None,
         }
     };
     let close_message = (raw_mode.enabled && command.is_none()).then_some(connection_name);
@@ -618,6 +624,10 @@ impl TerminalReset {
 struct RawMode {
     enabled: bool,
     reset: TerminalReset,
+    // Fields drop after RawMode::drop: VT parsing must remain active until
+    // the existing reset sequences have been written and flushed.
+    #[cfg(windows)]
+    output: Option<console_mode::OutputMode<crossterm_winapi::ConsoleMode>>,
 }
 
 impl RawMode {
@@ -626,10 +636,26 @@ impl RawMode {
         if enabled {
             enable_raw_mode().map_err(|error| terminal_io("enabling raw terminal mode", error))?;
         }
-        Ok(Self {
+        let guard = Self {
             enabled,
             reset: TerminalReset::LeaveAlternate,
-        })
+            #[cfg(windows)]
+            output: None,
+        };
+        #[cfg(windows)]
+        let guard = {
+            let mut guard = guard;
+            if enabled {
+                let console = crossterm_winapi::ConsoleMode::new()
+                    .map_err(|error| terminal_io("opening console output mode", error))?;
+                guard.output = Some(
+                    console_mode::OutputMode::enter(console, &mut io::stdout().lock())
+                        .map_err(|error| terminal_io("enabling console output mode", error))?,
+                );
+            }
+            guard
+        };
+        Ok(guard)
     }
 
     fn finish(

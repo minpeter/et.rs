@@ -42,6 +42,8 @@ rustix = { version = "1.1.4", features = ["event", "fs", "process", "time"] }
 signal-hook = "0.3.18"
 
 [target.'cfg(windows)'.dependencies]
+# Already used by crossterm; safe GetConsoleMode/SetConsoleMode wrappers.
+crossterm_winapi = "0.9.1"
 # Ctrl+C / console shutdown signalling, the Windows analogue of SIGINT/SIGTERM.
 ctrlc = "3.5"
 # Safe CreateProcessW wrapper with an explicit inherited-handle allowlist.

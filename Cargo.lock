@@ -412,6 +412,7 @@ version = "0.0.25"
 dependencies = [
  "clap",
  "crossterm",
+ "crossterm_winapi",
  "ctrlc",
  "et-cli",
  "et-core",

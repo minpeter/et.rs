@@ -19,7 +19,7 @@ use crate::deadline::Deadline;
 use crate::error::ClientError;
 use crate::initial_connect::{connect_initial, reconnect, Endpoint, ReconnectOutcome};
 use crate::resolver::{EndpointResolver, SystemResolver};
-use crate::ssh_config::{resolve_ssh_config, resolve_ssh_config_on_port};
+use crate::ssh_config::{resolve_ssh_config, resolve_ssh_config_on_port, validate_ssh_config_file};
 use crate::ssh_process::{
     run_bootstrap, run_shell_probe, SshMasterTarget, SshRunner, SshSession, SystemSsh,
 };
@@ -90,6 +90,7 @@ fn run_client(
     let destination = parse_positional_host(&args.host, args.port)?;
     let requested_user = command_user(destination.user, args.username.clone());
     validate_ssh_destination(&destination.host, requested_user.as_deref())?;
+    let ssh_config = selected_ssh_config(args)?;
     let mut query_options = args.ssh_option.clone();
     if let Some(jumphost) = args.jumphost.as_deref() {
         validate_jumphost(jumphost)?;
@@ -102,6 +103,7 @@ fn run_client(
         &destination.host,
         requested_user.as_deref(),
         &query_options,
+        ssh_config.as_deref(),
         true,
         deadline,
     )?;
@@ -174,6 +176,7 @@ fn run_client(
             jumphost: args.jumphost.as_deref(),
         },
         &args.ssh_option,
+        ssh_config.as_deref(),
         deadline,
     );
     let has_forwarding = !forward_config.local_sources.is_empty()
@@ -192,6 +195,7 @@ fn run_client(
         kill_other_sessions: false,
         verbose: args.verbose,
         ssh_options: args.ssh_option.clone(),
+        ssh_config: ssh_config.clone(),
         term: term.clone(),
         remote_shell: RemoteShell::Posix,
         session_shell: None,
@@ -247,6 +251,7 @@ fn run_client(
         kill_other_sessions: args.kill_other_sessions,
         verbose: args.verbose,
         ssh_options: args.ssh_option.clone(),
+        ssh_config: ssh_config.clone(),
         term,
         remote_shell: remote_mode.bootstrap_shell,
         session_shell: (remote_mode.terminal_shell == RemoteShellKind::Powershell)
@@ -305,7 +310,8 @@ fn run_client(
             &jump_host,
             jump_user,
             jump_explicit_port,
-            &args.ssh_option,
+            &[],
+            ssh_config.as_deref(),
             false,
             deadline,
         )?;
@@ -321,7 +327,8 @@ fn run_client(
                 resolved_port: jump_resolved.port,
                 jumphost: None,
             },
-            &args.ssh_option,
+            &[],
+            ssh_config.as_deref(),
             deadline,
         );
         let jump_request = JumpBootstrapRequest {
@@ -332,7 +339,7 @@ fn run_client(
             terminal_path: args.terminal_path.clone(),
             kill_other_sessions: args.kill_other_sessions,
             verbose: args.verbose,
-            ssh_options: args.ssh_option.clone(),
+            ssh_config: ssh_config.clone(),
             term: request.term.clone(),
         };
         let jump_invocation = build_jump_invocation(&jump_request, &provisional);
@@ -538,6 +545,20 @@ fn bootstrap_log_message(request: &BootstrapRequest) -> String {
     )
 }
 
+fn selected_ssh_config(args: &ClientArgs) -> Result<Option<String>, ClientError> {
+    if args.no_ssh_config {
+        return Ok(Some("none".to_owned()));
+    }
+    match args.ssh_config.as_deref() {
+        None => Ok(None),
+        Some("none") => Ok(Some("none".to_owned())),
+        Some(path) => {
+            validate_ssh_config_file(path)?;
+            Ok(Some(path.to_owned()))
+        }
+    }
+}
+
 fn command_user(positional: Option<String>, option: Option<String>) -> Option<String> {
     match positional {
         Some(user) if user.is_empty() => None,
@@ -740,6 +761,30 @@ mod tests {
     }
 
     #[test]
+    fn selected_ssh_config_maps_flags_and_none() {
+        let ambient = ClientArgs::try_parse_from(["et", "host"]).unwrap();
+        assert_eq!(selected_ssh_config(&ambient).unwrap(), None);
+
+        let disabled = ClientArgs::try_parse_from(["et", "host", "--no-ssh-config"]).unwrap();
+        assert_eq!(
+            selected_ssh_config(&disabled).unwrap().as_deref(),
+            Some("none")
+        );
+
+        let none = ClientArgs::try_parse_from(["et", "host", "--ssh-config", "none"]).unwrap();
+        assert_eq!(selected_ssh_config(&none).unwrap().as_deref(), Some("none"));
+
+        let relative =
+            ClientArgs::try_parse_from(["et", "host", "--ssh-config", "relative"]).unwrap();
+        assert!(matches!(
+            selected_ssh_config(&relative),
+            Err(ClientError::InvalidSshConfig(
+                "must be an absolute path or 'none'"
+            ))
+        ));
+    }
+
+    #[test]
     fn username_precedence_matches_upstream() {
         assert_eq!(
             effective_user(
@@ -876,6 +921,7 @@ mod tests {
             kill_other_sessions: false,
             verbose: 2,
             ssh_options: vec!["Compression=yes".to_owned()],
+            ssh_config: None,
             term: "xterm".to_owned(),
             remote_shell: RemoteShell::Posix,
             session_shell: None,

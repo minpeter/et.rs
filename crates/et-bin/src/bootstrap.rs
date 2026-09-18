@@ -47,6 +47,8 @@ pub struct BootstrapRequest {
     pub kill_other_sessions: bool,
     pub verbose: u8,
     pub ssh_options: Vec<String>,
+    /// OpenSSH `-F` argument. `None` keeps ambient user/system config.
+    pub ssh_config: Option<String>,
     pub term: String,
     pub remote_shell: RemoteShell,
     pub session_shell: Option<String>,
@@ -68,7 +70,8 @@ pub struct JumpBootstrapRequest {
     pub terminal_path: Option<String>,
     pub kill_other_sessions: bool,
     pub verbose: u8,
-    pub ssh_options: Vec<String>,
+    /// OpenSSH `-F` argument. Destination `--ssh-option` values stay off this hop.
+    pub ssh_config: Option<String>,
     pub term: String,
 }
 
@@ -80,11 +83,14 @@ pub fn build_jump_invocation(
     // ssh destinations do not accept user@host:port, so the ssh port from the
     // jumphost string becomes an explicit `-p` flag.
     let mut args = Vec::new();
+    // Destination `--ssh-option` values configure the target bootstrap only.
+    // Replaying them here would rewrite jumphost identity and host-key policy.
+    append_ssh_config_flag(&mut args, request.ssh_config.as_deref());
     if let Some(port) = parsed.port_suffix.strip_prefix(':') {
         args.push("-p".to_string());
         args.push(port.to_string());
     }
-    append_operational_options(&mut args, &request.ssh_options);
+    append_operational_options(&mut args, &[]);
     let host = parsed.host.trim_matches(|c| c == '[' || c == ']');
     args.push(if parsed.user.is_empty() {
         host.to_string()
@@ -168,6 +174,7 @@ pub fn provisional_credentials() -> Result<Credentials, ClientError> {
 
 pub fn build_invocation(request: &BootstrapRequest, credentials: &Credentials) -> SshInvocation {
     let mut args = Vec::new();
+    append_ssh_config_flag(&mut args, request.ssh_config.as_deref());
     if let Some(jumphost) = request.jumphost.as_deref() {
         args.push("-J".to_string());
         args.push(jumphost.to_string());
@@ -192,6 +199,7 @@ pub fn build_invocation(request: &BootstrapRequest, credentials: &Credentials) -
 
 pub fn build_shell_probe(request: &BootstrapRequest) -> SshInvocation {
     let mut args = Vec::new();
+    append_ssh_config_flag(&mut args, request.ssh_config.as_deref());
     if let Some(jumphost) = request.jumphost.as_deref() {
         args.push("-J".to_string());
         args.push(jumphost.to_string());
@@ -210,6 +218,13 @@ pub fn build_shell_probe(request: &BootstrapRequest) -> SshInvocation {
         operation: "detecting the remote login shell",
         completion: InvocationCompletion::ShellProbe,
         control_path: None,
+    }
+}
+
+pub(crate) fn append_ssh_config_flag(args: &mut Vec<String>, ssh_config: Option<&str>) {
+    if let Some(path) = ssh_config {
+        args.push("-F".to_string());
+        args.push(path.to_string());
     }
 }
 
@@ -443,6 +458,7 @@ mod tests {
             kill_other_sessions: false,
             verbose: 2,
             ssh_options: vec!["Port=2222".into()],
+            ssh_config: None,
             term: "xterm-256color".into(),
             remote_shell: RemoteShell::Posix,
             session_shell: None,
@@ -503,7 +519,7 @@ mod tests {
                 terminal_path: None,
                 kill_other_sessions: false,
                 verbose: 0,
-                ssh_options: request.ssh_options.clone(),
+                ssh_config: None,
                 term: "xterm-256color".to_owned(),
             },
             &credentials,
@@ -533,13 +549,12 @@ mod tests {
             ]
         );
         assert_eq!(
-            &jump.args[0..6],
+            &jump.args[0..5],
             [
                 "-oClearAllForwardings=yes",
                 "-oRemoteCommand=none",
                 "-oPermitLocalCommand=no",
                 "-oSessionType=default",
-                "-oPort=2222",
                 "jump.example",
             ]
         );
@@ -671,7 +686,7 @@ mod tests {
             terminal_path: None,
             kill_other_sessions: false,
             verbose: 0,
-            ssh_options: Vec::new(),
+            ssh_config: None,
             term: "xterm-256color".to_owned(),
         };
         let invocation = build_jump_invocation(&request, &provisional_credentials().unwrap());
@@ -870,12 +885,12 @@ mod tests {
             terminal_path: None,
             kill_other_sessions: false,
             verbose: 1,
-            ssh_options: vec!["StrictHostKeyChecking=no".into()],
+            ssh_config: None,
             term: "xterm-256color".into(),
         };
         let invocation = build_jump_invocation(&request, &credentials);
         assert_eq!(
-            invocation.args[0..8],
+            invocation.args[0..7],
             [
                 "-p",
                 "2200",
@@ -883,7 +898,6 @@ mod tests {
                 "-oRemoteCommand=none",
                 "-oPermitLocalCommand=no",
                 "-oSessionType=default",
-                "-oStrictHostKeyChecking=no",
                 "user@jump.example"
             ]
         );
@@ -905,7 +919,7 @@ mod tests {
             terminal_path: None,
             kill_other_sessions: false,
             verbose: 0,
-            ssh_options: Vec::new(),
+            ssh_config: None,
             term: "xterm".into(),
         };
         let command = build_jump_invocation(&request, &credentials)
@@ -935,5 +949,113 @@ mod tests {
             validate_ssh_destination("host", Some("-oProxyCommand=bad")),
             Err(ClientError::InvalidSshComponent("user"))
         ));
+    }
+
+    #[test]
+    fn destination_ssh_options_stay_off_direct_jumphost_argv() {
+        let credentials = provisional_credentials().unwrap();
+        let mut destination = request();
+        destination.ssh_options.extend([
+            "IdentityFile=/tmp/destination-id".to_owned(),
+            "StrictHostKeyChecking=no".to_owned(),
+            "UserKnownHostsFile=/tmp/destination-known-hosts".to_owned(),
+        ]);
+        destination.ssh_config = Some("/etc/et/ssh_config".to_owned());
+        let destination_invocation = build_invocation(&destination, &credentials);
+        let probe = build_shell_probe(&destination);
+        let jump = build_jump_invocation(
+            &JumpBootstrapRequest {
+                jumphost: "jump.example".to_owned(),
+                destination_host: "destination.example".to_owned(),
+                destination_port: 2022,
+                jump_server_fifo: None,
+                terminal_path: None,
+                kill_other_sessions: false,
+                verbose: 0,
+                ssh_config: destination.ssh_config.clone(),
+                term: "xterm-256color".to_owned(),
+            },
+            &credentials,
+        );
+
+        assert_eq!(
+            &destination_invocation.args[..9],
+            [
+                "-F",
+                "/etc/et/ssh_config",
+                "-oClearAllForwardings=yes",
+                "-oRemoteCommand=none",
+                "-oPermitLocalCommand=no",
+                "-oSessionType=default",
+                "-oPort=2222",
+                "-oIdentityFile=/tmp/destination-id",
+                "-oStrictHostKeyChecking=no",
+            ]
+        );
+        assert_eq!(
+            &probe.args[..8],
+            [
+                "-F",
+                "/etc/et/ssh_config",
+                "-oClearAllForwardings=yes",
+                "-oRemoteCommand=none",
+                "-oPermitLocalCommand=no",
+                "-oSessionType=default",
+                "-oPort=2222",
+                "-oIdentityFile=/tmp/destination-id",
+            ]
+        );
+        assert_eq!(
+            &jump.args[..7],
+            [
+                "-F",
+                "/etc/et/ssh_config",
+                "-oClearAllForwardings=yes",
+                "-oRemoteCommand=none",
+                "-oPermitLocalCommand=no",
+                "-oSessionType=default",
+                "jump.example",
+            ]
+        );
+        for option in [
+            "IdentityFile=/tmp/destination-id",
+            "StrictHostKeyChecking=no",
+            "UserKnownHostsFile=/tmp/destination-known-hosts",
+            "Port=2222",
+        ] {
+            assert!(
+                !jump
+                    .args
+                    .iter()
+                    .any(|argument| argument == &format!("-o{option}")),
+                "direct jumphost argv must not replay destination option {option}: {:?}",
+                jump.args
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_config_none_disables_config_on_destination_and_jump() {
+        let credentials = provisional_credentials().unwrap();
+        let mut destination = request();
+        destination.ssh_config = Some("none".to_owned());
+        let destination_invocation = build_invocation(&destination, &credentials);
+        let jump = build_jump_invocation(
+            &JumpBootstrapRequest {
+                jumphost: "jump.example".to_owned(),
+                destination_host: "destination.example".to_owned(),
+                destination_port: 2022,
+                jump_server_fifo: None,
+                terminal_path: None,
+                kill_other_sessions: false,
+                verbose: 0,
+                ssh_config: Some("none".to_owned()),
+                term: "xterm-256color".to_owned(),
+            },
+            &credentials,
+        );
+
+        assert_eq!(&destination_invocation.args[..2], ["-F", "none"]);
+        assert_eq!(&jump.args[..2], ["-F", "none"]);
     }
 }

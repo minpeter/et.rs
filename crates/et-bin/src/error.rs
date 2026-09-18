@@ -11,6 +11,7 @@ pub enum ClientError {
     ForwardConfig(ForwardConfigError),
     Unsupported(&'static str),
     InvalidSshComponent(&'static str),
+    InvalidSshConfig(&'static str),
     SshSpawn(io::Error),
     SshStdout(io::Error),
     SshWait(io::Error),
@@ -74,6 +75,7 @@ impl std::fmt::Display for ClientError {
             Self::InvalidSshComponent(component) => {
                 write!(f, "SSH {component} must not begin with a hyphen")
             }
+            Self::InvalidSshConfig(reason) => write!(f, "--ssh-config {reason}"),
             Self::SshSpawn(error) => write!(f, "could not start system ssh: {error}"),
             Self::SshStdout(error) => write!(f, "could not read system ssh stdout: {error}"),
             Self::SshWait(error) => write!(f, "could not wait for system ssh: {error}"),
@@ -187,6 +189,7 @@ impl ClientError {
         match self {
             Self::Unsupported(_)
             | Self::ForwardConfig(_)
+            | Self::InvalidSshConfig(_)
             | Self::SshConfigMalformedForward { .. } => 2,
             _ => 1,
         }

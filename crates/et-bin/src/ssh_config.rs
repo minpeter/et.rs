@@ -39,6 +39,24 @@ pub struct ResolvedSshConfig {
     pub identity_agent: Option<String>,
 }
 
+/// Inputs for `ssh -G` configuration expansion.
+#[derive(Clone, Copy)]
+pub struct SshConfigQuery<'a> {
+    pub host_alias: &'a str,
+    pub requested_user: Option<&'a str>,
+    /// Port given explicitly on the command line (`host:port`). It must reach
+    /// `ssh -G`, because the resolved port becomes part of the control-master
+    /// identity: resolving without it yields the config/default port and would
+    /// multiplex a session for `host:2200` through a master established for
+    /// `host:22`.
+    pub explicit_port: Option<u16>,
+    pub ssh_options: &'a [String],
+    pub ssh_config: Option<&'a str>,
+    /// When false, jumphost-only lookups resolve address/user/port and do not
+    /// import or reject session options belonging to the relay host.
+    pub parse_local_forwards: bool,
+}
+
 enum ForwardRecord {
     Supported(PortForwardSourceRequest),
     Unsupported(String),
@@ -55,49 +73,43 @@ pub fn resolve_ssh_config(
 ) -> Result<ResolvedSshConfig, ClientError> {
     resolve_ssh_config_on_port(
         runner,
-        host_alias,
-        requested_user,
-        None,
-        ssh_options,
-        ssh_config,
-        parse_local_forwards,
+        SshConfigQuery {
+            host_alias,
+            requested_user,
+            explicit_port: None,
+            ssh_options,
+            ssh_config,
+            parse_local_forwards,
+        },
         deadline,
     )
 }
 
-/// Resolve SSH configuration, honouring a port given explicitly on the command
-/// line (`host:port`). The explicit port must reach `ssh -G`, because the
-/// resolved port becomes part of the control-master identity: resolving
-/// without it yields the config/default port and would multiplex a session for
-/// `host:2200` through a master established for `host:22`.
+/// Resolve SSH configuration, honouring an explicit command-line port.
 pub fn resolve_ssh_config_on_port(
     runner: &dyn SshRunner,
-    host_alias: &str,
-    requested_user: Option<&str>,
-    explicit_port: Option<u16>,
-    ssh_options: &[String],
-    ssh_config: Option<&str>,
-    parse_local_forwards: bool,
+    query: SshConfigQuery<'_>,
     deadline: Deadline,
 ) -> Result<ResolvedSshConfig, ClientError> {
-    validate_ssh_destination(host_alias, requested_user)?;
+    validate_ssh_destination(query.host_alias, query.requested_user)?;
     // Config expansion never opens a remote session. Disable PTY allocation
     // so Windows OpenSSH completes reliably when stdout is a pipe, preserving
     // the bounded SystemSsh capture path.
     let mut args = vec!["-G".to_string(), "-T".to_string()];
-    append_ssh_config_flag(&mut args, ssh_config);
-    if let Some(port) = explicit_port {
+    append_ssh_config_flag(&mut args, query.ssh_config);
+    if let Some(port) = query.explicit_port {
         args.extend(["-p".to_string(), port.to_string()]);
     }
     args.extend(
-        ssh_options
+        query
+            .ssh_options
             .iter()
             .filter(|option| !is_control_option(option))
             .map(|option| format!("-o{option}")),
     );
-    let destination = match requested_user {
-        Some(user) => format!("{user}@{host_alias}"),
-        None => host_alias.to_string(),
+    let destination = match query.requested_user {
+        Some(user) => format!("{user}@{}", query.host_alias),
+        None => query.host_alias.to_string(),
     };
     args.push(destination);
     let invocation = SshInvocation {
@@ -121,7 +133,7 @@ pub fn resolve_ssh_config_on_port(
             .insert(2, "-oSetEnv=ET_RS_CONFIG_SENTINEL=1".to_owned());
         verify_setenv_block(&stdout, &run_checked(runner, &baseline, deadline)?)?;
     }
-    parse_ssh_config(&stdout, parse_local_forwards)
+    parse_ssh_config(&stdout, query.parse_local_forwards)
 }
 
 fn verify_setenv_block(original: &[u8], baseline: &[u8]) -> Result<(), ClientError> {
@@ -999,12 +1011,14 @@ mod tests {
         };
         let resolved = resolve_ssh_config_on_port(
             &runner,
-            "jump-alias",
-            None,
-            Some(2200),
-            &[],
-            None,
-            false,
+            SshConfigQuery {
+                host_alias: "jump-alias",
+                requested_user: None,
+                explicit_port: Some(2200),
+                ssh_options: &[],
+                ssh_config: None,
+                parse_local_forwards: false,
+            },
             Deadline::after(Duration::from_secs(1)),
         )
         .unwrap();

@@ -19,7 +19,9 @@ use crate::deadline::Deadline;
 use crate::error::ClientError;
 use crate::initial_connect::{connect_initial, reconnect, Endpoint, ReconnectOutcome};
 use crate::resolver::{EndpointResolver, SystemResolver};
-use crate::ssh_config::{resolve_ssh_config, resolve_ssh_config_on_port, validate_ssh_config_file};
+use crate::ssh_config::{
+    resolve_ssh_config, resolve_ssh_config_on_port, validate_ssh_config_file, SshConfigQuery,
+};
 use crate::ssh_process::{
     run_bootstrap, run_shell_probe, SshMasterTarget, SshRunner, SshSession, SystemSsh,
 };
@@ -307,12 +309,14 @@ fn run_client(
             .map_err(ClientError::Host)?;
         let jump_resolved = resolve_ssh_config_on_port(
             runner,
-            &jump_host,
-            jump_user,
-            jump_explicit_port,
-            &[],
-            ssh_config.as_deref(),
-            false,
+            SshConfigQuery {
+                host_alias: &jump_host,
+                requested_user: jump_user,
+                explicit_port: jump_explicit_port,
+                ssh_options: &[],
+                ssh_config: ssh_config.as_deref(),
+                parse_local_forwards: false,
+            },
             deadline,
         )?;
         let jump_effective_user = jump_user

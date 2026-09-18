@@ -124,6 +124,18 @@ pub struct ClientArgs {
     #[arg(long = "ssh-option", value_name = "OPT")]
     pub ssh_option: Vec<String>,
 
+    /// Read only this absolute SSH configuration file (or `none`).
+    #[arg(
+        long = "ssh-config",
+        value_name = "PATH",
+        conflicts_with = "no_ssh_config"
+    )]
+    pub ssh_config: Option<String>,
+
+    /// Do not read user or system SSH configuration for the destination or jumphost.
+    #[arg(long = "no-ssh-config", conflicts_with = "ssh_config")]
+    pub no_ssh_config: bool,
+
     /// Accepted for upstream compatibility; et.rs never collects telemetry.
     #[arg(
         long = "telemetry",
@@ -378,5 +390,50 @@ mod tests {
     #[test]
     fn requires_host_without_explicit_mode() {
         assert!(ClientArgs::try_parse_from(["et"]).is_err());
+    }
+
+    #[test]
+    fn ssh_config_and_no_ssh_config_parse() {
+        let selected =
+            ClientArgs::try_parse_from(["et", "host", "--ssh-config", "/etc/et/ssh_config"])
+                .unwrap();
+        assert_eq!(selected.ssh_config.as_deref(), Some("/etc/et/ssh_config"));
+        assert!(!selected.no_ssh_config);
+
+        let none = ClientArgs::try_parse_from(["et", "host", "--ssh-config", "none"]).unwrap();
+        assert_eq!(none.ssh_config.as_deref(), Some("none"));
+        assert!(!none.no_ssh_config);
+
+        let windows =
+            ClientArgs::try_parse_from(["et", "host", "--ssh-config", r"C:\Users\me\.ssh\config"])
+                .unwrap();
+        assert_eq!(
+            windows.ssh_config.as_deref(),
+            Some(r"C:\Users\me\.ssh\config")
+        );
+
+        let disabled = ClientArgs::try_parse_from(["et", "host", "--no-ssh-config"]).unwrap();
+        assert!(disabled.ssh_config.is_none());
+        assert!(disabled.no_ssh_config);
+    }
+
+    #[test]
+    fn ssh_config_conflicts_with_no_ssh_config() {
+        assert!(ClientArgs::try_parse_from([
+            "et",
+            "host",
+            "--ssh-config",
+            "/etc/et/ssh_config",
+            "--no-ssh-config",
+        ])
+        .is_err());
+        assert!(ClientArgs::try_parse_from([
+            "et",
+            "host",
+            "--no-ssh-config",
+            "--ssh-config",
+            "none",
+        ])
+        .is_err());
     }
 }

@@ -2027,6 +2027,219 @@ fn jumphost_starts_a_jump_terminal_and_connects_to_the_jumphost() {
 }
 
 #[test]
+fn destination_ssh_options_stay_off_jumphost_and_ssh_config_reaches_both() {
+    let directory = TestDir::new("ssh-config-file");
+    let config = directory.0.join("ssh_config");
+    fs::write(&config, "Host *\n").unwrap();
+    let config_path = config.to_str().unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        bound(&stream);
+        let request = read_request(&mut stream).unwrap();
+        assert_eq!(request.version, Some(6));
+        write_response(&mut stream, &response_status(ConnectStatus::NewClient)).unwrap();
+        let key = passkey_to_key(SERVER_KEY).unwrap();
+        let mut connection = Connection::new_server(stream, &key);
+        let packet = connection.read_packet().unwrap();
+        assert_eq!(packet.header(), EtPacketType::InitialPayload as u8);
+        let payload = InitialPayload::decode(packet.payload()).unwrap();
+        assert_eq!(payload.jumphost, Some(true));
+        connection
+            .write_packet(
+                EtPacketType::InitialResponse as u8,
+                &InitialResponse { error: None }.encode_to_vec(),
+            )
+            .unwrap();
+    });
+
+    let fake = FakeSsh::new();
+    let output = fake
+        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
+        .args([
+            "-N",
+            "--jumphost",
+            "jump.example",
+            "--jport",
+            &address.port().to_string(),
+            "--ssh-option",
+            "IdentityFile=/tmp/destination-id",
+            "--ssh-option",
+            "StrictHostKeyChecking=no",
+            "--ssh-config",
+            config_path,
+            "test-user@server-alias:2022",
+        ])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let invocations = fake.work_invocations();
+    assert_eq!(invocations.len(), 5, "{invocations:?}");
+    assert_eq!(
+        invocations[0],
+        [
+            "-G",
+            "-T",
+            "-F",
+            config_path,
+            "-oProxyJump=jump.example",
+            "-oIdentityFile=/tmp/destination-id",
+            "-oStrictHostKeyChecking=no",
+            "test-user@server-alias"
+        ]
+    );
+    let destination = &invocations[2];
+    assert_eq!(&destination[..2], ["-F", config_path]);
+    assert!(destination.iter().any(|arg| arg == "-J"));
+    assert!(destination
+        .iter()
+        .any(|arg| arg == "-oIdentityFile=/tmp/destination-id"));
+    assert!(destination
+        .iter()
+        .any(|arg| arg == "-oStrictHostKeyChecking=no"));
+    assert_eq!(
+        invocations[3],
+        ["-G", "-T", "-F", config_path, "jump.example"]
+    );
+    let jump = &invocations[4];
+    assert_eq!(&jump[..2], ["-F", config_path]);
+    for option in [
+        "-oIdentityFile=/tmp/destination-id",
+        "-oStrictHostKeyChecking=no",
+    ] {
+        assert!(
+            !jump.iter().any(|arg| arg == option),
+            "direct jumphost argv must not replay {option}: {jump:?}"
+        );
+    }
+    assert!(jump.iter().any(|arg| arg == "jump.example"), "{jump:?}");
+}
+
+#[test]
+fn no_ssh_config_disables_config_on_destination_and_jumphost() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        bound(&stream);
+        let _request = read_request(&mut stream).unwrap();
+        write_response(&mut stream, &response_status(ConnectStatus::NewClient)).unwrap();
+        let key = passkey_to_key(SERVER_KEY).unwrap();
+        let mut connection = Connection::new_server(stream, &key);
+        let packet = connection.read_packet().unwrap();
+        let payload = InitialPayload::decode(packet.payload()).unwrap();
+        assert_eq!(payload.jumphost, Some(true));
+        connection
+            .write_packet(
+                EtPacketType::InitialResponse as u8,
+                &InitialResponse { error: None }.encode_to_vec(),
+            )
+            .unwrap();
+    });
+
+    let fake = FakeSsh::new();
+    let output = fake
+        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
+        .args([
+            "-N",
+            "--jumphost",
+            "jump.example",
+            "--jport",
+            &address.port().to_string(),
+            "--no-ssh-config",
+            "test-user@server-alias:2022",
+        ])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let invocations = fake.work_invocations();
+    assert_eq!(
+        invocations[0],
+        [
+            "-G",
+            "-T",
+            "-F",
+            "none",
+            "-oProxyJump=jump.example",
+            "test-user@server-alias"
+        ]
+    );
+    assert_eq!(&invocations[2][..2], ["-F", "none"]);
+    assert_eq!(invocations[3], ["-G", "-T", "-F", "none", "jump.example"]);
+    assert_eq!(&invocations[4][..2], ["-F", "none"]);
+}
+
+#[test]
+fn ssh_config_path_validation_fails_closed_before_ssh() {
+    let directory = TestDir::new("ssh-config-bad");
+    let missing = directory.0.join("missing");
+    let not_file = directory.0.join("dir");
+    fs::create_dir(&not_file).unwrap();
+    let link = directory.0.join("link");
+    let regular = directory.0.join("ssh_config");
+    fs::write(&regular, "Host *\n").unwrap();
+    std::os::unix::fs::symlink(&regular, &link).unwrap();
+
+    let fake = FakeSsh::new();
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["-N", "--ssh-config", "relative", "example.test"],
+            "must be an absolute path or 'none'",
+        ),
+        (
+            &["-N", "--ssh-config", "/tmp/et config", "example.test"],
+            "must contain only ASCII letters, digits",
+        ),
+        (
+            &[
+                "-N",
+                "--ssh-config",
+                missing.to_str().unwrap(),
+                "example.test",
+            ],
+            "must name a readable, non-symlink regular file",
+        ),
+        (
+            &[
+                "-N",
+                "--ssh-config",
+                not_file.to_str().unwrap(),
+                "example.test",
+            ],
+            "must name a readable, non-symlink regular file",
+        ),
+        (
+            &["-N", "--ssh-config", link.to_str().unwrap(), "example.test"],
+            "must name a readable, non-symlink regular file",
+        ),
+    ];
+    for (args, message) in cases {
+        let output = fake
+            .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
+            .args(*args)
+            .output()
+            .unwrap();
+        assert_ne!(output.status.code(), Some(0), "args={args:?}");
+        let err = stderr(&output);
+        assert!(
+            err.contains(message),
+            "args={args:?} expected `{message}` in stderr={err}"
+        );
+    }
+    assert!(
+        fake.invocations().is_empty(),
+        "invalid --ssh-config must fail before ssh: {:?}",
+        fake.invocations()
+    );
+}
+
+#[test]
 fn malformed_jumphost_and_jserverfifo_fail_before_ssh_bootstrap() {
     let fake = FakeSsh::new();
     // Use `--jumphost=value` form so values starting with `-` reach validation.

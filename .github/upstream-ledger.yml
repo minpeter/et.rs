@@ -10,10 +10,10 @@
 #   note: short string
 #   et_pr: optional upstream PR number
 #
-# Classified 2026-09-17. #804 passed independent review in et.rs #100.
+# Classified 2026-09-18. #804 passed independent review in et.rs #100.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-09-17"
+classified: "2026-09-18"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -142,3 +142,21 @@ commits:
     status: ported
     note: "#813 command/target/layout/affinity/capture/lifecycle semantics audited against current canonical C++; sandboxed canonical libvterm and authenticated pane diagnostics implemented. No canonical command deferrals; native Windows/macOS and actual GUI verification limits remain explicit in docs/htm-control-mode.md."
     et_pr: 813
+  - sha: 02b21424b4c85ababe9fd0e446d2e484f16b0c6b
+    date: "2026-09-17"
+    kind: security
+    status: skip
+    note: "#810 close completed-session router FDs, remaining client/server forwarding sockets, and generated socket directories. et.rs already does this via RAII: Runtime/Router/ActiveSession/Forwarder Drop shut down connections; forward_worker_state::remove calls stop_io; ForwardListener/ForwardPipe/PendingPath/PendingDirectories/UserSocketCleanup Drop remove unix sockets and created temp dirs. Reconnect/timeout paths are unchanged. PROTOCOL_VERSION stays 6."
+    et_pr: 810
+  - sha: 0e38189fcd57269244f7bdf1bd9dfd0ee97df8f8
+    date: "2026-09-17"
+    kind: product
+    status: skip
+    note: "#811 honor explicit TCP forwarding destinations instead of forcing loopback. et.rs already preserves non-empty TCP names in Endpoint::parse_destination and connects via connect_tcp(host, port); localhost/empty keep IPv6-then-IPv4 loopback. Covered by destination_parser_preserves_explicit_tcp_names_and_families. PROTOCOL_VERSION stays 6."
+    et_pr: 811
+  - sha: 2d3e2fc0f57e7adb1cfffe58c7e1d67906292322
+    date: "2026-09-17"
+    kind: product
+    status: ported
+    note: "#814 isolate destination --ssh-option off the direct jumphost SSH argv and add --ssh-config/--no-ssh-config (-F) for destination and jumphost resolution. Fail-closed on relative/symlink/non-regular/shell-unsafe paths; Windows absolute paths accepted. PROTOCOL_VERSION stays 6. Landed in et.rs #110."
+    et_pr: 814

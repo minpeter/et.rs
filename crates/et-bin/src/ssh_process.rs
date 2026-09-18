@@ -8,8 +8,8 @@ use std::time::Duration;
 use wait_timeout::ChildExt;
 
 use crate::bootstrap::{
-    is_forced_operational_option, parse_id_passkey, parse_shell_probe, Credentials,
-    InvocationCompletion, RemoteShell, SshInvocation,
+    append_ssh_config_flag, is_forced_operational_option, parse_id_passkey, parse_shell_probe,
+    Credentials, InvocationCompletion, RemoteShell, SshInvocation,
 };
 use crate::deadline::Deadline;
 use crate::error::ClientError;
@@ -78,6 +78,7 @@ impl<'a> SshSession<'a> {
         runner: &'a dyn SshRunner,
         target: SshMasterTarget<'_>,
         ssh_options: &[String],
+        ssh_config: Option<&str>,
         deadline: Deadline,
     ) -> Self {
         let destination = target.user.map_or_else(
@@ -85,7 +86,15 @@ impl<'a> SshSession<'a> {
             |user| format!("{user}@{}", target.host_alias),
         );
         let jumphost = target.jumphost;
-        if check_master(runner, &destination, jumphost, ssh_options, None, deadline) {
+        if check_master(
+            runner,
+            &destination,
+            jumphost,
+            ssh_options,
+            ssh_config,
+            None,
+            deadline,
+        ) {
             return Self {
                 runner,
                 control_path: None,
@@ -122,6 +131,7 @@ impl<'a> SshSession<'a> {
             &destination,
             jumphost,
             ssh_options,
+            ssh_config,
             Some(&path),
             deadline,
         ) {
@@ -139,10 +149,18 @@ impl<'a> SshSession<'a> {
                     &destination,
                     jumphost,
                     ssh_options,
+                    ssh_config,
                     Some(&path),
                     deadline,
-                ) && !start_master(runner, &destination, jumphost, ssh_options, &path, deadline)
-                {
+                ) && !start_master(
+                    runner,
+                    &destination,
+                    jumphost,
+                    ssh_options,
+                    ssh_config,
+                    &path,
+                    deadline,
+                ) {
                     et_cli::logging::warn(
                         "private SSH control master failed to start; continuing without ET multiplexing",
                     );
@@ -160,6 +178,7 @@ impl<'a> SshSession<'a> {
                         &destination,
                         jumphost,
                         ssh_options,
+                        ssh_config,
                         Some(&path),
                         deadline,
                     ) {
@@ -183,6 +202,7 @@ impl<'a> SshSession<'a> {
             &destination,
             jumphost,
             ssh_options,
+            ssh_config,
             Some(&path),
             deadline,
         )
@@ -221,10 +241,12 @@ fn check_master(
     destination: &str,
     jumphost: Option<&str>,
     ssh_options: &[String],
+    ssh_config: Option<&str>,
     control_path: Option<&Path>,
     deadline: Deadline,
 ) -> bool {
     let mut args = vec!["-O".to_owned(), "check".to_owned()];
+    append_ssh_config_flag(&mut args, ssh_config);
     if let Some(jumphost) = jumphost {
         args.extend(["-J".to_owned(), jumphost.to_owned()]);
     }
@@ -256,10 +278,12 @@ fn start_master(
     destination: &str,
     jumphost: Option<&str>,
     ssh_options: &[String],
+    ssh_config: Option<&str>,
     path: &Path,
     deadline: Deadline,
 ) -> bool {
     let mut args = vec!["-MNf".to_owned()];
+    append_ssh_config_flag(&mut args, ssh_config);
     if let Some(jumphost) = jumphost {
         args.extend(["-J".to_owned(), jumphost.to_owned()]);
     }

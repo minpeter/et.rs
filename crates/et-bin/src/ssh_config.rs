@@ -1,5 +1,6 @@
 use crate::bootstrap::{
-    is_control_option, validate_ssh_destination, InvocationCompletion, SshInvocation,
+    append_ssh_config_flag, is_control_option, validate_ssh_destination, InvocationCompletion,
+    SshInvocation,
 };
 use crate::deadline::Deadline;
 use crate::error::ClientError;
@@ -38,6 +39,24 @@ pub struct ResolvedSshConfig {
     pub identity_agent: Option<String>,
 }
 
+/// Inputs for `ssh -G` configuration expansion.
+#[derive(Clone, Copy)]
+pub struct SshConfigQuery<'a> {
+    pub host_alias: &'a str,
+    pub requested_user: Option<&'a str>,
+    /// Port given explicitly on the command line (`host:port`). It must reach
+    /// `ssh -G`, because the resolved port becomes part of the control-master
+    /// identity: resolving without it yields the config/default port and would
+    /// multiplex a session for `host:2200` through a master established for
+    /// `host:22`.
+    pub explicit_port: Option<u16>,
+    pub ssh_options: &'a [String],
+    pub ssh_config: Option<&'a str>,
+    /// When false, jumphost-only lookups resolve address/user/port and do not
+    /// import or reject session options belonging to the relay host.
+    pub parse_local_forwards: bool,
+}
+
 enum ForwardRecord {
     Supported(PortForwardSourceRequest),
     Unsupported(String),
@@ -48,51 +67,49 @@ pub fn resolve_ssh_config(
     host_alias: &str,
     requested_user: Option<&str>,
     ssh_options: &[String],
+    ssh_config: Option<&str>,
     parse_local_forwards: bool,
     deadline: Deadline,
 ) -> Result<ResolvedSshConfig, ClientError> {
     resolve_ssh_config_on_port(
         runner,
-        host_alias,
-        requested_user,
-        None,
-        ssh_options,
-        parse_local_forwards,
+        SshConfigQuery {
+            host_alias,
+            requested_user,
+            explicit_port: None,
+            ssh_options,
+            ssh_config,
+            parse_local_forwards,
+        },
         deadline,
     )
 }
 
-/// Resolve SSH configuration, honouring a port given explicitly on the command
-/// line (`host:port`). The explicit port must reach `ssh -G`, because the
-/// resolved port becomes part of the control-master identity: resolving
-/// without it yields the config/default port and would multiplex a session for
-/// `host:2200` through a master established for `host:22`.
+/// Resolve SSH configuration, honouring an explicit command-line port.
 pub fn resolve_ssh_config_on_port(
     runner: &dyn SshRunner,
-    host_alias: &str,
-    requested_user: Option<&str>,
-    explicit_port: Option<u16>,
-    ssh_options: &[String],
-    parse_local_forwards: bool,
+    query: SshConfigQuery<'_>,
     deadline: Deadline,
 ) -> Result<ResolvedSshConfig, ClientError> {
-    validate_ssh_destination(host_alias, requested_user)?;
+    validate_ssh_destination(query.host_alias, query.requested_user)?;
     // Config expansion never opens a remote session. Disable PTY allocation
     // so Windows OpenSSH completes reliably when stdout is a pipe, preserving
     // the bounded SystemSsh capture path.
     let mut args = vec!["-G".to_string(), "-T".to_string()];
-    if let Some(port) = explicit_port {
+    append_ssh_config_flag(&mut args, query.ssh_config);
+    if let Some(port) = query.explicit_port {
         args.extend(["-p".to_string(), port.to_string()]);
     }
     args.extend(
-        ssh_options
+        query
+            .ssh_options
             .iter()
             .filter(|option| !is_control_option(option))
             .map(|option| format!("-o{option}")),
     );
-    let destination = match requested_user {
-        Some(user) => format!("{user}@{host_alias}"),
-        None => host_alias.to_string(),
+    let destination = match query.requested_user {
+        Some(user) => format!("{user}@{}", query.host_alias),
+        None => query.host_alias.to_string(),
     };
     args.push(destination);
     let invocation = SshInvocation {
@@ -116,7 +133,7 @@ pub fn resolve_ssh_config_on_port(
             .insert(2, "-oSetEnv=ET_RS_CONFIG_SENTINEL=1".to_owned());
         verify_setenv_block(&stdout, &run_checked(runner, &baseline, deadline)?)?;
     }
-    parse_ssh_config(&stdout, parse_local_forwards)
+    parse_ssh_config(&stdout, query.parse_local_forwards)
 }
 
 fn verify_setenv_block(original: &[u8], baseline: &[u8]) -> Result<(), ClientError> {
@@ -502,6 +519,69 @@ fn parse_port(value: &str) -> Option<i32> {
     (port != 0).then(|| i32::from(port))
 }
 
+/// Validate `--ssh-config <path>`. `none` is handled by the caller.
+///
+/// Fail closed on relative, shell-unsafe, missing, non-regular, or symlink
+/// paths. Windows drive and UNC shapes are accepted as absolute so the
+/// Windows client can select a policy file.
+pub fn validate_ssh_config_file(path: &str) -> Result<(), ClientError> {
+    if !is_absolute_ssh_config_path(path) {
+        return Err(ClientError::InvalidSshConfig(
+            "must be an absolute path or 'none'",
+        ));
+    }
+    if !is_ssh_config_path_safe_for_proxy_jump(path) {
+        return Err(ClientError::InvalidSshConfig(
+            "must contain only ASCII letters, digits, '/', '.', '_', and '-' (Windows also allows ':' and '\\')",
+        ));
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| {
+        ClientError::InvalidSshConfig("must name a readable, non-symlink regular file")
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(ClientError::InvalidSshConfig(
+            "must name a readable, non-symlink regular file",
+        ));
+    }
+    std::fs::File::open(path).map_err(|_| {
+        ClientError::InvalidSshConfig("must name a readable, non-symlink regular file")
+    })?;
+    Ok(())
+}
+
+pub(crate) fn is_absolute_ssh_config_path(path: &str) -> bool {
+    if std::path::Path::new(path).is_absolute() {
+        return true;
+    }
+    is_windows_absolute_ssh_config_path(path)
+}
+
+fn is_windows_absolute_ssh_config_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'\\' && bytes[1] == b'\\' {
+        return true;
+    }
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+}
+
+pub(crate) fn is_ssh_config_path_safe_for_proxy_jump(path: &str) -> bool {
+    if !is_absolute_ssh_config_path(path) {
+        return false;
+    }
+    let windows_path = is_windows_absolute_ssh_config_path(path);
+    path.chars()
+        .all(|character| is_ssh_config_path_char_safe(character, windows_path))
+}
+
+fn is_ssh_config_path_char_safe(character: char, windows_path: bool) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(character, '/' | '.' | '_' | '-')
+        || (windows_path && matches!(character, ':' | '\\'))
+}
+
 #[cfg(test)]
 mod tests {
     use std::process::{Command, ExitStatus};
@@ -542,6 +622,7 @@ mod tests {
             "server-alias",
             Some("requested"),
             &["Port=2222".to_string()],
+            None,
             true,
             Deadline::after(Duration::from_secs(1)),
         )
@@ -766,6 +847,7 @@ mod tests {
             "host",
             None,
             &["SetEnv=A=user".into()],
+            None,
             true,
             deadline,
         )
@@ -805,6 +887,7 @@ mod tests {
                 "example.test",
                 None,
                 &[format!("SetEnv=\"A={value}\"")],
+                None,
                 true,
                 Deadline::after(Duration::from_secs(3)),
             )
@@ -819,6 +902,7 @@ mod tests {
             "example.test",
             None,
             &["SetEnv=A=one ET_RS_CONFIG_SENTINEL=user".into()],
+            None,
             true,
             Deadline::after(Duration::from_secs(3)),
         )
@@ -854,6 +938,7 @@ mod tests {
             "alias",
             Some("cli-user"),
             &[],
+            None,
             true,
             Deadline::after(Duration::from_secs(3)),
         )
@@ -883,6 +968,7 @@ mod tests {
                 "IdentityAgent=none".into(),
                 "ProxyJump=cli-jump:2300".into(),
             ],
+            None,
             true,
             Deadline::after(Duration::from_secs(3)),
         )
@@ -925,11 +1011,14 @@ mod tests {
         };
         let resolved = resolve_ssh_config_on_port(
             &runner,
-            "jump-alias",
-            None,
-            Some(2200),
-            &[],
-            false,
+            SshConfigQuery {
+                host_alias: "jump-alias",
+                requested_user: None,
+                explicit_port: Some(2200),
+                ssh_options: &[],
+                ssh_config: None,
+                parse_local_forwards: false,
+            },
             Deadline::after(Duration::from_secs(1)),
         )
         .unwrap();
@@ -1307,6 +1396,117 @@ mod tests {
                 reason: "expected exactly two fields",
             })
         ));
+    }
+
+    #[test]
+    fn ssh_config_query_emits_selected_file_or_none() {
+        struct CapturingRunner {
+            args: std::sync::Mutex<Vec<String>>,
+        }
+        impl SshRunner for CapturingRunner {
+            fn run(
+                &self,
+                invocation: &SshInvocation,
+                _: Deadline,
+            ) -> Result<SshOutput, ClientError> {
+                self.args.lock().unwrap().clone_from(&invocation.args);
+                Ok(SshOutput {
+                    status: Some(success_status()),
+                    stdout: b"host alias\nhostname 127.0.0.1\nport 22\n".to_vec(),
+                })
+            }
+        }
+
+        for selected in [Some("/etc/et/ssh_config"), Some("none")] {
+            let runner = CapturingRunner {
+                args: std::sync::Mutex::new(Vec::new()),
+            };
+            resolve_ssh_config(
+                &runner,
+                "alias",
+                None,
+                &[],
+                selected,
+                false,
+                Deadline::after(Duration::from_secs(1)),
+            )
+            .unwrap();
+            let args = runner.args.lock().unwrap().clone();
+            assert_eq!(
+                &args[..4],
+                ["-G", "-T", "-F", selected.unwrap()],
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_config_path_accepts_unix_and_windows_absolute_shapes() {
+        assert!(is_absolute_ssh_config_path("/etc/et/ssh_config"));
+        assert!(is_absolute_ssh_config_path(r"C:\Users\me\.ssh\config"));
+        assert!(is_absolute_ssh_config_path(r"C:/Users/me/.ssh/config"));
+        assert!(is_absolute_ssh_config_path(r"\\server\share\config"));
+        assert!(!is_absolute_ssh_config_path("relative/config"));
+        assert!(!is_absolute_ssh_config_path("./config"));
+        assert!(!is_absolute_ssh_config_path("none"));
+    }
+
+    #[test]
+    fn ssh_config_path_rejects_shell_unsafe_and_relative_names() {
+        assert!(is_ssh_config_path_safe_for_proxy_jump("/etc/et/ssh_config"));
+        assert!(is_ssh_config_path_safe_for_proxy_jump(
+            r"C:\Users\me\.ssh\config"
+        ));
+        assert!(!is_ssh_config_path_safe_for_proxy_jump("relative"));
+        assert!(!is_ssh_config_path_safe_for_proxy_jump("/tmp/et config"));
+        assert!(!is_ssh_config_path_safe_for_proxy_jump("/tmp/et;id"));
+        assert!(!is_ssh_config_path_safe_for_proxy_jump("/tmp/et$(id)"));
+        assert!(!is_ssh_config_path_safe_for_proxy_jump("/tmp/et`id`"));
+        assert!(!is_ssh_config_path_safe_for_proxy_jump("/tmp/et\"quote\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_config_file_validation_fails_closed() {
+        let directory =
+            std::env::temp_dir().join(format!("et-ssh-config-validate-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let regular = directory.join("ssh_config");
+        std::fs::write(&regular, "Host *\n").unwrap();
+        validate_ssh_config_file(regular.to_str().unwrap()).unwrap();
+
+        assert!(matches!(
+            validate_ssh_config_file("relative/config"),
+            Err(ClientError::InvalidSshConfig(
+                "must be an absolute path or 'none'"
+            ))
+        ));
+        assert!(matches!(
+            validate_ssh_config_file("/tmp/et config"),
+            Err(ClientError::InvalidSshConfig(_))
+        ));
+        let missing = directory.join("missing");
+        assert!(matches!(
+            validate_ssh_config_file(missing.to_str().unwrap()),
+            Err(ClientError::InvalidSshConfig(
+                "must name a readable, non-symlink regular file"
+            ))
+        ));
+        assert!(matches!(
+            validate_ssh_config_file(directory.to_str().unwrap()),
+            Err(ClientError::InvalidSshConfig(
+                "must name a readable, non-symlink regular file"
+            ))
+        ));
+        let link = directory.join("link");
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+        assert!(matches!(
+            validate_ssh_config_file(link.to_str().unwrap()),
+            Err(ClientError::InvalidSshConfig(
+                "must name a readable, non-symlink regular file"
+            ))
+        ));
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     fn request(

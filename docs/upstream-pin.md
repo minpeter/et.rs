@@ -10,7 +10,7 @@ Canonical machine files:
 - Ledger (every `master` commit after baseline):
   [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml)
 
-Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-17.
+Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-18.
 `#784` marked `ported` after et.rs [#31](https://github.com/minpeter/et.rs/pull/31) / `906a7ca86691f00a82f88b99b21d7afceb07bf97`.
 `#798` marked `ported` after et.rs [#77](https://github.com/minpeter/et.rs/pull/77).
 
@@ -20,13 +20,13 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-17.
 | Baseline / latest release tag | [`et-v7.0.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.0.0) |
 | Baseline / release commit | [`7656a32a5bc15c6746726a27a5a4ba1e468fab6e`](https://github.com/MisterTea/EternalTerminal/commit/7656a32a5bc15c6746726a27a5a4ba1e468fab6e) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`8a306f6`](https://github.com/MisterTea/EternalTerminal/commit/8a306f6d3580886f77357864fc010a4e8b78c3a6) (#813 HTM control-mode parity, reviewed 2026-09-17) |
+| Pin tip (last classified) | [`2d3e2fc`](https://github.com/MisterTea/EternalTerminal/commit/2d3e2fc0f57e7adb1cfffe58c7e1d67906292322) (#814 SSH config isolation, reviewed 2026-09-18) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
 | ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.0.0` and `master`) |
 
-The reviewed baseline-to-#813 range contains 22 classified commits. Unclassified commits would be drift.
+The reviewed baseline-to-#814 range contains 25 classified commits. Unclassified commits would be drift.
 
-## Ledger (classified 2026-09-17)
+## Ledger (classified 2026-09-18)
 
 | sha | date | kind | status | note |
 | --- | --- | --- | --- | --- |
@@ -52,6 +52,9 @@ The reviewed baseline-to-#813 range contains 22 classified commits. Unclassified
 | [`59cee86`](https://github.com/MisterTea/EternalTerminal/commit/59cee86068bea79090b57a96c366243fc73d6130) | 2026-09-11 | docs | skip | C++ comment-only; Rust has its own screen model and ESC-k filter. |
 | [`ea2c2ed`](https://github.com/MisterTea/EternalTerminal/commit/ea2c2ed170b6f0a106a7eee324b14395345a6671) | 2026-09-14 | product | skip | #812 optional RAW_STACKTRACE for C++ logger; et.rs has no easylogging/ust path. PROTOCOL_VERSION stays 6. |
 | [`8a306f6`](https://github.com/MisterTea/EternalTerminal/commit/8a306f6d3580886f77357864fc010a4e8b78c3a6) | 2026-09-17 | product | **ported** | Canonical command/state parity, sandboxed libvterm, authenticated diagnostics, bounded bridges and lifecycle. [Native-platform/GUI verification limits](htm-control-mode.md) remain explicit. |
+| [`02b2142`](https://github.com/MisterTea/EternalTerminal/commit/02b21424b4c85ababe9fd0e446d2e484f16b0c6b) | 2026-09-17 | security | skip | #810 session/forwarding FD and generated socket-dir cleanup. et.rs RAII Drop already closes sessions, forwards, and temp unix-socket dirs. |
+| [`0e38189`](https://github.com/MisterTea/EternalTerminal/commit/0e38189fcd57269244f7bdf1bd9dfd0ee97df8f8) | 2026-09-17 | product | skip | #811 honor explicit TCP forwarding destinations. et.rs `Endpoint::parse_destination` already preserves names. |
+| [`2d3e2fc`](https://github.com/MisterTea/EternalTerminal/commit/2d3e2fc0f57e7adb1cfffe58c7e1d67906292322) | 2026-09-17 | product | **ported** | #814 isolate destination `--ssh-option` off the jumphost SSH argv; add `--ssh-config` / `--no-ssh-config`. |
 
 ## Ported and residual
 
@@ -118,8 +121,32 @@ crash logs can emit PCs without synchronous symbolization that held the logger
 mutex. et.rs has no easylogging/ust/`ET_RAW_STACKTRACE` path (`forbid(unsafe)`),
 so the C++ stacktrace helpers are not ported. `PROTOCOL_VERSION` stays 6.
 
+[`02b2142`](https://github.com/MisterTea/EternalTerminal/commit/02b21424b4c85ababe9fd0e446d2e484f16b0c6b)
+(`#810`) stays `status: skip`. Upstream now closes completed sessions' router
+connections and leftover forwarding sockets and removes generated socket
+directories. et.rs already does this through RAII: `Runtime`/`Router`/
+`ActiveSession`/`Forwarder` `Drop` shut down connections, `forward_worker_state::remove`
+calls `stop_io`, and `ForwardListener`/`ForwardPipe`/`PendingPath`/
+`PendingDirectories`/`UserSocketCleanup` remove unix sockets and created temp
+dirs. Reconnect and timeout paths are unchanged. `PROTOCOL_VERSION` stays 6.
+
+[`0e38189`](https://github.com/MisterTea/EternalTerminal/commit/0e38189fcd57269244f7bdf1bd9dfd0ee97df8f8)
+(`#811`) stays `status: skip`. Upstream stopped ignoring explicit TCP
+destination hostnames (empty names still try IPv6 loopback then IPv4). et.rs
+already preserves non-empty names in `Endpoint::parse_destination` and connects
+via `connect_tcp(host, port)`. `PROTOCOL_VERSION` stays 6.
+
+[`2d3e2fc`](https://github.com/MisterTea/EternalTerminal/commit/2d3e2fc0f57e7adb1cfffe58c7e1d67906292322)
+(`#814`) is `status: ported`. Destination `--ssh-option` values stay on the
+target bootstrap/probe/`ssh -G` path and are no longer replayed onto the
+direct jumphost SSH argv (operational guards such as `ClearAllForwardings`
+remain). `--ssh-config <absolute-path|none>` and `--no-ssh-config` select the
+sole OpenSSH `-F` policy for destination and jumphost resolution. Validation
+fails closed on relative, symlink, non-regular, missing, or shell-unsafe
+paths; Windows drive and UNC paths are accepted as absolute.
+
 et.rs still claims **protocol v6**. EternalTerminal’s latest product release is
-**v7.0.0**, and the reviewed tip is twenty-two classified commits past that tag.
+**v7.0.0**, and the reviewed tip is twenty-five classified commits past that tag.
 
 Review ports against the conflict policy in
 [`docs/upstream-factory.md`](upstream-factory.md). Gate any later port with

@@ -1455,9 +1455,8 @@ mod tests {
     #[test]
     fn ssh_config_file_validation_fails_closed() {
         let directory = std::env::temp_dir().join(format!(
-            "et-ssh-config-validate-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("validate")
+            "et-ssh-config-validate-{}",
+            std::process::id()
         ));
         std::fs::create_dir(&directory).unwrap();
         let regular = directory.join("ssh_config");

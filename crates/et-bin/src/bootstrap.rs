@@ -901,7 +901,7 @@ mod tests {
                 "user@jump.example"
             ]
         );
-        let command = &invocation.args[8];
+        let command = &invocation.args[7];
         assert!(command.contains("'--serverfifo=/tmp/jump.fifo'"));
         assert!(command.contains("'--jump'"));
         assert!(command.contains("'--dsthost=dst.internal'"));

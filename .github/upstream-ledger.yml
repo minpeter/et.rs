@@ -158,5 +158,5 @@ commits:
     date: "2026-09-17"
     kind: product
     status: ported
-    note: "#814 isolate destination --ssh-option off the direct jumphost SSH argv and add --ssh-config/--no-ssh-config (-F) for destination and jumphost resolution. Fail-closed on relative/symlink/non-regular/shell-unsafe paths; Windows absolute paths accepted. PROTOCOL_VERSION stays 6. Landed in this et.rs PR."
+    note: "#814 isolate destination --ssh-option off the direct jumphost SSH argv and add --ssh-config/--no-ssh-config (-F) for destination and jumphost resolution. Fail-closed on relative/symlink/non-regular/shell-unsafe paths; Windows absolute paths accepted. PROTOCOL_VERSION stays 6. Landed in et.rs #110."
     et_pr: 814

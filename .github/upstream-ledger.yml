@@ -10,10 +10,10 @@
 #   note: short string
 #   et_pr: optional upstream PR number
 #
-# Classified 2026-09-18. #804 passed independent review in et.rs #100.
+# Classified 2026-09-21. #804 passed independent review in et.rs #100.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-09-18"
+classified: "2026-09-21"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -160,3 +160,37 @@ commits:
     status: ported
     note: "#814 isolate destination --ssh-option off the direct jumphost SSH argv and add --ssh-config/--no-ssh-config (-F) for destination and jumphost resolution. Fail-closed on relative/symlink/non-regular/shell-unsafe paths; Windows absolute paths accepted. PROTOCOL_VERSION stays 6. Landed in et.rs #110."
     et_pr: 814
+  - sha: 5673969b7c04d15111dcd330710ae31ba0c33499
+    date: "2026-09-18"
+    kind: security
+    status: skip
+    note: "#815 UnixSocketHandler::write returned -1 after a successful prefix, so writeAllOrThrow retried from offset 0 and corrupted CatchupBuffer framing. et.rs has no that C++ path: write_all_until advances on Ok(count); on mid-frame error write_live_frame_until soft-disconnects/shuts down so a partial frame cannot desync recovery; local write_local_packet resumes WouldBlock from the partial. PROTOCOL_VERSION stays 6."
+    et_pr: 815
+  - sha: a8d84af99ba377b75dfa230e55774c8d9a540681
+    date: "2026-09-18"
+    kind: product
+    status: skip
+    note: "C++ UniversalStacktrace / easylogging only; et.rs has no ust path (same family as #812). PROTOCOL_VERSION stays 6."
+  - sha: 71bfe95216333628a0b4cb26d8a5b12a247d61e1
+    date: "2026-09-18"
+    kind: product
+    status: skip
+    note: "external/UniversalStacktrace MinGW only; N/A to Rust. PROTOCOL_VERSION stays 6."
+  - sha: 0e3e3e0cbf3fe5bf329cfb2feff08995140d5470
+    date: "2026-09-18"
+    kind: ci
+    status: skip
+    note: "#817 C++ Windows test/WSAPoll port; et.rs already has Windows-native ConPTY server and its own tests. Not wire/auth. PROTOCOL_VERSION stays 6."
+    et_pr: 817
+  - sha: 17ec75556521df092024ceb6b95636cef367a0aa
+    date: "2026-09-19"
+    kind: ci
+    status: skip
+    note: "#818 OpenWrt packaging/workflows only. PROTOCOL_VERSION stays 6."
+    et_pr: 818
+  - sha: db4f6f63183b403c5a530249fe5e126c59adf660
+    date: "2026-09-19"
+    kind: product
+    status: skip
+    note: "#816 portability CI plus optional C++ SshSetupHandler displayLoginOutput (strip IDPASSKEY from MOTD/login banner). et.rs already has terminal_motd / ssh_process paths; not a protocol/wire/auth change. PROTOCOL_VERSION stays 6."
+    et_pr: 816

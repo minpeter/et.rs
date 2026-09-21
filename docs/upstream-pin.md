@@ -10,7 +10,7 @@ Canonical machine files:
 - Ledger (every `master` commit after baseline):
   [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml)
 
-Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-18.
+Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-21.
 `#784` marked `ported` after et.rs [#31](https://github.com/minpeter/et.rs/pull/31) / `906a7ca86691f00a82f88b99b21d7afceb07bf97`.
 `#798` marked `ported` after et.rs [#77](https://github.com/minpeter/et.rs/pull/77).
 
@@ -20,13 +20,13 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-18.
 | Baseline / latest release tag | [`et-v7.0.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.0.0) |
 | Baseline / release commit | [`7656a32a5bc15c6746726a27a5a4ba1e468fab6e`](https://github.com/MisterTea/EternalTerminal/commit/7656a32a5bc15c6746726a27a5a4ba1e468fab6e) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`2d3e2fc`](https://github.com/MisterTea/EternalTerminal/commit/2d3e2fc0f57e7adb1cfffe58c7e1d67906292322) (#814 SSH config isolation, reviewed 2026-09-18) |
+| Pin tip (last classified) | [`db4f6f6`](https://github.com/MisterTea/EternalTerminal/commit/db4f6f63183b403c5a530249fe5e126c59adf660) (#816 Rocky/Gentoo CI + SSH login output, reviewed 2026-09-21) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
 | ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.0.0` and `master`) |
 
-The reviewed baseline-to-#814 range contains 25 classified commits. Unclassified commits would be drift.
+The reviewed baseline-to-#816 range contains 31 classified commits. Unclassified commits would be drift.
 
-## Ledger (classified 2026-09-18)
+## Ledger (classified 2026-09-21)
 
 | sha | date | kind | status | note |
 | --- | --- | --- | --- | --- |
@@ -55,6 +55,12 @@ The reviewed baseline-to-#814 range contains 25 classified commits. Unclassified
 | [`02b2142`](https://github.com/MisterTea/EternalTerminal/commit/02b21424b4c85ababe9fd0e446d2e484f16b0c6b) | 2026-09-17 | security | skip | #810 session/forwarding FD and generated socket-dir cleanup. et.rs RAII Drop already closes sessions, forwards, and temp unix-socket dirs. |
 | [`0e38189`](https://github.com/MisterTea/EternalTerminal/commit/0e38189fcd57269244f7bdf1bd9dfd0ee97df8f8) | 2026-09-17 | product | skip | #811 honor explicit TCP forwarding destinations. et.rs `Endpoint::parse_destination` already preserves names. |
 | [`2d3e2fc`](https://github.com/MisterTea/EternalTerminal/commit/2d3e2fc0f57e7adb1cfffe58c7e1d67906292322) | 2026-09-17 | product | **ported** | #814 isolate destination `--ssh-option` off the jumphost SSH argv; add `--ssh-config` / `--no-ssh-config`. |
+| [`5673969`](https://github.com/MisterTea/EternalTerminal/commit/5673969b7c04d15111dcd330710ae31ba0c33499) | 2026-09-18 | security | skip | #815 preserve partial socket write progress. et.rs `write_all_until` / `write_live_frame_until` / `write_local_packet` already avoid the C++ retry-from-0 framing bug. |
+| [`a8d84af`](https://github.com/MisterTea/EternalTerminal/commit/a8d84af99ba377b75dfa230e55774c8d9a540681) | 2026-09-18 | product | skip | C++ UniversalStacktrace / easylogging only; et.rs has no ust path (same family as #812). |
+| [`71bfe95`](https://github.com/MisterTea/EternalTerminal/commit/71bfe95216333628a0b4cb26d8a5b12a247d61e1) | 2026-09-18 | product | skip | external/UniversalStacktrace MinGW only; N/A to Rust. |
+| [`0e3e3e0`](https://github.com/MisterTea/EternalTerminal/commit/0e3e3e0cbf3fe5bf329cfb2feff08995140d5470) | 2026-09-18 | ci | skip | #817 C++ Windows test/WSAPoll port; et.rs already has Windows-native ConPTY server and its own tests. |
+| [`17ec755`](https://github.com/MisterTea/EternalTerminal/commit/17ec75556521df092024ceb6b95636cef367a0aa) | 2026-09-19 | ci | skip | #818 OpenWrt packaging/workflows only. |
+| [`db4f6f6`](https://github.com/MisterTea/EternalTerminal/commit/db4f6f63183b403c5a530249fe5e126c59adf660) | 2026-09-19 | product | skip | #816 Rocky/Gentoo CI plus optional C++ SSH login/MOTD display; et.rs already has `terminal_motd` / `ssh_process` paths. |
 
 ## Ported and residual
 
@@ -145,8 +151,40 @@ sole OpenSSH `-F` policy for destination and jumphost resolution. Validation
 fails closed on relative, symlink, non-regular, missing, or shell-unsafe
 paths; Windows drive and UNC paths are accepted as absolute.
 
+[`5673969`](https://github.com/MisterTea/EternalTerminal/commit/5673969b7c04d15111dcd330710ae31ba0c33499)
+(`#815`) stays `status: skip`. Upstream `UnixSocketHandler::write` returned
+`-1` after a successful prefix, so `writeAllOrThrow` retried from offset 0
+and corrupted CatchupBuffer framing. et.rs has no that C++ path:
+`write_all_until` advances on `Ok(count)`; on mid-frame error
+`write_live_frame_until` soft-disconnects/shuts down so a partial frame
+cannot desync recovery; local `write_local_packet` resumes `WouldBlock`
+from the partial. `PROTOCOL_VERSION` stays 6.
+
+[`a8d84af`](https://github.com/MisterTea/EternalTerminal/commit/a8d84af99ba377b75dfa230e55774c8d9a540681)
+stays `status: skip`. C++ UniversalStacktrace / easylogging only; et.rs
+has no ust path (same family as `#812`). `PROTOCOL_VERSION` stays 6.
+
+[`71bfe95`](https://github.com/MisterTea/EternalTerminal/commit/71bfe95216333628a0b4cb26d8a5b12a247d61e1)
+stays `status: skip`. `external/UniversalStacktrace` MinGW only; N/A to
+Rust. `PROTOCOL_VERSION` stays 6.
+
+[`0e3e3e0`](https://github.com/MisterTea/EternalTerminal/commit/0e3e3e0cbf3fe5bf329cfb2feff08995140d5470)
+(`#817`) stays `status: skip`. C++ Windows test/WSAPoll port; et.rs already
+has a Windows-native ConPTY server and its own tests. Not wire/auth.
+`PROTOCOL_VERSION` stays 6.
+
+[`17ec755`](https://github.com/MisterTea/EternalTerminal/commit/17ec75556521df092024ceb6b95636cef367a0aa)
+(`#818`) stays `status: skip`. OpenWrt packaging/workflows only.
+`PROTOCOL_VERSION` stays 6.
+
+[`db4f6f6`](https://github.com/MisterTea/EternalTerminal/commit/db4f6f63183b403c5a530249fe5e126c59adf660)
+(`#816`) stays `status: skip`. Portability CI plus optional C++
+`SshSetupHandler` `displayLoginOutput` (strip `IDPASSKEY` from MOTD/login
+banner). et.rs already has `terminal_motd` / `ssh_process` paths; not a
+protocol/wire/auth change. `PROTOCOL_VERSION` stays 6.
+
 et.rs still claims **protocol v6**. EternalTerminal’s latest product release is
-**v7.0.0**, and the reviewed tip is twenty-five classified commits past that tag.
+**v7.0.0**, and the reviewed tip is thirty-one classified commits past that tag.
 
 Review ports against the conflict policy in
 [`docs/upstream-factory.md`](upstream-factory.md). Gate any later port with

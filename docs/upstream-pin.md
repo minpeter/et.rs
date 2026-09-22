@@ -72,7 +72,7 @@ The reviewed baseline-to-#830 range contains 44 classified commits (31 prior + 1
 | [`651fe3e`](https://github.com/MisterTea/EternalTerminal/commit/651fe3e717305240643a6201422dd9baeaacb867) | 2026-09-21 | security | skip | #799/#848 unknown packet session-local; et.rs already SessionError |
 | [`5661a4b`](https://github.com/MisterTea/EternalTerminal/commit/5661a4b6e4f367b493ee557496919b619a65747e) | 2026-09-21 | product | skip | #683/#835 FreeBSD login argv0; et.rs uses `-l` |
 | [`f49e556`](https://github.com/MisterTea/EternalTerminal/commit/f49e55681049c7784d4f4012d9eacbbcedf48e6f) | 2026-09-21 | docs | skip | #752/#841 README roles |
-| [`d70e00a`](https://github.com/MisterTea/EternalTerminal/commit/d70e00ac44758b8037847ce128e647204f2e0603) | 2026-09-21 | protocol | **ported** | #707/#837 `TERMINAL_CLOSE=11` / `--close-on-hangup`. PROTOCOL_VERSION stays 6. |
+| [`d70e00a`](https://github.com/MisterTea/EternalTerminal/commit/d70e00ac44758b8037847ce128e647204f2e0603) | 2026-09-21 | protocol | **ported** | #707/#837 `TERMINAL_CLOSE=11` / `--close-on-hangup`. Landed via #116. PROTOCOL_VERSION stays 6. |
 | [`a836741`](https://github.com/MisterTea/EternalTerminal/commit/a8367415783a64405c62c70b755b4c09b410532b) | 2026-09-21 | product | skip | #653/#830 ProxyJump none; et.rs already handles |
 
 
@@ -84,7 +84,8 @@ parsed independently in `crates/et-cli/src/tunnel.rs` (et-style when ≤2 colon
 parts, otherwise ssh-style). Protocol v6 is unchanged.
 
 [`d70e00a`](https://github.com/MisterTea/EternalTerminal/commit/d70e00ac44758b8037847ce128e647204f2e0603)
-(`#707` / `#837`) is `status: ported`. Upstream added `TERMINAL_CLOSE = 11`
+(`#707` / `#837`) is `status: ported`. It landed in et.rs via
+[#116](https://github.com/minpeter/et.rs/pull/116). Upstream added `TERMINAL_CLOSE = 11`
 and optional `--close-on-hangup` without bumping `PROTOCOL_VERSION` (still 6).
 With the flag, the et client sends that packet on Unix `SIGHUP` and on
 Windows console close, logoff, shutdown, or break, then leaves the client

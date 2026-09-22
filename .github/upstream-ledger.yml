@@ -262,7 +262,7 @@ commits:
     date: "2026-09-21"
     kind: protocol
     status: ported
-    note: "#707/#837 optional --close-on-hangup sends TERMINAL_CLOSE=11 and tears down that session only. Landed in et.rs. PROTOCOL_VERSION stays 6."
+    note: "#707/#837 optional --close-on-hangup sends TERMINAL_CLOSE=11 and tears down that session only. Landed in et.rs via #116. PROTOCOL_VERSION stays 6."
     et_pr: 707
   - sha: a8367415783a64405c62c70b755b4c09b410532b
     date: "2026-09-21"

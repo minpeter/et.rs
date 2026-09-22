@@ -139,6 +139,9 @@ where
     }
     let mut pump_probe = PumpProbe::connect()?;
     loop {
+        if crate::client_hangup::take_terminal_close(connection) {
+            return Ok(());
+        }
         if let Some(probe) = pump_probe.as_mut() {
             probe.arm()?;
         }
@@ -223,6 +226,11 @@ where
                         .map_err(|_| terminal_text("keepalive deadline exceeds poll range"))?;
                 match poll(&mut descriptors, Some(&timeout)) {
                     Ok(_) => break,
+                    Err(error)
+                        if error == rustix::io::Errno::INTR && crate::client_hangup::pending() =>
+                    {
+                        break;
+                    }
                     Err(error) if error == rustix::io::Errno::INTR => {}
                     Err(error) => {
                         return Err(terminal_io(

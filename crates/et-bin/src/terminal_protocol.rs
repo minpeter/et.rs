@@ -75,11 +75,19 @@ pub fn read_ready_packet(
     }
 }
 
+/// What one local packet asks this terminal process to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalTerminalAction {
+    Continue,
+    /// `#837` / `#707`: the client asked to end this session, not etserver.
+    CloseSession,
+}
+
 pub fn handle_packet(
     packet: Packet,
     master: &dyn MasterPty,
     writer: &mut dyn Write,
-) -> Result<(), String> {
+) -> Result<LocalTerminalAction, String> {
     if packet.is_encrypted() {
         return Err("encrypted local terminal packet rejected".to_owned());
     }
@@ -93,14 +101,19 @@ pub fn handle_packet(
             writer
                 .write_all(&bytes)
                 .and_then(|()| writer.flush())
-                .map_err(|error| format!("could not write PTY input: {error}"))
+                .map_err(|error| format!("could not write PTY input: {error}"))?;
+            Ok(LocalTerminalAction::Continue)
         }
         header if header == TerminalPacketType::TerminalInfo as u8 => {
             let info = TerminalInfo::decode(packet.payload())
                 .map_err(|_| "TERMINAL_INFO protobuf is malformed".to_owned())?;
             master
                 .resize(terminal_size(&info))
-                .map_err(|error| format!("could not resize PTY: {error}"))
+                .map_err(|error| format!("could not resize PTY: {error}"))?;
+            Ok(LocalTerminalAction::Continue)
+        }
+        header if header == TerminalPacketType::TerminalClose as u8 => {
+            Ok(LocalTerminalAction::CloseSession)
         }
         _ => Err("unsupported local terminal packet type".to_owned()),
     }
@@ -136,6 +149,27 @@ mod tests {
     use super::*;
     use et_core::packet::Packet;
     use et_net::local_packet::write_local_packet;
+    use portable_pty::{native_pty_system, PtySize};
+
+    #[test]
+    fn terminal_close_ends_only_this_session() {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut writer = pair.master.take_writer().unwrap();
+        let action = handle_packet(
+            Packet::new(TerminalPacketType::TerminalClose as u8, Vec::new()),
+            pair.master.as_ref(),
+            &mut writer,
+        )
+        .unwrap();
+        assert_eq!(action, LocalTerminalAction::CloseSession);
+    }
 
     #[test]
     fn resize_accepts_zero_and_truncates_like_upstream_winsize() {

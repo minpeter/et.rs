@@ -120,50 +120,73 @@ impl Fixture {
         path
     }
 
-    /// Wrapper that emits an ANSI palette color marker only when argv[1] is `-l`.
+    /// Binary that emits an ANSI palette color marker only for a login argv[0].
     pub fn login_probe_shell(&self) -> std::path::PathBuf {
         self.login_shell_wrapper(
             "login-probe-shell",
-            "printf '\\033[31mET-LOGIN-COLOR\\033[0m\\n'",
-            "printf 'ET-NON-LOGIN\\n'\n",
+            b"\x1b[31mET-LOGIN-COLOR\x1b[0m\n",
+            b"ET-NON-LOGIN\n",
         )
     }
 
-    /// Wrapper that emits a prompt marker immediately when invoked as a login shell.
+    /// Binary that emits a prompt marker immediately when invoked as a login shell.
     pub fn prompt_probe_shell(&self) -> std::path::PathBuf {
-        self.login_shell_wrapper("prompt-probe-shell", "printf 'ET-PROMPT> '", "")
+        self.login_shell_wrapper("prompt-probe-shell", b"ET-PROMPT> ", b"")
     }
 
-    /// Login-shell wrapper matching profiles that begin by moving to a fresh line.
+    /// Login-shell binary matching profiles that begin by moving to a fresh line.
     pub fn leading_newline_prompt_shell(&self) -> std::path::PathBuf {
-        self.login_shell_wrapper(
-            "leading-newline-prompt-shell",
-            "printf '\\r\\nET-PROMPT> '",
-            "",
-        )
+        self.login_shell_wrapper("leading-newline-prompt-shell", b"\r\nET-PROMPT> ", b"")
     }
 
+    /// Real executable so the login `argv[0]` survives process start.
+    ///
+    /// A `#!/bin/sh` wrapper cannot observe it: Linux replaces a script's
+    /// `argv[0]` with the script path before the interpreter runs.
     fn login_shell_wrapper(
         &self,
         name: &str,
-        login_output: &str,
-        non_login_output: &str,
+        login_output: &[u8],
+        non_login_output: &[u8],
     ) -> std::path::PathBuf {
+        let source = self.directory.join(format!("{name}.c"));
         let path = self.directory.join(name);
         fs::write(
-            &path,
+            &source,
             format!(
-                "#!/bin/sh\n\
-                 if [ \"${{1-}}\" = \"-l\" ]; then\n\
-                 {login_output}\n\
-                 shift\n\
-                 exec /bin/sh \"$@\"\n\
-                 fi\n\
-                 {non_login_output}exec /bin/sh \"$@\"\n"
+                "#include <stdio.h>\n\
+                 #include <string.h>\n\
+                 #include <unistd.h>\n\
+                 int main(int argc, char **argv) {{\n\
+                     const char *arg0 = (argc > 0 && argv[0]) ? argv[0] : \"\";\n\
+                     const char *slash = strrchr(arg0, '/');\n\
+                     const char *base = slash ? slash + 1 : arg0;\n\
+                     const unsigned char login_output[] = {{ {login} }};\n\
+                     const unsigned char non_login_output[] = {{ {non_login} }};\n\
+                     if (base[0] == '-') {{\n\
+                         if (sizeof login_output)\n\
+                             fwrite(login_output, 1, sizeof login_output, stdout);\n\
+                     }} else if (sizeof non_login_output) {{\n\
+                         fwrite(non_login_output, 1, sizeof non_login_output, stdout);\n\
+                     }}\n\
+                     fflush(stdout);\n\
+                     char *shell_argv[] = {{\"sh\", NULL}};\n\
+                     execv(\"/bin/sh\", shell_argv);\n\
+                     perror(\"exec /bin/sh\");\n\
+                     return 127;\n\
+                 }}\n",
+                login = c_byte_list(login_output),
+                non_login = c_byte_list(non_login_output),
             ),
         )
         .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let status = Command::new("gcc")
+            .args(["-o"])
+            .arg(&path)
+            .arg(&source)
+            .status()
+            .expect("gcc is required to build the login-shell probe");
+        assert!(status.success(), "gcc failed to build {name}");
         path
     }
 
@@ -192,6 +215,14 @@ impl Fixture {
         });
         assert_eq!(receiver.recv_timeout(TIMEOUT).unwrap().unwrap(), [1]);
     }
+}
+
+fn c_byte_list(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| byte.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl Drop for Fixture {

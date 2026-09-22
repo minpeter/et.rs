@@ -64,6 +64,9 @@ where
     let mut pending_output: Option<et_core::packet::Packet> = None;
     let mut interrupt_input = et_core::output_interrupt::InterruptInput::default();
     loop {
+        if crate::client_hangup::take_terminal_close(connection) {
+            return Ok(());
+        }
         console_output
             .check_error()
             .map_err(|error| terminal_io("writing terminal output", error))?;

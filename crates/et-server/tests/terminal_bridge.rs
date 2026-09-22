@@ -10,7 +10,9 @@ use et_core::proto::{
 };
 use et_net::local_packet::{read_local_packet, write_local_packet};
 use prost::Message;
-use runtime_support::{default_payload, initialize, TestRuntime, ID_A, KEY_A, TIMEOUT};
+use runtime_support::{
+    default_payload, initialize, TestRuntime, ID_A, ID_B, KEY_A, KEY_B, TIMEOUT,
+};
 
 #[test]
 fn encrypted_client_and_registered_terminal_exchange_packets() {
@@ -287,5 +289,123 @@ fn terminal_environment_is_forwarded_without_interpolation() {
     assert_eq!(environment.environmentnames, vec!["LITERAL"]);
     assert_eq!(environment.environmentvalues, vec!["$(not-executed)"]);
     drop(terminal);
+    server.runtime.shutdown().unwrap();
+}
+
+fn active_pair(
+    server: &TestRuntime,
+    id: &str,
+    key: &str,
+) -> (
+    et_net::connection::Connection,
+    std::os::unix::net::UnixStream,
+) {
+    let mut terminal = server.register(id, key);
+    terminal.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let (stream, response) = server.handshake(id);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let decoded = passkey_to_key(key).unwrap();
+    let (client, initial) = initialize(stream, &decoded, default_payload());
+    assert_eq!(initial.error, None);
+    let init = read_local_packet(&mut terminal).unwrap();
+    assert_eq!(init.header(), TerminalPacketType::TerminalInit as u8);
+    (client, terminal)
+}
+
+#[test]
+fn terminal_close_flushes_the_marker_and_leaves_the_other_session_running() {
+    let mut server = TestRuntime::start();
+    let (mut client_a, mut terminal_a) = active_pair(&server, ID_A, KEY_A);
+    let (mut client_b, mut terminal_b) = active_pair(&server, ID_B, KEY_B);
+
+    let before = TerminalBuffer {
+        buffer: Some(b"before-close".to_vec()),
+    };
+    client_a
+        .write_packet(
+            TerminalPacketType::TerminalBuffer as u8,
+            &before.encode_to_vec(),
+        )
+        .unwrap();
+    let delivered = read_local_packet(&mut terminal_a).unwrap();
+    assert_eq!(
+        TerminalBuffer::decode(delivered.payload())
+            .unwrap()
+            .buffer
+            .as_deref(),
+        Some(b"before-close".as_slice())
+    );
+
+    client_a
+        .write_packet(TerminalPacketType::TerminalClose as u8, &[])
+        .unwrap();
+    let marker = read_local_packet(&mut terminal_a).unwrap();
+    assert_eq!(marker.header(), TerminalPacketType::TerminalClose as u8);
+    assert!(
+        read_local_packet(&mut terminal_a).is_err(),
+        "the closed session bridge must end after the marker is flushed"
+    );
+
+    let still = TerminalBuffer {
+        buffer: Some(b"session-b-lives".to_vec()),
+    };
+    client_b
+        .write_packet(
+            TerminalPacketType::TerminalBuffer as u8,
+            &still.encode_to_vec(),
+        )
+        .unwrap();
+    let delivered = read_local_packet(&mut terminal_b).unwrap();
+    assert_eq!(
+        TerminalBuffer::decode(delivered.payload())
+            .unwrap()
+            .buffer
+            .as_deref(),
+        Some(b"session-b-lives".as_slice())
+    );
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
+fn unknown_client_packet_closes_only_that_session() {
+    let mut server = TestRuntime::start();
+    let (mut client_a, mut terminal_a) = active_pair(&server, ID_A, KEY_A);
+    let (mut client_b, mut terminal_b) = active_pair(&server, ID_B, KEY_B);
+
+    client_a.write_packet(42, b"not-a-terminal-packet").unwrap();
+    assert!(
+        read_local_packet(&mut terminal_a).is_err(),
+        "an unknown client packet must not be relayed and must end only this session"
+    );
+
+    let still = TerminalBuffer {
+        buffer: Some(b"session-b-lives".to_vec()),
+    };
+    client_b
+        .write_packet(
+            TerminalPacketType::TerminalBuffer as u8,
+            &still.encode_to_vec(),
+        )
+        .unwrap();
+    let delivered = read_local_packet(&mut terminal_b).unwrap();
+    assert_eq!(
+        TerminalBuffer::decode(delivered.payload())
+            .unwrap()
+            .buffer
+            .as_deref(),
+        Some(b"session-b-lives".as_slice())
+    );
+
+    const ID_C: &str = "cccccccccccccccc";
+    const KEY_C: &str = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+    let mut terminal_c = server.register(ID_C, KEY_C);
+    terminal_c.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let (stream, response) = server.handshake(ID_C);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let key = passkey_to_key(KEY_C).unwrap();
+    let (_client, initial) = initialize(stream, &key, default_payload());
+    assert_eq!(initial.error, None);
+    let init = read_local_packet(&mut terminal_c).unwrap();
+    assert_eq!(init.header(), TerminalPacketType::TerminalInit as u8);
     server.runtime.shutdown().unwrap();
 }

@@ -23,25 +23,92 @@ use sysinfo::{Pid as SystemPid, ProcessesToUpdate, Signal as SystemSignal, Syste
 const MAX_OUTPUT_CHUNK: usize = 16 * 1024;
 const FINAL_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-use crate::terminal_protocol::{handle_packet, read_initialization, read_ready_packet};
+use crate::terminal_protocol::{
+    handle_packet, read_initialization, read_ready_packet, LocalTerminalAction,
+};
 
 enum WorkerEvent {
     Output(Result<(), String>),
     Child(Result<u32, String>),
 }
 
+/// Internal argv token. The spawned helper re-execs the login shell with a
+/// portable `argv[0]` (`-sh`, `-bash`, …) instead of passing `-l`.
+pub(crate) const LOGIN_SHELL_MARKER: &str = "__et-login-shell";
+
+/// `argv[0]` for a POSIX login shell (#835 / #683).
+///
+/// Prefixing the shell's basename with `-` is the portable convention.
+/// Passing `-l` is not: FreeBSD `/bin/sh` rejects it.
+pub fn login_shell_arg0(shell: &str) -> String {
+    let name = shell.rsplit('/').next().unwrap_or(shell);
+    format!("-{name}")
+}
+
+/// Replace this process with the login shell when `et` was spawned as the
+/// portable login helper. Returns `None` for every normal role.
+#[cfg(unix)]
+pub fn maybe_exec_login_shell() -> Option<i32> {
+    use std::os::unix::process::CommandExt;
+
+    let mut args = std::env::args_os();
+    let _argv0 = args.next()?;
+    let marker = args.next()?;
+    if marker != std::ffi::OsStr::new(LOGIN_SHELL_MARKER) {
+        return None;
+    }
+    let Some(shell) = args.next() else {
+        eprintln!("et: login shell helper requires an absolute shell path");
+        return Some(2);
+    };
+    if args.next().is_some() {
+        eprintln!("et: login shell helper received extra arguments");
+        return Some(2);
+    }
+    let Some(shell) = shell.to_str() else {
+        eprintln!("et: login shell path is not valid Unicode");
+        return Some(2);
+    };
+    if !shell.starts_with('/') || shell.contains('\0') {
+        eprintln!("et: login shell must be an absolute path");
+        return Some(2);
+    }
+    let mut command = std::process::Command::new(shell);
+    command.arg0(login_shell_arg0(shell));
+    let error = command.exec();
+    eprintln!("et: could not exec login shell: {error}");
+    Some(127)
+}
+
 pub fn run_with_startup<F>(router: LocalStream, term: &str, started: F) -> Result<i32, String>
 where
     F: FnOnce(&mut LocalStream) -> Result<(), String>,
 {
-    let command = CommandBuilder::new(default_shell());
-    #[cfg(unix)]
-    let command = {
-        let mut command = command;
-        command.arg("-l");
-        command
-    };
+    let command = login_shell_command()?;
     run_with_command(router, term, command, Duration::ZERO, started)
+}
+
+fn login_shell_command() -> Result<CommandBuilder, String> {
+    #[cfg(unix)]
+    {
+        // portable-pty uses argv[0] as both the executable and the process
+        // name, so a direct `-sh` argv[0] would hide the binary path. Spawn
+        // this binary as a helper that `exec`s the shell with the login name.
+        let shell = default_shell();
+        let executable = std::env::current_exe().map_err(|error| {
+            format!("could not locate the et binary for a login shell: {error}")
+        })?;
+        let mut command = CommandBuilder::new(executable);
+        command.arg(LOGIN_SHELL_MARKER);
+        command.arg(shell);
+        Ok(command)
+    }
+    #[cfg(windows)]
+    {
+        // Windows sessions use ConPTY and `%COMSPEC%`. There is no POSIX
+        // login-shell argv[0] convention to apply.
+        Ok(CommandBuilder::new(default_shell()))
+    }
 }
 
 fn run_with_command<F>(
@@ -478,7 +545,12 @@ fn pump_poll(
         }
         if router_events.contains(PollFlags::IN) {
             if let Some(packet) = read_ready_packet(router, &mut decoder)? {
-                handle_packet(packet, master, pty_writer)?;
+                if handle_packet(packet, master, pty_writer)? == LocalTerminalAction::CloseSession {
+                    return Ok(PumpCompletion {
+                        status: 0,
+                        drained: true,
+                    });
+                }
                 decoder = LocalPacketDecoder::new();
             }
         }
@@ -514,7 +586,12 @@ fn pump_windows(
         match read_ready_packet(router, &mut decoder) {
             Ok(Some(packet)) => {
                 progress = true;
-                handle_packet(packet, master, pty_writer)?;
+                if handle_packet(packet, master, pty_writer)? == LocalTerminalAction::CloseSession {
+                    return Ok(PumpCompletion {
+                        status: 0,
+                        drained: true,
+                    });
+                }
                 decoder = LocalPacketDecoder::new();
             }
             Ok(None) => {}
@@ -611,6 +688,13 @@ mod tests {
     };
     use prost::Message;
     use std::io::Cursor;
+
+    #[test]
+    fn login_shell_argv0_matches_upstream_basename_convention() {
+        assert_eq!(login_shell_arg0("/bin/sh"), "-sh");
+        assert_eq!(login_shell_arg0("/usr/local/bin/bash"), "-bash");
+        assert_eq!(login_shell_arg0("zsh"), "-zsh");
+    }
 
     struct SegmentedReader {
         segments: std::collections::VecDeque<Vec<u8>>,

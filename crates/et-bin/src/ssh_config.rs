@@ -247,7 +247,7 @@ fn parse_ssh_config(
                 }
             }
             Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("proxyjump") => {
-                extra.proxy_jump = (value != "none").then(|| value.to_owned());
+                extra.proxy_jump = (!value.eq_ignore_ascii_case("none")).then(|| value.to_owned());
             }
             Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("forwardagent") => {
                 extra.forward_agent = parse_yes_no(value)?;
@@ -663,6 +663,8 @@ mod tests {
         assert!(!disabled.forward_agent);
         assert_eq!(disabled.identity_agent.as_deref(), Some("none"));
         assert_eq!(disabled.proxy_jump, None);
+        let disabled_case = parse_ssh_config(b"hostname host\nproxyjump NONE\n", true).unwrap();
+        assert_eq!(disabled_case.proxy_jump, None);
         let spaced = parse_ssh_config(
             b"hostname host\nidentityagent  /tmp/agent \nsetenv A= leading and trailing \n",
             true,

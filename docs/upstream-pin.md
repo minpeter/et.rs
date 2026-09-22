@@ -10,7 +10,7 @@ Canonical machine files:
 - Ledger (every `master` commit after baseline):
   [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml)
 
-Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-21.
+Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-22.
 `#784` marked `ported` after et.rs [#31](https://github.com/minpeter/et.rs/pull/31) / `906a7ca86691f00a82f88b99b21d7afceb07bf97`.
 `#798` marked `ported` after et.rs [#77](https://github.com/minpeter/et.rs/pull/77).
 
@@ -20,13 +20,13 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-21.
 | Baseline / latest release tag | [`et-v7.0.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.0.0) |
 | Baseline / release commit | [`7656a32a5bc15c6746726a27a5a4ba1e468fab6e`](https://github.com/MisterTea/EternalTerminal/commit/7656a32a5bc15c6746726a27a5a4ba1e468fab6e) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`db4f6f6`](https://github.com/MisterTea/EternalTerminal/commit/db4f6f63183b403c5a530249fe5e126c59adf660) (#816 Rocky/Gentoo CI + SSH login output, reviewed 2026-09-21) |
+| Pin tip (last classified) | [`a836741`](https://github.com/MisterTea/EternalTerminal/commit/a8367415783a64405c62c70b755b4c09b410532b) (#830 ProxyJump none, reviewed 2026-09-22) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
 | ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.0.0` and `master`) |
 
-The reviewed baseline-to-#816 range contains 31 classified commits. Unclassified commits would be drift.
+The reviewed baseline-to-#830 range contains 44 classified commits. Unclassified commits would be drift.
 
-## Ledger (classified 2026-09-21)
+## Ledger (classified 2026-09-22)
 
 | sha | date | kind | status | note |
 | --- | --- | --- | --- | --- |
@@ -61,6 +61,19 @@ The reviewed baseline-to-#816 range contains 31 classified commits. Unclassified
 | [`0e3e3e0`](https://github.com/MisterTea/EternalTerminal/commit/0e3e3e0cbf3fe5bf329cfb2feff08995140d5470) | 2026-09-18 | ci | skip | #817 C++ Windows test/WSAPoll port; et.rs already has Windows-native ConPTY server and its own tests. |
 | [`17ec755`](https://github.com/MisterTea/EternalTerminal/commit/17ec75556521df092024ceb6b95636cef367a0aa) | 2026-09-19 | ci | skip | #818 OpenWrt packaging/workflows only. |
 | [`db4f6f6`](https://github.com/MisterTea/EternalTerminal/commit/db4f6f63183b403c5a530249fe5e126c59adf660) | 2026-09-19 | product | skip | #816 Rocky/Gentoo CI plus optional C++ SSH login/MOTD display; et.rs already has `terminal_motd` / `ssh_process` paths. |
+| [`e34389e`](https://github.com/MisterTea/EternalTerminal/commit/e34389ea302b949c8c3342c0bce1ef11472abef8) | 2026-09-19 | security | skip | #778 / CVE-2023-23558 audit notes only. et.rs sockets are already per-user 0700. |
+| [`91cb503`](https://github.com/MisterTea/EternalTerminal/commit/91cb5031cd30bf127455615462dc30f47a51e913) | 2026-09-21 | ci | skip | clang-format PRCI; reverted by the next commit. |
+| [`5b2cd10`](https://github.com/MisterTea/EternalTerminal/commit/5b2cd10256433926bbcff3ca57b4620234430258) | 2026-09-21 | ci | skip | Revert of the clang-format PRCI commit. |
+| [`09551a9`](https://github.com/MisterTea/EternalTerminal/commit/09551a96c123879d785c230c9ece2d418cf38222) | 2026-09-21 | product | **ported** | #847 / #789 comma-separated ssh-style tunnels. |
+| [`8f3b44c`](https://github.com/MisterTea/EternalTerminal/commit/8f3b44c18329374d8752486aa0329fbd9ca90299) | 2026-09-21 | security | skip | #834 / #677 C++ non-executable stack linker flag. rustc already emits a non-executable GNU_STACK. |
+| [`c097839`](https://github.com/MisterTea/EternalTerminal/commit/c097839f059a7ef431939fe6574b80968051f73c) | 2026-09-21 | product | **ported** | #833 / #669 partial listener bind failures. |
+| [`62a9dd5`](https://github.com/MisterTea/EternalTerminal/commit/62a9dd54d8d2fb6c70b9548d347a029620f7c29d) | 2026-09-21 | product | skip | #831 / #655 subprocess pipe deadlock. et.rs already drains stdout before wait. |
+| [`3abb882`](https://github.com/MisterTea/EternalTerminal/commit/3abb882f5675550d876bb0efbc119dd9fee17fd3) | 2026-09-21 | docs | skip | #821 / #219 installed-program README. et.rs README already lists the roles. |
+| [`651fe3e`](https://github.com/MisterTea/EternalTerminal/commit/651fe3e717305240643a6201422dd9baeaacb867) | 2026-09-21 | security | **ported** | #848 / #799 isolate unknown client packets to that session. |
+| [`5661a4b`](https://github.com/MisterTea/EternalTerminal/commit/5661a4b6e4f367b493ee557496919b619a65747e) | 2026-09-21 | product | **ported** | #835 / #683 portable login-shell argv[0]. |
+| [`f49e556`](https://github.com/MisterTea/EternalTerminal/commit/f49e55681049c7784d4f4012d9eacbbcedf48e6f) | 2026-09-21 | docs | skip | #841 / #752 binary overview README. Already covered. |
+| [`d70e00a`](https://github.com/MisterTea/EternalTerminal/commit/d70e00ac44758b8037847ce128e647204f2e0603) | 2026-09-21 | protocol | **ported** | #837 / #707 `TERMINAL_CLOSE` (type 11) ends only that session. PROTOCOL_VERSION stays 6. |
+| [`a836741`](https://github.com/MisterTea/EternalTerminal/commit/a8367415783a64405c62c70b755b4c09b410532b) | 2026-09-21 | product | **ported** | #830 / #653 honor `ProxyJump none`. |
 
 ## Ported and residual
 
@@ -183,8 +196,39 @@ has a Windows-native ConPTY server and its own tests. Not wire/auth.
 banner). et.rs already has `terminal_motd` / `ssh_process` paths; not a
 protocol/wire/auth change. `PROTOCOL_VERSION` stays 6.
 
+[`09551a9`](https://github.com/MisterTea/EternalTerminal/commit/09551a96c123879d785c230c9ece2d418cf38222)
+(`#847` / `#789`) is `status: ported`. A comma-separated `-t`/`-r` value parses
+each piece on its own: two colon fields stay et-style, and four-field pieces
+are ssh-style tunnels. `PROTOCOL_VERSION` stays 6.
+
+[`c097839`](https://github.com/MisterTea/EternalTerminal/commit/c097839f059a7ef431939fe6574b80968051f73c)
+(`#833` / `#669`) is `status: ported`. Wildcard and multi-address binds keep
+every family that succeeded. The listen fails only when none bound. A setup
+deadline still aborts. `PROTOCOL_VERSION` stays 6.
+
+[`651fe3e`](https://github.com/MisterTea/EternalTerminal/commit/651fe3e717305240643a6201422dd9baeaacb867)
+(`#848` / `#799`) is `status: ported`. An unknown client terminal packet closes
+that connection and ends that bridge. Other sessions keep running, and the
+process accepts new sessions. `PROTOCOL_VERSION` stays 6.
+
+[`5661a4b`](https://github.com/MisterTea/EternalTerminal/commit/5661a4b6e4f367b493ee557496919b619a65747e)
+(`#835` / `#683`) is `status: ported`. Unix login shells are started with
+`argv[0]` set to `-{basename}`. Windows ConPTY sessions still use `%COMSPEC%`
+and do not pass `-l`. `PROTOCOL_VERSION` stays 6.
+
+[`d70e00a`](https://github.com/MisterTea/EternalTerminal/commit/d70e00ac44758b8037847ce128e647204f2e0603)
+(`#837` / `#707`) is `status: ported`. `--close-on-hangup` sends terminal
+packet type 11 (`TERMINAL_CLOSE`) after `SIGHUP`. The server writes that marker
+to the session terminal and, after the frame flushes, ends only that bridge.
+`PROTOCOL_VERSION` stays 6. Windows `CTRL_CLOSE_EVENT` is not installed: the
+workspace forbids `unsafe` and no dependency exposes that console event.
+
+[`a836741`](https://github.com/MisterTea/EternalTerminal/commit/a8367415783a64405c62c70b755b4c09b410532b)
+(`#830` / `#653`) is `status: ported`. `--jumphost none` clears the hop and
+does not copy `ProxyJump` from ssh config. `PROTOCOL_VERSION` stays 6.
+
 et.rs still claims **protocol v6**. EternalTerminal’s latest product release is
-**v7.0.0**, and the reviewed tip is thirty-one classified commits past that tag.
+**v7.0.0**, and the reviewed tip is forty-four classified commits past that tag.
 
 Review ports against the conflict policy in
 [`docs/upstream-factory.md`](upstream-factory.md). Gate any later port with

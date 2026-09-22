@@ -24,6 +24,10 @@ use std::ffi::OsString;
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() {
+    #[cfg(unix)]
+    if let Some(code) = crate::terminal_pty::maybe_exec_login_shell() {
+        std::process::exit(code);
+    }
     #[cfg(windows)]
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__et-console-writer")) {
         std::process::exit(crate::client_output::run_windows_helper());
@@ -88,6 +92,7 @@ fn role(name: &str, args: &[OsString]) -> Result<i32, clap::Error> {
 mod bootstrap;
 mod client;
 mod client_environment;
+mod client_hangup;
 mod client_output;
 mod client_terminal;
 mod client_terminal_loop;

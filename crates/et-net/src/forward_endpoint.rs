@@ -508,22 +508,30 @@ fn bind_tcp_addresses_with(
     mut bind: impl FnMut(std::net::SocketAddr) -> io::Result<Option<TcpListener>>,
 ) -> io::Result<Vec<ForwardListener>> {
     let mut listeners = Vec::new();
+    let mut last_error = None;
     for address in addresses {
-        if let Some(listener) = bind(address)? {
-            listeners.push(ForwardListener {
+        match bind(address) {
+            Ok(Some(listener)) => listeners.push(ForwardListener {
                 inner: ListenerKind::Tcp(listener),
                 cleanup: None,
                 #[cfg(unix)]
                 user_cleanup: None,
                 cleanup_dirs: Vec::new(),
-            });
+            }),
+            Ok(None) => {}
+            // A deadline must still abort setup. A single bind/listen failure
+            // (#833 / #669) is skipped so the families that succeeded stay up.
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => return Err(error),
+            Err(error) => last_error = Some(error),
         }
     }
     if listeners.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::AddrNotAvailable,
-            "endpoint did not resolve",
-        ));
+        return Err(last_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "could not bind to any interface",
+            )
+        }));
     }
     Ok(listeners)
 }
@@ -861,12 +869,24 @@ mod tests {
             port,
         };
 
-        let error = match endpoint.bind() {
-            Ok(_) => panic!("a partially bound localhost source must fail"),
-            Err(error) => error,
-        };
-
-        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        let ipv6_can_bind =
+            std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).is_ok();
+        match endpoint.bind() {
+            Ok(listeners) => {
+                assert!(
+                    ipv6_can_bind,
+                    "an occupied-only address list must fail when no family binds"
+                );
+                assert_eq!(listeners.len(), 1);
+            }
+            Err(error) => {
+                assert!(
+                    !ipv6_can_bind,
+                    "a free address family must survive one occupied family"
+                );
+                assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+            }
+        }
     }
 
     #[test]
@@ -875,7 +895,7 @@ mod tests {
         let mut earlier = None;
         let mut calls = 0;
 
-        let error = match bind_tcp_addresses_with([address, address], |_| {
+        let listeners = bind_tcp_addresses_with([address, address], |_| {
             calls += 1;
             if calls == 1 {
                 let listener = TcpListener::bind(address)?;
@@ -885,14 +905,25 @@ mod tests {
             } else {
                 Err(io::Error::new(io::ErrorKind::AddrInUse, "occupied"))
             }
-        }) {
-            Ok(_) => panic!("a partially bound address list must fail"),
-            Err(error) => error,
-        };
+        })
+        .expect("one successful family is enough");
 
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(calls, 2);
+        drop(listeners);
+        TcpListener::bind(earlier.unwrap()).expect("the returned listener is dropped with the vec");
+    }
+
+    #[test]
+    fn every_address_failing_is_still_an_error() {
+        let address: std::net::SocketAddr = (std::net::Ipv4Addr::LOCALHOST, 0).into();
+        let result = bind_tcp_addresses_with([address], |_| {
+            Err(io::Error::new(io::ErrorKind::AddrInUse, "occupied"))
+        });
+        let Err(error) = result else {
+            panic!("no successful listener");
+        };
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
-        TcpListener::bind(earlier.unwrap())
-            .expect("the earlier listener must be dropped on failure");
     }
 
     #[test]

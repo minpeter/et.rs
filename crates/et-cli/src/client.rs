@@ -58,6 +58,15 @@ pub struct ClientArgs {
     #[arg(short = 'x', long = "kill-other-sessions")]
     pub kill_other_sessions: bool,
 
+    /// Send `TERMINAL_CLOSE` when this process receives SIGHUP (Unix) so the
+    /// server ends only that remote session. Windows console-close delivery
+    /// is limited; see `client_hangup`.
+    #[arg(
+        long = "close-on-hangup",
+        help = "Terminate the remote session when this terminal receives SIGHUP or closes"
+    )]
+    pub close_on_hangup: bool,
+
     #[arg(
         long = "macserver",
         help = "Set when connecting to an macOS server.  Sets --terminal-path=/usr/local/bin/etterminal"
@@ -363,6 +372,14 @@ mod tests {
     fn no_terminal_flag() {
         let a = ClientArgs::try_parse_from(["et", "host", "-N"]).unwrap();
         assert!(a.no_terminal);
+    }
+
+    #[test]
+    fn close_on_hangup_is_opt_in() {
+        let defaulted = ClientArgs::try_parse_from(["et", "host"]).unwrap();
+        assert!(!defaulted.close_on_hangup);
+        let enabled = ClientArgs::try_parse_from(["et", "host", "--close-on-hangup"]).unwrap();
+        assert!(enabled.close_on_hangup);
     }
 
     #[test]

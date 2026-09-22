@@ -115,6 +115,7 @@ fn run_mode_poll(
     // A partially written client packet. Its frame and offset must survive
     // local-stream backpressure, and ordered client reads pause behind it.
     let mut pending_local: Option<PendingLocalFrame> = None;
+    let mut close_after_local = false;
     let mut terminal_closing = false;
     let mut terminal_eof = false;
     let mut client_buffered = false;
@@ -200,6 +201,9 @@ fn run_mode_poll(
                 .map_err(SessionError::Io)?;
             if complete {
                 pending_local = None;
+                if close_after_local {
+                    return Ok(());
+                }
             }
         }
         if pending_terminal.is_none()
@@ -257,19 +261,17 @@ fn run_mode_poll(
                         true
                     }
                     Ok(Some(packet)) => {
-                        let (local, control) = forward_client_packet(&session, packet)?;
-                        if let Some(packet) = local {
-                            pending_local =
-                                Some(PendingLocalFrame::new(&packet).map_err(SessionError::Io)?);
-                        }
-                        if let Some(control) = control {
-                            enqueue_outbound(
-                                &session,
-                                &mut pending_outbound,
-                                control,
-                                &mut connected,
-                                &mut connection_generation,
-                            )?;
+                        if apply_client_plan(
+                            &session,
+                            forward_client_packet(&session, packet)?,
+                            &mut pending_local,
+                            &mut pending_outbound,
+                            &mut connected,
+                            &mut connection_generation,
+                            &mut close_after_local,
+                        )? == ClientPlanEffect::Stop
+                        {
+                            return Ok(());
                         }
                         true
                     }
@@ -354,6 +356,7 @@ fn run_mode_windows(
     let mut pending_outbound = VecDeque::with_capacity(FORWARD_BACKLOG_CAPACITY);
     let mut pending_terminal: Option<Packet> = None;
     let mut pending_local: Option<PendingLocalFrame> = None;
+    let mut close_after_local = false;
     loop {
         if session.is_shutting_down() {
             return Ok(());
@@ -363,6 +366,9 @@ fn run_mode_windows(
         if let Some(frame) = pending_local.as_mut() {
             if frame.try_write(&mut terminal).map_err(SessionError::Io)? {
                 pending_local = None;
+                if close_after_local {
+                    return Ok(());
+                }
                 progress = true;
             }
         }
@@ -434,22 +440,17 @@ fn run_mode_windows(
                                 Some(PendingLocalFrame::new(&packet).map_err(SessionError::Io)?);
                         } else if is_forward_packet(packet.header()) {
                             enqueue_forwarding(&forwarder, &mut pending_forward, packet)?;
-                        } else {
-                            let (local, control) = forward_client_packet(&session, packet)?;
-                            if let Some(packet) = local {
-                                pending_local = Some(
-                                    PendingLocalFrame::new(&packet).map_err(SessionError::Io)?,
-                                );
-                            }
-                            if let Some(control) = control {
-                                enqueue_outbound(
-                                    &session,
-                                    &mut pending_outbound,
-                                    control,
-                                    &mut connected,
-                                    &mut connection_generation,
-                                )?;
-                            }
+                        } else if apply_client_plan(
+                            &session,
+                            forward_client_packet(&session, packet)?,
+                            &mut pending_local,
+                            &mut pending_outbound,
+                            &mut connected,
+                            &mut connection_generation,
+                            &mut close_after_local,
+                        )? == ClientPlanEffect::Stop
+                        {
+                            return Ok(());
                         }
                     }
                     Ok(None) => break,
@@ -817,16 +818,38 @@ fn jumphost_terminal_packet(
     ))
 }
 
+/// What the terminal bridge should do with one decrypted client packet.
+enum ClientPacketPlan {
+    /// Relay `local` to this session's terminal and/or `control` back to the client.
+    Forward {
+        local: Option<Packet>,
+        control: Option<Packet>,
+    },
+    /// Write `marker` to this session's terminal, then end the bridge once it flushes.
+    CloseAfterFlush(Packet),
+    /// Unknown client packet (#848 / #799): end this bridge only.
+    CloseConnection,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClientPlanEffect {
+    Continue,
+    Stop,
+}
+
 fn forward_client_packet(
     session: &ActiveSession,
     packet: Packet,
-) -> Result<(Option<Packet>, Option<Packet>), SessionError> {
+) -> Result<ClientPacketPlan, SessionError> {
     match packet.header() {
         value
             if value == TerminalPacketType::TerminalBuffer as u8
                 || value == TerminalPacketType::TerminalInfo as u8 =>
         {
-            Ok((Some(packet), None))
+            Ok(ClientPacketPlan::Forward {
+                local: Some(packet),
+                control: None,
+            })
         }
         header if header == TerminalPacketType::KeepAlive as u8 => {
             if let Some(ack) = et_core::keepalive::decode_ack(packet.payload()) {
@@ -835,18 +858,64 @@ fn forward_client_packet(
             // The echo acknowledges everything read from the client, letting
             // an et.rs client trim its own replay backup. Legacy peers
             // (upstream C++, released et.rs) ignore the payload.
-            Ok((
-                None,
-                Some(Packet::new(
+            Ok(ClientPacketPlan::Forward {
+                local: None,
+                control: Some(Packet::new(
                     TerminalPacketType::KeepAlive as u8,
                     session.keepalive_ack()?.to_vec(),
                 )),
-            ))
+            })
         }
-        _ => Err(SessionError::Io(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "client sent an unsupported terminal packet",
-        ))),
+        // #837 / #707. The marker is a local TERMINAL_CLOSE frame. The bridge
+        // ends only after that frame is flushed, and only for this session.
+        header if header == TerminalPacketType::TerminalClose as u8 => {
+            Ok(ClientPacketPlan::CloseAfterFlush(Packet::new(
+                TerminalPacketType::TerminalClose as u8,
+                Vec::new(),
+            )))
+        }
+        // #848 / #799. Upstream used to STFATAL here, which aborted etserver.
+        // Close this client connection and leave every other session running.
+        header => {
+            crate::diag::info(format!(
+                "rejecting untrusted packet type {header} from client; closing connection"
+            ));
+            Ok(ClientPacketPlan::CloseConnection)
+        }
+    }
+}
+
+fn apply_client_plan(
+    session: &ActiveSession,
+    plan: ClientPacketPlan,
+    pending_local: &mut Option<PendingLocalFrame>,
+    pending_outbound: &mut VecDeque<Packet>,
+    connected: &mut bool,
+    connection_generation: &mut u64,
+    close_after_local: &mut bool,
+) -> Result<ClientPlanEffect, SessionError> {
+    match plan {
+        ClientPacketPlan::Forward { local, control } => {
+            if let Some(packet) = local {
+                *pending_local = Some(PendingLocalFrame::new(&packet).map_err(SessionError::Io)?);
+            }
+            if let Some(control) = control {
+                enqueue_outbound(
+                    session,
+                    pending_outbound,
+                    control,
+                    connected,
+                    connection_generation,
+                )?;
+            }
+            Ok(ClientPlanEffect::Continue)
+        }
+        ClientPacketPlan::CloseAfterFlush(marker) => {
+            *pending_local = Some(PendingLocalFrame::new(&marker).map_err(SessionError::Io)?);
+            *close_after_local = true;
+            Ok(ClientPlanEffect::Continue)
+        }
+        ClientPacketPlan::CloseConnection => Ok(ClientPlanEffect::Stop),
     }
 }
 

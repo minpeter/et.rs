@@ -40,6 +40,22 @@ fn explicit_ipv6_listener_is_v6_only() {
 }
 
 #[test]
+fn wildcard_bind_keeps_ipv4_when_ipv6_is_occupied() {
+    if TcpListener::bind((Ipv6Addr::UNSPECIFIED, 0)).is_err() {
+        return;
+    }
+    let occupied = TcpListener::bind((Ipv6Addr::UNSPECIFIED, 0)).unwrap();
+    let port = occupied.local_addr().unwrap().port();
+
+    let listeners = bind_tcp(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port).unwrap();
+    assert!(listeners.ipv4().is_some());
+    assert!(listeners.ipv6().is_none());
+    let client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let _accepted = listeners.ipv4().unwrap().accept().unwrap();
+    drop(client);
+}
+
+#[test]
 fn occupied_address_is_a_typed_bind_error() {
     let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = occupied.local_addr().unwrap().port();

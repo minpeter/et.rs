@@ -95,8 +95,13 @@ fn run_client(
     let ssh_config = selected_ssh_config(args)?;
     let mut query_options = args.ssh_option.clone();
     if let Some(jumphost) = args.jumphost.as_deref() {
-        validate_jumphost(jumphost)?;
-        query_options.insert(0, format!("ProxyJump={jumphost}"));
+        if jumphost_disables_jump(jumphost) {
+            // Explicit `--jumphost none` clears a configured hop (#830 / #653).
+            query_options.insert(0, "ProxyJump=none".to_owned());
+        } else {
+            validate_jumphost(jumphost)?;
+            query_options.insert(0, format!("ProxyJump={jumphost}"));
+        }
     }
     // The destination port is ET's port, not SSH's. Resolve configuration
     // before choosing forwarding, environment budgets, or the native relay.
@@ -407,6 +412,7 @@ fn run_client(
             terminal_enabled: !args.no_terminal,
             lines: crate::client_terminal::RemoteLines::from(remote_mode.terminal_shell),
             connection_name: &request.host_alias,
+            close_on_hangup: args.close_on_hangup,
         },
         forwarder,
         |connection| reconnect_with_retry(connection, &endpoint, &credentials, resolver),
@@ -600,7 +606,11 @@ fn effective_ssh_args(
     config: &crate::ssh_config::ResolvedSshConfig,
 ) -> Result<ClientArgs, ClientError> {
     let mut args = args.clone();
-    if args.jumphost.is_none() {
+    // Command-line `--jumphost` wins, including an explicit `none` that must
+    // not fall through to `ProxyJump` from ssh config (#830 / #653).
+    if args.jumphost.as_deref().is_some_and(jumphost_disables_jump) {
+        args.jumphost = None;
+    } else if args.jumphost.is_none() {
         args.jumphost.clone_from(&config.proxy_jump);
     }
     args.forward_ssh_agent |= config.forward_agent;
@@ -620,6 +630,11 @@ fn effective_ssh_args(
         }
     }
     Ok(args)
+}
+
+/// `none` (any case) disables ProxyJump, matching OpenSSH and upstream #830.
+fn jumphost_disables_jump(value: &str) -> bool {
+    value.eq_ignore_ascii_case("none")
 }
 
 /// Validate `--jumphost` as an SSH ProxyJump target (OpenSSH `-J` argument).
@@ -864,6 +879,16 @@ mod tests {
         };
         let selected = effective_ssh_args(&base, &config).unwrap();
         assert_eq!(selected.jumphost.as_deref(), Some("config-jump"));
+        for disabled in ["none", "None", "NONE"] {
+            let explicit_none =
+                ClientArgs::try_parse_from(["et", "host", &format!("--jumphost={disabled}")])
+                    .unwrap();
+            let selected = effective_ssh_args(&explicit_none, &config).unwrap();
+            assert_eq!(
+                selected.jumphost, None,
+                "{disabled} must override a configured ProxyJump"
+            );
+        }
         assert!(selected.forward_ssh_agent);
         let forward = crate::forward_config::build(&selected, Some("/tmp/env-agent")).unwrap();
         assert_eq!(

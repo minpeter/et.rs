@@ -115,35 +115,55 @@ pub fn bind_tcp_with_backlog(
 }
 
 fn bind_wildcard(port: u16, listen_backlog: i32) -> Result<BoundTcpListeners, ListenerError> {
+    // #833 / #669: one family failing must not take the listener down when
+    // another family bound. Fail only when every address failed.
     let ipv4_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
-    let ipv4 = bind_one(ipv4_address, listen_backlog)?;
+    let (ipv4, ipv4_error) = bind_optional(ipv4_address, listen_backlog);
+    let ipv6_port = ipv4
+        .as_ref()
+        .and_then(|listener| listener.local_addr().ok())
+        .map(|address| address.port())
+        .unwrap_or(port);
+    let ipv6_address = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), ipv6_port);
+    let (ipv6, ipv6_error) = bind_optional(ipv6_address, listen_backlog);
+    if ipv4.is_none() && ipv6.is_none() {
+        let source = ipv4_error.or(ipv6_error).unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "could not bind to any interface",
+            )
+        });
+        return Err(ListenerError {
+            address: ipv4_address,
+            source,
+        });
+    }
     let actual_port = ipv4
+        .as_ref()
+        .or(ipv6.as_ref())
+        .expect("at least one family bound")
         .local_addr()
         .map_err(|source| ListenerError {
             address: ipv4_address,
             source,
         })?
         .port();
-
-    let ipv6 = if ipv6_available() {
-        Some(bind_one(
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), actual_port),
-            listen_backlog,
-        )?)
-    } else {
-        None
-    };
     Ok(BoundTcpListeners {
-        ipv4: Some(ipv4),
+        ipv4,
         ipv6,
         port: actual_port,
         listen_backlog,
     })
 }
 
-fn ipv6_available() -> bool {
-    let address = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
-    bind_one(address, DEFAULT_LISTEN_BACKLOG).is_ok()
+fn bind_optional(
+    address: SocketAddr,
+    listen_backlog: i32,
+) -> (Option<TcpListener>, Option<io::Error>) {
+    match bind_one(address, listen_backlog) {
+        Ok(listener) => (Some(listener), None),
+        Err(error) => (None, Some(error.source)),
+    }
 }
 
 fn bind_one(address: SocketAddr, listen_backlog: i32) -> Result<TcpListener, ListenerError> {

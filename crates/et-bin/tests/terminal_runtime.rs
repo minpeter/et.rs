@@ -521,12 +521,12 @@ fn real_terminal_starts_login_shell_and_loads_profile_color() {
     assert!(status.success());
     assert!(
         contains(&output, LOGIN_COLOR_MARKER),
-        "expected ANSI login-shell color marker when SHELL receives -l; got {:?}",
+        "expected ANSI login-shell color marker when argv[0] is a login name; got {:?}",
         String::from_utf8_lossy(&output),
     );
     assert!(
         !contains(&output, NON_LOGIN_MARKER),
-        "login-shell color marker must be emitted only when SHELL receives -l; got {:?}",
+        "login-shell color marker must be emitted only for a login argv[0]; got {:?}",
         String::from_utf8_lossy(&output),
     );
 }
@@ -568,7 +568,7 @@ fn real_terminal_login_shell_preserves_term_without_colorterm() {
     assert!(status.success());
     assert!(
         contains(&output, LOGIN_COLOR_MARKER),
-        "expected ANSI login-shell color marker when SHELL receives -l; got {:?}",
+        "expected ANSI login-shell color marker when argv[0] is a login name; got {:?}",
         String::from_utf8_lossy(&output),
     );
     let lines: Vec<&[u8]> = output

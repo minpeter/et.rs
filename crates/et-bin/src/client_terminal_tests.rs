@@ -72,6 +72,7 @@ fn unavailable_initial_terminal_size_does_not_skip_command_validation() {
             terminal_enabled: true,
             lines: RemoteLines::Posix,
             connection_name: "test",
+            close_on_hangup: false,
         },
         et_net::forward::Forwarder::start(Vec::new()).unwrap(),
         |_| panic!("a size observation must not reconnect"),

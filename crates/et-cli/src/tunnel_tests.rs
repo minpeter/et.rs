@@ -81,6 +81,45 @@ fn parses_environment_variable_named_pipe_form() {
 }
 
 #[test]
+fn parses_comma_separated_ssh_style_tunnels_independently() {
+    // Upstream #847 / #789: each four-part entry is its own ssh-style tunnel.
+    let requests =
+        parse_tunnels(&["localhost:8888:0.0.0.0:9999,localhost:7777:1.2.3.4:6666".to_owned()])
+            .unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].source.as_ref().unwrap().name.as_deref(),
+        Some("localhost")
+    );
+    assert_eq!(requests[0].source.as_ref().unwrap().port, Some(8888));
+    assert_eq!(
+        requests[0].destination.as_ref().unwrap().name.as_deref(),
+        Some("0.0.0.0")
+    );
+    assert_eq!(requests[0].destination.as_ref().unwrap().port, Some(9999));
+    assert_eq!(
+        requests[1].source.as_ref().unwrap().name.as_deref(),
+        Some("localhost")
+    );
+    assert_eq!(requests[1].source.as_ref().unwrap().port, Some(7777));
+    assert_eq!(
+        requests[1].destination.as_ref().unwrap().name.as_deref(),
+        Some("1.2.3.4")
+    );
+    assert_eq!(requests[1].destination.as_ref().unwrap().port, Some(6666));
+
+    let mixed = parse_tunnels(&["1000:2000,[::1]:8080:[::1]:9090".to_owned()]).unwrap();
+    assert_eq!(mixed.len(), 2);
+    assert_eq!(mixed[0].source.as_ref().unwrap().port, Some(1000));
+    assert_eq!(mixed[0].destination.as_ref().unwrap().name, None);
+    assert_eq!(
+        mixed[1].source.as_ref().unwrap().name.as_deref(),
+        Some("::1")
+    );
+    assert_eq!(mixed[1].destination.as_ref().unwrap().port, Some(9090));
+}
+
+#[test]
 fn parses_ssh_style_with_empty_bind_and_bracketed_ipv6() {
     let requests = parse_tunnels(&[":8080:localhost:80".to_owned()]).unwrap();
     assert_eq!(

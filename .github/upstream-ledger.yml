@@ -10,10 +10,10 @@
 #   note: short string
 #   et_pr: optional upstream PR number
 #
-# Classified 2026-09-21. #804 passed independent review in et.rs #100.
+# Classified 2026-09-22. #804 passed independent review in et.rs #100.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-09-21"
+classified: "2026-09-22"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -194,3 +194,78 @@ commits:
     status: skip
     note: "#816 portability CI plus optional C++ SshSetupHandler displayLoginOutput (strip IDPASSKEY from MOTD/login banner). et.rs already has terminal_motd / ssh_process paths; not a protocol/wire/auth change. PROTOCOL_VERSION stays 6."
     et_pr: 816
+  - sha: e34389ea302b949c8c3342c0bce1ef11472abef8
+    date: "2026-09-19"
+    kind: security
+    status: skip
+    note: "#778 / CVE-2023-23558 audit markdown only; no runtime change. et.rs router sockets are already per-user (XDG_RUNTIME_DIR or HOME, mode 0700, owner checks) and et.rs has no telemetry temp file. PROTOCOL_VERSION stays 6."
+  - sha: 91cb5031cd30bf127455615462dc30f47a51e913
+    date: "2026-09-21"
+    kind: ci
+    status: skip
+    note: "clang-format PRCI plus a UniversalStacktrace submodule bump. Reverted by the next commit. Not wire/auth."
+  - sha: 5b2cd10256433926bbcff3ca57b4620234430258
+    date: "2026-09-21"
+    kind: ci
+    status: skip
+    note: "Revert of the clang-format PRCI commit. No product change remains."
+  - sha: 09551a96c123879d785c230c9ece2d418cf38222
+    date: "2026-09-21"
+    kind: product
+    status: ported
+    note: "#847 / #789 parse each comma-separated ssh-style tunnel independently. et.rs previously treated every comma piece as et-style and kept only the first two colon fields. PROTOCOL_VERSION stays 6."
+    et_pr: 847
+  - sha: 8f3b44c18329374d8752486aa0329fbd9ca90299
+    date: "2026-09-21"
+    kind: security
+    status: skip
+    note: "#834 / #677 CMake -Wl,-z,noexecstack and an ELF readelf check for the C++ binaries. et.rs is Rust (forbid unsafe); rustc already emits a non-executable GNU_STACK. No CMake tree to link. PROTOCOL_VERSION stays 6."
+    et_pr: 834
+  - sha: c097839f059a7ef431939fe6574b80968051f73c
+    date: "2026-09-21"
+    kind: product
+    status: ported
+    note: "#833 / #669 a failed IPv4 or IPv6 bind/listen no longer fails the whole listener when another family succeeded. Deadline errors still abort. A single explicit address that fails still errors. PROTOCOL_VERSION stays 6."
+    et_pr: 833
+  - sha: 62a9dd54d8d2fb6c70b9548d347a029620f7c29d
+    date: "2026-09-21"
+    kind: product
+    status: skip
+    note: "#831 / #655 C++ waited on the child before reading a full stdout pipe, and did not capture stderr. et.rs already drains stdout on a reader thread before wait. stderr stays inherited, so it cannot fill that pipe. PROTOCOL_VERSION stays 6."
+    et_pr: 831
+  - sha: 3abb882f5675550d876bb0efbc119dd9fee17fd3
+    date: "2026-09-21"
+    kind: docs
+    status: skip
+    note: "#821 / #219 upstream README installed-program list. et.rs README already documents et, etserver, etterminal, htm, and htmd. PROTOCOL_VERSION stays 6."
+    et_pr: 821
+  - sha: 651fe3e717305240643a6201422dd9baeaacb867
+    date: "2026-09-21"
+    kind: security
+    status: ported
+    note: "#848 / #799 unknown client terminal packets close that connection only. et.rs used to return a bridge error for the same case; it now logs and returns without aborting etserver or other sessions. PROTOCOL_VERSION stays 6."
+    et_pr: 848
+  - sha: 5661a4b6e4f367b493ee557496919b619a65747e
+    date: "2026-09-21"
+    kind: product
+    status: ported
+    note: "#835 / #683 login shells use argv[0] '-basename' instead of a non-portable -l option. Unix re-execs the shell from a helper because portable-pty ties argv[0] to the executable path. Windows ConPTY sessions are unchanged. PROTOCOL_VERSION stays 6."
+    et_pr: 835
+  - sha: f49e55681049c7784d4f4012d9eacbbcedf48e6f
+    date: "2026-09-21"
+    kind: docs
+    status: skip
+    note: "#841 / #752 upstream README client/server/helper overview. et.rs README already describes the same roles and the default port 2022. PROTOCOL_VERSION stays 6."
+    et_pr: 841
+  - sha: d70e00ac44758b8037847ce128e647204f2e0603
+    date: "2026-09-21"
+    kind: protocol
+    status: ported
+    note: "#837 / #707 opt-in TERMINAL_CLOSE (packet type 11) on SIGHUP. The server flushes the marker to that session's terminal, then ends only that bridge. PROTOCOL_VERSION stays 6. Windows CTRL_CLOSE_EVENT is not hooked (forbid unsafe)."
+    et_pr: 837
+  - sha: a8367415783a64405c62c70b755b4c09b410532b
+    date: "2026-09-21"
+    kind: product
+    status: ported
+    note: "#830 / #653 --jumphost none (any case) clears the hop and does not fall through to ssh-config ProxyJump. Config ProxyJump none/NONE was already dropped; matching is now case-insensitive. PROTOCOL_VERSION stays 6."
+    et_pr: 830

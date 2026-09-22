@@ -14,6 +14,9 @@ enum TerminalPacketType {
   TERMINAL_USER_INFO = 8;
   TERMINAL_INIT = 9;
   JUMPHOST_INIT = 10;
+  // Opt-in (#837 / #707). PROTOCOL_VERSION stays 6. The server delivers this
+  // marker to one session and ends only that session.
+  TERMINAL_CLOSE = 11;
 }
 
 enum FlowControlMode {

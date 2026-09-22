@@ -52,6 +52,7 @@ pub struct TerminalOptions<'a> {
     pub terminal_enabled: bool,
     pub lines: RemoteLines,
     pub connection_name: &'a str,
+    pub close_on_hangup: bool,
 }
 
 pub fn run<F>(
@@ -71,7 +72,14 @@ where
         terminal_enabled,
         lines,
         connection_name,
+        close_on_hangup,
     } = options;
+    #[cfg(unix)]
+    if close_on_hangup {
+        crate::client_hangup::install_sighup()?;
+    }
+    #[cfg(windows)]
+    let _ = close_on_hangup;
     let raw_mode = if terminal_enabled {
         RawMode::enter()?
     } else {

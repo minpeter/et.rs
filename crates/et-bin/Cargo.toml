@@ -46,6 +46,9 @@ signal-hook = "0.3.18"
 crossterm_winapi = "0.9.1"
 # Ctrl+C / console shutdown signalling, the Windows analogue of SIGINT/SIGTERM.
 ctrlc = "3.5"
+# Console close/logoff/shutdown/break for `--close-on-hangup`. The handler
+# parks close-family events so the client can emit TERMINAL_CLOSE first.
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "signal"] }
 # Safe CreateProcessW wrapper with an explicit inherited-handle allowlist.
 windows-spawn = "0.1.0"
 

@@ -261,8 +261,8 @@ commits:
   - sha: d70e00ac44758b8037847ce128e647204f2e0603
     date: "2026-09-21"
     kind: protocol
-    status: backlog
-    note: "#707/#837 optional --close-on-hangup sends new TERMINAL_CLOSE=11 (proto enum only; PROTOCOL_VERSION still 6). et.rs proto gains TerminalClose=11 in this watch; client/server hangup wiring remains backlog."
+    status: ported
+    note: "#707/#837 optional --close-on-hangup sends TERMINAL_CLOSE=11 and tears down that session only. Landed in et.rs. PROTOCOL_VERSION stays 6."
     et_pr: 707
   - sha: a8367415783a64405c62c70b755b4c09b410532b
     date: "2026-09-21"

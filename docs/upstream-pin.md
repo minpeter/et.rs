@@ -24,7 +24,7 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-22.
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
 | ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.0.0` and `master`) |
 
-The reviewed baseline-to-#830 range contains 44 classified commits (31 prior + 13 on 2026-09-22). Unclassified commits would be drift. `#837` (`TERMINAL_CLOSE` / `--close-on-hangup`) remains `protocol/backlog`.
+The reviewed baseline-to-#830 range contains 44 classified commits (31 prior + 13 on 2026-09-22). Unclassified commits would be drift. `#837` (`TERMINAL_CLOSE` / `--close-on-hangup`) is `ported`.
 
 ## Ledger (classified 2026-09-22)
 
@@ -72,7 +72,7 @@ The reviewed baseline-to-#830 range contains 44 classified commits (31 prior + 1
 | [`651fe3e`](https://github.com/MisterTea/EternalTerminal/commit/651fe3e717305240643a6201422dd9baeaacb867) | 2026-09-21 | security | skip | #799/#848 unknown packet session-local; et.rs already SessionError |
 | [`5661a4b`](https://github.com/MisterTea/EternalTerminal/commit/5661a4b6e4f367b493ee557496919b619a65747e) | 2026-09-21 | product | skip | #683/#835 FreeBSD login argv0; et.rs uses `-l` |
 | [`f49e556`](https://github.com/MisterTea/EternalTerminal/commit/f49e55681049c7784d4f4012d9eacbbcedf48e6f) | 2026-09-21 | docs | skip | #752/#841 README roles |
-| [`d70e00a`](https://github.com/MisterTea/EternalTerminal/commit/d70e00ac44758b8037847ce128e647204f2e0603) | 2026-09-21 | protocol | **backlog** | #707/#837 TERMINAL_CLOSE=11 / `--close-on-hangup` (PROTOCOL_VERSION still 6) |
+| [`d70e00a`](https://github.com/MisterTea/EternalTerminal/commit/d70e00ac44758b8037847ce128e647204f2e0603) | 2026-09-21 | protocol | **ported** | #707/#837 `TERMINAL_CLOSE=11` / `--close-on-hangup`. PROTOCOL_VERSION stays 6. |
 | [`a836741`](https://github.com/MisterTea/EternalTerminal/commit/a8367415783a64405c62c70b755b4c09b410532b) | 2026-09-21 | product | skip | #653/#830 ProxyJump none; et.rs already handles |
 
 
@@ -84,10 +84,14 @@ parsed independently in `crates/et-cli/src/tunnel.rs` (et-style when ≤2 colon
 parts, otherwise ssh-style). Protocol v6 is unchanged.
 
 [`d70e00a`](https://github.com/MisterTea/EternalTerminal/commit/d70e00ac44758b8037847ce128e647204f2e0603)
-(`#707` / `#837`) is `status: backlog` (protocol). Upstream added
-`TERMINAL_CLOSE = 11` and optional `--close-on-hangup` without bumping
-`PROTOCOL_VERSION` (still 6). et.rs gains the proto enum value in this watch;
-client/server hangup wiring is a follow-up port.
+(`#707` / `#837`) is `status: ported`. Upstream added `TERMINAL_CLOSE = 11`
+and optional `--close-on-hangup` without bumping `PROTOCOL_VERSION` (still 6).
+With the flag, the et client sends that packet on Unix `SIGHUP` and on
+Windows console close, logoff, shutdown, or break, then leaves the client
+loop. etserver writes a framed local `TERMINAL_CLOSE` and ends that session's
+terminal bridge; etterminal treats the framed packet as a clean PTY shutdown.
+Unknown client packet types stay `SessionError` (session-local, same as the
+`#848` skip). The default remains no remote close.
 
 
 [`cd731902`](https://github.com/MisterTea/EternalTerminal/commit/cd7319020edce131fbd6f21b1a87e07f4ac41cdb)

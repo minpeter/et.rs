@@ -126,6 +126,48 @@ fn write_lastlog_record(path: &Path, timestamp: u32, host: &[u8]) {
 }
 
 #[test]
+fn framed_terminal_close_shuts_the_pty_down_successfully() {
+    let fixture = Fixture::new("terminal-close");
+    let mut child = fixture.spawn_with_shell("/bin/sh");
+    write_credentials(&mut child);
+    let mut router = fixture.accept();
+    let _registration = read_local_packet(&mut router).unwrap();
+    acknowledge_registration(&mut router);
+    fixture.wait_ready();
+    send(
+        &mut router,
+        TerminalPacketType::TerminalInit,
+        &TermInit {
+            environmentnames: Vec::new(),
+            environmentvalues: Vec::new(),
+            flowcontrol: None,
+        },
+    );
+    expect_startup(&mut router);
+    write_local_packet(
+        &mut router,
+        &Packet::new(TerminalPacketType::TerminalClose as u8, Vec::new()),
+    )
+    .unwrap();
+    let status = child
+        .wait_timeout(TIMEOUT)
+        .unwrap()
+        .expect("etterminal hung after framed TERMINAL_CLOSE");
+    let mut stderr = String::new();
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
+    }
+    assert!(
+        status.success(),
+        "framed TERMINAL_CLOSE should be a success path, got {status}, stderr={stderr}"
+    );
+    assert!(
+        !stderr.to_ascii_lowercase().contains("unsupported"),
+        "close path logged an unsupported-packet error: {stderr}"
+    );
+}
+
+#[test]
 fn bootstrap_parent_reports_marker_and_leaves_registered_session_running() {
     let fixture = Fixture::new("bootstrap-parent");
     let mut parent = fixture.spawn_parent();

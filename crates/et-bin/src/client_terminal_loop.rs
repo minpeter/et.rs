@@ -92,6 +92,7 @@ pub(crate) struct PumpOptions<'a> {
     pub(crate) terminal_enabled: bool,
     pub(crate) auto_cursor_report: bool,
     pub(crate) terminal_modes: &'a mut TerminalModeState,
+    pub(crate) hangup: &'a crate::client_hangup::HangupClose,
 }
 
 #[cfg(unix)]
@@ -112,6 +113,7 @@ where
         terminal_enabled,
         auto_cursor_report,
         terminal_modes,
+        hangup,
     } = options;
     let stdin = io::stdin();
     let mut console_output = crate::client_output::ConsoleOutput::stdout(flow_control)
@@ -139,6 +141,9 @@ where
     }
     let mut pump_probe = PumpProbe::connect()?;
     loop {
+        if crate::client_hangup::take_hangup_close(connection, hangup) {
+            return Ok(());
+        }
         if let Some(probe) = pump_probe.as_mut() {
             probe.arm()?;
         }

@@ -23,7 +23,9 @@ use sysinfo::{Pid as SystemPid, ProcessesToUpdate, Signal as SystemSignal, Syste
 const MAX_OUTPUT_CHUNK: usize = 16 * 1024;
 const FINAL_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-use crate::terminal_protocol::{handle_packet, read_initialization, read_ready_packet};
+use crate::terminal_protocol::{
+    handle_packet, read_initialization, read_ready_packet, LocalPacketEffect,
+};
 
 enum WorkerEvent {
     Output(Result<(), String>),
@@ -478,7 +480,9 @@ fn pump_poll(
         }
         if router_events.contains(PollFlags::IN) {
             if let Some(packet) = read_ready_packet(router, &mut decoder)? {
-                handle_packet(packet, master, pty_writer)?;
+                if handle_packet(packet, master, pty_writer)? == LocalPacketEffect::Close {
+                    return Ok(terminal_close_completion());
+                }
                 decoder = LocalPacketDecoder::new();
             }
         }
@@ -514,7 +518,9 @@ fn pump_windows(
         match read_ready_packet(router, &mut decoder) {
             Ok(Some(packet)) => {
                 progress = true;
-                handle_packet(packet, master, pty_writer)?;
+                if handle_packet(packet, master, pty_writer)? == LocalPacketEffect::Close {
+                    return Ok(terminal_close_completion());
+                }
                 decoder = LocalPacketDecoder::new();
             }
             Ok(None) => {}
@@ -523,6 +529,19 @@ fn pump_windows(
         if !progress {
             std::thread::sleep(IDLE);
         }
+    }
+}
+
+/// `TERMINAL_CLOSE` ends the PTY session successfully.
+///
+/// `drained` stays false so cleanup cancels output and shuts the router
+/// writer down. A peer that has already stopped reading (the server just
+/// ended `runTerminal`) must not leave the output worker blocked, and the
+/// exit is still success rather than an unsupported-packet error.
+fn terminal_close_completion() -> PumpCompletion {
+    PumpCompletion {
+        status: 0,
+        drained: false,
     }
 }
 

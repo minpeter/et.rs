@@ -115,6 +115,7 @@ fn run_mode_poll(
     // A partially written client packet. Its frame and offset must survive
     // local-stream backpressure, and ordered client reads pause behind it.
     let mut pending_local: Option<PendingLocalFrame> = None;
+    let mut close_after_local = false;
     let mut terminal_closing = false;
     let mut terminal_eof = false;
     let mut client_buffered = false;
@@ -200,6 +201,9 @@ fn run_mode_poll(
                 .map_err(SessionError::Io)?;
             if complete {
                 pending_local = None;
+                if close_after_local {
+                    return Ok(());
+                }
             }
         }
         if pending_terminal.is_none()
@@ -257,19 +261,27 @@ fn run_mode_poll(
                         true
                     }
                     Ok(Some(packet)) => {
-                        let (local, control) = forward_client_packet(&session, packet)?;
-                        if let Some(packet) = local {
-                            pending_local =
-                                Some(PendingLocalFrame::new(&packet).map_err(SessionError::Io)?);
-                        }
-                        if let Some(control) = control {
-                            enqueue_outbound(
-                                &session,
-                                &mut pending_outbound,
-                                control,
-                                &mut connected,
-                                &mut connection_generation,
-                            )?;
+                        match forward_client_packet(&session, packet)? {
+                            ClientForward::ToTerminal(packet) => {
+                                pending_local = Some(
+                                    PendingLocalFrame::new(&packet).map_err(SessionError::Io)?,
+                                );
+                            }
+                            ClientForward::KeepAlive(control) => {
+                                enqueue_outbound(
+                                    &session,
+                                    &mut pending_outbound,
+                                    control,
+                                    &mut connected,
+                                    &mut connection_generation,
+                                )?;
+                            }
+                            ClientForward::CloseSession => {
+                                close_after_local = true;
+                                if write_local_terminal_close(&mut terminal, &mut pending_local)? {
+                                    return Ok(());
+                                }
+                            }
                         }
                         true
                     }
@@ -354,6 +366,7 @@ fn run_mode_windows(
     let mut pending_outbound = VecDeque::with_capacity(FORWARD_BACKLOG_CAPACITY);
     let mut pending_terminal: Option<Packet> = None;
     let mut pending_local: Option<PendingLocalFrame> = None;
+    let mut close_after_local = false;
     loop {
         if session.is_shutting_down() {
             return Ok(());
@@ -364,6 +377,9 @@ fn run_mode_windows(
             if frame.try_write(&mut terminal).map_err(SessionError::Io)? {
                 pending_local = None;
                 progress = true;
+                if close_after_local {
+                    return Ok(());
+                }
             }
         }
 
@@ -435,20 +451,31 @@ fn run_mode_windows(
                         } else if is_forward_packet(packet.header()) {
                             enqueue_forwarding(&forwarder, &mut pending_forward, packet)?;
                         } else {
-                            let (local, control) = forward_client_packet(&session, packet)?;
-                            if let Some(packet) = local {
-                                pending_local = Some(
-                                    PendingLocalFrame::new(&packet).map_err(SessionError::Io)?,
-                                );
-                            }
-                            if let Some(control) = control {
-                                enqueue_outbound(
-                                    &session,
-                                    &mut pending_outbound,
-                                    control,
-                                    &mut connected,
-                                    &mut connection_generation,
-                                )?;
+                            match forward_client_packet(&session, packet)? {
+                                ClientForward::ToTerminal(packet) => {
+                                    pending_local = Some(
+                                        PendingLocalFrame::new(&packet)
+                                            .map_err(SessionError::Io)?,
+                                    );
+                                }
+                                ClientForward::KeepAlive(control) => {
+                                    enqueue_outbound(
+                                        &session,
+                                        &mut pending_outbound,
+                                        control,
+                                        &mut connected,
+                                        &mut connection_generation,
+                                    )?;
+                                }
+                                ClientForward::CloseSession => {
+                                    close_after_local = true;
+                                    if write_local_terminal_close(
+                                        &mut terminal,
+                                        &mut pending_local,
+                                    )? {
+                                        return Ok(());
+                                    }
+                                }
                             }
                         }
                     }
@@ -817,36 +844,81 @@ fn jumphost_terminal_packet(
     ))
 }
 
+enum ClientForward {
+    ToTerminal(Packet),
+    KeepAlive(Packet),
+    /// Upstream `runTerminal` writes a local `TERMINAL_CLOSE` and ends that
+    /// session's terminal loop. The etserver process keeps running.
+    CloseSession,
+}
+
+/// Classify a decrypted client packet for one terminal session.
+///
+/// Unknown types stay [`ClientTerminalDisposition::Reject`], which the bridge
+/// turns into a connection-local [`SessionError`] (upstream `#848`).
+fn client_terminal_disposition(header: u8) -> ClientTerminalDisposition {
+    if header == TerminalPacketType::TerminalBuffer as u8
+        || header == TerminalPacketType::TerminalInfo as u8
+    {
+        ClientTerminalDisposition::Relay
+    } else if header == TerminalPacketType::KeepAlive as u8 {
+        ClientTerminalDisposition::KeepAlive
+    } else if header == TerminalPacketType::TerminalClose as u8 {
+        ClientTerminalDisposition::CloseSession
+    } else {
+        ClientTerminalDisposition::Reject
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientTerminalDisposition {
+    Relay,
+    KeepAlive,
+    CloseSession,
+    Reject,
+}
+
 fn forward_client_packet(
     session: &ActiveSession,
     packet: Packet,
-) -> Result<(Option<Packet>, Option<Packet>), SessionError> {
-    match packet.header() {
-        value
-            if value == TerminalPacketType::TerminalBuffer as u8
-                || value == TerminalPacketType::TerminalInfo as u8 =>
-        {
-            Ok((Some(packet), None))
-        }
-        header if header == TerminalPacketType::KeepAlive as u8 => {
+) -> Result<ClientForward, SessionError> {
+    match client_terminal_disposition(packet.header()) {
+        ClientTerminalDisposition::Relay => Ok(ClientForward::ToTerminal(packet)),
+        ClientTerminalDisposition::KeepAlive => {
             if let Some(ack) = et_core::keepalive::decode_ack(packet.payload()) {
                 session.acknowledge_delivery(ack)?;
             }
             // The echo acknowledges everything read from the client, letting
             // an et.rs client trim its own replay backup. Legacy peers
             // (upstream C++, released et.rs) ignore the payload.
-            Ok((
-                None,
-                Some(Packet::new(
-                    TerminalPacketType::KeepAlive as u8,
-                    session.keepalive_ack()?.to_vec(),
-                )),
-            ))
+            Ok(ClientForward::KeepAlive(Packet::new(
+                TerminalPacketType::KeepAlive as u8,
+                session.keepalive_ack()?.to_vec(),
+            )))
         }
-        _ => Err(SessionError::Io(io::Error::new(
+        ClientTerminalDisposition::CloseSession => Ok(ClientForward::CloseSession),
+        ClientTerminalDisposition::Reject => Err(SessionError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
             "client sent an unsupported terminal packet",
         ))),
+    }
+}
+
+/// Write a framed local `TERMINAL_CLOSE`. et.rs local sockets use framed
+/// packets, not the raw C++ type byte.
+///
+/// Returns `true` when the frame is fully written and the bridge can end.
+fn write_local_terminal_close(
+    terminal: &mut LocalStream,
+    pending_local: &mut Option<PendingLocalFrame>,
+) -> Result<bool, SessionError> {
+    let packet = Packet::new(TerminalPacketType::TerminalClose as u8, Vec::new());
+    let mut frame = PendingLocalFrame::new(&packet).map_err(SessionError::Io)?;
+    if frame.try_write(terminal).map_err(SessionError::Io)? {
+        Ok(true)
+    } else {
+        *pending_local = Some(frame);
+        Ok(false)
     }
 }
 
@@ -936,6 +1008,28 @@ mod tests {
 
         assert!(flags.contains(PollFlags::IN));
         assert_eq!(timeout, Some(Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn terminal_close_is_session_local_and_unknown_types_stay_rejected() {
+        assert_eq!(TerminalPacketType::TerminalClose as u8, 11);
+        assert_eq!(et_core::PROTOCOL_VERSION, 6);
+        assert_eq!(
+            client_terminal_disposition(TerminalPacketType::TerminalClose as u8),
+            ClientTerminalDisposition::CloseSession
+        );
+        assert_eq!(
+            client_terminal_disposition(TerminalPacketType::TerminalBuffer as u8),
+            ClientTerminalDisposition::Relay
+        );
+        assert_eq!(
+            client_terminal_disposition(TerminalPacketType::KeepAlive as u8),
+            ClientTerminalDisposition::KeepAlive
+        );
+        assert_eq!(
+            client_terminal_disposition(4),
+            ClientTerminalDisposition::Reject
+        );
     }
 
     #[cfg(unix)]

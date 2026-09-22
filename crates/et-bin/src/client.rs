@@ -407,6 +407,7 @@ fn run_client(
             terminal_enabled: !args.no_terminal,
             lines: crate::client_terminal::RemoteLines::from(remote_mode.terminal_shell),
             connection_name: &request.host_alias,
+            close_on_hangup: args.close_on_hangup,
         },
         forwarder,
         |connection| reconnect_with_retry(connection, &endpoint, &credentials, resolver),

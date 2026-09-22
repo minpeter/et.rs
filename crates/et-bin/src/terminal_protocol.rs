@@ -75,13 +75,39 @@ pub fn read_ready_packet(
     }
 }
 
+/// What a framed local packet asks `etterminal` to do.
+///
+/// `Close` is the success path for upstream `TERMINAL_CLOSE`: stop the PTY
+/// session without reporting an unsupported-packet error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalPacketEffect {
+    Continue,
+    Close,
+}
+
+pub(crate) fn local_packet_effect(packet: &Packet) -> Result<LocalPacketEffect, String> {
+    if packet.is_encrypted() {
+        return Err("encrypted local terminal packet rejected".to_owned());
+    }
+    match packet.header() {
+        header
+            if header == TerminalPacketType::TerminalBuffer as u8
+                || header == TerminalPacketType::TerminalInfo as u8 =>
+        {
+            Ok(LocalPacketEffect::Continue)
+        }
+        header if header == TerminalPacketType::TerminalClose as u8 => Ok(LocalPacketEffect::Close),
+        _ => Err("unsupported local terminal packet type".to_owned()),
+    }
+}
+
 pub fn handle_packet(
     packet: Packet,
     master: &dyn MasterPty,
     writer: &mut dyn Write,
-) -> Result<(), String> {
-    if packet.is_encrypted() {
-        return Err("encrypted local terminal packet rejected".to_owned());
+) -> Result<LocalPacketEffect, String> {
+    if local_packet_effect(&packet)? == LocalPacketEffect::Close {
+        return Ok(LocalPacketEffect::Close);
     }
     match packet.header() {
         header if header == TerminalPacketType::TerminalBuffer as u8 => {
@@ -93,14 +119,16 @@ pub fn handle_packet(
             writer
                 .write_all(&bytes)
                 .and_then(|()| writer.flush())
-                .map_err(|error| format!("could not write PTY input: {error}"))
+                .map_err(|error| format!("could not write PTY input: {error}"))?;
+            Ok(LocalPacketEffect::Continue)
         }
         header if header == TerminalPacketType::TerminalInfo as u8 => {
             let info = TerminalInfo::decode(packet.payload())
                 .map_err(|_| "TERMINAL_INFO protobuf is malformed".to_owned())?;
             master
                 .resize(terminal_size(&info))
-                .map_err(|error| format!("could not resize PTY: {error}"))
+                .map_err(|error| format!("could not resize PTY: {error}"))?;
+            Ok(LocalPacketEffect::Continue)
         }
         _ => Err("unsupported local terminal packet type".to_owned()),
     }
@@ -223,6 +251,27 @@ mod tests {
         let (mut reader, mut writer) = et_net::local::wake_pair().unwrap();
         write_local_packet(&mut writer, &packet).unwrap();
         read_initialization(&mut reader).map(|initialization| initialization.environment)
+    }
+
+    #[test]
+    fn terminal_close_is_a_clean_effect_and_unknown_types_stay_errors() {
+        assert_eq!(TerminalPacketType::TerminalClose as u8, 11);
+        assert_eq!(et_core::PROTOCOL_VERSION, 6);
+        let close = Packet::new(TerminalPacketType::TerminalClose as u8, Vec::new());
+        assert_eq!(
+            local_packet_effect(&close).unwrap(),
+            LocalPacketEffect::Close
+        );
+        let buffer = Packet::new(TerminalPacketType::TerminalBuffer as u8, Vec::new());
+        assert_eq!(
+            local_packet_effect(&buffer).unwrap(),
+            LocalPacketEffect::Continue
+        );
+        let unknown = Packet::new(4, Vec::new());
+        let error = local_packet_effect(&unknown).unwrap_err();
+        assert!(error.contains("unsupported"));
+        let encrypted = Packet::raw(true, TerminalPacketType::TerminalClose as u8, Vec::new());
+        assert!(local_packet_effect(&encrypted).is_err());
     }
 
     #[test]

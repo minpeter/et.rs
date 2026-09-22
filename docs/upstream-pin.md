@@ -10,7 +10,7 @@ Canonical machine files:
 - Ledger (every `master` commit after baseline):
   [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml)
 
-Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-21.
+Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-22.
 `#784` marked `ported` after et.rs [#31](https://github.com/minpeter/et.rs/pull/31) / `906a7ca86691f00a82f88b99b21d7afceb07bf97`.
 `#798` marked `ported` after et.rs [#77](https://github.com/minpeter/et.rs/pull/77).
 
@@ -20,13 +20,13 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-21.
 | Baseline / latest release tag | [`et-v7.0.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.0.0) |
 | Baseline / release commit | [`7656a32a5bc15c6746726a27a5a4ba1e468fab6e`](https://github.com/MisterTea/EternalTerminal/commit/7656a32a5bc15c6746726a27a5a4ba1e468fab6e) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`db4f6f6`](https://github.com/MisterTea/EternalTerminal/commit/db4f6f63183b403c5a530249fe5e126c59adf660) (#816 Rocky/Gentoo CI + SSH login output, reviewed 2026-09-21) |
+| Pin tip (last classified) | [`a836741`](https://github.com/MisterTea/EternalTerminal/commit/a8367415783a64405c62c70b755b4c09b410532b) (#830 ProxyJump none, reviewed 2026-09-22) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
 | ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.0.0` and `master`) |
 
-The reviewed baseline-to-#816 range contains 31 classified commits. Unclassified commits would be drift.
+The reviewed baseline-to-#830 range contains 44 classified commits (31 prior + 13 on 2026-09-22). Unclassified commits would be drift. `#837` (`TERMINAL_CLOSE` / `--close-on-hangup`) remains `protocol/backlog`.
 
-## Ledger (classified 2026-09-21)
+## Ledger (classified 2026-09-22)
 
 | sha | date | kind | status | note |
 | --- | --- | --- | --- | --- |
@@ -61,8 +61,34 @@ The reviewed baseline-to-#816 range contains 31 classified commits. Unclassified
 | [`0e3e3e0`](https://github.com/MisterTea/EternalTerminal/commit/0e3e3e0cbf3fe5bf329cfb2feff08995140d5470) | 2026-09-18 | ci | skip | #817 C++ Windows test/WSAPoll port; et.rs already has Windows-native ConPTY server and its own tests. |
 | [`17ec755`](https://github.com/MisterTea/EternalTerminal/commit/17ec75556521df092024ceb6b95636cef367a0aa) | 2026-09-19 | ci | skip | #818 OpenWrt packaging/workflows only. |
 | [`db4f6f6`](https://github.com/MisterTea/EternalTerminal/commit/db4f6f63183b403c5a530249fe5e126c59adf660) | 2026-09-19 | product | skip | #816 Rocky/Gentoo CI plus optional C++ SSH login/MOTD display; et.rs already has `terminal_motd` / `ssh_process` paths. |
+| [`e34389e`](https://github.com/MisterTea/EternalTerminal/commit/e34389ea302b949c8c3342c0bce1ef11472abef8) | 2026-09-19 | security | skip | #778 CVE-2023-23558 telemetry/temp audit; et.rs has no telemetry |
+| [`91cb503`](https://github.com/MisterTea/EternalTerminal/commit/91cb5031cd30bf127455615462dc30f47a51e913) | 2026-09-21 | ci | skip | clang-format PRCI (reverted) |
+| [`5b2cd10`](https://github.com/MisterTea/EternalTerminal/commit/5b2cd10256433926bbcff3ca57b4620234430258) | 2026-09-21 | ci | skip | revert clang-format |
+| [`09551a9`](https://github.com/MisterTea/EternalTerminal/commit/09551a96c123879d785c230c9ece2d418cf38222) | 2026-09-21 | product | **ported** | #789/#847 comma-separated SSH-style tunnels |
+| [`8f3b44c`](https://github.com/MisterTea/EternalTerminal/commit/8f3b44c18329374d8752486aa0329fbd9ca90299) | 2026-09-21 | ci | skip | #677/#834 C++ noexecstack |
+| [`c097839`](https://github.com/MisterTea/EternalTerminal/commit/c097839f059a7ef431939fe6574b80968051f73c) | 2026-09-21 | product | skip | #669/#833 partial listen; et.rs already probes IPv6 |
+| [`62a9dd5`](https://github.com/MisterTea/EternalTerminal/commit/62a9dd54d8d2fb6c70b9548d347a029620f7c29d) | 2026-09-21 | product | skip | #655/#831 subprocess drain; et.rs ssh_process already drains |
+| [`3abb882`](https://github.com/MisterTea/EternalTerminal/commit/3abb882f5675550d876bb0efbc119dd9fee17fd3) | 2026-09-21 | docs | skip | #219/#821 README binaries |
+| [`651fe3e`](https://github.com/MisterTea/EternalTerminal/commit/651fe3e717305240643a6201422dd9baeaacb867) | 2026-09-21 | security | skip | #799/#848 unknown packet session-local; et.rs already SessionError |
+| [`5661a4b`](https://github.com/MisterTea/EternalTerminal/commit/5661a4b6e4f367b493ee557496919b619a65747e) | 2026-09-21 | product | skip | #683/#835 FreeBSD login argv0; et.rs uses `-l` |
+| [`f49e556`](https://github.com/MisterTea/EternalTerminal/commit/f49e55681049c7784d4f4012d9eacbbcedf48e6f) | 2026-09-21 | docs | skip | #752/#841 README roles |
+| [`d70e00a`](https://github.com/MisterTea/EternalTerminal/commit/d70e00ac44758b8037847ce128e647204f2e0603) | 2026-09-21 | protocol | **backlog** | #707/#837 TERMINAL_CLOSE=11 / `--close-on-hangup` (PROTOCOL_VERSION still 6) |
+| [`a836741`](https://github.com/MisterTea/EternalTerminal/commit/a8367415783a64405c62c70b755b4c09b410532b) | 2026-09-21 | product | skip | #653/#830 ProxyJump none; et.rs already handles |
+
 
 ## Ported and residual
+
+[`09551a9`](https://github.com/MisterTea/EternalTerminal/commit/09551a96c123879d785c230c9ece2d418cf38222)
+(`#789` / `#847`) is `status: ported`. Comma-separated SSH-style tunnels are
+parsed independently in `crates/et-cli/src/tunnel.rs` (et-style when ≤2 colon
+parts, otherwise ssh-style). Protocol v6 is unchanged.
+
+[`d70e00a`](https://github.com/MisterTea/EternalTerminal/commit/d70e00ac44758b8037847ce128e647204f2e0603)
+(`#707` / `#837`) is `status: backlog` (protocol). Upstream added
+`TERMINAL_CLOSE = 11` and optional `--close-on-hangup` without bumping
+`PROTOCOL_VERSION` (still 6). et.rs gains the proto enum value in this watch;
+client/server hangup wiring is a follow-up port.
+
 
 [`cd731902`](https://github.com/MisterTea/EternalTerminal/commit/cd7319020edce131fbd6f21b1a87e07f4ac41cdb)
 (`#804`) is `status: ported` after independent review of

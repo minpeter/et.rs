@@ -52,6 +52,7 @@ pub struct TerminalOptions<'a> {
     pub terminal_enabled: bool,
     pub lines: RemoteLines,
     pub connection_name: &'a str,
+    pub close_on_hangup: bool,
 }
 
 pub fn run<F>(
@@ -71,7 +72,14 @@ where
         terminal_enabled,
         lines,
         connection_name,
+        close_on_hangup,
     } = options;
+    let hangup = if close_on_hangup {
+        crate::client_hangup::HangupClose::install()
+            .map_err(|error| terminal_io("installing hangup close handler", error))?
+    } else {
+        crate::client_hangup::HangupClose::disabled()
+    };
     let raw_mode = if terminal_enabled {
         RawMode::enter()?
     } else {
@@ -161,6 +169,7 @@ where
                 terminal_enabled,
                 auto_cursor_report,
                 terminal_modes: &mut terminal_modes,
+                hangup: &hangup,
             },
             &mut forwarder,
             reconnect,
@@ -179,6 +188,7 @@ where
             terminal_enabled,
             auto_cursor_report,
             terminal_modes: &mut terminal_modes,
+            hangup: &hangup,
         },
         &mut forwarder,
         reconnect,

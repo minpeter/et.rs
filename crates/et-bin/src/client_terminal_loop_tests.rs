@@ -19,6 +19,56 @@ fn full_forwarding_backlog_stops_polling_network_readability() {
 }
 
 #[test]
+fn close_on_hangup_sends_terminal_close_and_exits_the_loop() {
+    use et_core::crypto::KEY_LEN;
+    use std::net::{Ipv4Addr, TcpListener, TcpStream};
+    use std::time::Duration;
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let client = thread::spawn(move || TcpStream::connect(address).unwrap());
+    let (server_stream, _) = listener.accept().unwrap();
+    let stream = client.join().unwrap();
+    server_stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let server = thread::spawn(move || {
+        let mut receiver =
+            et_net::connection::Connection::new_server(server_stream, &[7u8; KEY_LEN]);
+        let packet = receiver.read_packet().unwrap();
+        assert_eq!(
+            packet.header(),
+            et_core::proto::TerminalPacketType::TerminalClose as u8
+        );
+        assert!(packet.payload().is_empty());
+    });
+    let mut connection = et_net::connection::Connection::new_client(stream, &[7u8; KEY_LEN]);
+    let (mut wake, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    wake.set_nonblocking(true).unwrap();
+    let mut modes = TerminalModeState::default();
+    let hangup = crate::client_hangup::HangupClose::disabled();
+    hangup.request();
+    pump(
+        &mut connection,
+        &mut wake,
+        PumpOptions {
+            read_stdin: false,
+            keepalive_seconds: 5,
+            flow_control: et_cli::client::FlowControlMode::None,
+            terminal_enabled: false,
+            auto_cursor_report: false,
+            terminal_modes: &mut modes,
+            hangup: &hangup,
+        },
+        &mut et_net::forward::Forwarder::start(Vec::new()).unwrap(),
+        |_| panic!("hangup close must not reconnect"),
+    )
+    .unwrap();
+    assert!(hangup.completed());
+    server.join().unwrap();
+}
+
+#[test]
 fn available_forwarding_backlog_keeps_polling_network_readability() {
     let flags = network_poll_flags(false, false);
 

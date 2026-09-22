@@ -50,6 +50,7 @@ where
         terminal_enabled,
         auto_cursor_report,
         terminal_modes,
+        hangup,
     } = options;
     let console_output = crate::client_output::ConsoleOutput::stdout(flow_control)
         .map_err(|error| terminal_io("starting console output worker", error))?;
@@ -64,6 +65,9 @@ where
     let mut pending_output: Option<et_core::packet::Packet> = None;
     let mut interrupt_input = et_core::output_interrupt::InterruptInput::default();
     loop {
+        if crate::client_hangup::take_hangup_close(connection, hangup) {
+            return Ok(());
+        }
         console_output
             .check_error()
             .map_err(|error| terminal_io("writing terminal output", error))?;

@@ -10,7 +10,9 @@ use et_core::proto::{
 };
 use et_net::local_packet::{read_local_packet, write_local_packet};
 use prost::Message;
-use runtime_support::{default_payload, initialize, TestRuntime, ID_A, KEY_A, TIMEOUT};
+use runtime_support::{
+    default_payload, initialize, TestRuntime, ID_A, ID_B, KEY_A, KEY_B, TIMEOUT,
+};
 
 #[test]
 fn encrypted_client_and_registered_terminal_exchange_packets() {
@@ -287,5 +289,107 @@ fn terminal_environment_is_forwarded_without_interpolation() {
     assert_eq!(environment.environmentnames, vec!["LITERAL"]);
     assert_eq!(environment.environmentvalues, vec!["$(not-executed)"]);
     drop(terminal);
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
+fn terminal_close_ends_only_that_session() {
+    let mut server = TestRuntime::start();
+    let mut terminal_a = server.register(ID_A, KEY_A);
+    let mut terminal_b = server.register(ID_B, KEY_B);
+    terminal_a.set_read_timeout(Some(TIMEOUT)).unwrap();
+    terminal_b.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let (stream_a, response_a) = server.handshake(ID_A);
+    let (stream_b, response_b) = server.handshake(ID_B);
+    assert_eq!(response_a.status, Some(ConnectStatus::NewClient as i32));
+    assert_eq!(response_b.status, Some(ConnectStatus::NewClient as i32));
+    let (mut client_a, initial_a) =
+        initialize(stream_a, &passkey_to_key(KEY_A).unwrap(), default_payload());
+    let (mut client_b, initial_b) =
+        initialize(stream_b, &passkey_to_key(KEY_B).unwrap(), default_payload());
+    assert_eq!(initial_a.error, None);
+    assert_eq!(initial_b.error, None);
+    assert_eq!(
+        read_local_packet(&mut terminal_a).unwrap().header(),
+        TerminalPacketType::TerminalInit as u8
+    );
+    assert_eq!(
+        read_local_packet(&mut terminal_b).unwrap().header(),
+        TerminalPacketType::TerminalInit as u8
+    );
+
+    client_a
+        .write_packet(TerminalPacketType::TerminalClose as u8, &[])
+        .unwrap();
+    let close = read_local_packet(&mut terminal_a).unwrap();
+    assert!(!close.is_encrypted());
+    assert_eq!(close.header(), TerminalPacketType::TerminalClose as u8);
+    assert!(close.payload().is_empty());
+    assert_eq!(TerminalPacketType::TerminalClose as u8, 11);
+
+    let input = TerminalBuffer {
+        buffer: Some(b"still-alive".to_vec()),
+    };
+    client_b
+        .write_packet(
+            TerminalPacketType::TerminalBuffer as u8,
+            &input.encode_to_vec(),
+        )
+        .unwrap();
+    let forwarded = read_local_packet(&mut terminal_b).unwrap();
+    assert_eq!(
+        TerminalBuffer::decode(forwarded.payload())
+            .unwrap()
+            .buffer
+            .as_deref(),
+        Some(b"still-alive".as_slice())
+    );
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
+fn unknown_client_packet_is_session_local() {
+    let mut server = TestRuntime::start();
+    let mut terminal_a = server.register(ID_A, KEY_A);
+    let mut terminal_b = server.register(ID_B, KEY_B);
+    terminal_a.set_read_timeout(Some(TIMEOUT)).unwrap();
+    terminal_b.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let (stream_a, _) = server.handshake(ID_A);
+    let (stream_b, _) = server.handshake(ID_B);
+    let (mut client_a, initial_a) =
+        initialize(stream_a, &passkey_to_key(KEY_A).unwrap(), default_payload());
+    let (mut client_b, initial_b) =
+        initialize(stream_b, &passkey_to_key(KEY_B).unwrap(), default_payload());
+    assert_eq!(initial_a.error, None);
+    assert_eq!(initial_b.error, None);
+    assert_eq!(
+        read_local_packet(&mut terminal_a).unwrap().header(),
+        TerminalPacketType::TerminalInit as u8
+    );
+    assert_eq!(
+        read_local_packet(&mut terminal_b).unwrap().header(),
+        TerminalPacketType::TerminalInit as u8
+    );
+
+    client_a.write_packet(4, b"nope").unwrap();
+    assert!(read_local_packet(&mut terminal_a).is_err());
+
+    let input = TerminalBuffer {
+        buffer: Some(b"other-session".to_vec()),
+    };
+    client_b
+        .write_packet(
+            TerminalPacketType::TerminalBuffer as u8,
+            &input.encode_to_vec(),
+        )
+        .unwrap();
+    let forwarded = read_local_packet(&mut terminal_b).unwrap();
+    assert_eq!(
+        TerminalBuffer::decode(forwarded.payload())
+            .unwrap()
+            .buffer
+            .as_deref(),
+        Some(b"other-session".as_slice())
+    );
     server.runtime.shutdown().unwrap();
 }

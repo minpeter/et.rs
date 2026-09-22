@@ -13,7 +13,7 @@
 # Classified 2026-09-21. #804 passed independent review in et.rs #100.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-09-21"
+classified: "2026-09-22"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -194,3 +194,79 @@ commits:
     status: skip
     note: "#816 portability CI plus optional C++ SshSetupHandler displayLoginOutput (strip IDPASSKEY from MOTD/login banner). et.rs already has terminal_motd / ssh_process paths; not a protocol/wire/auth change. PROTOCOL_VERSION stays 6."
     et_pr: 816
+  - sha: e34389ea302b949c8c3342c0bce1ef11472abef8
+    date: "2026-09-19"
+    kind: security
+    status: skip
+    note: "#778 CVE-2023-23558 audit/docs for TelemetryService + secure temp paths. et.rs has no telemetry (GHSA-m7cp N/A); router/FIFO already uses XDG/home with symlink/mode checks. PROTOCOL_VERSION stays 6."
+    et_pr: 778
+  - sha: 91cb5031cd30bf127455615462dc30f47a51e913
+    date: "2026-09-21"
+    kind: ci
+    status: skip
+    note: "clang-format PRCI noise; immediately reverted by 5b2cd10."
+  - sha: 5b2cd10256433926bbcff3ca57b4620234430258
+    date: "2026-09-21"
+    kind: ci
+    status: skip
+    note: "Revert clang-format PRCI commit 91cb503."
+  - sha: 09551a96c123879d785c230c9ece2d418cf38222
+    date: "2026-09-21"
+    kind: product
+    status: ported
+    note: "#789/#847 parse comma-separated SSH-style tunnels independently. Landed in et.rs via this watch (et-cli tunnel.rs). PROTOCOL_VERSION stays 6."
+    et_pr: 789
+  - sha: 8f3b44c18329374d8752486aa0329fbd9ca90299
+    date: "2026-09-21"
+    kind: ci
+    status: skip
+    note: "#677/#834 C++ -Wl,-z,noexecstack / RPM ELF check. N/A to Rust. PROTOCOL_VERSION stays 6."
+    et_pr: 677
+  - sha: c097839f059a7ef431939fe6574b80968051f73c
+    date: "2026-09-21"
+    kind: product
+    status: skip
+    note: "#669/#833 tolerate partial TCP listener bind / IPV6_V6ONLY failures. et.rs et-net already probes IPv6 and uses typed bind errors (no exit(1)). PROTOCOL_VERSION stays 6."
+    et_pr: 669
+  - sha: 62a9dd54d8d2fb6c70b9548d347a029620f7c29d
+    date: "2026-09-21"
+    kind: product
+    status: skip
+    note: "#655/#831 drain large SSH subprocess output before wait. et.rs ssh_process already captures/drains stdout via reader thread. PROTOCOL_VERSION stays 6."
+    et_pr: 655
+  - sha: 3abb882f5675550d876bb0efbc119dd9fee17fd3
+    date: "2026-09-21"
+    kind: docs
+    status: skip
+    note: "#219/#821 README installed binaries docs only."
+    et_pr: 219
+  - sha: 651fe3e717305240643a6201422dd9baeaacb867
+    date: "2026-09-21"
+    kind: security
+    status: skip
+    note: "#799/#848 replace process-fatal STFATAL on unknown client packet with connection-local close. et.rs terminal_bridge already returns SessionError::Io for unsupported types (session-local). PROTOCOL_VERSION stays 6."
+    et_pr: 799
+  - sha: 5661a4b6e4f367b493ee557496919b619a65747e
+    date: "2026-09-21"
+    kind: product
+    status: skip
+    note: "#683/#835 FreeBSD portable login-shell argv[0]. et.rs uses portable-pty with -l; niche FreeBSD argv0 form deferred. PROTOCOL_VERSION stays 6."
+    et_pr: 683
+  - sha: f49e55681049c7784d4f4012d9eacbbcedf48e6f
+    date: "2026-09-21"
+    kind: docs
+    status: skip
+    note: "#752/#841 README client/server/helper docs only."
+    et_pr: 752
+  - sha: d70e00ac44758b8037847ce128e647204f2e0603
+    date: "2026-09-21"
+    kind: protocol
+    status: backlog
+    note: "#707/#837 optional --close-on-hangup sends new TERMINAL_CLOSE=11 (proto enum only; PROTOCOL_VERSION still 6). et.rs proto gains TerminalClose=11 in this watch; client/server hangup wiring remains backlog."
+    et_pr: 707
+  - sha: a8367415783a64405c62c70b755b4c09b410532b
+    date: "2026-09-21"
+    kind: product
+    status: skip
+    note: "#653/#830 honor ProxyJump none. et.rs ssh_config already treats ProxyJump none as disabled. PROTOCOL_VERSION stays 6."
+    et_pr: 653

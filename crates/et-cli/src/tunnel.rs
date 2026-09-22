@@ -50,9 +50,9 @@ pub fn parse_tunnels(arguments: &[String]) -> Result<Vec<PortForwardSourceReques
     Ok(requests)
 }
 
-/// One `-t`/`-r` value, mirroring upstream `parseRangesToRequests`: an
-/// argument with commas is a list of et-style tunnels; a single argument with
-/// three or more colon-separated parts is an ssh-style tunnel.
+/// One `-t`/`-r` value, mirroring upstream `parseRangesToRequests` after #789:
+/// comma-separated elements are parsed independently — et-style when they have
+/// at most two colon parts, otherwise ssh-style (`bind:port:host:hostport`).
 fn parse_argument(
     argument: &str,
     requests: &mut Vec<PortForwardSourceRequest>,
@@ -61,7 +61,11 @@ fn parse_argument(
     if elements.len() > 1 {
         for element in elements {
             let parts: Vec<&str> = element.split(':').collect();
-            parse_et_style(&parts, element, requests)?;
+            if parts.len() <= 2 {
+                parse_et_style(&parts, element, requests)?;
+            } else {
+                parse_ssh_style(element, requests)?;
+            }
         }
         return Ok(());
     }

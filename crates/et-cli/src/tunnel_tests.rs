@@ -125,19 +125,24 @@ fn rejects_malformed_mismatched_and_excessive_expansions() {
 #[test]
 fn parses_comma_separated_ssh_style_reverse_tunnels() {
     // Upstream #789 / #847: each four-part entry after a comma is SSH style.
-    let requests = parse_tunnels(&[
-        "localhost:8888:0.0.0.0:9999,localhost:7777:1.2.3.4:6666".to_owned(),
-    ])
-    .unwrap();
+    let requests =
+        parse_tunnels(&["localhost:8888:0.0.0.0:9999,localhost:7777:1.2.3.4:6666".to_owned()])
+            .unwrap();
     assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].source.as_ref().unwrap().name.as_deref(), Some("localhost"));
+    assert_eq!(
+        requests[0].source.as_ref().unwrap().name.as_deref(),
+        Some("localhost")
+    );
     assert_eq!(requests[0].source.as_ref().unwrap().port, Some(8888));
     assert_eq!(
         requests[0].destination.as_ref().unwrap().name.as_deref(),
         Some("0.0.0.0")
     );
     assert_eq!(requests[0].destination.as_ref().unwrap().port, Some(9999));
-    assert_eq!(requests[1].source.as_ref().unwrap().name.as_deref(), Some("localhost"));
+    assert_eq!(
+        requests[1].source.as_ref().unwrap().name.as_deref(),
+        Some("localhost")
+    );
     assert_eq!(requests[1].source.as_ref().unwrap().port, Some(7777));
     assert_eq!(
         requests[1].destination.as_ref().unwrap().name.as_deref(),

@@ -10,7 +10,7 @@ Canonical machine files:
 - Ledger (every `master` commit after baseline):
   [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml)
 
-Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-22.
+Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-23.
 `#784` marked `ported` after et.rs [#31](https://github.com/minpeter/et.rs/pull/31) / `906a7ca86691f00a82f88b99b21d7afceb07bf97`.
 `#798` marked `ported` after et.rs [#77](https://github.com/minpeter/et.rs/pull/77).
 
@@ -20,13 +20,13 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-22.
 | Baseline / latest release tag | [`et-v7.0.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.0.0) |
 | Baseline / release commit | [`7656a32a5bc15c6746726a27a5a4ba1e468fab6e`](https://github.com/MisterTea/EternalTerminal/commit/7656a32a5bc15c6746726a27a5a4ba1e468fab6e) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`a836741`](https://github.com/MisterTea/EternalTerminal/commit/a8367415783a64405c62c70b755b4c09b410532b) (#830 ProxyJump none, reviewed 2026-09-22) |
+| Pin tip (last classified) | [`9718366`](https://github.com/MisterTea/EternalTerminal/commit/9718366cc5059912791c2590972ec451a05eeb9a) (#829 tip, telemetry crash-signal skip, reviewed 2026-09-23) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
 | ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.0.0` and `master`) |
 
-The reviewed baseline-to-#830 range contains 44 classified commits (31 prior + 13 on 2026-09-22). Unclassified commits would be drift. `#837` (`TERMINAL_CLOSE` / `--close-on-hangup`) is `ported`.
+The reviewed baseline-to-#829 range contains 46 classified commits (44 prior + 2 on 2026-09-23). Unclassified commits would be drift. `#837` (`TERMINAL_CLOSE` / `--close-on-hangup`) is `ported`.
 
-## Ledger (classified 2026-09-22)
+## Ledger (classified 2026-09-23)
 
 | sha | date | kind | status | note |
 | --- | --- | --- | --- | --- |
@@ -74,6 +74,8 @@ The reviewed baseline-to-#830 range contains 44 classified commits (31 prior + 1
 | [`f49e556`](https://github.com/MisterTea/EternalTerminal/commit/f49e55681049c7784d4f4012d9eacbbcedf48e6f) | 2026-09-21 | docs | skip | #752/#841 README roles |
 | [`d70e00a`](https://github.com/MisterTea/EternalTerminal/commit/d70e00ac44758b8037847ce128e647204f2e0603) | 2026-09-21 | protocol | **ported** | #707/#837 `TERMINAL_CLOSE=11` / `--close-on-hangup`. Landed via #116. PROTOCOL_VERSION stays 6. |
 | [`a836741`](https://github.com/MisterTea/EternalTerminal/commit/a8367415783a64405c62c70b755b4c09b410532b) | 2026-09-21 | product | skip | #653/#830 ProxyJump none; et.rs already handles |
+| [`fcd4d95`](https://github.com/MisterTea/EternalTerminal/commit/fcd4d959c48082d465556a26400ab734bffdccc0) | 2026-09-22 | product | skip | #747/#840 nested SSH Include paths. C++ `ParseConfigFile.hpp` only; et.rs uses OpenSSH `ssh -G`, which already resolves relative Includes. Not wire/auth. |
+| [`9718366`](https://github.com/MisterTea/EternalTerminal/commit/9718366cc5059912791c2590972ec451a05eeb9a) | 2026-09-22 | product | skip | #570/#829 telemetry crash-signal handler (`signal`+`raise`). et.rs has no telemetry. Not wire/auth. Pin tip. |
 
 
 ## Ported and residual
@@ -214,8 +216,22 @@ has a Windows-native ConPTY server and its own tests. Not wire/auth.
 banner). et.rs already has `terminal_motd` / `ssh_process` paths; not a
 protocol/wire/auth change. `PROTOCOL_VERSION` stays 6.
 
+[`fcd4d95`](https://github.com/MisterTea/EternalTerminal/commit/fcd4d959c48082d465556a26400ab734bffdccc0)
+(`#747` / `#840`) stays `status: skip`. Upstream resolves nested SSH `Include`
+paths relative to the file that contains them (`ParseConfigFile.hpp`). et.rs
+resolves SSH config through real OpenSSH `ssh -G`
+(`crates/et-bin/src/ssh_config.rs`); OpenSSH already resolves relative
+`Include` paths against the containing file. Not protocol, wire, auth, or
+security. No Rust port. `PROTOCOL_VERSION` stays 6.
+
+[`9718366`](https://github.com/MisterTea/EternalTerminal/commit/9718366cc5059912791c2590972ec451a05eeb9a)
+(`#570` / `#829`) is the pin tip and stays `status: skip`. Upstream replaces
+the C++ `TelemetryService.cpp` crash-signal handler with `signal(sig, SIG_DFL)`
+plus `raise(sig)` so a fault terminates instead of looping. et.rs has no
+telemetry. Not wire or auth. No Rust port. `PROTOCOL_VERSION` stays 6.
+
 et.rs still claims **protocol v6**. EternalTerminal’s latest product release is
-**v7.0.0**, and the reviewed tip is thirty-one classified commits past that tag.
+**v7.0.0**, and the reviewed tip is forty-six classified commits past that tag.
 
 Review ports against the conflict policy in
 [`docs/upstream-factory.md`](upstream-factory.md). Gate any later port with

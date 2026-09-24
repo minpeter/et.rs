@@ -156,6 +156,7 @@ fn run_client(
             .chain(ssh_locale_environment()),
         &reserved_environment,
         forward_config.initial_payload.flowcontrol,
+        forward_config.initial_payload.command.as_deref(),
     )
     .map_err(crate::forward_config::ForwardConfigError::EnvironmentPacketTooLarge)?;
     if args.jumphost.is_some() {
@@ -235,6 +236,7 @@ fn run_client(
                 .cloned(),
             &reserved,
             initial_payload.flowcontrol,
+            initial_payload.command.as_deref(),
         )
         .map_err(crate::forward_config::ForwardConfigError::EnvironmentPacketTooLarge)?;
         if args.jumphost.is_some() {
@@ -408,6 +410,7 @@ fn run_client(
             lines: crate::client_terminal::RemoteLines::from(remote_mode.terminal_shell),
             connection_name: &request.host_alias,
             close_on_hangup: args.close_on_hangup,
+            no_pty: args.no_pty,
         },
         forwarder,
         |connection| reconnect_with_retry(connection, &endpoint, &credentials, resolver),
@@ -593,6 +596,11 @@ fn validate_bootstrap_mode(args: &ClientArgs) -> Result<(), ClientError> {
     if args.no_exit && args.command.is_none() {
         return Err(ClientError::Unsupported("--no-exit requires --command"));
     }
+    if args.no_pty && args.command.as_deref().unwrap_or("").is_empty() {
+        return Err(ClientError::Unsupported(
+            "-T/--no-pty requires -c/--command",
+        ));
+    }
     Ok(())
 }
 
@@ -690,6 +698,20 @@ fn validate_jumphost(jumphost: &str) -> Result<(), ClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_pty_requires_a_command() {
+        let missing = et_cli::client::ClientArgs::try_parse_from(["et", "-T", "host"]).unwrap();
+        assert!(matches!(
+            validate_bootstrap_mode(&missing),
+            Err(ClientError::Unsupported(
+                "-T/--no-pty requires -c/--command"
+            ))
+        ));
+        let present =
+            et_cli::client::ClientArgs::try_parse_from(["et", "-T", "-c", "true", "host"]).unwrap();
+        assert!(validate_bootstrap_mode(&present).is_ok());
+    }
 
     #[test]
     fn retry_transient_retries_until_success() {

@@ -57,6 +57,9 @@ where
     F: FnOnce(&mut LocalStream) -> Result<(), String>,
 {
     let initialization = read_initialization(&mut router)?;
+    if initialization.no_pty {
+        return crate::terminal_pipe::run(router, initialization, started);
+    }
     // Default sessions now also retain interruptible output in userspace.
     match initialization.flow_control {
         FlowControlMode::None | FlowControlMode::Backpressure | FlowControlMode::Discard => {
@@ -357,6 +360,8 @@ fn write_output(
     }
     let message = TerminalBuffer {
         buffer: Some(output.to_vec()),
+
+        is_stderr: None,
     };
     let packet = Packet::new(
         TerminalPacketType::TerminalBuffer as u8,

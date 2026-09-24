@@ -199,6 +199,7 @@ impl OutputQueue {
     pub fn flush_terminal_on_interrupt(&mut self) -> usize {
         let mut bytes = Vec::new();
         let mut lengths = Vec::new();
+        let mut stderr_flags = Vec::new();
         for packet in &self.terminal {
             // An opaque/malformed packet is not permission to discard data.
             let Ok(message) = TerminalBuffer::decode(packet.payload()) else {
@@ -206,6 +207,7 @@ impl OutputQueue {
             };
             let Some(body) = message.buffer else { return 0 };
             lengths.push(body.len());
+            stderr_flags.push(message.is_stderr);
             bytes.extend(body);
         }
         if bytes.len() < crate::output_interrupt::FLUSH_THRESHOLD {
@@ -215,7 +217,7 @@ impl OutputQueue {
         self.skip_until_newline |= result.skip_until_newline;
         let mut remaining = result.kept.as_slice();
         let mut retained = VecDeque::new();
-        for length in lengths {
+        for (index, length) in lengths.into_iter().enumerate() {
             let Some(packet) = self.terminal.pop_front() else {
                 break;
             };
@@ -227,6 +229,7 @@ impl OutputQueue {
             }
             let body = TerminalBuffer {
                 buffer: Some(remaining[..count].to_vec()),
+                is_stderr: stderr_flags.get(index).copied().flatten(),
             };
             let packet = Packet::new(packet.header(), body.encode_to_vec());
             self.terminal_bytes += packet_cost(&packet);
@@ -246,22 +249,25 @@ impl OutputQueue {
         self.promotion_pending = false;
         let mut bytes = Vec::new();
         let mut lengths = Vec::new();
+        let mut stderr_flags = Vec::new();
         for packet in &self.terminal {
             let Ok(message) = TerminalBuffer::decode(packet.payload()) else {
                 return;
             };
             let Some(body) = message.buffer else { return };
             lengths.push(body.len());
+            stderr_flags.push(message.is_stderr);
             bytes.extend(body);
         }
         let Some(promoted) = self.stream.promote_control(&bytes) else {
             return;
         };
         let mut remaining = promoted.as_slice();
-        for (packet, length) in self.terminal.iter_mut().zip(lengths) {
+        for (index, (packet, length)) in self.terminal.iter_mut().zip(lengths).enumerate() {
             self.terminal_bytes -= packet_cost(packet);
             let body = TerminalBuffer {
                 buffer: Some(remaining[..length].to_vec()),
+                is_stderr: stderr_flags.get(index).copied().flatten(),
             };
             *packet = Packet::new(packet.header(), body.encode_to_vec());
             self.terminal_bytes += packet_cost(packet);
@@ -286,12 +292,14 @@ fn truncate_terminal(packet: Packet, limit: usize) -> Result<Packet, Packet> {
     let Some(bytes) = message.buffer else {
         return Err(packet);
     };
+    let is_stderr = message.is_stderr;
     let mut low = 0usize;
     let mut high = bytes.len();
     while low < high {
         let middle = low + (high - low).div_ceil(2);
         let encoded = TerminalBuffer {
             buffer: Some(bytes[bytes.len() - middle..].to_vec()),
+            is_stderr,
         }
         .encode_to_vec();
         if encoded
@@ -306,6 +314,7 @@ fn truncate_terminal(packet: Packet, limit: usize) -> Result<Packet, Packet> {
     }
     let encoded = TerminalBuffer {
         buffer: Some(bytes[bytes.len() - low..].to_vec()),
+        is_stderr,
     }
     .encode_to_vec();
     Ok(Packet::new(packet.header(), encoded))

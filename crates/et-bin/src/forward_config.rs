@@ -148,6 +148,10 @@ pub fn build(
             jumphost: Some(false),
             reversetunnels: reverse_tunnels,
             environmentvariables: std::collections::HashMap::new(),
+            no_pty: args.no_pty.then_some(true),
+            command: args
+                .no_pty
+                .then(|| args.command.clone().unwrap_or_default()),
             flowcontrol: args.flow_control.protocol_value(),
         },
     })

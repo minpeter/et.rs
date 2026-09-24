@@ -60,6 +60,8 @@ impl Shell {
                 TerminalPacketType::TerminalBuffer as u8,
                 &TerminalBuffer {
                     buffer: Some(command.as_bytes().to_vec()),
+
+                    is_stderr: None,
                 }
                 .encode_to_vec(),
             )

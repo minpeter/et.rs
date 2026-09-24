@@ -53,6 +53,8 @@ pub struct TerminalOptions<'a> {
     pub lines: RemoteLines,
     pub connection_name: &'a str,
     pub close_on_hangup: bool,
+    /// `et -T`: binary stdio, no pty, no shell-injected command.
+    pub no_pty: bool,
 }
 
 pub fn run<F>(
@@ -73,6 +75,7 @@ where
         lines,
         connection_name,
         close_on_hangup,
+        no_pty,
     } = options;
     let hangup = if close_on_hangup {
         crate::client_hangup::HangupClose::install()
@@ -80,7 +83,7 @@ where
     } else {
         crate::client_hangup::HangupClose::disabled()
     };
-    let raw_mode = if terminal_enabled {
+    let raw_mode = if terminal_enabled && !no_pty {
         RawMode::enter()?
     } else {
         RawMode {
@@ -97,7 +100,7 @@ where
     // replay-buffered by `Connection`. Retry plaintext only when admission
     // failed before replay ownership; after admission, recover and let the
     // buffered packet replay instead of duplicating a `--command`.
-    if terminal_enabled {
+    if terminal_enabled && !no_pty {
         if let Some(initial_size) = terminal_size_payload() {
             if matches!(
                 write_terminal_size_recovering(&mut connection, &initial_size, &mut reconnect)?,
@@ -107,7 +110,9 @@ where
             }
         }
     }
-    if terminal_enabled {
+    // `-T` carries the command in InitialPayload. Typing it into a shell
+    // would inject `; exit` and would not be the raw pipe channel.
+    if terminal_enabled && !no_pty {
         if let Some(command) = command {
             let initial_command = command_payload(command, no_exit, lines)?;
             if matches!(
@@ -124,11 +129,16 @@ where
             }
         }
     }
-    let read_stdin = terminal_enabled && (command.is_none() || io::stdin().is_terminal());
+    let read_stdin = if no_pty {
+        terminal_enabled
+    } else {
+        terminal_enabled && (command.is_none() || io::stdin().is_terminal())
+    };
     // With `--command` (or without a real console) nothing will answer a
     // ConPTY cursor-position request, so the client answers it itself.
+    // Raw pipe sessions are binary and must not answer cursor reports.
     let auto_cursor_report =
-        command.is_some() || !io::stdout().is_terminal() || !io::stdin().is_terminal();
+        !no_pty && (command.is_some() || !io::stdout().is_terminal() || !io::stdin().is_terminal());
 
     // Unix reacts to SIGWINCH and polls stdin, the socket, and the forwarder
     // together. Windows has no SIGWINCH and cannot select() a console handle,
@@ -168,6 +178,7 @@ where
                 flow_control,
                 terminal_enabled,
                 auto_cursor_report,
+                binary_stdio: no_pty,
                 terminal_modes: &mut terminal_modes,
                 hangup: &hangup,
             },
@@ -187,6 +198,7 @@ where
             flow_control,
             terminal_enabled,
             auto_cursor_report,
+            binary_stdio: no_pty,
             terminal_modes: &mut terminal_modes,
             hangup: &hangup,
         },
@@ -268,7 +280,7 @@ pub(crate) fn display_packet_with<F>(
     mut output: F,
 ) -> Result<DisplayOutcome, ClientError>
 where
-    F: FnMut(&[u8]) -> Result<bool, ClientError>,
+    F: FnMut(&[u8], bool) -> Result<bool, ClientError>,
 {
     match packet.header() {
         value if value == TerminalPacketType::TerminalBuffer as u8 => {
@@ -277,11 +289,12 @@ where
             let bytes = message
                 .buffer
                 .ok_or_else(|| terminal_text("terminal output is missing bytes"))?;
-            if !output(&bytes)? {
+            let is_stderr = message.is_stderr.unwrap_or(false);
+            if !output(&bytes, is_stderr)? {
                 return Ok(DisplayOutcome::Pending(packet));
             }
             Ok(DisplayOutcome::Displayed {
-                cursor_report: contains_cursor_report_request(&bytes),
+                cursor_report: !is_stderr && contains_cursor_report_request(&bytes),
             })
         }
         value if value == TerminalPacketType::KeepAlive as u8 => Ok(DisplayOutcome::Displayed {
@@ -324,8 +337,21 @@ fn command_payload(
 pub(crate) fn encoded_buffer(bytes: &[u8]) -> Vec<u8> {
     TerminalBuffer {
         buffer: Some(bytes.to_vec()),
+        is_stderr: None,
     }
     .encode_to_vec()
+}
+
+pub(crate) fn write_binary_stdio(is_stderr: bool, bytes: &[u8]) -> Result<bool, ClientError> {
+    let write = |output: &mut dyn Write| output.write_all(bytes).and_then(|()| output.flush());
+    let result = if is_stderr {
+        write(&mut io::stderr().lock())
+    } else {
+        write(&mut io::stdout().lock())
+    };
+    result
+        .map(|()| true)
+        .map_err(|error| terminal_io("writing binary stdio", error))
 }
 
 #[cfg(test)]

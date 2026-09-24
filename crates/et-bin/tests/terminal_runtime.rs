@@ -80,6 +80,9 @@ fn assert_motd_prompt_spacing(
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
             flowcontrol: None,
+
+            no_pty: None,
+            command: None,
         },
     );
     expect_startup(&mut router);
@@ -99,6 +102,8 @@ fn assert_motd_prompt_spacing(
         TerminalPacketType::TerminalBuffer,
         &TerminalBuffer {
             buffer: Some(b"exit\n".to_vec()),
+
+            is_stderr: None,
         },
     );
     let status = child.wait_timeout(TIMEOUT).unwrap().unwrap();
@@ -141,6 +146,9 @@ fn framed_terminal_close_shuts_the_pty_down_successfully() {
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
             flowcontrol: None,
+
+            no_pty: None,
+            command: None,
         },
     );
     expect_startup(&mut router);
@@ -203,6 +211,9 @@ fn bootstrap_parent_reports_marker_and_leaves_registered_session_running() {
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
             flowcontrol: None,
+
+            no_pty: None,
+            command: None,
         },
     );
     expect_startup(&mut router);
@@ -211,6 +222,8 @@ fn bootstrap_parent_reports_marker_and_leaves_registered_session_running() {
         TerminalPacketType::TerminalBuffer,
         &TerminalBuffer {
             buffer: Some(b"printf 'DETACHED-PTY\\n'; exit\n".to_vec()),
+
+            is_stderr: None,
         },
     );
     let mut output = Vec::new();
@@ -317,6 +330,9 @@ fn new_terminal_uses_legacy_sequence_with_old_router() {
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
             flowcontrol: None,
+
+            no_pty: None,
+            command: None,
         },
     );
     send(
@@ -324,6 +340,8 @@ fn new_terminal_uses_legacy_sequence_with_old_router() {
         TerminalPacketType::TerminalBuffer,
         &TerminalBuffer {
             buffer: Some(b"printf 'MIXED-OLD-ROUTER\\n'; exit\n".to_vec()),
+
+            is_stderr: None,
         },
     );
     let output = collect_until(&mut router, |output| contains(output, b"MIXED-OLD-ROUTER"));
@@ -356,6 +374,9 @@ fn real_terminal_registers_runs_shell_and_resizes_pty() {
             environmentnames: vec!["G004_VALUE".to_owned()],
             environmentvalues: vec!["literal-value".to_owned()],
             flowcontrol: None,
+
+            no_pty: None,
+            command: None,
         },
     );
     expect_startup(&mut router);
@@ -377,6 +398,8 @@ fn real_terminal_registers_runs_shell_and_resizes_pty() {
             buffer: Some(
                 b"printf 'ETPTY:%s:%s\\n' \"$TERM\" \"$G004_VALUE\"; stty size; exit 7\n".to_vec(),
             ),
+
+            is_stderr: None,
         },
     );
 
@@ -414,6 +437,9 @@ fn pty_output_backpressure_longer_than_two_seconds_preserves_session_and_order()
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
             flowcontrol: None,
+
+            no_pty: None,
+            command: None,
         },
     );
     expect_startup(&mut router);
@@ -422,6 +448,8 @@ fn pty_output_backpressure_longer_than_two_seconds_preserves_session_and_order()
         TerminalPacketType::TerminalBuffer,
         &TerminalBuffer {
             buffer: Some(b"stty -echo; printf 'PTY-BACKPRESSURE-%s\\n' READY\n".to_vec()),
+
+            is_stderr: None,
         },
     );
     let _ = collect_until(&mut router, |output| {
@@ -435,6 +463,8 @@ fn pty_output_backpressure_longer_than_two_seconds_preserves_session_and_order()
                 b"head -c 1048576 /dev/zero | tr '\\000' x; printf 'PTY-BACKPRESSURE-%s\\n' MARKER; exit\n"
                     .to_vec(),
             ),
+
+            is_stderr: None,
         },
     );
 
@@ -520,6 +550,9 @@ fn router_disconnect_terminates_the_shell() {
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
             flowcontrol: None,
+
+            no_pty: None,
+            command: None,
         },
     );
     expect_startup(&mut router);
@@ -546,6 +579,9 @@ fn real_terminal_starts_login_shell_and_loads_profile_color() {
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
             flowcontrol: None,
+
+            no_pty: None,
+            command: None,
         },
     );
     expect_startup(&mut router);
@@ -554,6 +590,8 @@ fn real_terminal_starts_login_shell_and_loads_profile_color() {
         TerminalPacketType::TerminalBuffer,
         &TerminalBuffer {
             buffer: Some(b"exit\n".to_vec()),
+
+            is_stderr: None,
         },
     );
     let output = collect_until(&mut router, |output| {
@@ -591,6 +629,9 @@ fn real_terminal_login_shell_preserves_term_without_colorterm() {
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
             flowcontrol: None,
+
+            no_pty: None,
+            command: None,
         },
     );
     expect_startup(&mut router);
@@ -601,6 +642,8 @@ fn real_terminal_login_shell_preserves_term_without_colorterm() {
             buffer: Some(
                 b"printf '\\nTERM=%s\\nCOLORTERM=%s\\n' \"$TERM\" \"${COLORTERM-}\"; printf '__ET_LOGIN_TERM_%s__\\n' COMPLETE; exit\n".to_vec(),
             ),
+
+            is_stderr: None,
         },
     );
     let output = collect_until(&mut router, |output| {
@@ -655,6 +698,9 @@ fn real_terminal_emits_motd_before_login_shell_output() {
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
             flowcontrol: None,
+
+            no_pty: None,
+            command: None,
         },
     );
     expect_startup(&mut router);
@@ -663,6 +709,8 @@ fn real_terminal_emits_motd_before_login_shell_output() {
         TerminalPacketType::TerminalBuffer,
         &TerminalBuffer {
             buffer: Some(b"exit\n".to_vec()),
+
+            is_stderr: None,
         },
     );
     let output = collect_until(&mut router, |output| contains(output, LOGIN_COLOR_MARKER));
@@ -753,6 +801,9 @@ fn real_terminal_emits_last_login_between_motd_and_prompt() {
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
             flowcontrol: None,
+
+            no_pty: None,
+            command: None,
         },
     );
     expect_startup(&mut router);
@@ -772,6 +823,8 @@ fn real_terminal_emits_last_login_between_motd_and_prompt() {
         TerminalPacketType::TerminalBuffer,
         &TerminalBuffer {
             buffer: Some(b"exit\n".to_vec()),
+
+            is_stderr: None,
         },
     );
     let status = child.wait_timeout(TIMEOUT).unwrap().unwrap();
@@ -819,6 +872,9 @@ fn real_terminal_suppresses_motd_when_home_has_hushlogin() {
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
             flowcontrol: None,
+
+            no_pty: None,
+            command: None,
         },
     );
     expect_startup(&mut router);
@@ -827,6 +883,8 @@ fn real_terminal_suppresses_motd_when_home_has_hushlogin() {
         TerminalPacketType::TerminalBuffer,
         &TerminalBuffer {
             buffer: Some(b"exit\n".to_vec()),
+
+            is_stderr: None,
         },
     );
     let output = collect_until(&mut router, |output| contains(output, LOGIN_COLOR_MARKER));

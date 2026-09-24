@@ -131,8 +131,43 @@ fn flow_control_opt_in_modes_use_additive_proto_fields() {
         ..Default::default()
     };
 
-    assert_eq!(enc(&initial), [0x20, 0x01]);
-    assert_eq!(enc(&term), [0x18, 0x02]);
+    // Field 4/3 are upstream no_pty (ET #854). Flow control lives at
+    // InitialPayload field 6 and TermInit field 5 so Backpressure (varint 1)
+    // is not the same bytes as no_pty=true.
+    assert_eq!(enc(&initial), [0x30, 0x01]);
+    assert_eq!(enc(&term), [0x28, 0x02]);
+}
+
+#[test]
+fn raw_pipe_fields_match_upstream_wire_bytes() {
+    assert_eq!(et_core::PROTOCOL_VERSION, 6);
+    let initial = et::InitialPayload {
+        no_pty: Some(true),
+        command: Some("id".to_owned()),
+        ..Default::default()
+    };
+    let term = et::TermInit {
+        no_pty: Some(true),
+        command: Some("id".to_owned()),
+        ..Default::default()
+    };
+    let stdout = et::TerminalBuffer {
+        buffer: Some(b"hi".to_vec()),
+        is_stderr: None,
+    };
+    let stderr = et::TerminalBuffer {
+        buffer: Some(b"hi".to_vec()),
+        is_stderr: Some(true),
+    };
+
+    // InitialPayload: field 4 bool true, field 5 string "id".
+    assert_eq!(enc(&initial), [0x20, 0x01, 0x2a, 0x02, b'i', b'd']);
+    // TermInit: field 3 bool true, field 4 string "id".
+    assert_eq!(enc(&term), [0x18, 0x01, 0x22, 0x02, b'i', b'd']);
+    assert_eq!(enc(&stdout), [0x0a, 0x02, b'h', b'i']);
+    assert_eq!(enc(&stderr), [0x0a, 0x02, b'h', b'i', 0x10, 0x01]);
+    assert!(enc(&et::InitialPayload::default()).is_empty());
+    assert!(enc(&et::TermInit::default()).is_empty());
 }
 
 #[test]

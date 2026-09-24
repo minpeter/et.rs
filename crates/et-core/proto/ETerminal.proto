@@ -25,6 +25,9 @@ enum FlowControlMode {
 
 message TerminalBuffer {
   optional bytes buffer = 1;
+  // When true, buffer is remote stderr (raw pipe / -T sessions only).
+  // Named is_stderr (not stderr): musl #defines stderr as a macro.
+  optional bool is_stderr = 2 [default = false];
 }
 
 message TerminalInfo {
@@ -80,7 +83,13 @@ message InitialPayload {
   optional bool jumphost = 1 [default = false];
   repeated PortForwardSourceRequest reversetunnels = 2;
   map<string, string> environmentvariables = 3;
-  optional FlowControlMode flowcontrol = 4 [default = NONE];
+  // When true, etterminal runs `command` on pipes instead of a login pty.
+  // Field 4 matches EternalTerminal #854. et.rs flow control previously used
+  // this tag; it moved to field 6 so Backpressure (varint 1) is not decoded
+  // as no_pty=true. PROTOCOL_VERSION stays 6.
+  optional bool no_pty = 4 [default = false];
+  optional string command = 5;
+  optional FlowControlMode flowcontrol = 6 [default = NONE];
 }
 
 message InitialResponse {
@@ -95,7 +104,11 @@ message ConfigParams {
 message TermInit {
   repeated string environmentnames = 1;
   repeated string environmentvalues = 2;
-  optional FlowControlMode flowcontrol = 3 [default = NONE];
+  // Field 3 matches EternalTerminal #854 no_pty. Flow control moved to field 5
+  // so it does not collide with that bool. PROTOCOL_VERSION stays 6.
+  optional bool no_pty = 3 [default = false];
+  optional string command = 4;
+  optional FlowControlMode flowcontrol = 5 [default = NONE];
 }
 
 message TerminalUserInfo {

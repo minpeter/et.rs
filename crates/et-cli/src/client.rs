@@ -121,6 +121,15 @@ pub struct ClientArgs {
     #[arg(short = 'N', long = "no-terminal")]
     pub no_terminal: bool,
 
+    /// Run `-c` on pipes instead of a pty: binary stdio, separate stderr, no
+    /// shell injection. Matches EternalTerminal `-T` / `--no-pty`.
+    #[arg(
+        short = 'T',
+        long = "no-pty",
+        help = "Run -c command on pipes instead of a pty (binary stdio, separate stderr, no shell injection)"
+    )]
+    pub no_pty: bool,
+
     #[arg(short = 'f', long = "forward-ssh-agent")]
     pub forward_ssh_agent: bool,
 
@@ -282,6 +291,16 @@ mod tests {
         let discard =
             ClientArgs::try_parse_from(["et", "host", "--flow-control", "discard"]).unwrap();
         assert_eq!(discard.flow_control, FlowControlMode::Discard);
+    }
+
+    #[test]
+    fn no_pty_flag_parses_with_command() {
+        let raw = ClientArgs::try_parse_from(["et", "-T", "-c", "printf ok", "host"]).unwrap();
+        assert!(raw.no_pty);
+        assert_eq!(raw.command.as_deref(), Some("printf ok"));
+        let long =
+            ClientArgs::try_parse_from(["et", "--no-pty", "--command", "true", "host"]).unwrap();
+        assert!(long.no_pty);
     }
 
     #[test]

@@ -14,6 +14,9 @@ const READ_BUFFER: usize = 16 * 1024;
 pub struct TerminalInitialization {
     pub environment: Vec<(String, String)>,
     pub flow_control: FlowControlMode,
+    /// `TermInit.no_pty`: run `command` on pipes instead of a login pty.
+    pub no_pty: bool,
+    pub command: Option<String>,
 }
 
 pub fn read_initialization(router: &mut LocalStream) -> Result<TerminalInitialization, String> {
@@ -48,6 +51,8 @@ pub fn read_initialization(router: &mut LocalStream) -> Result<TerminalInitializ
     Ok(TerminalInitialization {
         environment,
         flow_control,
+        no_pty: init.no_pty.unwrap_or(false),
+        command: init.command,
     })
 }
 
@@ -211,6 +216,8 @@ mod tests {
             TerminalPacketType::TerminalBuffer as u8,
             TerminalBuffer {
                 buffer: Some(Vec::new()),
+
+                is_stderr: None,
             }
             .encode_to_vec(),
         );
@@ -225,21 +232,33 @@ mod tests {
                 environmentnames: vec!["A".to_owned()],
                 environmentvalues: Vec::new(),
                 flowcontrol: None,
+
+                no_pty: None,
+                command: None,
             },
             TermInit {
                 environmentnames: vec!["BAD-NAME".to_owned()],
                 environmentvalues: vec!["value".to_owned()],
                 flowcontrol: None,
+
+                no_pty: None,
+                command: None,
             },
             TermInit {
                 environmentnames: vec!["VALID".to_owned()],
                 environmentvalues: vec!["bad\0value".to_owned()],
                 flowcontrol: None,
+
+                no_pty: None,
+                command: None,
             },
             TermInit {
                 environmentnames: vec!["VALID".to_owned()],
                 environmentvalues: vec!["x".repeat(MAX_ENV_VALUE + 1)],
                 flowcontrol: None,
+
+                no_pty: None,
+                command: None,
             },
         ] {
             let packet = Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec());
@@ -281,6 +300,9 @@ mod tests {
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
             flowcontrol: Some(FlowControlMode::Discard as i32),
+
+            no_pty: None,
+            command: None,
         };
         write_local_packet(
             &mut server,

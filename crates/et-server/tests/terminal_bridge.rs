@@ -32,6 +32,8 @@ fn encrypted_client_and_registered_terminal_exchange_packets() {
 
     let input = TerminalBuffer {
         buffer: Some(b"client-input".to_vec()),
+
+        is_stderr: None,
     };
     client
         .write_packet(
@@ -41,6 +43,8 @@ fn encrypted_client_and_registered_terminal_exchange_packets() {
         .unwrap();
     let second_input = TerminalBuffer {
         buffer: Some(b"second-input".to_vec()),
+
+        is_stderr: None,
     };
     client
         .write_packet(
@@ -67,6 +71,8 @@ fn encrypted_client_and_registered_terminal_exchange_packets() {
 
     let output = TerminalBuffer {
         buffer: Some(b"terminal-output".to_vec()),
+
+        is_stderr: None,
     };
     write_local_packet(
         &mut terminal,
@@ -132,9 +138,13 @@ fn terminal_hup_still_delivers_buffered_final_packet() {
     let final_packets = [
         TerminalBuffer {
             buffer: Some(b"final-terminal-packet-one".to_vec()),
+
+            is_stderr: None,
         },
         TerminalBuffer {
             buffer: Some(b"final-terminal-packet-two".to_vec()),
+
+            is_stderr: None,
         },
     ];
     for packet in &final_packets {
@@ -183,6 +193,8 @@ fn flow_control_mode_reaches_terminal_and_relays_output() {
 
     let output = TerminalBuffer {
         buffer: Some(b"flow-controlled-output".to_vec()),
+
+        is_stderr: None,
     };
     write_local_packet(
         &mut terminal,
@@ -221,6 +233,8 @@ fn saturated_terminal_hup_retains_final_packets_by_mode() {
         let packets: Vec<TerminalBuffer> = (0u8..32)
             .map(|value| TerminalBuffer {
                 buffer: Some(vec![value; 16 * 1024]),
+
+                is_stderr: None,
             })
             .collect();
         let sent_packets = packets.clone();
@@ -329,6 +343,8 @@ fn terminal_close_ends_only_that_session() {
 
     let input = TerminalBuffer {
         buffer: Some(b"still-alive".to_vec()),
+
+        is_stderr: None,
     };
     client_b
         .write_packet(
@@ -376,6 +392,8 @@ fn unknown_client_packet_is_session_local() {
 
     let input = TerminalBuffer {
         buffer: Some(b"other-session".to_vec()),
+
+        is_stderr: None,
     };
     client_b
         .write_packet(

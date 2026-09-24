@@ -81,6 +81,9 @@ pub(crate) struct ActiveSession {
     flow_writer: Mutex<Option<std::thread::JoinHandle<()>>>,
     bridge_generation: Mutex<u64>,
     bridge_changed: Condvar,
+    /// Raw pipe session (`InitialPayload.no_pty`). Binary stdin must not be
+    /// treated as a terminal interrupt.
+    pipe_mode: bool,
 }
 
 pub(crate) enum SessionConnection {
@@ -138,9 +141,18 @@ impl std::error::Error for SessionError {
 
 impl ActiveSession {
     pub(crate) fn new(
+        connection: Connection,
+        terminal: &LocalStream,
+        flow_control: Option<i32>,
+    ) -> Result<Self, SessionError> {
+        Self::new_with_pipe(connection, terminal, flow_control, false)
+    }
+
+    pub(crate) fn new_with_pipe(
         mut connection: Connection,
         terminal: &LocalStream,
         flow_control: Option<i32>,
+        pipe_mode: bool,
     ) -> Result<Self, SessionError> {
         let queue_mode = queue_mode(flow_control);
         connection
@@ -174,6 +186,7 @@ impl ActiveSession {
             flow_writer: Mutex::new(None),
             bridge_generation: Mutex::new(0),
             bridge_changed: Condvar::new(),
+            pipe_mode,
         })
     }
 

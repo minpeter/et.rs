@@ -63,9 +63,13 @@ fn assert_motd_prompt_spacing(
     let fixture = Fixture::new(fixture_name);
     let motd = fixture.file("motd", motd_contents);
     let shell = shell_factory(&fixture);
+    let home = motd.parent().unwrap().to_owned();
     let mut child = fixture.spawn_session(
         shell.to_str().unwrap(),
-        &[("ET_MOTD_PATH", motd.as_os_str())],
+        &[
+            ("ET_MOTD_PATH", motd.as_os_str()),
+            ("HOME", home.as_os_str()),
+        ],
     );
     write_credentials(&mut child);
     let mut router = fixture.accept();
@@ -680,9 +684,13 @@ fn real_terminal_emits_motd_before_login_shell_output() {
     let fixture = Fixture::new("motd-before-shell");
     let motd = fixture.file("motd", b"ET-MOTD-MARKER\n");
     let shell = fixture.login_probe_shell();
+    let home = motd.parent().unwrap().to_owned();
     let mut child = fixture.spawn_session(
         shell.to_str().unwrap(),
-        &[("ET_MOTD_PATH", motd.as_os_str())],
+        &[
+            ("ET_MOTD_PATH", motd.as_os_str()),
+            ("HOME", home.as_os_str()),
+        ],
     );
     write_credentials(&mut child);
     let mut router = fixture.accept();
@@ -780,12 +788,14 @@ fn real_terminal_emits_last_login_between_motd_and_prompt() {
     let lastlog = fixture.file("lastlog", b"");
     write_lastlog_record(&lastlog, 1_788_475_267, b"127.0.0.1");
     let shell = fixture.prompt_probe_shell();
+    let home = motd.parent().unwrap().to_owned();
     let mut child = fixture.spawn_session(
         shell.to_str().unwrap(),
         &[
             ("ET_MOTD_PATH", motd.as_os_str()),
             ("ET_LASTLOG_PATH", lastlog.as_os_str()),
             ("TZ", std::ffi::OsStr::new("UTC")),
+            ("HOME", home.as_os_str()),
         ],
     );
     write_credentials(&mut child);

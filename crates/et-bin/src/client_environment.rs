@@ -84,12 +84,15 @@ pub(crate) fn bounded_locale_environment(
     candidates: impl IntoIterator<Item = (String, String)>,
     reserved: &BTreeMap<String, usize>,
     flowcontrol: Option<i32>,
+    pipe_command: Option<&str>,
 ) -> Result<Vec<(String, String)>, usize> {
     let mut packet_len = Packet::new(
         TerminalPacketType::TerminalInit as u8,
         TermInit {
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
+            no_pty: pipe_command.map(|_| true),
+            command: pipe_command.map(str::to_owned),
             flowcontrol,
         }
         .encode_to_vec(),
@@ -193,6 +196,7 @@ mod tests {
             ],
             &std::collections::BTreeMap::from([("SSH_AUTH_SOCK".into(), 321)]),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(selected, [("APP".into(), "first".into())]);
@@ -220,6 +224,9 @@ mod tests {
             reversetunnels: vec![request; 128],
             environmentvariables: Default::default(),
             flowcontrol: None,
+
+            no_pty: None,
+            command: None,
         };
         let mut locale = vec![
             ("LC_ALL".to_owned(), "C".to_owned()),
@@ -268,6 +275,9 @@ mod tests {
                         environmentnames: vec![name.clone()],
                         environmentvalues: vec!["x".repeat(*value_len)],
                         flowcontrol: None,
+
+                        no_pty: None,
+                        command: None,
                     };
                     Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec())
                         .wire_len()
@@ -280,6 +290,7 @@ mod tests {
                 [(name, "x".repeat(value_len))],
                 &reserved,
                 Some(mode as i32),
+                None,
             )
             .unwrap();
 
@@ -288,6 +299,9 @@ mod tests {
                 environmentnames: selected.iter().map(|(name, _)| name.clone()).collect(),
                 environmentvalues: selected.into_iter().map(|(_, value)| value).collect(),
                 flowcontrol: Some(mode as i32),
+
+                no_pty: None,
+                command: None,
             };
             assert!(
                 Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec(),)
@@ -307,15 +321,22 @@ mod tests {
                     environmentnames: vec![name.clone()],
                     environmentvalues: vec!["x".repeat(*value_len)],
                     flowcontrol: None,
+
+                    no_pty: None,
+                    command: None,
                 };
                 Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec()).wire_len()
                     == MAX_LOCAL_PACKET_LEN
             })
             .unwrap();
 
-        let selected =
-            super::bounded_locale_environment([(name, "x".repeat(value_len))], &reserved, None)
-                .unwrap();
+        let selected = super::bounded_locale_environment(
+            [(name, "x".repeat(value_len))],
+            &reserved,
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(selected[0].1.len(), value_len);
     }

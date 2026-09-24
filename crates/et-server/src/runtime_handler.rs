@@ -23,6 +23,27 @@ use crate::session_table::SessionClaim;
 const INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(8);
 const INITIALIZATION_RESPONSE_MARGIN: Duration = Duration::from_millis(500);
 
+/// Build the local `TERMINAL_INIT` for etterminal.
+///
+/// `no_pty` and `command` use the EternalTerminal #854 field numbers. Flow
+/// control stays on its relocated tag so it is not confused with `no_pty`.
+pub(crate) fn terminal_init_from_payload(
+    environment: &std::collections::BTreeMap<String, String>,
+    payload: &InitialPayload,
+) -> Result<TermInit, &'static str> {
+    let pipe_mode = payload.no_pty.unwrap_or(false);
+    if pipe_mode && payload.command.as_deref().unwrap_or("").is_empty() {
+        return Err("no_pty requires a non-empty command");
+    }
+    Ok(TermInit {
+        environmentnames: environment.keys().cloned().collect(),
+        environmentvalues: environment.values().cloned().collect(),
+        no_pty: pipe_mode.then_some(true),
+        command: pipe_mode.then(|| payload.command.clone().unwrap_or_default()),
+        flowcontrol: payload.flowcontrol,
+    })
+}
+
 pub(crate) fn handle(
     stream: TcpStream,
     core: Arc<RuntimeCore>,
@@ -379,10 +400,12 @@ fn handle_new(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     environment.extend(forward_environment);
-    let term_init = TermInit {
-        environmentnames: environment.keys().cloned().collect(),
-        environmentvalues: environment.values().cloned().collect(),
-        flowcontrol: payload.flowcontrol,
+    let term_init = match terminal_init_from_payload(&environment, &payload) {
+        Ok(term_init) => term_init,
+        Err(message) => {
+            send_initial_error(&mut connection, message);
+            return;
+        }
     };
     let init_packet = et_core::packet::Packet::new(
         TerminalPacketType::TerminalInit as u8,
@@ -426,7 +449,12 @@ fn handle_new(
         ));
         return;
     }
-    let active = match ActiveSession::new(connection, &terminal, payload.flowcontrol) {
+    let active = match ActiveSession::new_with_pipe(
+        connection,
+        &terminal,
+        payload.flowcontrol,
+        payload.no_pty.unwrap_or(false),
+    ) {
         Ok(active) => active,
         Err(error) => {
             crate::diag::info(format!(

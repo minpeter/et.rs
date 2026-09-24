@@ -37,6 +37,8 @@ fn malformed_initialization_and_shell_spawn_failure_are_typed() {
         TerminalPacketType::TerminalBuffer,
         &TerminalBuffer {
             buffer: Some(Vec::new()),
+
+            is_stderr: None,
         },
     );
     assert!(!malformed_child
@@ -59,6 +61,9 @@ fn malformed_initialization_and_shell_spawn_failure_are_typed() {
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
             flowcontrol: None,
+
+            no_pty: None,
+            command: None,
         },
     );
     assert!(!failed_child
@@ -96,6 +101,9 @@ fn shell_exit_reaps_background_process_group() {
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
             flowcontrol: None,
+
+            no_pty: None,
+            command: None,
         },
     );
     let mut output = String::new();

@@ -217,6 +217,8 @@ fn discard_flow_control_resumes_queued_terminal_output_after_recovery() {
     client.shutdown().unwrap();
     let output = TerminalBuffer {
         buffer: Some(b"newest-while-disconnected".to_vec()),
+
+        is_stderr: None,
     };
     write_local_packet(
         &mut terminal,

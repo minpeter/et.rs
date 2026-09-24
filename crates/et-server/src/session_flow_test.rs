@@ -573,6 +573,7 @@ fn full_control_lane_rejects_nonblocking_while_discard_terminal_and_recovery_pro
         et_core::proto::TerminalPacketType::TerminalBuffer as u8,
         et_core::proto::TerminalBuffer {
             buffer: Some(b"newest".to_vec()),
+            is_stderr: None,
         }
         .encode_to_vec(),
     );

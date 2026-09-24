@@ -13,7 +13,7 @@
 # Classified 2026-09-21. #804 passed independent review in et.rs #100.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-09-23"
+classified: "2026-09-24"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -282,3 +282,21 @@ commits:
     status: skip
     note: "#570/#829 C++ TelemetryService.cpp crash-signal handler (signal(sig, SIG_DFL)+raise) stops the infinite loop. et.rs has no telemetry. Not wire/auth. No Rust code port. PROTOCOL_VERSION stays 6."
     et_pr: 570
+  - sha: 34b194813dc4a660370755c4306a19a489edf5d2
+    date: "2026-09-23"
+    kind: protocol
+    status: ported
+    note: "#854 raw pipe command channel: TerminalBuffer.is_stderr, InitialPayload/TermInit no_pty+command, et -T. et.rs flowcontrol fields moved to 6/5 so they do not collide with upstream no_pty. PROTOCOL_VERSION stays 6."
+    et_pr: 854
+  - sha: 7a0fe09bc92eb80e7441c9d974daa9665c596113
+    date: "2026-09-23"
+    kind: product
+    status: skip
+    note: "#850 ssh-style positional remote command (ClientArgParsing). Product/CLI only; not wire. PROTOCOL_VERSION stays 6."
+    et_pr: 850
+  - sha: bb4701d8a67be77496bd5926ca6a4fa2cc07e991
+    date: "2026-09-23"
+    kind: product
+    status: skip
+    note: "#855 etserver --disconnect-timeout closes disconnected etterminal sessions. Product/cfg; existing TERMINAL_CLOSE covers explicit close. Not a protocol bump. PROTOCOL_VERSION stays 6."
+    et_pr: 855

@@ -57,6 +57,7 @@ fn close_on_hangup_sends_terminal_close_and_exits_the_loop() {
             flow_control: et_cli::client::FlowControlMode::None,
             terminal_enabled: false,
             auto_cursor_report: false,
+            binary_stdio: false,
             terminal_modes: &mut modes,
             hangup: &hangup,
         },
@@ -117,12 +118,14 @@ fn pending_console_output_does_not_block_terminal_input() {
         TerminalPacketType::TerminalBuffer as u8,
         TerminalBuffer {
             buffer: Some(b"pending".to_vec()),
+
+            is_stderr: None,
         }
         .encode_to_vec(),
     );
     let mut modes = TerminalModeState::default();
     assert!(matches!(
-        route_server_packet(packet, true, &mut modes, &output).unwrap(),
+        route_server_packet(packet, true, false, &mut modes, &output).unwrap(),
         DisplayOutcome::Pending(_)
     ));
 
@@ -172,6 +175,8 @@ fn remote_completion_bounds_a_retained_packet_behind_stalled_output() {
         TerminalPacketType::TerminalBuffer as u8,
         TerminalBuffer {
             buffer: Some(b"retained".to_vec()),
+
+            is_stderr: None,
         }
         .encode_to_vec(),
     );
@@ -185,6 +190,7 @@ fn remote_completion_bounds_a_retained_packet_behind_stalled_output() {
                 Some(retained),
                 VecDeque::new(),
                 true,
+                false,
                 &mut terminal_modes,
                 &mut forwarder,
                 None,
@@ -215,6 +221,8 @@ fn remote_completion_attempts_retained_output_before_draining() {
         TerminalPacketType::TerminalBuffer as u8,
         TerminalBuffer {
             buffer: Some(vec![b'x'; 64 * 1024 + 1]),
+
+            is_stderr: None,
         }
         .encode_to_vec(),
     );
@@ -226,6 +234,7 @@ fn remote_completion_attempts_retained_output_before_draining() {
         Some(retained),
         VecDeque::new(),
         true,
+        false,
         &mut terminal_modes,
         &mut forwarder,
         None,

@@ -56,6 +56,9 @@ fn real_client_recovers_same_shell_and_once_only_buffered_output() {
     client.env("TERM", "xterm-256color");
     client.env("ET_SSH_COUNT", &stack.ssh_count);
     client.env("ET_MOTD_PATH", &motd);
+    // etterminal inherits this process environment. A runner ~/.hushlogin
+    // would suppress the MOTD this test asserts.
+    client.env("HOME", &stack.directory);
     let client_ready = stack.directory.join("client-ready");
     client.env("ET_SSH_READY", &client_ready);
     let mut child = pair.slave.spawn_command(client).unwrap();

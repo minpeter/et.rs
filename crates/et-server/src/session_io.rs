@@ -55,7 +55,11 @@ impl ActiveSession {
                         },
                     )?;
                     if let Some(bytes) = input.buffer {
-                        flow.observe_input(&bytes)?;
+                        // Pipe stdin is an opaque byte stream. Ctrl+C and tmux
+                        // control bytes must not discard remote output.
+                        if !self.pipe_mode {
+                            flow.observe_input(&bytes)?;
+                        }
                     }
                 }
             }

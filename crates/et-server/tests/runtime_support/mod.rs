@@ -118,6 +118,9 @@ pub fn default_payload() -> InitialPayload {
         reversetunnels: Vec::new(),
         environmentvariables: HashMap::new(),
         flowcontrol: None,
+
+        no_pty: None,
+        command: None,
     }
 }
 

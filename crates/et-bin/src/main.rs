@@ -121,6 +121,7 @@ mod terminal_daemon;
 mod terminal_last_login;
 #[cfg(unix)]
 mod terminal_motd;
+mod terminal_pipe;
 mod terminal_protocol;
 mod terminal_pty;
 

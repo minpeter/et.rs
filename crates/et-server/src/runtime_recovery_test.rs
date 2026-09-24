@@ -77,6 +77,9 @@ fn terminal_hup_after_returning_status_delivers_final_output_only_to_recovered_c
         reversetunnels: Vec::new(),
         environmentvariables: HashMap::new(),
         flowcontrol: Some(FlowControlMode::Backpressure as i32),
+
+        no_pty: None,
+        command: None,
     };
     client.write_packet(253, &payload.encode_to_vec()).unwrap();
     let initial = client.read_packet().unwrap();
@@ -120,6 +123,8 @@ fn terminal_hup_after_returning_status_delivers_final_output_only_to_recovered_c
         .install_flow_enqueue_hook(queued_tx);
     let final_output = TerminalBuffer {
         buffer: Some(b"final-after-returning-status".to_vec()),
+
+        is_stderr: None,
     };
     write_local_packet(
         &mut terminal,

@@ -83,6 +83,8 @@ fn terminal(bytes: &[u8]) -> Packet {
         TerminalPacketType::TerminalBuffer as u8,
         TerminalBuffer {
             buffer: Some(bytes.to_vec()),
+
+            is_stderr: None,
         }
         .encode_to_vec(),
     )

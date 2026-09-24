@@ -183,6 +183,8 @@ fn terminal_hup_during_recovery_delivers_final_output_once_on_the_new_connection
     gate.snapshot.recv_timeout(TIMEOUT).unwrap();
     let final_output = TerminalBuffer {
         buffer: Some(b"final-before-hup".to_vec()),
+
+        is_stderr: None,
     };
     write_local_packet(
         &mut terminal,

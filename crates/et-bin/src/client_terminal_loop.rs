@@ -91,6 +91,9 @@ pub(crate) struct PumpOptions<'a> {
     pub(crate) flow_control: et_cli::client::FlowControlMode,
     pub(crate) terminal_enabled: bool,
     pub(crate) auto_cursor_report: bool,
+    /// `et -T`: write stdout and stderr as raw bytes, and do not treat stdin
+    /// as terminal interrupts.
+    pub(crate) binary_stdio: bool,
     pub(crate) terminal_modes: &'a mut TerminalModeState,
     pub(crate) hangup: &'a crate::client_hangup::HangupClose,
 }
@@ -112,6 +115,7 @@ where
         flow_control,
         terminal_enabled,
         auto_cursor_report,
+        binary_stdio,
         terminal_modes,
         hangup,
     } = options;
@@ -152,7 +156,13 @@ where
         // progress every iteration instead of deadlocking on a blocking send.
         flush_forwarding(forwarder, &mut pending_forward)?;
         if let Some(packet) = pending_output.take() {
-            match route_server_packet(packet, terminal_enabled, terminal_modes, &console_output)? {
+            match route_server_packet(
+                packet,
+                terminal_enabled,
+                binary_stdio,
+                terminal_modes,
+                &console_output,
+            )? {
                 DisplayOutcome::Displayed { cursor_report }
                     if cursor_report && auto_cursor_report && !console_output.is_async() =>
                 {
@@ -170,6 +180,7 @@ where
                             pending_output,
                             pending_forward,
                             terminal_enabled,
+                            binary_stdio,
                             terminal_modes,
                             forwarder,
                             None,
@@ -279,6 +290,7 @@ where
                             pending_output,
                             pending_forward,
                             terminal_enabled,
+                            binary_stdio,
                             terminal_modes,
                             forwarder,
                             None,
@@ -308,6 +320,7 @@ where
                             pending_output,
                             pending_forward,
                             terminal_enabled,
+                            binary_stdio,
                             terminal_modes,
                             forwarder,
                             None,
@@ -336,6 +349,7 @@ where
                         match route_server_packet(
                             packet,
                             terminal_enabled,
+                            binary_stdio,
                             terminal_modes,
                             &console_output,
                         )? {
@@ -358,6 +372,7 @@ where
                                         pending_output,
                                         pending_forward,
                                         terminal_enabled,
+                                        binary_stdio,
                                         terminal_modes,
                                         forwarder,
                                         None,
@@ -401,6 +416,7 @@ where
                             pending_output,
                             pending_forward,
                             terminal_enabled,
+                            binary_stdio,
                             terminal_modes,
                             forwarder,
                             Some(packet),
@@ -420,6 +436,7 @@ where
                     pending_output,
                     pending_forward,
                     terminal_enabled,
+                    binary_stdio,
                     terminal_modes,
                     forwarder,
                     None,
@@ -440,7 +457,7 @@ where
                     .complete(ConsoleCompletion::LocalInputClosed)
                     .map_err(|error| terminal_io("stopping terminal output", error));
             }
-            if interrupt_input.feed(&bytes[..count]) {
+            if !binary_stdio && interrupt_input.feed(&bytes[..count]) {
                 console_output
                     .interrupt()
                     .map_err(|error| terminal_io("interrupting console output", error))?;
@@ -465,6 +482,7 @@ where
                         pending_output,
                         pending_forward,
                         terminal_enabled,
+                        binary_stdio,
                         terminal_modes,
                         forwarder,
                         None,
@@ -498,6 +516,7 @@ where
                     pending_output,
                     pending_forward,
                     terminal_enabled,
+                    binary_stdio,
                     terminal_modes,
                     forwarder,
                     None,
@@ -559,15 +578,27 @@ fn network_poll_flags(output_pending: bool, forwarding_backlog_full: bool) -> Po
 fn route_server_packet(
     packet: et_core::packet::Packet,
     terminal_enabled: bool,
+    binary_stdio: bool,
     terminal_modes: &mut TerminalModeState,
     output: &crate::client_output::ConsoleOutput,
 ) -> Result<DisplayOutcome, ClientError> {
     if terminal_enabled || packet.header() == TerminalPacketType::KeepAlive as u8 {
-        return crate::client_terminal::display_packet_with(packet, |bytes| {
+        let outcome = crate::client_terminal::display_packet_with(packet, |bytes, is_stderr| {
+            if binary_stdio || is_stderr {
+                return crate::client_terminal::write_binary_stdio(is_stderr, bytes);
+            }
             output
                 .try_write(bytes, terminal_modes)
                 .map_err(|error| terminal_io("writing terminal output", error))
-        });
+        })?;
+        if binary_stdio {
+            if let DisplayOutcome::Displayed { .. } = outcome {
+                return Ok(DisplayOutcome::Displayed {
+                    cursor_report: false,
+                });
+            }
+        }
+        return Ok(outcome);
     }
     if packet.header() == TerminalPacketType::TerminalBuffer as u8 {
         return Ok(DisplayOutcome::Displayed {
@@ -580,11 +611,13 @@ fn route_server_packet(
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn finish_remote_completion(
     mut output: crate::client_output::ConsoleOutput,
     pending_output: Option<et_core::packet::Packet>,
     mut pending_forward: VecDeque<et_core::packet::Packet>,
     terminal_enabled: bool,
+    binary_stdio: bool,
     terminal_modes: &mut TerminalModeState,
     forwarder: &mut Forwarder,
     current_outbound: Option<et_core::packet::Packet>,
@@ -599,7 +632,13 @@ fn finish_remote_completion(
             .check_error()
             .map_err(|error| terminal_io("writing retained terminal output", error))?;
         if retained.advance(
-            |packet| match route_server_packet(packet, terminal_enabled, terminal_modes, &output)? {
+            |packet| match route_server_packet(
+                packet,
+                terminal_enabled,
+                binary_stdio,
+                terminal_modes,
+                &output,
+            )? {
                 DisplayOutcome::Displayed { .. } => Ok(None),
                 DisplayOutcome::Pending(packet) => Ok(Some(packet)),
             },

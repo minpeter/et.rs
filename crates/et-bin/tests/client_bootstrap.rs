@@ -1142,6 +1142,9 @@ fn effective_setenv_shares_terminal_and_jumphost_packet_budgets() {
                 environmentnames: payload.environmentvariables.keys().cloned().collect(),
                 environmentvalues: payload.environmentvariables.values().cloned().collect(),
                 flowcontrol: payload.flowcontrol,
+
+                no_pty: None,
+                command: None,
             };
             assert!(
                 Packet::new(TerminalPacketType::TerminalInit as u8, term.encode_to_vec())
@@ -1449,6 +1452,9 @@ fn posix_client_bounds_locale_to_local_terminal_packet() {
         environmentnames: environment.keys().cloned().collect(),
         environmentvalues: environment.values().cloned().collect(),
         flowcontrol: None,
+
+        no_pty: None,
+        command: None,
     };
     let packet = Packet::new(
         TerminalPacketType::TerminalInit as u8,

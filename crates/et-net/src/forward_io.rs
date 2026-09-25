@@ -48,6 +48,8 @@ pub(crate) fn commit_reservation(active: &ActiveIo, bytes: i64) {
 pub(crate) struct BoundSource {
     pub(crate) listener: ForwardListener,
     pub(crate) destination: SocketEndpoint,
+    /// SOCKS listener (`-D`). The destination is chosen per accepted client.
+    pub(crate) dynamic: bool,
 }
 
 pub(crate) struct ActiveIo {
@@ -117,6 +119,7 @@ pub(crate) fn spawn_listener(
         let BoundSource {
             listener,
             destination,
+            dynamic,
         } = source;
         loop {
             #[cfg(unix)]
@@ -157,12 +160,32 @@ pub(crate) fn spawn_listener(
                         if client_fd <= 0 {
                             return;
                         }
+                        if dynamic {
+                            let handshake_commands = commands.clone();
+                            thread::spawn(move || {
+                                let mut accepted = stream;
+                                if let Some(completed) = finish_dynamic_handshake(&mut accepted) {
+                                    let _ = handshake_commands.send(Command::Accepted {
+                                        client_fd,
+                                        destination: completed.destination,
+                                        stream: accepted,
+                                        early: completed.early_data,
+                                        socks_version: Some(completed.version),
+                                        half_close_on_eof: false,
+                                    });
+                                }
+                            });
+                            continue;
+                        }
                         if cancellation_requested(&cancel)
                             || commands
                                 .send(Command::Accepted {
                                     client_fd,
                                     destination: destination.clone(),
                                     stream,
+                                    early: Vec::new(),
+                                    socks_version: None,
+                                    half_close_on_eof: false,
                                 })
                                 .is_err()
                         {
@@ -204,6 +227,7 @@ pub(crate) fn spawn_connector(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_io(
     role: Role,
     socket_id: i32,
@@ -212,6 +236,7 @@ pub(crate) fn spawn_io(
     commands: CommandSender,
     cancel: channel::Receiver<()>,
     abandoned: Arc<AtomicBool>,
+    half_close_on_eof: bool,
 ) -> io::Result<(ActiveIo, [JoinHandle<()>; 2])> {
     spawn_io_inner(
         ReaderSetup {
@@ -219,6 +244,7 @@ pub(crate) fn spawn_io(
             socket_id,
             peer_window,
             read_limit: READ_CHUNK,
+            half_close_on_eof,
         },
         stream,
         commands,
@@ -243,6 +269,7 @@ fn spawn_io_with_read_limit(
             socket_id: socket.1,
             peer_window,
             read_limit,
+            half_close_on_eof: false,
         },
         stream,
         commands,
@@ -256,6 +283,7 @@ struct ReaderSetup {
     socket_id: i32,
     peer_window: Option<FlowWindow>,
     read_limit: usize,
+    half_close_on_eof: bool,
 }
 
 fn spawn_io_inner(
@@ -270,6 +298,7 @@ fn spawn_io_inner(
         socket_id,
         peer_window,
         read_limit,
+        half_close_on_eof,
     } = setup;
     #[cfg(windows)]
     {
@@ -360,7 +389,11 @@ fn spawn_io_inner(
                 Ok(0) => {
                     release_reservation(i64::try_from(read_len).unwrap_or(i64::MAX));
                     if !cancellation_requested(&reader_cancel) {
-                        let _ = reader_commands.send(Command::Closed { role, socket_id });
+                        let _ = reader_commands.send(Command::Closed {
+                            role,
+                            socket_id,
+                            half: half_close_on_eof,
+                        });
                     }
                     return;
                 }
@@ -540,6 +573,20 @@ fn write_all_cancellable(
         }
     }
     Ok(true)
+}
+
+fn finish_dynamic_handshake(stream: &mut ForwardStream) -> Option<crate::socks::CompletedSocks> {
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    match crate::socks::read_handshake(stream) {
+        Ok(completed) => {
+            let _ = stream.set_read_timeout(None);
+            Some(completed)
+        }
+        Err(_) => {
+            stream.shutdown();
+            None
+        }
+    }
 }
 
 fn cancellation_requested(cancel: &channel::Receiver<()>) -> bool {
@@ -730,6 +777,7 @@ mod tests {
             commands,
             cancel_receiver,
             abandoned,
+            false,
         )
         .unwrap();
         let started = active
@@ -892,6 +940,7 @@ mod tests {
             commands,
             cancel_receiver,
             abandoned,
+            false,
         )
         .unwrap();
         for _ in 0..64 {

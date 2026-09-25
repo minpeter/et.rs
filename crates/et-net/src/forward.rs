@@ -304,11 +304,19 @@ pub struct SkippedForward {
     pub error: io::Error,
 }
 
+/// Forwards opened after the session is up: SOCKS (`-D`) and stdio (`-W`).
+#[derive(Default)]
+pub struct RuntimeForwards {
+    pub dynamic: Vec<et_core::proto::SocketEndpoint>,
+    pub stdio: Option<et_core::proto::SocketEndpoint>,
+}
+
 pub struct Forwarder {
     commands: CommandSender,
     outbound: channel::Receiver<Outbound>,
     priority: channel::Receiver<Outbound>,
     cancel: Option<channel::Sender<()>>,
+    stdio_done: Arc<AtomicBool>,
     /// Readiness channel for outbound packets. Unix callers poll it exactly
     /// like upstream's `select()`; Windows callers drain [`Forwarder::try_outbound`]
     /// on the client loop's 10ms cadence instead, because a socket pair created
@@ -325,6 +333,7 @@ impl Forwarder {
         let sources = sources.into_iter().map(ForwardSource::explicit).collect();
         start_forwarder(
             sources,
+            RuntimeForwards::default(),
             None,
             Instant::now() + Duration::from_secs(30),
             Arc::new(SystemForwardResolver),
@@ -347,7 +356,25 @@ impl Forwarder {
         deadline: Instant,
         resolver: Arc<dyn ForwardResolver>,
     ) -> Result<(Self, Vec<SkippedForward>), ForwardError> {
-        start_forwarder(sources, None, deadline, resolver)
+        start_forwarder(
+            sources,
+            RuntimeForwards::default(),
+            None,
+            deadline,
+            resolver,
+        )
+        .map(|(forwarder, _, skipped)| (forwarder, skipped))
+    }
+
+    /// Bind explicit sources plus runtime `-D` listeners and an optional `-W`
+    /// stdio destination. Explicit dynamic bind failures are fatal.
+    pub fn start_with_runtime(
+        sources: Vec<ForwardSource>,
+        runtime: RuntimeForwards,
+        deadline: Instant,
+        resolver: Arc<dyn ForwardResolver>,
+    ) -> Result<(Self, Vec<SkippedForward>), ForwardError> {
+        start_forwarder(sources, runtime, None, deadline, resolver)
             .map(|(forwarder, _, skipped)| (forwarder, skipped))
     }
 
@@ -385,29 +412,46 @@ impl Forwarder {
         before_publish: impl FnOnce(),
     ) -> Result<(Self, ForwardEnvironment), ForwardError> {
         let sources = sources.into_iter().map(ForwardSource::explicit).collect();
-        start_forwarder_hook(sources, owner, deadline, resolver, before_publish, || {})
-            .map(|(forwarder, environment, _)| (forwarder, environment))
+        start_forwarder_hook(
+            sources,
+            RuntimeForwards::default(),
+            owner,
+            deadline,
+            resolver,
+            before_publish,
+            || {},
+        )
+        .map(|(forwarder, environment, _)| (forwarder, environment))
     }
 }
 
 fn start_forwarder(
     sources: Vec<ForwardSource>,
+    runtime: RuntimeForwards,
     owner: Option<(u32, u32)>,
     deadline: Instant,
     resolver: Arc<dyn ForwardResolver>,
 ) -> Result<(Forwarder, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
-    start_forwarder_hook(sources, owner, deadline, resolver, || {}, || {})
+    start_forwarder_hook(sources, runtime, owner, deadline, resolver, || {}, || {})
 }
 
 fn start_forwarder_hook(
     sources: Vec<ForwardSource>,
+    runtime: RuntimeForwards,
     owner: Option<(u32, u32)>,
     deadline: Instant,
     resolver: Arc<dyn ForwardResolver>,
     before_publish: impl FnOnce(),
     worker_start: impl FnOnce() + Send + 'static,
 ) -> Result<(Forwarder, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
-    let (sources, environment, skipped) = bind_sources(sources, owner, deadline, resolver)?;
+    let dynamic_resolver = resolver.clone();
+    let (mut sources, environment, skipped) = bind_sources(sources, owner, deadline, resolver)?;
+    sources.extend(bind_dynamic_sources(
+        &runtime.dynamic,
+        deadline,
+        dynamic_resolver,
+    )?);
+    let stdio = runtime.stdio;
     ensure_setup_deadline(deadline)?;
     let session_user = owner;
     let (commands_tx, commands_rx) = command_channel(CHANNEL_CAPACITY);
@@ -420,6 +464,8 @@ fn start_forwarder_hook(
     let (cancel_tx, cancel_rx) = channel::bounded(1);
     let abandoned = Arc::new(AtomicBool::new(false));
     let worker_abandoned = abandoned.clone();
+    let stdio_done = Arc::new(AtomicBool::new(false));
+    let worker_stdio_done = stdio_done.clone();
     #[cfg(unix)]
     let (wake, wake_writer) = {
         let (reader, writer) = UnixStream::pair()?;
@@ -441,6 +487,7 @@ fn start_forwarder_hook(
             worker_start();
             run(
                 sources,
+                stdio,
                 WorkerChannels {
                     receiver: commands_rx,
                     sender: worker_commands,
@@ -448,6 +495,7 @@ fn start_forwarder_hook(
                     priority: priority_tx,
                     cancel: cancel_rx,
                     abandoned: worker_abandoned,
+                    stdio_done: worker_stdio_done,
                 },
                 #[cfg(unix)]
                 wake_writer,
@@ -464,6 +512,7 @@ fn start_forwarder_hook(
         outbound: outbound_rx,
         priority: priority_rx,
         cancel: Some(cancel_tx),
+        stdio_done,
         #[cfg(unix)]
         wake,
         shutdown,
@@ -476,6 +525,12 @@ fn start_forwarder_hook(
 }
 
 impl Forwarder {
+    /// `ssh -W` finished: the remote side fully closed the stdio socket, the
+    /// destination connect failed, or the forwarder stopped.
+    pub fn stdio_finished(&self) -> bool {
+        self.stdio_done.load(Ordering::Acquire)
+    }
+
     /// Pollable readiness handle for outbound forwarding packets (Unix only).
     #[cfg(unix)]
     pub fn wake(&self) -> Result<&UnixStream, ForwardError> {
@@ -650,6 +705,32 @@ enum PlannedSource {
     },
 }
 
+fn bind_dynamic_sources(
+    endpoints: &[et_core::proto::SocketEndpoint],
+    deadline: Instant,
+    resolver: Arc<dyn ForwardResolver>,
+) -> Result<Vec<BoundSource>, ForwardError> {
+    let mut bound = Vec::new();
+    for endpoint in endpoints {
+        ensure_setup_deadline(deadline)?;
+        let parsed = Endpoint::parse(Some(endpoint.clone())).map_err(ForwardError::Io)?;
+        let resolved = parsed
+            .resolve_for_bind_deadline(deadline, resolver.clone())
+            .map_err(ForwardError::Io)?;
+        let listeners = resolved
+            .bind_with_user_deadline_resolver(None, deadline, resolver.clone())
+            .map_err(ForwardError::Io)?;
+        for listener in listeners {
+            bound.push(BoundSource {
+                listener,
+                destination: et_core::proto::SocketEndpoint::default(),
+                dynamic: true,
+            });
+        }
+    }
+    Ok(bound)
+}
+
 fn bind_sources(
     sources: Vec<ForwardSource>,
     owner: Option<(u32, u32)>,
@@ -758,6 +839,7 @@ fn bind_sources(
                         bound.push(BoundSource {
                             listener,
                             destination: destination.clone(),
+                            dynamic: false,
                         });
                     }
                 }
@@ -789,6 +871,7 @@ fn bind_sources(
                     bound.push(BoundSource {
                         listener,
                         destination: destination.clone(),
+                        dynamic: false,
                     });
                 }
             }
@@ -1185,6 +1268,7 @@ mod tests {
             let (worker_release_tx, worker_release_rx) = mpsc::sync_channel(1);
             let (forwarder, _, _) = start_forwarder_hook(
                 vec![ForwardSource::explicit(request)],
+                RuntimeForwards::default(),
                 None,
                 Instant::now() + Duration::from_secs(3),
                 Arc::new(SystemForwardResolver),
@@ -1208,6 +1292,7 @@ mod tests {
                         buffer: None,
                         error: None,
                         closed: Some(true),
+                        half_close: None,
                         window: None,
                     }
                     .encode_to_vec(),
@@ -1225,6 +1310,7 @@ mod tests {
                     buffer: None,
                     error: None,
                     closed: Some(true),
+                    half_close: None,
                     window: None,
                 }
                 .encode_to_vec(),

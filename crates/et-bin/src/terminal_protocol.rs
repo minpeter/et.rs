@@ -17,6 +17,8 @@ pub struct TerminalInitialization {
     /// `TermInit.no_pty`: run `command` on pipes instead of a login pty.
     pub no_pty: bool,
     pub command: Option<String>,
+    /// `TermInit.no_shell`: keep the session without a pty or a shell (`ssh -W`).
+    pub no_shell: bool,
 }
 
 pub fn read_initialization(router: &mut LocalStream) -> Result<TerminalInitialization, String> {
@@ -53,6 +55,7 @@ pub fn read_initialization(router: &mut LocalStream) -> Result<TerminalInitializ
         flow_control,
         no_pty: init.no_pty.unwrap_or(false),
         command: init.command,
+        no_shell: init.no_shell.unwrap_or(false),
     })
 }
 
@@ -121,22 +124,50 @@ pub fn handle_packet(
             let bytes = message
                 .buffer
                 .ok_or_else(|| "TERMINAL_BUFFER is missing bytes".to_owned())?;
-            writer
-                .write_all(&bytes)
-                .and_then(|()| writer.flush())
-                .map_err(|error| format!("could not write PTY input: {error}"))?;
+            if let Err(error) = writer.write_all(&bytes).and_then(|()| writer.flush()) {
+                if !dead_terminal_io(&error) {
+                    return Err(format!("could not write PTY input: {error}"));
+                }
+            }
             Ok(LocalPacketEffect::Continue)
         }
         header if header == TerminalPacketType::TerminalInfo as u8 => {
             let info = TerminalInfo::decode(packet.payload())
                 .map_err(|_| "TERMINAL_INFO protobuf is malformed".to_owned())?;
-            master
-                .resize(terminal_size(&info))
-                .map_err(|error| format!("could not resize PTY: {error}"))?;
+            if let Err(error) = master.resize(terminal_size(&info)) {
+                let message = error.to_string();
+                if !message.contains("Broken pipe")
+                    && !message.contains("os error 32")
+                    && !message.contains("EPIPE")
+                    && !message.contains("os error 9")
+                {
+                    return Err(format!("could not resize PTY: {error}"));
+                }
+            }
             Ok(LocalPacketEffect::Continue)
         }
         _ => Err("unsupported local terminal packet type".to_owned()),
     }
+}
+
+fn dead_terminal_io(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::UnexpectedEof
+    ) || matches!(error.raw_os_error(), Some(32) | Some(9))
+}
+
+pub(crate) fn write_exit_status(router: &mut impl Write, code: i32) {
+    let payload = et_core::proto::TerminalExitStatus {
+        exitcode: Some(code),
+    }
+    .encode_to_vec();
+    let packet = Packet::new(TerminalPacketType::TerminalExitStatus as u8, payload);
+    let _ = et_net::local_packet::write_local_packet(router, &packet);
 }
 
 pub(crate) fn valid_environment_name(name: &str) -> bool {
@@ -235,6 +266,7 @@ mod tests {
 
                 no_pty: None,
                 command: None,
+                no_shell: None,
             },
             TermInit {
                 environmentnames: vec!["BAD-NAME".to_owned()],
@@ -243,6 +275,7 @@ mod tests {
 
                 no_pty: None,
                 command: None,
+                no_shell: None,
             },
             TermInit {
                 environmentnames: vec!["VALID".to_owned()],
@@ -251,6 +284,7 @@ mod tests {
 
                 no_pty: None,
                 command: None,
+                no_shell: None,
             },
             TermInit {
                 environmentnames: vec!["VALID".to_owned()],
@@ -259,6 +293,7 @@ mod tests {
 
                 no_pty: None,
                 command: None,
+                no_shell: None,
             },
         ] {
             let packet = Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec());
@@ -303,6 +338,7 @@ mod tests {
 
             no_pty: None,
             command: None,
+            no_shell: None,
         };
         write_local_packet(
             &mut server,

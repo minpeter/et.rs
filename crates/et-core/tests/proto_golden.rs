@@ -131,11 +131,42 @@ fn flow_control_opt_in_modes_use_additive_proto_fields() {
         ..Default::default()
     };
 
-    // Field 4/3 are upstream no_pty (ET #854). Flow control lives at
-    // InitialPayload field 6 and TermInit field 5 so Backpressure (varint 1)
-    // is not the same bytes as no_pty=true.
-    assert_eq!(enc(&initial), [0x30, 0x01]);
-    assert_eq!(enc(&term), [0x28, 0x02]);
+    // Upstream #851/#849 own InitialPayload fields 6 and 7 and TermInit field 5.
+    // Flow control lives at InitialPayload field 8 and TermInit field 6.
+    assert_eq!(enc(&initial), [0x40, 0x01]);
+    assert_eq!(enc(&term), [0x30, 0x02]);
+}
+
+#[test]
+fn exit_status_and_shell_flags_use_upstream_field_numbers() {
+    assert_eq!(et::TerminalPacketType::TerminalExitStatus as i32, 12);
+    let initial = et::InitialPayload {
+        supports_exit_status: Some(true),
+        no_shell: Some(true),
+        ..Default::default()
+    };
+    let term = et::TermInit {
+        no_shell: Some(true),
+        ..Default::default()
+    };
+    let status = et::TerminalExitStatus {
+        exitcode: Some(128 + 15),
+    };
+    let half = et::PortForwardData {
+        socketid: Some(9),
+        closed: Some(true),
+        half_close: Some(true),
+        ..Default::default()
+    };
+    // InitialPayload fields 6 and 7, both bool true.
+    assert_eq!(enc(&initial), [0x30, 0x01, 0x38, 0x01]);
+    // TermInit field 5 bool true.
+    assert_eq!(enc(&term), [0x28, 0x01]);
+    // TerminalExitStatus field 1 varint 143.
+    assert_eq!(enc(&status), [0x08, 0x8f, 0x01]);
+    // socket id 9, closed, half_close. Window is not field 6.
+    assert_eq!(enc(&half), [0x10, 0x09, 0x28, 0x01, 0x30, 0x01]);
+    assert!(enc(&et::TerminalExitStatus::default()).is_empty());
 }
 
 #[test]
@@ -194,6 +225,7 @@ fn port_forward_windows_use_additive_proto_fields() {
         buffer: None,
         error: None,
         closed: None,
+        half_close: None,
         window: Some(et::PortForwardWindow {
             bytes: Some(131_072),
             packets: Some(8),

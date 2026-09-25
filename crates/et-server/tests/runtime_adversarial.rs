@@ -118,6 +118,8 @@ fn delayed_valid_reverse_forward_times_out_rolls_back_and_resets_slot() {
 
         no_pty: None,
         command: None,
+        supports_exit_status: None,
+        no_shell: None,
     };
     let (stream, response) = server.handshake(ID_A);
     assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
@@ -230,6 +232,8 @@ fn stalled_privileged_tcp_helper_honors_initialization_deadline_and_resets_slot(
 
         no_pty: None,
         command: None,
+        supports_exit_status: None,
+        no_shell: None,
     };
     let (stream, response) = server.handshake(ID_A);
     assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
@@ -302,6 +306,8 @@ fn unbindable_reverse_tunnel_reports_an_error_and_resets_the_slot() {
 
         no_pty: None,
         command: None,
+        supports_exit_status: None,
+        no_shell: None,
     };
     let (stream, response) = server.handshake(ID_A);
     assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
@@ -341,6 +347,8 @@ fn occupied_reverse_row_is_fatal_and_rolls_back_sibling() {
 
         no_pty: None,
         command: None,
+        supports_exit_status: None,
+        no_shell: None,
     };
 
     let (stream, _) = server.handshake(ID_A);
@@ -404,6 +412,8 @@ fn reverse_bind_failure_never_activates_the_session() {
 
         no_pty: None,
         command: None,
+        supports_exit_status: None,
+        no_shell: None,
     };
 
     let (stream, _) = server.handshake(ID_A);
@@ -447,6 +457,8 @@ fn reverse_failures_are_plain_fatal_errors() {
 
             no_pty: None,
             command: None,
+            supports_exit_status: None,
+            no_shell: None,
         };
 
         let (stream, _) = server.handshake(ID_A);
@@ -487,6 +499,8 @@ fn reverse_listener_cap_is_prebind_transactional_on_server() {
 
         no_pty: None,
         command: None,
+        supports_exit_status: None,
+        no_shell: None,
     };
 
     let (stream, _) = server.handshake(ID_A);
@@ -529,6 +543,8 @@ fn obsolete_origin_marker_has_no_privileged_meaning() {
 
         no_pty: None,
         command: None,
+        supports_exit_status: None,
+        no_shell: None,
     };
 
     let (stream, _) = server.handshake(ID_A);
@@ -552,6 +568,8 @@ fn jumphost_payload_is_relayed_to_the_registered_terminal() {
 
         no_pty: None,
         command: None,
+        supports_exit_status: None,
+        no_shell: None,
     };
     let (stream, response) = server.handshake(ID_A);
     assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));

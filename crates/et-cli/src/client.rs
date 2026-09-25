@@ -121,6 +121,21 @@ pub struct ClientArgs {
     #[arg(short = 'N', long = "no-terminal")]
     pub no_terminal: bool,
 
+    /// Dynamic SOCKS4/SOCKS5 CONNECT listener, opened after the session is up.
+    /// OpenSSH `-D`: `[bind_address:]port`. Repeatable.
+    #[arg(
+        short = 'D',
+        long = "dynamicforward",
+        visible_alias = "dynamic-forward",
+        value_name = "BIND"
+    )]
+    pub dynamic: Vec<String>,
+
+    /// Forward stdin and stdout to one remote destination after connect.
+    /// OpenSSH `-W`: `host:port` or a Unix socket path. Implies no local shell.
+    #[arg(short = 'W', long = "stdio-forward", value_name = "HOST:PORT")]
+    pub stdio_forward: Option<String>,
+
     /// Run `-c` on pipes instead of a pty: binary stdio, separate stderr, no
     /// shell injection. Matches EternalTerminal `-T` / `--no-pty`.
     #[arg(
@@ -471,5 +486,22 @@ mod tests {
             "none",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn dynamic_and_stdio_forwards_parse_like_openssh() {
+        let parsed = ClientArgs::try_parse_from([
+            "et",
+            "host",
+            "-D",
+            "1080",
+            "-D",
+            "[::1]:1081",
+            "-W",
+            "127.0.0.1:8080",
+        ])
+        .unwrap();
+        assert_eq!(parsed.dynamic, ["1080", "[::1]:1081"]);
+        assert_eq!(parsed.stdio_forward.as_deref(), Some("127.0.0.1:8080"));
     }
 }

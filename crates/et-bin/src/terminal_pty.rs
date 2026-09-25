@@ -57,6 +57,9 @@ where
     F: FnOnce(&mut LocalStream) -> Result<(), String>,
 {
     let initialization = read_initialization(&mut router)?;
+    if initialization.no_shell {
+        return run_idle(router, started);
+    }
     if initialization.no_pty {
         return crate::terminal_pipe::run(router, initialization, started);
     }
@@ -155,7 +158,7 @@ where
                 .and_then(|mut child| {
                     child
                         .wait()
-                        .map(|status| status.exit_code())
+                        .map(|status| normalize_pty_status(&status))
                         .map_err(|error| format!("could not wait for terminal shell: {error}"))
                 });
             let _ = events_tx.send(WorkerEvent::Child(result));
@@ -243,8 +246,62 @@ where
     let completion = result?;
     output_join?;
     child_join?;
-    i32::try_from(completion.status)
-        .map_err(|_| "terminal shell exit status is out of range".to_owned())
+    let code = i32::try_from(completion.status)
+        .map_err(|_| "terminal shell exit status is out of range".to_owned())?;
+    if let Ok(mut writer) = router_writer.lock() {
+        crate::terminal_protocol::write_exit_status(&mut *writer, code);
+    }
+    Ok(code)
+}
+
+fn run_idle<F>(mut router: LocalStream, started: F) -> Result<i32, String>
+where
+    F: FnOnce(&mut LocalStream) -> Result<(), String>,
+{
+    let mut writer = router
+        .try_clone()
+        .map_err(|error| format!("could not clone idle terminal router: {error}"))?;
+    started(&mut writer)?;
+    loop {
+        let packet = et_net::local_packet::read_local_packet(&mut router)
+            .map_err(|error| format!("idle terminal router disconnected: {error}"))?;
+        if packet.header() == TerminalPacketType::TerminalClose as u8 {
+            return Ok(0);
+        }
+    }
+}
+
+fn normalize_pty_status(status: &portable_pty::ExitStatus) -> u32 {
+    if let Some(signal) = status.signal() {
+        if let Some(number) = signal_number(signal) {
+            return u32::try_from(128 + number).unwrap_or(1);
+        }
+    }
+    status.exit_code()
+}
+
+fn signal_number(name: &str) -> Option<i32> {
+    if let Some(rest) = name.strip_prefix("Signal ") {
+        return rest.parse().ok();
+    }
+    Some(match name {
+        "Hangup" => 1,
+        "Interrupt" => 2,
+        "Quit" => 3,
+        "Illegal instruction" => 4,
+        "Trace/breakpoint trap" => 5,
+        "Aborted" => 6,
+        "Bus error" => 7,
+        "Floating point exception" => 8,
+        "Killed" => 9,
+        "User defined signal 1" => 10,
+        "Segmentation fault" => 11,
+        "User defined signal 2" => 12,
+        "Broken pipe" => 13,
+        "Alarm clock" => 14,
+        "Terminated" => 15,
+        _ => return None,
+    })
 }
 
 /// Shell the session hosts.

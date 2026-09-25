@@ -12,6 +12,7 @@ use crate::terminal_protocol::{valid_environment_name, MAX_ENVIRONMENT};
 pub enum ForwardConfigError {
     MissingAgentSocket,
     Tunnel(et_cli::tunnel::TunnelError),
+    ForwardSpec(String),
     InvalidEnvironmentName(String),
     TooManyEnvironmentNames(usize),
     EnvironmentPacketTooLarge(usize),
@@ -26,6 +27,7 @@ impl std::fmt::Display for ForwardConfigError {
                 "Missing environment variable SSH_AUTH_SOCK.  Are you sure you ran ssh-agent first?"
             ),
             Self::Tunnel(error) => error.fmt(formatter),
+            Self::ForwardSpec(message) => write!(formatter, "{message}"),
             Self::InvalidEnvironmentName(name) => {
                 write!(
                     formatter,
@@ -54,6 +56,7 @@ impl std::error::Error for ForwardConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Tunnel(error) => Some(error),
+            Self::ForwardSpec(_) => None,
             Self::MissingAgentSocket
             | Self::InvalidEnvironmentName(_)
             | Self::TooManyEnvironmentNames(_)
@@ -72,6 +75,8 @@ impl From<et_cli::tunnel::TunnelError> for ForwardConfigError {
 pub struct ForwardConfig {
     pub local_sources: Vec<ForwardSource>,
     pub initial_payload: InitialPayload,
+    pub dynamic: Vec<SocketEndpoint>,
+    pub stdio: Option<SocketEndpoint>,
 }
 
 impl ForwardConfig {
@@ -142,16 +147,33 @@ pub fn build(
         });
     }
     validate_environment_names(&reverse_tunnels)?;
+    let mut dynamic = Vec::with_capacity(args.dynamic.len());
+    for spec in &args.dynamic {
+        dynamic.push(
+            et_net::socks::parse_dynamic_forward_arg(spec)
+                .map_err(ForwardConfigError::ForwardSpec)?,
+        );
+    }
+    let stdio = args
+        .stdio_forward
+        .as_deref()
+        .map(et_net::socks::parse_stdio_forward_arg)
+        .transpose()
+        .map_err(ForwardConfigError::ForwardSpec)?;
+    let no_shell = stdio.is_some();
     Ok(ForwardConfig {
         local_sources,
+        dynamic,
+        stdio,
         initial_payload: InitialPayload {
             jumphost: Some(false),
             reversetunnels: reverse_tunnels,
             environmentvariables: std::collections::HashMap::new(),
-            no_pty: args.no_pty.then_some(true),
-            command: args
-                .no_pty
+            no_pty: (args.no_pty && !no_shell).then_some(true),
+            command: (args.no_pty && !no_shell)
                 .then(|| args.command.clone().unwrap_or_default()),
+            supports_exit_status: Some(true),
+            no_shell: no_shell.then_some(true),
             flowcontrol: args.flow_control.protocol_value(),
         },
     })

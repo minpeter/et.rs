@@ -84,6 +84,8 @@ pub(crate) struct ActiveSession {
     /// Raw pipe session (`InitialPayload.no_pty`). Binary stdin must not be
     /// treated as a terminal interrupt.
     pipe_mode: bool,
+    /// Client set `supports_exit_status`. Type 12 is forwarded only then.
+    forward_exit_status: bool,
 }
 
 pub(crate) enum SessionConnection {
@@ -140,12 +142,13 @@ impl std::error::Error for SessionError {
 }
 
 impl ActiveSession {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(
         connection: Connection,
         terminal: &LocalStream,
         flow_control: Option<i32>,
     ) -> Result<Self, SessionError> {
-        Self::new_with_pipe(connection, terminal, flow_control, false)
+        Self::new_with_pipe(connection, terminal, flow_control, false, false)
     }
 
     pub(crate) fn new_with_pipe(
@@ -153,6 +156,7 @@ impl ActiveSession {
         terminal: &LocalStream,
         flow_control: Option<i32>,
         pipe_mode: bool,
+        forward_exit_status: bool,
     ) -> Result<Self, SessionError> {
         let queue_mode = queue_mode(flow_control);
         connection
@@ -187,7 +191,12 @@ impl ActiveSession {
             bridge_generation: Mutex::new(0),
             bridge_changed: Condvar::new(),
             pipe_mode,
+            forward_exit_status,
         })
+    }
+
+    pub(crate) fn forwards_exit_status(&self) -> bool {
+        self.forward_exit_status
     }
 
     pub(crate) fn start_flow_writer(self: &Arc<Self>) {
@@ -264,6 +273,7 @@ impl ActiveSession {
         if let Some(state) = self.output_flow().filter(|_| {
             self.flow_control.is_some()
                 || header == et_core::proto::TerminalPacketType::TerminalBuffer as u8
+                || header == et_core::proto::TerminalPacketType::TerminalExitStatus as u8
         }) {
             return state
                 .enqueue(Packet::new(header, payload))

@@ -74,6 +74,7 @@ fn unavailable_initial_terminal_size_does_not_skip_command_validation() {
             connection_name: "test",
             close_on_hangup: false,
             no_pty: false,
+            stdio_forward: false,
         },
         et_net::forward::Forwarder::start(Vec::new()).unwrap(),
         |_| panic!("a size observation must not reconnect"),
@@ -119,6 +120,9 @@ fn unavailable_live_terminal_size_keeps_the_pump_alive() {
             binary_stdio: false,
             terminal_modes: &mut modes,
             hangup: &crate::client_hangup::HangupClose::disabled(),
+            want_exit_status: false,
+            exit_code: &mut None,
+            stdio_forward: false,
         },
         &mut et_net::forward::Forwarder::start(Vec::new()).unwrap(),
         |_| {

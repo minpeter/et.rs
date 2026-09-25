@@ -30,12 +30,22 @@ pub(crate) enum Role {
     Destination,
 }
 
+pub(crate) struct PendingAccept {
+    pub(crate) stream: ForwardStream,
+    pub(crate) early: Vec<u8>,
+    pub(crate) socks_version: Option<u8>,
+    pub(crate) half_close_on_eof: bool,
+}
+
 pub(crate) enum Command {
     Packet(Packet),
     Accepted {
         client_fd: i32,
         destination: SocketEndpoint,
         stream: ForwardStream,
+        early: Vec<u8>,
+        socks_version: Option<u8>,
+        half_close_on_eof: bool,
     },
     Connected {
         client_fd: i32,
@@ -61,6 +71,7 @@ pub(crate) enum Command {
     Closed {
         role: Role,
         socket_id: i32,
+        half: bool,
     },
     IoFailed {
         role: Role,
@@ -252,10 +263,12 @@ pub(crate) struct WorkerChannels {
     pub(crate) priority: channel::Sender<Outbound>,
     pub(crate) cancel: channel::Receiver<()>,
     pub(crate) abandoned: Arc<AtomicBool>,
+    pub(crate) stdio_done: Arc<AtomicBool>,
 }
 
 pub(crate) fn run(
     sources: Vec<BoundSource>,
+    stdio: Option<SocketEndpoint>,
     channels: WorkerChannels,
     #[cfg(unix)] mut outbound_wake: UnixStream,
     control: (ListenerStop, Option<(u32, u32)>, Arc<AtomicBool>),
@@ -267,6 +280,7 @@ pub(crate) fn run(
         priority,
         cancel,
         abandoned,
+        stdio_done,
     } = channels;
     let (listener_stop, session_user, shutdown) = control;
     #[cfg(unix)]
@@ -277,8 +291,9 @@ pub(crate) fn run(
         outbound_wake.try_clone().ok(),
         cancel.clone(),
         abandoned,
+        stdio_done,
     )
-    .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user));
+    .and_then(|mut worker| worker.run(sources, stdio, commands, listener_stop, session_user));
     #[cfg(windows)]
     let result = Worker::new(
         command_sender,
@@ -286,8 +301,9 @@ pub(crate) fn run(
         priority.clone(),
         cancel.clone(),
         abandoned,
+        stdio_done,
     )
-    .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user));
+    .and_then(|mut worker| worker.run(sources, stdio, commands, listener_stop, session_user));
     if let Err(error) = result {
         if !shutdown.load(Ordering::Acquire) {
             channel::select! {
@@ -308,7 +324,11 @@ struct Worker {
     abandoned: Arc<AtomicBool>,
     #[cfg(unix)]
     outbound_wake: UnixStream,
-    pending: HashMap<i32, ForwardStream>,
+    pending: HashMap<i32, PendingAccept>,
+    stdio_done: Arc<AtomicBool>,
+    stdio_requested: bool,
+    stdio_client_fd: Option<i32>,
+    stdio_socket_id: Option<i32>,
     connecting: HashSet<i32>,
     sources: HashMap<i32, ActiveIo>,
     destinations: HashMap<i32, ActiveIo>,
@@ -328,6 +348,7 @@ impl Worker {
         #[cfg(unix)] outbound_wake: Option<UnixStream>,
         cancel: channel::Receiver<()>,
         abandoned: Arc<AtomicBool>,
+        stdio_done: Arc<AtomicBool>,
     ) -> Result<Self, ForwardError> {
         #[cfg(unix)]
         let outbound_wake = {
@@ -344,6 +365,10 @@ impl Worker {
             #[cfg(unix)]
             outbound_wake,
             pending: HashMap::new(),
+            stdio_done,
+            stdio_requested: false,
+            stdio_client_fd: None,
+            stdio_socket_id: None,
             connecting: HashSet::new(),
             sources: HashMap::new(),
             destinations: HashMap::new(),
@@ -357,12 +382,17 @@ impl Worker {
     fn run(
         &mut self,
         sources: Vec<BoundSource>,
+        stdio: Option<SocketEndpoint>,
         commands: CommandReceiver,
         listener_stop: ListenerStop,
         session_user: Option<(u32, u32)>,
     ) -> Result<(), ForwardError> {
         self.session_user = session_user;
         let next_client_fd = Arc::new(AtomicI32::new(1));
+        if let Some(destination) = stdio {
+            self.stdio_requested = true;
+            self.spawn_stdio(destination, &next_client_fd)?;
+        }
         for source in sources {
             #[cfg(unix)]
             let stop = listener_stop.try_clone().map_err(ForwardError::Io)?;
@@ -386,7 +416,17 @@ impl Worker {
                     client_fd,
                     destination,
                     stream,
-                } => self.accepted(client_fd, destination, stream),
+                    early,
+                    socks_version,
+                    half_close_on_eof,
+                } => self.accepted(
+                    client_fd,
+                    destination,
+                    stream,
+                    early,
+                    socks_version,
+                    half_close_on_eof,
+                ),
                 Command::Connected {
                     client_fd,
                     socket_id,
@@ -414,7 +454,11 @@ impl Worker {
                     socket_id,
                     bytes,
                 } => self.return_credit(role, socket_id, bytes),
-                Command::Closed { role, socket_id } => self.read_closed(role, socket_id),
+                Command::Closed {
+                    role,
+                    socket_id,
+                    half,
+                } => self.read_closed(role, socket_id, half),
                 Command::IoFailed {
                     role,
                     socket_id,
@@ -433,8 +477,11 @@ impl Worker {
         let _ = listener_stop.shutdown(std::net::Shutdown::Both);
         #[cfg(windows)]
         listener_stop.store(true, std::sync::atomic::Ordering::Release);
-        for (_, stream) in self.pending.drain() {
-            stream.shutdown();
+        for (_, pending) in self.pending.drain() {
+            pending.stream.shutdown();
+        }
+        if self.stdio_requested {
+            self.mark_stdio_done();
         }
         let hard_cancelled = !matches!(self.cancel.try_recv(), Err(channel::TryRecvError::Empty));
         for (_, io) in self.sources.drain().chain(self.destinations.drain()) {
@@ -448,6 +495,92 @@ impl Worker {
             let _ = thread.join();
         }
         result
+    }
+
+    fn mark_stdio_done(&mut self) {
+        self.stdio_done.store(true, Ordering::Release);
+        #[cfg(unix)]
+        {
+            let _ = self.outbound_wake.write_all(&[1]);
+        }
+    }
+
+    /// Bridge local stdin/stdout to one remote destination (`ssh -W`).
+    ///
+    /// The copy threads are detached: joining them would block shutdown on
+    /// a still-open stdin. Closing the forwarded end unblocks the stdout
+    /// copy; the process exits once the client observes `stdio_done`.
+    fn spawn_stdio(
+        &mut self,
+        destination: SocketEndpoint,
+        next_client_fd: &AtomicI32,
+    ) -> Result<(), ForwardError> {
+        #[cfg(not(unix))]
+        {
+            let _ = (destination, next_client_fd);
+            Err(ForwardError::Protocol(
+                "-W stdio forwarding is not supported on Windows",
+            ))
+        }
+        #[cfg(unix)]
+        {
+            use std::io::{Read, Write};
+            let (app, forwarded) = UnixStream::pair().map_err(ForwardError::Io)?;
+            let client_fd = next_client_fd.fetch_add(1, Ordering::Relaxed);
+            if client_fd <= 0 {
+                return Err(ForwardError::Unavailable);
+            }
+            self.stdio_client_fd = Some(client_fd);
+            let mut to_remote = app.try_clone().map_err(ForwardError::Io)?;
+            let mut from_remote = app;
+            std::thread::spawn(move || {
+                let mut stdin = std::io::stdin();
+                let mut buffer = [0u8; 16 * 1024];
+                loop {
+                    match stdin.read(&mut buffer) {
+                        Ok(0) => {
+                            let _ = to_remote.shutdown(std::net::Shutdown::Write);
+                            break;
+                        }
+                        Ok(count) => {
+                            if to_remote.write_all(&buffer[..count]).is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
+            });
+            std::thread::spawn(move || {
+                let mut stdout = std::io::stdout();
+                let mut buffer = [0u8; 16 * 1024];
+                loop {
+                    match from_remote.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(count) => {
+                            if stdout.write_all(&buffer[..count]).is_err() || stdout.flush().is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
+            });
+            self.commands
+                .send(Command::Accepted {
+                    client_fd,
+                    destination,
+                    stream: ForwardStream::Unix(forwarded),
+                    early: Vec::new(),
+                    socks_version: None,
+                    half_close_on_eof: true,
+                })
+                .map_err(|_| ForwardError::Unavailable)?;
+            Ok(())
+        }
     }
 }
 #[path = "forward_worker_state.rs"]
@@ -491,6 +624,7 @@ mod tests {
                 priority,
                 Some(wake_writer),
                 cancel_receiver,
+                Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
             )
             .unwrap(),

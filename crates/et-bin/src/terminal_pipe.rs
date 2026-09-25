@@ -132,6 +132,11 @@ where
 
     let status = pump(&mut router, wake_reader, &events_rx, &mut Some(stdin));
     drop(cleanup);
+    if let Ok(code) = status {
+        if let Ok(mut writer) = router_writer.lock() {
+            crate::terminal_protocol::write_exit_status(&mut *writer, code);
+        }
+    }
     status
 }
 
@@ -478,7 +483,17 @@ fn signal(wake: &mut LocalStream) {
 }
 
 fn exit_code(status: ExitStatus) -> i32 {
-    status.code().unwrap_or(1)
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    1
 }
 
 struct Cleanup {

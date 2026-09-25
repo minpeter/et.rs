@@ -2,7 +2,7 @@ use prost::Message;
 
 use crate::flow_control::{FlowControlMode, OutputQueue, QueuePushError, MAX_PACKETS_PER_LANE};
 use crate::packet::Packet;
-use crate::proto::{TerminalBuffer, TerminalPacketType};
+use crate::proto::{TerminalBuffer, TerminalExitStatus, TerminalPacketType};
 
 const LIMIT: usize = 64;
 
@@ -179,4 +179,28 @@ fn failed_send_restoration_retains_its_capacity_reservation() {
     queue.restore_front(in_flight);
     assert!(queue.bytes() <= LIMIT);
     assert_eq!(queue.pop(), Some(first));
+}
+
+#[test]
+fn exit_status_follows_queued_terminal_bytes_and_survives_discard() {
+    let mut queue = OutputQueue::new(FlowControlMode::Discard, LIMIT);
+    let output = terminal(b"hello\n");
+    let status = Packet::new(
+        TerminalPacketType::TerminalExitStatus as u8,
+        TerminalExitStatus {
+            exitcode: Some(17),
+        }
+        .encode_to_vec(),
+    );
+    queue.push(output.clone()).unwrap();
+    queue.push(status.clone()).unwrap();
+    queue.push(terminal(&[b'x'; 80])).unwrap();
+    assert_eq!(queue.pop().as_ref().map(Packet::header), Some(output.header()));
+    let next = queue.pop().unwrap();
+    assert_eq!(next.header(), TerminalPacketType::TerminalExitStatus as u8);
+    assert!(queue.is_empty());
+    queue.push(status.clone()).unwrap();
+    queue.restore_front(status.clone());
+    assert!(!queue.is_empty());
+    assert_eq!(queue.pop(), Some(status));
 }

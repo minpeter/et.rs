@@ -116,6 +116,7 @@ fn run_mode_poll(
     // local-stream backpressure, and ordered client reads pause behind it.
     let mut pending_local: Option<PendingLocalFrame> = None;
     let mut close_after_local = false;
+    let mut terminal_input_closed = false;
     let mut terminal_closing = false;
     let mut terminal_eof = false;
     let mut client_buffered = false;
@@ -193,16 +194,29 @@ fn run_mode_poll(
             session.note_bridge_generation(connection_generation)?;
         }
         terminal_closing |= terminal_events.intersects(PollFlags::HUP | PollFlags::ERR);
-        if pending_local.is_some() && terminal_events.contains(PollFlags::OUT) {
-            let complete = pending_local
-                .as_mut()
-                .expect("checked above")
-                .try_write(&mut terminal)
-                .map_err(SessionError::Io)?;
-            if complete {
+        if pending_local.is_some()
+            && (terminal_input_closed || terminal_events.contains(PollFlags::OUT))
+        {
+            if terminal_input_closed {
                 pending_local = None;
-                if close_after_local {
-                    return Ok(());
+            } else {
+                let write_result = pending_local
+                    .as_mut()
+                    .expect("checked above")
+                    .try_write(&mut terminal);
+                match write_result {
+                    Ok(true) => {
+                        pending_local = None;
+                        if close_after_local && !session.forwards_exit_status() {
+                            return Ok(());
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) if terminal_input_lost(&error) => {
+                        pending_local = None;
+                        terminal_input_closed = true;
+                    }
+                    Err(error) => return Err(SessionError::Io(error)),
                 }
             }
         }
@@ -212,15 +226,15 @@ fn run_mode_poll(
         {
             match read_terminal_packet(&mut terminal, &mut decoder) {
                 Ok(Some(packet)) => {
-                    let packet = if mode == BridgeMode::Terminal {
-                        validate_terminal_output(&packet)?;
-                        packet
-                    } else {
-                        jumphost_terminal_packet(&session, packet)?
-                    };
                     decoder = LocalPacketDecoder::new();
-                    pending_terminal =
-                        send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
+                    if let Some(packet) = take_terminal_output(&session, mode, packet)? {
+                        pending_terminal = send_or_hold(
+                            &session,
+                            packet,
+                            &mut connected,
+                            &mut connection_generation,
+                        )?;
+                    }
                 }
                 Ok(None) => {}
                 Err(SessionError::Io(error))
@@ -251,9 +265,11 @@ fn run_mode_poll(
                     // Jumphost relays every packet verbatim to the jump
                     // terminal, which owns the destination connection.
                     Ok(Some(packet)) if mode == BridgeMode::Jumphost => {
-                        let packet = jumphost_client_packet(&session, packet)?;
-                        pending_local =
-                            Some(PendingLocalFrame::new(&packet).map_err(SessionError::Io)?);
+                        if !terminal_input_closed {
+                            let packet = jumphost_client_packet(&session, packet)?;
+                            pending_local =
+                                Some(PendingLocalFrame::new(&packet).map_err(SessionError::Io)?);
+                        }
                         true
                     }
                     Ok(Some(packet)) if is_forward_packet(packet.header()) => {
@@ -263,9 +279,11 @@ fn run_mode_poll(
                     Ok(Some(packet)) => {
                         match forward_client_packet(&session, packet)? {
                             ClientForward::ToTerminal(packet) => {
-                                pending_local = Some(
-                                    PendingLocalFrame::new(&packet).map_err(SessionError::Io)?,
-                                );
+                                if !terminal_input_closed {
+                                    pending_local = Some(
+                                        PendingLocalFrame::new(&packet).map_err(SessionError::Io)?,
+                                    );
+                                }
                             }
                             ClientForward::KeepAlive(control) => {
                                 enqueue_outbound(
@@ -278,8 +296,23 @@ fn run_mode_poll(
                             }
                             ClientForward::CloseSession => {
                                 close_after_local = true;
-                                if write_local_terminal_close(&mut terminal, &mut pending_local)? {
-                                    return Ok(());
+                                if !terminal_input_closed {
+                                    match write_local_terminal_close(
+                                        &mut terminal,
+                                        &mut pending_local,
+                                    ) {
+                                        Ok(true) if !session.forwards_exit_status() => {
+                                            return Ok(());
+                                        }
+                                        Ok(_) => {}
+                                        Err(SessionError::Io(error))
+                                            if terminal_input_lost(&error) =>
+                                        {
+                                            pending_local = None;
+                                            terminal_input_closed = true;
+                                        }
+                                        Err(error) => return Err(error),
+                                    }
                                 }
                             }
                         }
@@ -367,18 +400,35 @@ fn run_mode_windows(
     let mut pending_terminal: Option<Packet> = None;
     let mut pending_local: Option<PendingLocalFrame> = None;
     let mut close_after_local = false;
+    let mut terminal_input_closed = false;
     loop {
         if session.is_shutting_down() {
             return Ok(());
         }
         let mut progress = false;
 
-        if let Some(frame) = pending_local.as_mut() {
-            if frame.try_write(&mut terminal).map_err(SessionError::Io)? {
+        if pending_local.is_some() {
+            if terminal_input_closed {
                 pending_local = None;
-                progress = true;
-                if close_after_local {
-                    return Ok(());
+            } else {
+                let write_result = pending_local
+                    .as_mut()
+                    .expect("checked above")
+                    .try_write(&mut terminal);
+                match write_result {
+                    Ok(true) => {
+                        pending_local = None;
+                        progress = true;
+                        if close_after_local && !session.forwards_exit_status() {
+                            return Ok(());
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) if terminal_input_lost(&error) => {
+                        pending_local = None;
+                        terminal_input_closed = true;
+                    }
+                    Err(error) => return Err(SessionError::Io(error)),
                 }
             }
         }
@@ -420,15 +470,15 @@ fn run_mode_windows(
             match read_terminal_packet(&mut terminal, &mut decoder) {
                 Ok(Some(packet)) => {
                     progress = true;
-                    let packet = if mode == BridgeMode::Terminal {
-                        validate_terminal_output(&packet)?;
-                        packet
-                    } else {
-                        jumphost_terminal_packet(&session, packet)?
-                    };
                     decoder = LocalPacketDecoder::new();
-                    pending_terminal =
-                        send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
+                    if let Some(packet) = take_terminal_output(&session, mode, packet)? {
+                        pending_terminal = send_or_hold(
+                            &session,
+                            packet,
+                            &mut connected,
+                            &mut connection_generation,
+                        )?;
+                    }
                 }
                 Ok(None) => {}
                 Err(error) => return Err(error),
@@ -445,18 +495,23 @@ fn run_mode_windows(
                     Ok(Some(packet)) => {
                         progress = true;
                         if mode == BridgeMode::Jumphost {
-                            let packet = jumphost_client_packet(&session, packet)?;
-                            pending_local =
-                                Some(PendingLocalFrame::new(&packet).map_err(SessionError::Io)?);
+                            if !terminal_input_closed {
+                                let packet = jumphost_client_packet(&session, packet)?;
+                                pending_local = Some(
+                                    PendingLocalFrame::new(&packet).map_err(SessionError::Io)?,
+                                );
+                            }
                         } else if is_forward_packet(packet.header()) {
                             enqueue_forwarding(&forwarder, &mut pending_forward, packet)?;
                         } else {
                             match forward_client_packet(&session, packet)? {
                                 ClientForward::ToTerminal(packet) => {
-                                    pending_local = Some(
-                                        PendingLocalFrame::new(&packet)
-                                            .map_err(SessionError::Io)?,
-                                    );
+                                    if !terminal_input_closed {
+                                        pending_local = Some(
+                                            PendingLocalFrame::new(&packet)
+                                                .map_err(SessionError::Io)?,
+                                        );
+                                    }
                                 }
                                 ClientForward::KeepAlive(control) => {
                                     enqueue_outbound(
@@ -469,11 +524,23 @@ fn run_mode_windows(
                                 }
                                 ClientForward::CloseSession => {
                                     close_after_local = true;
-                                    if write_local_terminal_close(
-                                        &mut terminal,
-                                        &mut pending_local,
-                                    )? {
-                                        return Ok(());
+                                    if !terminal_input_closed {
+                                        match write_local_terminal_close(
+                                            &mut terminal,
+                                            &mut pending_local,
+                                        ) {
+                                            Ok(true) if !session.forwards_exit_status() => {
+                                                return Ok(());
+                                            }
+                                            Ok(_) => {}
+                                            Err(SessionError::Io(error))
+                                                if terminal_input_lost(&error) =>
+                                            {
+                                                pending_local = None;
+                                                terminal_input_closed = true;
+                                            }
+                                            Err(error) => return Err(error),
+                                        }
                                     }
                                 }
                             }
@@ -798,6 +865,44 @@ fn read_terminal_packet(
             Err(error) => return Err(SessionError::Io(error)),
         }
     }
+}
+
+fn terminal_input_lost(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::UnexpectedEof
+    ) || matches!(error.raw_os_error(), Some(32) | Some(9))
+}
+
+/// Forward terminal output, dropping `TERMINAL_EXIT_STATUS` unless the client
+/// advertised `supports_exit_status`. Older peers abort on unknown type 12.
+fn take_terminal_output(
+    session: &ActiveSession,
+    mode: BridgeMode,
+    packet: Packet,
+) -> Result<Option<Packet>, SessionError> {
+    if packet.header() == TerminalPacketType::TerminalExitStatus as u8 {
+        if !session.forwards_exit_status() {
+            return Ok(None);
+        }
+        let packet = if mode == BridgeMode::Jumphost {
+            jumphost_terminal_packet(session, packet)?
+        } else {
+            packet
+        };
+        return Ok(Some(packet));
+    }
+    let packet = if mode == BridgeMode::Terminal {
+        validate_terminal_output(&packet)?;
+        packet
+    } else {
+        jumphost_terminal_packet(session, packet)?
+    };
+    Ok(Some(packet))
 }
 
 fn validate_terminal_output(packet: &Packet) -> Result<(), SessionError> {

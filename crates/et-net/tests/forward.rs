@@ -292,6 +292,7 @@ fn hard_shutdown_reports_admitted_socket_bytes_abandoned() {
                 buffer: Some(vec![9u8; 64 * 1024]),
                 error: None,
                 closed: None,
+                half_close: None,
                 window: None,
             }
             .encode_to_vec(),

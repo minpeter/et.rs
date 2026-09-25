@@ -36,6 +36,9 @@ pub struct OutputQueue {
     before_take: Option<crate::output_interrupt::TerminalStream>,
     skip_until_newline: bool,
     promotion_pending: bool,
+    /// Remote command status. Held until terminal bytes already queued have
+    /// been taken, and never discarded with pane output.
+    pending_exit: Option<Packet>,
 }
 
 impl OutputQueue {
@@ -54,10 +57,15 @@ impl OutputQueue {
             before_take: None,
             skip_until_newline: false,
             promotion_pending: false,
+            pending_exit: None,
         }
     }
 
     pub fn push(&mut self, packet: Packet) -> Result<(), QueuePushError> {
+        if packet.header() == TerminalPacketType::TerminalExitStatus as u8 {
+            self.pending_exit = Some(packet);
+            return Ok(());
+        }
         if is_terminal_output(&packet) {
             self.push_terminal(packet)
         } else {
@@ -128,6 +136,11 @@ impl OutputQueue {
 
     pub fn take(&mut self) -> Option<Packet> {
         self.promote_terminal_control();
+        if self.terminal.is_empty() {
+            if let Some(packet) = self.pending_exit.take() {
+                return Some(packet);
+            }
+        }
         let packet = if self.prefer_terminal {
             self.terminal
                 .pop_front()
@@ -149,6 +162,9 @@ impl OutputQueue {
     }
 
     pub fn complete(&mut self, packet: &Packet) {
+        if packet.header() == TerminalPacketType::TerminalExitStatus as u8 {
+            return;
+        }
         if is_terminal_output(packet) {
             self.terminal_bytes -= packet_cost(packet);
             self.terminal_packets -= 1;
@@ -159,6 +175,10 @@ impl OutputQueue {
     }
 
     pub fn restore_front(&mut self, packet: Packet) {
+        if packet.header() == TerminalPacketType::TerminalExitStatus as u8 {
+            self.pending_exit = Some(packet);
+            return;
+        }
         if is_terminal_output(&packet) {
             if let Some(stream) = self.before_take.take() {
                 self.stream = stream;
@@ -187,7 +207,7 @@ impl OutputQueue {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.terminal.is_empty() && self.control.is_empty()
+        self.terminal.is_empty() && self.control.is_empty() && self.pending_exit.is_none()
     }
 
     pub fn bytes(&self) -> usize {

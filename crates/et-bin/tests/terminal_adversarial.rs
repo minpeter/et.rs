@@ -64,6 +64,7 @@ fn malformed_initialization_and_shell_spawn_failure_are_typed() {
 
             no_pty: None,
             command: None,
+            no_shell: None,
         },
     );
     assert!(!failed_child
@@ -104,6 +105,7 @@ fn shell_exit_reaps_background_process_group() {
 
             no_pty: None,
             command: None,
+            no_shell: None,
         },
     );
     let mut output = String::new();

@@ -55,6 +55,8 @@ pub struct TerminalOptions<'a> {
     pub close_on_hangup: bool,
     /// `et -T`: binary stdio, no pty, no shell-injected command.
     pub no_pty: bool,
+    /// `ssh -W`: stdin/stdout are the forward, not a terminal.
+    pub stdio_forward: bool,
 }
 
 pub fn run<F>(
@@ -62,7 +64,7 @@ pub fn run<F>(
     options: TerminalOptions<'_>,
     mut forwarder: Forwarder,
     mut reconnect: F,
-) -> Result<(), ClientError>
+) -> Result<i32, ClientError>
 where
     F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
 {
@@ -76,6 +78,7 @@ where
         connection_name,
         close_on_hangup,
         no_pty,
+        stdio_forward,
     } = options;
     let hangup = if close_on_hangup {
         crate::client_hangup::HangupClose::install()
@@ -106,7 +109,9 @@ where
                 write_terminal_size_recovering(&mut connection, &initial_size, &mut reconnect)?,
                 OwnedWriteOutcome::SessionEnded
             ) {
-                return raw_mode.finish(Ok(()), close_message, terminal_modes.alternate_screen());
+                return raw_mode
+                    .finish(Ok(()), close_message, terminal_modes.alternate_screen())
+                    .map(|()| 0);
             }
         }
     }
@@ -125,15 +130,21 @@ where
                 )?,
                 OwnedWriteOutcome::SessionEnded
             ) {
-                return raw_mode.finish(Ok(()), close_message, terminal_modes.alternate_screen());
+                return raw_mode
+                    .finish(Ok(()), close_message, terminal_modes.alternate_screen())
+                    .map(|()| 0);
             }
         }
     }
-    let read_stdin = if no_pty {
+    let read_stdin = if stdio_forward {
+        false
+    } else if no_pty {
         terminal_enabled
     } else {
         terminal_enabled && (command.is_none() || io::stdin().is_terminal())
     };
+    let want_exit_status = command.is_some() && !no_exit && !stdio_forward;
+    let mut exit_code = None;
     // With `--command` (or without a real console) nothing will answer a
     // ConPTY cursor-position request, so the client answers it itself.
     // Raw pipe sessions are binary and must not answer cursor reports.
@@ -181,6 +192,9 @@ where
                 binary_stdio: no_pty,
                 terminal_modes: &mut terminal_modes,
                 hangup: &hangup,
+                want_exit_status,
+                exit_code: &mut exit_code,
+                stdio_forward,
             },
             &mut forwarder,
             reconnect,
@@ -201,11 +215,52 @@ where
             binary_stdio: no_pty,
             terminal_modes: &mut terminal_modes,
             hangup: &hangup,
+            want_exit_status,
+            exit_code: &mut exit_code,
+            stdio_forward,
         },
         &mut forwarder,
         reconnect,
     );
-    raw_mode.finish(result, close_message, terminal_modes.alternate_screen())
+    let status = match result {
+        Ok(()) => {
+            raw_mode.finish(Ok(()), close_message, terminal_modes.alternate_screen())?;
+            if want_exit_status {
+                exit_code.unwrap_or(0)
+            } else {
+                0
+            }
+        }
+        Err(error) if want_exit_status && exit_code.is_some() && is_output_closed(&error) => {
+            raw_mode.finish(Ok(()), close_message, terminal_modes.alternate_screen())?;
+            exit_code.unwrap_or(1)
+        }
+        Err(error) => {
+            return raw_mode
+                .finish(Err(error), close_message, terminal_modes.alternate_screen())
+                .map(|()| 0);
+        }
+    };
+    Ok(status)
+}
+
+pub(crate) fn is_output_closed(error: &ClientError) -> bool {
+    let text = error.to_string();
+    text.contains("Broken pipe")
+        || text.contains("os error 32")
+        || text.contains("EPIPE")
+        || text.contains("os error 9")
+}
+
+pub(crate) fn tolerate_dead_output(
+    exit_known: bool,
+    result: Result<bool, ClientError>,
+) -> Result<bool, ClientError> {
+    match result {
+        Ok(written) => Ok(written),
+        Err(error) if exit_known && is_output_closed(&error) => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
 /// Device Status Report request (`ESC [ 6 n`).

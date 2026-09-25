@@ -32,6 +32,10 @@ pub(crate) fn terminal_init_from_payload(
     payload: &InitialPayload,
 ) -> Result<TermInit, &'static str> {
     let pipe_mode = payload.no_pty.unwrap_or(false);
+    let no_shell = payload.no_shell.unwrap_or(false);
+    if pipe_mode && no_shell {
+        return Err("no_pty and no_shell cannot both be set");
+    }
     if pipe_mode && payload.command.as_deref().unwrap_or("").is_empty() {
         return Err("no_pty requires a non-empty command");
     }
@@ -40,6 +44,7 @@ pub(crate) fn terminal_init_from_payload(
         environmentvalues: environment.values().cloned().collect(),
         no_pty: pipe_mode.then_some(true),
         command: pipe_mode.then(|| payload.command.clone().unwrap_or_default()),
+        no_shell: no_shell.then_some(true),
         flowcontrol: payload.flowcontrol,
     })
 }
@@ -454,6 +459,7 @@ fn handle_new(
         &terminal,
         payload.flowcontrol,
         payload.no_pty.unwrap_or(false),
+        payload.supports_exit_status.unwrap_or(false),
     ) {
         Ok(active) => active,
         Err(error) => {
@@ -605,7 +611,13 @@ fn run_jumphost(
     {
         return;
     }
-    let active = match ActiveSession::new(connection, &terminal, payload.flowcontrol) {
+    let active = match ActiveSession::new_with_pipe(
+        connection,
+        &terminal,
+        payload.flowcontrol,
+        false,
+        payload.supports_exit_status.unwrap_or(false),
+    ) {
         Ok(active) => active,
         Err(error) => {
             crate::diag::info(format!(

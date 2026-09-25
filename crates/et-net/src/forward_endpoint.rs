@@ -614,10 +614,11 @@ impl ForwardStream {
         };
     }
 
-    #[cfg(windows)]
     pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         match self {
             Self::Tcp(stream) => stream.set_read_timeout(timeout),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.set_read_timeout(timeout),
         }
     }
 

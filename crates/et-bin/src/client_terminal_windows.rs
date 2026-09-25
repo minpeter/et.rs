@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use et_core::proto::TerminalPacketType;
+use prost::Message;
 use et_net::connection::Connection;
 use et_net::forward::{is_forward_packet, Forwarder};
 
@@ -52,6 +53,9 @@ where
         binary_stdio,
         terminal_modes,
         hangup,
+        want_exit_status,
+        exit_code,
+        stdio_forward,
     } = options;
     let console_output = crate::client_output::ConsoleOutput::stdout(flow_control)
         .map_err(|error| terminal_io("starting console output worker", error))?;
@@ -111,6 +115,7 @@ where
                 binary_stdio,
                 terminal_modes,
                 &console_output,
+                exit_code,
             )? {
                 DisplayOutcome::Displayed { cursor_report }
                     if cursor_report && auto_cursor_report && !console_output.is_async() =>
@@ -134,6 +139,31 @@ where
                 DisplayOutcome::Displayed { .. } => {}
                 DisplayOutcome::Pending(packet) => pending_output = Some(packet),
             }
+        }
+        if stdio_forward && forwarder.stdio_finished() {
+            let _ = connection.write_packet(TerminalPacketType::TerminalClose as u8, &[]);
+            return finish_remote_completion(
+                console_output,
+                pending_output,
+                pending_forward,
+                terminal_enabled,
+                binary_stdio,
+                terminal_modes,
+                forwarder,
+                None,
+            );
+        }
+        if want_exit_status && exit_code.is_some() && pending_output.is_none() {
+            return finish_remote_completion(
+                console_output,
+                pending_output,
+                pending_forward,
+                terminal_enabled,
+                binary_stdio,
+                terminal_modes,
+                forwarder,
+                None,
+            );
         }
 
         // 1. Console input and resize notifications.
@@ -233,6 +263,7 @@ where
                             binary_stdio,
                             terminal_modes,
                             &console_output,
+                            exit_code,
                         )? {
                             DisplayOutcome::Displayed { cursor_report }
                                 if cursor_report
@@ -388,6 +419,7 @@ fn finish_remote_completion(
                 binary_stdio,
                 terminal_modes,
                 &output,
+                &mut None,
             )? {
                 DisplayOutcome::Displayed { .. } => Ok(None),
                 DisplayOutcome::Pending(packet) => Ok(Some(packet)),
@@ -465,15 +497,28 @@ fn route_server_packet(
     binary_stdio: bool,
     terminal_modes: &mut TerminalModeState,
     output: &crate::client_output::ConsoleOutput,
+    exit_code: &mut Option<i32>,
 ) -> Result<DisplayOutcome, ClientError> {
+    if packet.header() == TerminalPacketType::TerminalExitStatus as u8 {
+        if let Ok(status) = et_core::proto::TerminalExitStatus::decode(packet.payload()) {
+            if let Some(code) = status.exitcode {
+                *exit_code = Some(code);
+            }
+        }
+        return Ok(DisplayOutcome::Displayed {
+            cursor_report: false,
+        });
+    }
     if terminal_enabled || packet.header() == TerminalPacketType::KeepAlive as u8 {
         let outcome = crate::client_terminal::display_packet_with(packet, |bytes, is_stderr| {
-            if binary_stdio || is_stderr {
-                return crate::client_terminal::write_binary_stdio(is_stderr, bytes);
-            }
-            output
-                .try_write(bytes, terminal_modes)
-                .map_err(|error| terminal_io("writing terminal output", error))
+            let result = if binary_stdio || is_stderr {
+                crate::client_terminal::write_binary_stdio(is_stderr, bytes)
+            } else {
+                output
+                    .try_write(bytes, terminal_modes)
+                    .map_err(|error| terminal_io("writing terminal output", error))
+            };
+            crate::client_terminal::tolerate_dead_output(exit_code.is_some(), result)
         })?;
         if binary_stdio {
             if let DisplayOutcome::Displayed { .. } = outcome {

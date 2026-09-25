@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use et_core::proto::TerminalPacketType;
 #[cfg(unix)]
+use prost::Message;
+#[cfg(unix)]
 use et_net::connection::Connection;
 #[cfg(unix)]
 use et_net::forward::is_forward_packet;
@@ -96,6 +98,11 @@ pub(crate) struct PumpOptions<'a> {
     pub(crate) binary_stdio: bool,
     pub(crate) terminal_modes: &'a mut TerminalModeState,
     pub(crate) hangup: &'a crate::client_hangup::HangupClose,
+    /// Remember `TERMINAL_EXIT_STATUS` and stop once console output is drained.
+    pub(crate) want_exit_status: bool,
+    pub(crate) exit_code: &'a mut Option<i32>,
+    /// `ssh -W`: leave the session when the stdio forward finishes.
+    pub(crate) stdio_forward: bool,
 }
 
 #[cfg(unix)]
@@ -118,6 +125,9 @@ where
         binary_stdio,
         terminal_modes,
         hangup,
+        want_exit_status,
+        exit_code,
+        stdio_forward,
     } = options;
     let stdin = io::stdin();
     let mut console_output = crate::client_output::ConsoleOutput::stdout(flow_control)
@@ -162,6 +172,7 @@ where
                 binary_stdio,
                 terminal_modes,
                 &console_output,
+                exit_code,
             )? {
                 DisplayOutcome::Displayed { cursor_report }
                     if cursor_report && auto_cursor_report && !console_output.is_async() =>
@@ -190,6 +201,31 @@ where
                 DisplayOutcome::Displayed { .. } => {}
                 DisplayOutcome::Pending(packet) => pending_output = Some(packet),
             }
+        }
+        if stdio_forward && forwarder.stdio_finished() {
+            let _ = connection.write_packet(TerminalPacketType::TerminalClose as u8, &[]);
+            return finish_remote_completion(
+                console_output,
+                pending_output,
+                pending_forward,
+                terminal_enabled,
+                binary_stdio,
+                terminal_modes,
+                forwarder,
+                None,
+            );
+        }
+        if want_exit_status && exit_code.is_some() && pending_output.is_none() {
+            return finish_remote_completion(
+                console_output,
+                pending_output,
+                pending_forward,
+                terminal_enabled,
+                binary_stdio,
+                terminal_modes,
+                forwarder,
+                None,
+            );
         }
         // The transport is shared by every forwarded socket AND the session
         // keepalives, so forwarding congestion must never suppress its reads:
@@ -352,6 +388,7 @@ where
                             binary_stdio,
                             terminal_modes,
                             &console_output,
+                            exit_code,
                         )? {
                             DisplayOutcome::Displayed { cursor_report }
                                 if cursor_report
@@ -581,15 +618,28 @@ fn route_server_packet(
     binary_stdio: bool,
     terminal_modes: &mut TerminalModeState,
     output: &crate::client_output::ConsoleOutput,
+    exit_code: &mut Option<i32>,
 ) -> Result<DisplayOutcome, ClientError> {
+    if packet.header() == TerminalPacketType::TerminalExitStatus as u8 {
+        if let Ok(status) = et_core::proto::TerminalExitStatus::decode(packet.payload()) {
+            if let Some(code) = status.exitcode {
+                *exit_code = Some(code);
+            }
+        }
+        return Ok(DisplayOutcome::Displayed {
+            cursor_report: false,
+        });
+    }
     if terminal_enabled || packet.header() == TerminalPacketType::KeepAlive as u8 {
         let outcome = crate::client_terminal::display_packet_with(packet, |bytes, is_stderr| {
-            if binary_stdio || is_stderr {
-                return crate::client_terminal::write_binary_stdio(is_stderr, bytes);
-            }
-            output
-                .try_write(bytes, terminal_modes)
-                .map_err(|error| terminal_io("writing terminal output", error))
+            let result = if binary_stdio || is_stderr {
+                crate::client_terminal::write_binary_stdio(is_stderr, bytes)
+            } else {
+                output
+                    .try_write(bytes, terminal_modes)
+                    .map_err(|error| terminal_io("writing terminal output", error))
+            };
+            crate::client_terminal::tolerate_dead_output(exit_code.is_some(), result)
         })?;
         if binary_stdio {
             if let DisplayOutcome::Displayed { .. } = outcome {
@@ -638,6 +688,7 @@ fn finish_remote_completion(
                 binary_stdio,
                 terminal_modes,
                 &output,
+                &mut None,
             )? {
                 DisplayOutcome::Displayed { .. } => Ok(None),
                 DisplayOutcome::Pending(packet) => Ok(Some(packet)),

@@ -75,7 +75,7 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
     let resolver = SystemResolver;
     let deadline = runner.deadline();
     match run_client(&parsed, &runner, &resolver, deadline) {
-        Ok(()) => Ok(0),
+        Ok(code) => Ok(code),
         Err(error) => {
             eprintln!("et: {error}");
             Ok(error.exit_code())
@@ -88,7 +88,7 @@ fn run_client(
     runner: &dyn SshRunner,
     resolver: &dyn EndpointResolver,
     deadline: Deadline,
-) -> Result<(), ClientError> {
+) -> Result<i32, ClientError> {
     let destination = parse_positional_host(&args.host, args.port)?;
     let requested_user = command_user(destination.user, args.username.clone());
     validate_ssh_destination(&destination.host, requested_user.as_deref())?;
@@ -182,8 +182,12 @@ fn run_client(
         ssh_config.as_deref(),
         deadline,
     );
+    let dynamic = forward_config.dynamic;
+    let stdio = forward_config.stdio;
     let has_forwarding = !forward_config.local_sources.is_empty()
-        || !forward_config.initial_payload.reversetunnels.is_empty();
+        || !forward_config.initial_payload.reversetunnels.is_empty()
+        || !dynamic.is_empty()
+        || stdio.is_some();
     // Bind local sources only after the encrypted session exists so accepted
     // tunnels can be multiplexed immediately (avoids pre-handshake accept races).
     let local_sources = forward_config.local_sources;
@@ -378,10 +382,14 @@ fn run_client(
     )?;
     et_cli::logging::verbose(1, format!("Client created with id: {}", credentials.id));
     if args.no_terminal && !has_forwarding {
-        return Ok(());
+        return Ok(0);
     }
-    let (forwarder, skipped) = et_net::forward::Forwarder::start_with_origins_deadline(
+    let (forwarder, skipped) = et_net::forward::Forwarder::start_with_runtime(
         local_sources,
+        et_net::forward::RuntimeForwards {
+            dynamic,
+            stdio: stdio.clone(),
+        },
         deadline.expires_at(),
         std::sync::Arc::new(et_net::forward::SystemForwardResolver),
     )
@@ -406,11 +414,12 @@ fn run_client(
             no_exit: args.no_exit,
             keepalive: args.keepalive,
             flow_control: args.flow_control,
-            terminal_enabled: !args.no_terminal,
+            terminal_enabled: !args.no_terminal && stdio.is_none(),
             lines: crate::client_terminal::RemoteLines::from(remote_mode.terminal_shell),
             connection_name: &request.host_alias,
             close_on_hangup: args.close_on_hangup,
-            no_pty: args.no_pty,
+            no_pty: args.no_pty && stdio.is_none(),
+            stdio_forward: stdio.is_some(),
         },
         forwarder,
         |connection| reconnect_with_retry(connection, &endpoint, &credentials, resolver),
@@ -599,6 +608,17 @@ fn validate_bootstrap_mode(args: &ClientArgs) -> Result<(), ClientError> {
     if args.no_pty && args.command.as_deref().unwrap_or("").is_empty() {
         return Err(ClientError::Unsupported(
             "-T/--no-pty requires -c/--command",
+        ));
+    }
+    if args.stdio_forward.is_some() && args.no_pty {
+        return Err(ClientError::Unsupported(
+            "-W cannot be combined with -T/--no-pty",
+        ));
+    }
+    #[cfg(windows)]
+    if args.stdio_forward.is_some() {
+        return Err(ClientError::Unsupported(
+            "-W is not supported on Windows",
         ));
     }
     Ok(())

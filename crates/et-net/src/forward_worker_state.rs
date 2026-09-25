@@ -68,13 +68,16 @@ impl Worker {
         &mut self,
         client_fd: i32,
         destination: SocketEndpoint,
-        stream: ForwardStream,
+        pending: super::PendingAccept,
     ) -> Result<(), ForwardError> {
         if self.total_sockets() >= MAX_ACTIVE_SOCKETS {
-            stream.shutdown();
+            pending.stream.shutdown();
+            if pending.stdio {
+                self.clear_stdio();
+            }
             return Ok(());
         }
-        self.pending.insert(client_fd, stream);
+        self.pending.insert(client_fd, pending);
         self.emit(
             TerminalPacketType::PortForwardDestinationRequest as u8,
             PortForwardDestinationRequest {
@@ -182,25 +185,51 @@ impl Worker {
     ) -> Result<(), ForwardError> {
         // A response for an fd we no longer track is logged-and-ignored
         // upstream (`closeSourceFd`), not treated as a fatal protocol error.
-        let Some(stream) = response
+        let Some(pending) = response
             .clientfd
             .and_then(|client_fd| self.pending.remove(&client_fd))
         else {
             return Ok(());
         };
         if response.error.is_some() {
-            stream.shutdown();
+            write_socks_reply(&pending.stream, pending.socks_version, false);
+            pending.stream.shutdown();
+            if pending.stdio {
+                self.clear_stdio();
+            }
             return Ok(());
         }
         let Some(socket_id) = response.socketid.filter(|value| *value > 0) else {
-            stream.shutdown();
+            write_socks_reply(&pending.stream, pending.socks_version, false);
+            pending.stream.shutdown();
+            if pending.stdio {
+                self.clear_stdio();
+            }
             return Ok(());
         };
         // The response carries a window only when the peer supports windowing
         // and the socket was established, so this is the source side's
         // negotiation point.
         let peer_advertised = decode_window(response.window);
-        self.activate(Role::Source, socket_id, stream, peer_advertised)
+        write_socks_reply(&pending.stream, pending.socks_version, true);
+        let super::PendingAccept {
+            stream,
+            early,
+            half_close_on_eof,
+            stdio,
+            ..
+        } = pending;
+        self.activate(Role::Source, socket_id, stream, peer_advertised)?;
+        if let Some(active) = self.sources.get_mut(&socket_id) {
+            active.half_close_on_eof = half_close_on_eof;
+        }
+        if stdio {
+            self.stdio_socket = Some(socket_id);
+        }
+        if !early.is_empty() {
+            self.send_data(Role::Source, socket_id, early, false, None)?;
+        }
+        Ok(())
     }
 
     fn receive_data(&mut self, data: PortForwardData) -> Result<(), ForwardError> {
@@ -226,9 +255,22 @@ impl Worker {
             if let Some(active) = self.map(role).get_mut(&socket_id) {
                 apply_delivery(active, delivered);
             }
-            if buffer.is_empty() && !data.closed.unwrap_or(false) {
+            if buffer.is_empty()
+                && !data.closed.unwrap_or(false)
+                && !data.half_close.unwrap_or(false)
+            {
                 return Ok(());
             }
+        }
+        if data.half_close.unwrap_or(false) {
+            // Source finished writing. Keep this socket readable for the reply.
+            let Some(active) = self.map(role).get_mut(&socket_id) else {
+                return Ok(());
+            };
+            if !close_write(active) {
+                return Err(ForwardError::Unavailable);
+            }
+            return Ok(());
         }
         if data.closed.unwrap_or(false) {
             let Some(active) = self.map(role).get_mut(&socket_id) else {
@@ -327,6 +369,7 @@ impl Worker {
                 buffer: None,
                 error: None,
                 closed: None,
+                half_close: None,
                 window: Some(PortForwardWindow {
                     bytes: Some(credit),
                     packets: Some(i32::try_from(packet_credit).unwrap_or(i32::MAX)),
@@ -336,6 +379,17 @@ impl Worker {
     }
 
     pub(super) fn read_closed(&mut self, role: Role, socket_id: i32) -> Result<(), ForwardError> {
+        let half_close = self
+            .map(role)
+            .get(&socket_id)
+            .is_some_and(|active| active.half_close_on_eof);
+        if half_close {
+            if let Some(active) = self.map(role).get_mut(&socket_id) {
+                active.read_closed = true;
+                active.half_close_on_eof = false;
+            }
+            return self.send_half_close(role, socket_id);
+        }
         let fully_closed = self.map(role).get_mut(&socket_id).is_some_and(|active| {
             active.read_closed = true;
             active.write_closed
@@ -374,9 +428,32 @@ impl Worker {
                 buffer,
                 error,
                 closed,
+                half_close: None,
                 window: None,
             },
         )
+    }
+
+    fn send_half_close(&mut self, role: Role, socket_id: i32) -> Result<(), ForwardError> {
+        self.emit(
+            TerminalPacketType::PortForwardData as u8,
+            PortForwardData {
+                sourcetodestination: Some(role == Role::Source),
+                socketid: Some(socket_id),
+                buffer: None,
+                error: None,
+                closed: Some(true),
+                half_close: Some(true),
+                window: None,
+            },
+        )
+    }
+
+    fn clear_stdio(&mut self) {
+        self.stdio_socket = None;
+        if let Some(open) = &self.stdio_open {
+            open.store(false, std::sync::atomic::Ordering::Release);
+        }
     }
 
     fn activate(
@@ -402,6 +479,9 @@ impl Worker {
     }
 
     pub(super) fn remove(&mut self, role: Role, socket_id: i32) {
+        if role == Role::Source && self.stdio_socket == Some(socket_id) {
+            self.clear_stdio();
+        }
         if let Some(active) = self.map(role).remove(&socket_id) {
             super::stop_io(active);
         }
@@ -464,6 +544,18 @@ impl Worker {
         let _ = self.outbound_wake.write(&[1]);
         Ok(())
     }
+}
+
+fn write_socks_reply(stream: &ForwardStream, version: Option<u8>, success: bool) {
+    let Some(version) = version else {
+        return;
+    };
+    let mut stream = match stream.try_clone() {
+        Ok(stream) => stream,
+        Err(_) => return,
+    };
+    let reply = crate::socks::socks_connect_reply(version, success);
+    let _ = std::io::Write::write_all(&mut stream, &reply);
 }
 
 #[cfg(test)]

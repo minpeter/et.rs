@@ -131,11 +131,11 @@ fn flow_control_opt_in_modes_use_additive_proto_fields() {
         ..Default::default()
     };
 
-    // Field 4/3 are upstream no_pty (ET #854). Flow control lives at
-    // InitialPayload field 6 and TermInit field 5 so Backpressure (varint 1)
-    // is not the same bytes as no_pty=true.
-    assert_eq!(enc(&initial), [0x30, 0x01]);
-    assert_eq!(enc(&term), [0x28, 0x02]);
+    // Field 6/5 are upstream supports_exit_status and no_shell (#851/#849).
+    // Flow control lives at InitialPayload field 8 and TermInit field 6 so
+    // Backpressure (varint 1) is not the same bytes as those bools.
+    assert_eq!(enc(&initial), [0x40, 0x01]);
+    assert_eq!(enc(&term), [0x30, 0x02]);
 }
 
 #[test]
@@ -194,6 +194,7 @@ fn port_forward_windows_use_additive_proto_fields() {
         buffer: None,
         error: None,
         closed: None,
+        half_close: None,
         window: Some(et::PortForwardWindow {
             bytes: Some(131_072),
             packets: Some(8),
@@ -209,4 +210,39 @@ fn port_forward_windows_use_additive_proto_fields() {
         *f.get("proto_portforward_response_window").unwrap()
     );
     assert_eq!(enc(&credit), *f.get("proto_portforward_credit").unwrap());
+}
+
+#[test]
+fn upstream_exit_status_and_stdio_fields_use_upstream_tags() {
+    assert_eq!(et_core::PROTOCOL_VERSION, 6);
+    assert_eq!(et::TerminalPacketType::TerminalExitStatus as i32, 12);
+
+    let initial = et::InitialPayload {
+        supports_exit_status: Some(true),
+        no_shell: Some(true),
+        ..Default::default()
+    };
+    // Field 6 bool true, field 7 bool true.
+    assert_eq!(enc(&initial), [0x30, 0x01, 0x38, 0x01]);
+
+    let term = et::TermInit {
+        no_shell: Some(true),
+        ..Default::default()
+    };
+    // Field 5 bool true. Must not be the old flow-control tag for Discard.
+    assert_eq!(enc(&term), [0x28, 0x01]);
+
+    let status = et::TerminalExitStatus {
+        exitcode: Some(143),
+    };
+    assert_eq!(enc(&status), [0x08, 0x8f, 0x01]);
+
+    let half = et::PortForwardData {
+        socketid: Some(3),
+        closed: Some(true),
+        half_close: Some(true),
+        ..Default::default()
+    };
+    // Field 2 varint 3, field 5 bool true, field 6 bool true.
+    assert_eq!(enc(&half), [0x10, 0x03, 0x28, 0x01, 0x30, 0x01]);
 }

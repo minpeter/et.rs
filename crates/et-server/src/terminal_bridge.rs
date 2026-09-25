@@ -116,6 +116,7 @@ fn run_mode_poll(
     // local-stream backpressure, and ordered client reads pause behind it.
     let mut pending_local: Option<PendingLocalFrame> = None;
     let mut close_after_local = false;
+    let mut terminal_input_closed = false;
     let mut terminal_closing = false;
     let mut terminal_eof = false;
     let mut client_buffered = false;
@@ -194,16 +195,26 @@ fn run_mode_poll(
         }
         terminal_closing |= terminal_events.intersects(PollFlags::HUP | PollFlags::ERR);
         if pending_local.is_some() && terminal_events.contains(PollFlags::OUT) {
-            let complete = pending_local
+            match pending_local
                 .as_mut()
                 .expect("checked above")
                 .try_write(&mut terminal)
-                .map_err(SessionError::Io)?;
-            if complete {
-                pending_local = None;
-                if close_after_local {
-                    return Ok(());
+            {
+                Ok(true) => {
+                    pending_local = None;
+                    if close_after_local {
+                        return Ok(());
+                    }
                 }
+                Ok(false) => {}
+                Err(error) if terminal_input_gone(&error) => {
+                    // A late resize or keystroke must not tear the client down
+                    // before TERMINAL_EXIT_STATUS can be forwarded.
+                    pending_local = None;
+                    close_after_local = false;
+                    terminal_input_closed = true;
+                }
+                Err(error) => return Err(SessionError::Io(error)),
             }
         }
         if pending_terminal.is_none()
@@ -212,11 +223,9 @@ fn run_mode_poll(
         {
             match read_terminal_packet(&mut terminal, &mut decoder) {
                 Ok(Some(packet)) => {
-                    let packet = if mode == BridgeMode::Terminal {
-                        validate_terminal_output(&packet)?;
-                        packet
-                    } else {
-                        jumphost_terminal_packet(&session, packet)?
+                    let Some(packet) = accept_terminal_packet(&session, mode, packet)? else {
+                        decoder = LocalPacketDecoder::new();
+                        continue;
                     };
                     decoder = LocalPacketDecoder::new();
                     pending_terminal =
@@ -263,6 +272,9 @@ fn run_mode_poll(
                     Ok(Some(packet)) => {
                         match forward_client_packet(&session, packet)? {
                             ClientForward::ToTerminal(packet) => {
+                                if terminal_input_closed {
+                                    continue;
+                                }
                                 pending_local = Some(
                                     PendingLocalFrame::new(&packet).map_err(SessionError::Io)?,
                                 );
@@ -277,9 +289,15 @@ fn run_mode_poll(
                                 )?;
                             }
                             ClientForward::CloseSession => {
-                                close_after_local = true;
-                                if write_local_terminal_close(&mut terminal, &mut pending_local)? {
-                                    return Ok(());
+                                match write_local_terminal_close(&mut terminal, &mut pending_local)?
+                                {
+                                    LocalClose::Done => return Ok(()),
+                                    LocalClose::Pending => close_after_local = true,
+                                    LocalClose::InputGone => {
+                                        pending_local = None;
+                                        close_after_local = false;
+                                        terminal_input_closed = true;
+                                    }
                                 }
                             }
                         }
@@ -367,6 +385,7 @@ fn run_mode_windows(
     let mut pending_terminal: Option<Packet> = None;
     let mut pending_local: Option<PendingLocalFrame> = None;
     let mut close_after_local = false;
+    let mut terminal_input_closed = false;
     loop {
         if session.is_shutting_down() {
             return Ok(());
@@ -374,12 +393,22 @@ fn run_mode_windows(
         let mut progress = false;
 
         if let Some(frame) = pending_local.as_mut() {
-            if frame.try_write(&mut terminal).map_err(SessionError::Io)? {
-                pending_local = None;
-                progress = true;
-                if close_after_local {
-                    return Ok(());
+            match frame.try_write(&mut terminal) {
+                Ok(true) => {
+                    pending_local = None;
+                    progress = true;
+                    if close_after_local {
+                        return Ok(());
+                    }
                 }
+                Ok(false) => {}
+                Err(error) if terminal_input_gone(&error) => {
+                    pending_local = None;
+                    close_after_local = false;
+                    terminal_input_closed = true;
+                    progress = true;
+                }
+                Err(error) => return Err(SessionError::Io(error)),
             }
         }
 
@@ -420,11 +449,9 @@ fn run_mode_windows(
             match read_terminal_packet(&mut terminal, &mut decoder) {
                 Ok(Some(packet)) => {
                     progress = true;
-                    let packet = if mode == BridgeMode::Terminal {
-                        validate_terminal_output(&packet)?;
-                        packet
-                    } else {
-                        jumphost_terminal_packet(&session, packet)?
+                    let Some(packet) = accept_terminal_packet(&session, mode, packet)? else {
+                        decoder = LocalPacketDecoder::new();
+                        continue;
                     };
                     decoder = LocalPacketDecoder::new();
                     pending_terminal =
@@ -453,6 +480,9 @@ fn run_mode_windows(
                         } else {
                             match forward_client_packet(&session, packet)? {
                                 ClientForward::ToTerminal(packet) => {
+                                    if terminal_input_closed {
+                                        continue;
+                                    }
                                     pending_local = Some(
                                         PendingLocalFrame::new(&packet)
                                             .map_err(SessionError::Io)?,
@@ -468,12 +498,17 @@ fn run_mode_windows(
                                     )?;
                                 }
                                 ClientForward::CloseSession => {
-                                    close_after_local = true;
-                                    if write_local_terminal_close(
+                                    match write_local_terminal_close(
                                         &mut terminal,
                                         &mut pending_local,
                                     )? {
-                                        return Ok(());
+                                        LocalClose::Done => return Ok(()),
+                                        LocalClose::Pending => close_after_local = true,
+                                        LocalClose::InputGone => {
+                                            pending_local = None;
+                                            close_after_local = false;
+                                            terminal_input_closed = true;
+                                        }
                                     }
                                 }
                             }
@@ -810,6 +845,44 @@ fn validate_terminal_output(packet: &Packet) -> Result<(), SessionError> {
     Ok(())
 }
 
+/// Terminal packets etserver may forward.
+///
+/// `TERMINAL_EXIT_STATUS` is dropped when the client did not set
+/// `supports_exit_status`, because et-v7.0.0 aborts on unknown type 12.
+fn accept_terminal_packet(
+    session: &ActiveSession,
+    mode: BridgeMode,
+    packet: Packet,
+) -> Result<Option<Packet>, SessionError> {
+    let exit_status = packet.header() == TerminalPacketType::TerminalExitStatus as u8;
+    if exit_status && !session.forwards_exit_status() {
+        return Ok(None);
+    }
+    if mode == BridgeMode::Jumphost {
+        return Ok(Some(jumphost_terminal_packet(session, packet)?));
+    }
+    if packet.is_encrypted()
+        || (packet.header() != TerminalPacketType::TerminalBuffer as u8 && !exit_status)
+    {
+        return Err(SessionError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "terminal emitted an invalid packet",
+        )));
+    }
+    Ok(Some(packet))
+}
+
+fn terminal_input_gone(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::NotConnected
+    )
+}
+
 /// Normalize a client packet relayed towards the jump terminal.
 ///
 /// Keep-alive acknowledgements are per-hop: the payload the client sent
@@ -904,21 +977,32 @@ fn forward_client_packet(
     }
 }
 
+enum LocalClose {
+    /// Frame is fully written; the bridge can end.
+    Done,
+    /// Frame is held until the terminal socket is writable.
+    Pending,
+    /// The pty is already gone. Keep reading so `TERMINAL_EXIT_STATUS` is
+    /// not abandoned behind a failed close write.
+    InputGone,
+}
+
 /// Write a framed local `TERMINAL_CLOSE`. et.rs local sockets use framed
 /// packets, not the raw C++ type byte.
-///
-/// Returns `true` when the frame is fully written and the bridge can end.
 fn write_local_terminal_close(
     terminal: &mut LocalStream,
     pending_local: &mut Option<PendingLocalFrame>,
-) -> Result<bool, SessionError> {
+) -> Result<LocalClose, SessionError> {
     let packet = Packet::new(TerminalPacketType::TerminalClose as u8, Vec::new());
     let mut frame = PendingLocalFrame::new(&packet).map_err(SessionError::Io)?;
-    if frame.try_write(terminal).map_err(SessionError::Io)? {
-        Ok(true)
-    } else {
-        *pending_local = Some(frame);
-        Ok(false)
+    match frame.try_write(terminal) {
+        Ok(true) => Ok(LocalClose::Done),
+        Ok(false) => {
+            *pending_local = Some(frame);
+            Ok(LocalClose::Pending)
+        }
+        Err(error) if terminal_input_gone(&error) => Ok(LocalClose::InputGone),
+        Err(error) => Err(SessionError::Io(error)),
     }
 }
 
@@ -939,6 +1023,8 @@ fn drain(wake: &mut LocalStream) -> Result<(), SessionError> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+
+    use prost::Message;
 
     use super::*;
 
@@ -1029,6 +1115,47 @@ mod tests {
         assert_eq!(
             client_terminal_disposition(4),
             ClientTerminalDisposition::Reject
+        );
+        // Type 12 is terminal -> server. A client that sends it is still rejected.
+        assert_eq!(
+            client_terminal_disposition(TerminalPacketType::TerminalExitStatus as u8),
+            ClientTerminalDisposition::Reject
+        );
+    }
+
+    #[test]
+    fn exit_status_is_forwarded_only_when_the_client_opted_in() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || std::net::TcpStream::connect(address).unwrap());
+        let (stream, _) = listener.accept().unwrap();
+        let _peer = peer.join().unwrap();
+        let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
+        let session = ActiveSession::new(
+            et_net::connection::Connection::new_server(stream, &[7; 32]),
+            &terminal,
+            None,
+        )
+        .unwrap();
+        let packet = Packet::new(
+            TerminalPacketType::TerminalExitStatus as u8,
+            et_core::proto::TerminalExitStatus {
+                exitcode: Some(143),
+            }
+            .encode_to_vec(),
+        );
+        assert!(
+            accept_terminal_packet(&session, BridgeMode::Terminal, packet.clone())
+                .unwrap()
+                .is_none()
+        );
+        session.set_forward_exit_status(true);
+        let forwarded = accept_terminal_packet(&session, BridgeMode::Terminal, packet)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            forwarded.header(),
+            TerminalPacketType::TerminalExitStatus as u8
         );
     }
 

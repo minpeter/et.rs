@@ -46,8 +46,10 @@ pub(crate) fn commit_reservation(active: &ActiveIo, bytes: i64) {
 }
 
 pub(crate) struct BoundSource {
-    pub(crate) listener: ForwardListener,
+    pub(crate) listener: Option<ForwardListener>,
     pub(crate) destination: SocketEndpoint,
+    pub(crate) socks: bool,
+    pub(crate) stdio: bool,
 }
 
 pub(crate) struct ActiveIo {
@@ -58,6 +60,8 @@ pub(crate) struct ActiveIo {
     pub(crate) abandoned: Arc<AtomicBool>,
     pub(crate) read_closed: bool,
     pub(crate) write_closed: bool,
+    /// Stdio (`-W`) EOF shuts the remote write side and keeps the reply open.
+    pub(crate) half_close_on_eof: bool,
     /// Bytes sent on this socket but not yet confirmed delivered by the peer.
     pub(crate) in_flight: Arc<AtomicI64>,
     /// Data packets sent but not yet confirmed delivered by the peer.
@@ -117,7 +121,12 @@ pub(crate) fn spawn_listener(
         let BoundSource {
             listener,
             destination,
+            socks: _,
+            stdio: _,
         } = source;
+        let Some(listener) = listener else {
+            return;
+        };
         loop {
             #[cfg(unix)]
             {
@@ -163,6 +172,10 @@ pub(crate) fn spawn_listener(
                                     client_fd,
                                     destination: destination.clone(),
                                     stream,
+                                    early: Vec::new(),
+                                    socks_version: None,
+                                    half_close_on_eof: false,
+                                    stdio: false,
                                 })
                                 .is_err()
                         {
@@ -182,6 +195,210 @@ pub(crate) fn spawn_listener(
             let _ = accepted_any;
         }
     })
+}
+
+pub(crate) fn spawn_socks_listener(
+    source: BoundSource,
+    commands: CommandSender,
+    cancel: channel::Receiver<()>,
+    stop: ListenerStop,
+    next_client_fd: Arc<AtomicI32>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let BoundSource {
+            listener,
+            socks: _,
+            stdio: _,
+            ..
+        } = source;
+        let Some(listener) = listener else {
+            return;
+        };
+        loop {
+            #[cfg(unix)]
+            {
+                let mut descriptors = [
+                    PollFd::new(&listener, PollFlags::IN),
+                    PollFd::new(&stop, PollFlags::IN),
+                ];
+                match poll(&mut descriptors, None) {
+                    Ok(_) => {}
+                    Err(error) if error == rustix::io::Errno::INTR => continue,
+                    Err(_) => return,
+                }
+                if descriptors[1]
+                    .revents()
+                    .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
+                {
+                    return;
+                }
+                if !descriptors[0].revents().contains(PollFlags::IN) {
+                    continue;
+                }
+            }
+            #[cfg(windows)]
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            match listener.accept() {
+                Ok(stream) => {
+                    let client_fd = next_client_fd.fetch_add(1, Ordering::Relaxed);
+                    if client_fd <= 0 || cancellation_requested(&cancel) {
+                        return;
+                    }
+                    let commands = commands.clone();
+                    let cancel = cancel.clone();
+                    thread::spawn(move || {
+                        if let Some(accepted) = finish_socks_handshake(client_fd, stream, &cancel) {
+                            let _ = commands.send(accepted);
+                        }
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return,
+            }
+            #[cfg(windows)]
+            thread::sleep(ACCEPT_INTERVAL);
+        }
+    })
+}
+
+fn finish_socks_handshake(
+    client_fd: i32,
+    mut stream: ForwardStream,
+    cancel: &channel::Receiver<()>,
+) -> Option<Command> {
+    use crate::socks::{feed_socks_handshake, SocksHandshake, SocksParseStatus};
+
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+    let mut state = SocksHandshake::default();
+    let mut buffer = [0u8; 1024];
+    let outcome = loop {
+        if cancellation_requested(cancel) {
+            return None;
+        }
+        match feed_socks_handshake(&mut state) {
+            SocksParseStatus::Complete => break true,
+            SocksParseStatus::Error => {
+                if !state.reply.is_empty() {
+                    let _ = stream.write_all(&state.reply);
+                }
+                break false;
+            }
+            SocksParseStatus::NeedMore => {
+                if !state.reply.is_empty() {
+                    if stream.write_all(&std::mem::take(&mut state.reply)).is_err() {
+                        break false;
+                    }
+                }
+                match stream.read(&mut buffer) {
+                    Ok(0) => break false,
+                    Ok(count) => state.push(&buffer[..count]),
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => break false,
+                }
+            }
+        }
+    };
+    if !outcome || cancellation_requested(cancel) {
+        stream.shutdown();
+        return None;
+    }
+    // Follow-on bytes can already be buffered after CONNECT completes.
+    let _ = stream.set_nonblocking(true);
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(count) if count == 0 => break,
+            Ok(count) => state.early_data.extend_from_slice(&buffer[..count]),
+        }
+    }
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(None);
+    Some(Command::Accepted {
+        client_fd,
+        destination: state.destination,
+        stream,
+        early: state.early_data,
+        socks_version: Some(state.version),
+        half_close_on_eof: false,
+        stdio: false,
+    })
+}
+
+#[cfg(unix)]
+pub(crate) fn spawn_stdio(
+    destination: SocketEndpoint,
+    commands: CommandSender,
+    cancel: channel::Receiver<()>,
+    next_client_fd: Arc<AtomicI32>,
+) -> io::Result<JoinHandle<()>> {
+    let (worker_end, app_end) = std::os::unix::net::UnixStream::pair()?;
+    let client_fd = next_client_fd.fetch_add(1, Ordering::Relaxed);
+    if client_fd <= 0 {
+        return Err(io::Error::other("stdio forward client id exhausted"));
+    }
+    let mut inbound = app_end.try_clone()?;
+    let mut outbound = app_end;
+    thread::spawn(move || {
+        let mut stdin = io::stdin();
+        let mut buffer = [0u8; READ_CHUNK];
+        loop {
+            if cancellation_requested(&cancel) {
+                let _ = inbound.shutdown(Shutdown::Write);
+                break;
+            }
+            match stdin.read(&mut buffer) {
+                Ok(0) => {
+                    let _ = inbound.shutdown(Shutdown::Write);
+                    break;
+                }
+                Ok(count) => {
+                    if inbound.write_all(&buffer[..count]).is_err() {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => {
+                    let _ = inbound.shutdown(Shutdown::Write);
+                    break;
+                }
+            }
+        }
+    });
+    thread::spawn(move || {
+        let mut stdout = io::stdout();
+        let mut buffer = [0u8; READ_CHUNK];
+        loop {
+            match outbound.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    if stdout.write_all(&buffer[..count]).is_err() || stdout.flush().is_err() {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+    Ok(thread::spawn(move || {
+        let _ = commands.send(Command::Accepted {
+            client_fd,
+            destination,
+            stream: ForwardStream::Unix(worker_end),
+            early: Vec::new(),
+            socks_version: None,
+            half_close_on_eof: true,
+            stdio: true,
+        });
+    }))
 }
 
 pub(crate) fn spawn_connector(
@@ -491,6 +708,7 @@ fn spawn_io_inner(
             abandoned,
             read_closed: false,
             write_closed: false,
+            half_close_on_eof: false,
             in_flight,
             packets_in_flight,
             reserved_bytes,

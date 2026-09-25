@@ -93,6 +93,7 @@ pub(crate) fn bounded_locale_environment(
             environmentvalues: Vec::new(),
             no_pty: pipe_command.map(|_| true),
             command: pipe_command.map(str::to_owned),
+            no_shell: None,
             flowcontrol,
         }
         .encode_to_vec(),
@@ -227,6 +228,9 @@ mod tests {
 
             no_pty: None,
             command: None,
+
+            supports_exit_status: None,
+            no_shell: None,
         };
         let mut locale = vec![
             ("LC_ALL".to_owned(), "C".to_owned()),
@@ -278,6 +282,8 @@ mod tests {
 
                         no_pty: None,
                         command: None,
+
+                        no_shell: None,
                     };
                     Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec())
                         .wire_len()
@@ -302,6 +308,8 @@ mod tests {
 
                 no_pty: None,
                 command: None,
+
+                no_shell: None,
             };
             assert!(
                 Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec(),)
@@ -324,6 +332,8 @@ mod tests {
 
                     no_pty: None,
                     command: None,
+
+                    no_shell: None,
                 };
                 Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec()).wire_len()
                     == MAX_LOCAL_PACKET_LEN

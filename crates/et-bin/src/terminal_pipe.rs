@@ -5,6 +5,8 @@
 //! no `; exit` typed into a shell. Stderr is framed as `TerminalBuffer.is_stderr`.
 
 use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -17,8 +19,11 @@ use et_net::local::LocalStream;
 use et_net::local_packet::{write_local_packet_until_cancelled, LocalPacketDecoder};
 use prost::Message;
 
+#[cfg(unix)]
+use crate::terminal_protocol::openssh_exit_code;
 use crate::terminal_protocol::{
-    local_packet_effect, read_ready_packet, LocalPacketEffect, TerminalInitialization,
+    local_packet_effect, read_ready_packet, write_terminal_exit_status, LocalPacketEffect,
+    TerminalInitialization,
 };
 
 const MAX_OUTPUT_CHUNK: usize = 16 * 1024;
@@ -132,7 +137,14 @@ where
 
     let status = pump(&mut router, wake_reader, &events_rx, &mut Some(stdin));
     drop(cleanup);
-    status
+    let status = status?;
+    if let PipeStatus::Exited(code) = status {
+        if let Err(error) = write_terminal_exit_status(&mut router, code) {
+            et_cli::logging::info(format!("pipe exit status was not sent: {error}"));
+        }
+        return Ok(code);
+    }
+    Ok(0)
 }
 
 fn spawn_command(script: &str, environment: &[(String, String)]) -> Result<Child, String> {
@@ -284,12 +296,17 @@ fn wait_child(slot: Arc<Mutex<Option<Child>>>, kill: &AtomicBool) -> Result<i32,
     }
 }
 
+enum PipeStatus {
+    Exited(i32),
+    Closed,
+}
+
 fn pump(
     router: &mut LocalStream,
     mut wake_reader: LocalStream,
     events: &mpsc::Receiver<PipeEvent>,
     stdin: &mut Option<ChildStdin>,
-) -> Result<i32, String> {
+) -> Result<PipeStatus, String> {
     wake_reader
         .set_nonblocking(true)
         .map_err(|error| format!("could not configure pipe wakeup: {error}"))?;
@@ -301,7 +318,7 @@ fn pump(
         apply_events(events, &mut stdout_done, &mut child_status)?;
         if stdout_done {
             if let Some(status) = child_status {
-                return Ok(status);
+                return Ok(PipeStatus::Exited(status));
             }
         }
         if stdout_done {
@@ -313,7 +330,7 @@ fn pump(
         }
         if stdout_done && stdin.is_none() {
             if let Some(status) = child_status {
-                return Ok(status);
+                return Ok(PipeStatus::Exited(status));
             }
         }
 
@@ -339,7 +356,7 @@ fn pump(
         }
         if stdout_done {
             if let Some(status) = child_status {
-                return Ok(status);
+                return Ok(PipeStatus::Exited(status));
             }
         }
         if accept_input {
@@ -348,7 +365,7 @@ fn pump(
                     // TERMINAL_CLOSE ends the pipe session successfully.
                     // Cleanup kills the child; its signal status is not the
                     // session status.
-                    return Ok(0);
+                    return Ok(PipeStatus::Closed);
                 }
                 decoder = LocalPacketDecoder::new();
             }
@@ -478,7 +495,14 @@ fn signal(wake: &mut LocalStream) {
 }
 
 fn exit_code(status: ExitStatus) -> i32 {
-    status.code().unwrap_or(1)
+    #[cfg(unix)]
+    {
+        openssh_exit_code(status.code(), status.signal())
+    }
+    #[cfg(not(unix))]
+    {
+        status.code().unwrap_or(1)
+    }
 }
 
 struct Cleanup {

@@ -280,6 +280,82 @@ fn ensure_capacity(current: usize, additional: usize) -> Result<(), TunnelError>
     Ok(())
 }
 
+/// Parse `-D [bind_address:]port` into a listen endpoint (EternalTerminal #849).
+pub fn parse_dynamic_forward(input: &str) -> Result<SocketEndpoint, TunnelError> {
+    if input.is_empty() {
+        return Err(TunnelError::InvalidSyntax(
+            "Dynamic forward (-D) requires [bind:]port".to_owned(),
+        ));
+    }
+    if let Some(host) = input.strip_prefix('[') {
+        let Some((host, rest)) = host.split_once(']') else {
+            return Err(TunnelError::InvalidSyntax(
+                "Dynamic forward IPv6 bind must look like [::1]:1080".to_owned(),
+            ));
+        };
+        let Some(port) = rest.strip_prefix(':') else {
+            return Err(TunnelError::InvalidSyntax(
+                "Dynamic forward IPv6 bind must look like [::1]:1080".to_owned(),
+            ));
+        };
+        return Ok(tcp_endpoint(host, parse_single_port(port)?));
+    }
+    match input.rsplit_once(':') {
+        None => Ok(tcp_endpoint("127.0.0.1", parse_single_port(input)?)),
+        Some((host, port)) => {
+            let host = if host.is_empty() { "0.0.0.0" } else { host };
+            Ok(tcp_endpoint(host, parse_single_port(port)?))
+        }
+    }
+}
+
+/// Parse `-W host:port` or a Unix path into a destination endpoint.
+pub fn parse_stdio_forward(input: &str) -> Result<SocketEndpoint, TunnelError> {
+    if input.is_empty() {
+        return Err(TunnelError::InvalidSyntax(
+            "Stdio forward (-W) requires host:port".to_owned(),
+        ));
+    }
+    if input.starts_with('/') {
+        return unix_endpoint(input);
+    }
+    if let Some(host) = input.strip_prefix('[') {
+        let Some((host, rest)) = host.split_once(']') else {
+            return Err(TunnelError::InvalidSyntax(
+                "Stdio forward IPv6 destination must look like [::1]:8080".to_owned(),
+            ));
+        };
+        let Some(port) = rest.strip_prefix(':') else {
+            return Err(TunnelError::InvalidSyntax(
+                "Stdio forward IPv6 destination must look like [::1]:8080".to_owned(),
+            ));
+        };
+        if host.is_empty() {
+            return Err(TunnelError::InvalidSyntax(
+                "Stdio forward host must not be empty".to_owned(),
+            ));
+        }
+        return Ok(SocketEndpoint {
+            name: Some(host.to_owned()),
+            port: Some(i32::from(parse_single_port(port)?)),
+        });
+    }
+    let Some((host, port)) = input.rsplit_once(':') else {
+        return Err(TunnelError::InvalidSyntax(
+            "Stdio forward (-W) requires host:port or a Unix path".to_owned(),
+        ));
+    };
+    if host.is_empty() {
+        return Err(TunnelError::InvalidSyntax(
+            "Stdio forward host must not be empty".to_owned(),
+        ));
+    }
+    Ok(SocketEndpoint {
+        name: Some(host.to_owned()),
+        port: Some(i32::from(parse_single_port(port)?)),
+    })
+}
+
 #[cfg(test)]
 #[path = "tunnel_tests.rs"]
 mod tests;

@@ -145,7 +145,6 @@ impl ConsoleOutput {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn new(mode: FlowControlMode, writer: Box<dyn Write + Send>) -> io::Result<Self> {
         Self::new_with_lifecycle(mode, writer, Box::new(|| {}), Box::new(|| Ok(())))
     }
@@ -314,6 +313,18 @@ impl ConsoleOutput {
 
     pub(crate) fn is_async(&self) -> bool {
         self.shared.is_some()
+    }
+
+    /// Bytes still queued for the console worker. Synchronous writers have none.
+    pub(crate) fn has_pending_data(&self) -> io::Result<bool> {
+        let Some(shared) = &self.shared else {
+            return Ok(false);
+        };
+        let state = shared
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("console output worker unavailable"))?;
+        Ok(state.bytes > 0 || !state.queue.is_empty())
     }
 
     pub(crate) fn take_cursor_reports(&self) -> io::Result<usize> {

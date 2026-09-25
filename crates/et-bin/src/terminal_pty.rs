@@ -24,7 +24,8 @@ const MAX_OUTPUT_CHUNK: usize = 16 * 1024;
 const FINAL_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 use crate::terminal_protocol::{
-    handle_packet, read_initialization, read_ready_packet, LocalPacketEffect,
+    handle_packet, read_initialization, read_ready_packet, write_terminal_exit_status,
+    LocalPacketEffect, TerminalPacketError,
 };
 
 enum WorkerEvent {
@@ -57,6 +58,9 @@ where
     F: FnOnce(&mut LocalStream) -> Result<(), String>,
 {
     let initialization = read_initialization(&mut router)?;
+    if initialization.no_shell {
+        return run_idle(router, started);
+    }
     if initialization.no_pty {
         return crate::terminal_pipe::run(router, initialization, started);
     }
@@ -152,12 +156,7 @@ where
                         .take()
                         .ok_or_else(|| "terminal shell is not owned".to_owned())
                 })
-                .and_then(|mut child| {
-                    child
-                        .wait()
-                        .map(|status| status.exit_code())
-                        .map_err(|error| format!("could not wait for terminal shell: {error}"))
-                });
+                .and_then(|child| reap_shell(child));
             let _ = events_tx.send(WorkerEvent::Child(result));
             signal(wake_writer);
         }) {
@@ -214,6 +213,18 @@ where
             &events_rx,
         )
     });
+    if let Ok(completion) = result.as_ref() {
+        if completion.reaped {
+            if let Ok(mut writer) = router_writer.lock() {
+                if let Err(error) = write_terminal_exit_status(
+                    &mut writer,
+                    i32::try_from(completion.status).unwrap_or(1),
+                ) {
+                    et_cli::logging::info(format!("terminal exit status was not sent: {error}"));
+                }
+            }
+        }
+    }
     let graceful_drain = result.as_ref().is_ok_and(|completion| completion.drained);
     kill_process_group(child_pid);
     // Preserve normal output through PTY EOF. If the bounded fallback elapsed,
@@ -377,6 +388,9 @@ fn write_output(
 struct PumpCompletion {
     status: u32,
     drained: bool,
+    /// The child was reaped. `TERMINAL_CLOSE` before that leaves this false
+    /// so a placeholder 0 is not reported as the command status.
+    reaped: bool,
 }
 
 #[derive(Default)]
@@ -396,6 +410,7 @@ impl CompletionState {
                 Ok(self.output_done.then_some(PumpCompletion {
                     status,
                     drained: true,
+                    reaped: true,
                 }))
             }
             WorkerEvent::Output(Ok(())) => {
@@ -403,6 +418,7 @@ impl CompletionState {
                 Ok(self.child_status.map(|status| PumpCompletion {
                     status,
                     drained: true,
+                    reaped: true,
                 }))
             }
         }
@@ -417,6 +433,7 @@ impl CompletionState {
             .map(|status| PumpCompletion {
                 status,
                 drained: false,
+                reaped: true,
             })
     }
 }
@@ -485,8 +502,11 @@ fn pump_poll(
         }
         if router_events.contains(PollFlags::IN) {
             if let Some(packet) = read_ready_packet(router, &mut decoder)? {
-                if handle_packet(packet, master, pty_writer)? == LocalPacketEffect::Close {
-                    return Ok(terminal_close_completion());
+                match handle_packet(packet, master, pty_writer) {
+                    Ok(LocalPacketEffect::Close) => return Ok(terminal_close_completion()),
+                    Ok(LocalPacketEffect::Continue) => {}
+                    Err(TerminalPacketError::Pty(_)) => {}
+                    Err(TerminalPacketError::Protocol(error)) => return Err(error),
                 }
                 decoder = LocalPacketDecoder::new();
             }
@@ -523,8 +543,11 @@ fn pump_windows(
         match read_ready_packet(router, &mut decoder) {
             Ok(Some(packet)) => {
                 progress = true;
-                if handle_packet(packet, master, pty_writer)? == LocalPacketEffect::Close {
-                    return Ok(terminal_close_completion());
+                match handle_packet(packet, master, pty_writer) {
+                    Ok(LocalPacketEffect::Close) => return Ok(terminal_close_completion()),
+                    Ok(LocalPacketEffect::Continue) => {}
+                    Err(TerminalPacketError::Pty(_)) => {}
+                    Err(TerminalPacketError::Protocol(error)) => return Err(error),
                 }
                 decoder = LocalPacketDecoder::new();
             }
@@ -547,6 +570,80 @@ fn terminal_close_completion() -> PumpCompletion {
     PumpCompletion {
         status: 0,
         drained: false,
+        reaped: false,
+    }
+}
+
+/// `et -W`: no pty and no shell. Discard terminal input and leave on close.
+fn run_idle<F>(mut router: LocalStream, started: F) -> Result<i32, String>
+where
+    F: FnOnce(&mut LocalStream) -> Result<(), String>,
+{
+    router
+        .set_nonblocking(true)
+        .map_err(|error| format!("could not configure idle terminal router: {error}"))?;
+    started(&mut router)?;
+    let mut decoder = LocalPacketDecoder::new();
+    loop {
+        match read_ready_packet(&mut router, &mut decoder) {
+            Ok(Some(packet)) => {
+                match crate::terminal_protocol::local_packet_effect(&packet)? {
+                    LocalPacketEffect::Close => return Ok(0),
+                    LocalPacketEffect::Continue => {}
+                }
+                decoder = LocalPacketDecoder::new();
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) if error.contains("disconnected") => return Ok(0),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn reap_shell(child: Box<dyn portable_pty::Child + Send + Sync>) -> Result<u32, String> {
+    #[cfg(unix)]
+    {
+        let pid = child
+            .process_id()
+            .ok_or_else(|| "terminal shell has no pid".to_owned())?;
+        // portable-pty reports a signaled child as exit code 1. Reap with
+        // waitpid so the wire status is 128+signal, and do not let Drop wait
+        // a second time.
+        std::mem::forget(child);
+        return reap_unix_pid(pid);
+    }
+    #[cfg(not(unix))]
+    {
+        child
+            .wait()
+            .map(|status| status.exit_code())
+            .map_err(|error| format!("could not wait for terminal shell: {error}"))
+    }
+}
+
+#[cfg(unix)]
+fn reap_unix_pid(pid: u32) -> Result<u32, String> {
+    let raw = i32::try_from(pid).map_err(|_| "terminal shell pid is out of range".to_owned())?;
+    let pid = Pid::from_raw(raw);
+    loop {
+        match nix::sys::wait::waitpid(pid, None) {
+            Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
+                return u32::try_from(code)
+                    .map_err(|_| "terminal shell exit status is out of range".to_owned());
+            }
+            Ok(nix::sys::wait::WaitStatus::Signaled(_, signal, _)) => {
+                let number = signal as i32;
+                return u32::try_from(128i32.saturating_add(number))
+                    .map_err(|_| "terminal shell signal status is out of range".to_owned());
+            }
+            Ok(nix::sys::wait::WaitStatus::Stopped(_, _))
+            | Ok(nix::sys::wait::WaitStatus::Continued(_))
+            | Ok(nix::sys::wait::WaitStatus::StillAlive) => {}
+            Ok(status) => return Err(format!("unexpected terminal wait status: {status:?}")),
+            Err(nix::errno::Errno::EINTR) => {}
+            Err(nix::errno::Errno::ECHILD) => return Ok(0),
+            Err(error) => return Err(format!("could not wait for terminal shell: {error}")),
+        }
     }
 }
 

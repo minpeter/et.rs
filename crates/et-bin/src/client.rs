@@ -75,7 +75,7 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
     let resolver = SystemResolver;
     let deadline = runner.deadline();
     match run_client(&parsed, &runner, &resolver, deadline) {
-        Ok(()) => Ok(0),
+        Ok(code) => Ok(code),
         Err(error) => {
             eprintln!("et: {error}");
             Ok(error.exit_code())
@@ -88,7 +88,13 @@ fn run_client(
     runner: &dyn SshRunner,
     resolver: &dyn EndpointResolver,
     deadline: Deadline,
-) -> Result<(), ClientError> {
+) -> Result<i32, ClientError> {
+    #[cfg(windows)]
+    if args.stdio_forward.is_some() {
+        return Err(ClientError::Unsupported(
+            "-W/--stdio-forward is not supported on Windows",
+        ));
+    }
     let destination = parse_positional_host(&args.host, args.port)?;
     let requested_user = command_user(destination.user, args.username.clone());
     validate_ssh_destination(&destination.host, requested_user.as_deref())?;
@@ -378,7 +384,7 @@ fn run_client(
     )?;
     et_cli::logging::verbose(1, format!("Client created with id: {}", credentials.id));
     if args.no_terminal && !has_forwarding {
-        return Ok(());
+        return Ok(0);
     }
     let (forwarder, skipped) = et_net::forward::Forwarder::start_with_origins_deadline(
         local_sources,
@@ -406,11 +412,12 @@ fn run_client(
             no_exit: args.no_exit,
             keepalive: args.keepalive,
             flow_control: args.flow_control,
-            terminal_enabled: !args.no_terminal,
+            terminal_enabled: !args.no_terminal && args.stdio_forward.is_none(),
             lines: crate::client_terminal::RemoteLines::from(remote_mode.terminal_shell),
             connection_name: &request.host_alias,
             close_on_hangup: args.close_on_hangup,
             no_pty: args.no_pty,
+            stdio_forward: args.stdio_forward.is_some(),
         },
         forwarder,
         |connection| reconnect_with_retry(connection, &endpoint, &credentials, resolver),

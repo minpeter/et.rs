@@ -46,6 +46,26 @@ pub struct ClientArgs {
     )]
     pub reverse_tunnel: Vec<String>,
 
+    /// Listen for SOCKS4/SOCKS5 clients and open the destination they choose
+    /// after connect (ssh -D). May be repeated.
+    #[arg(
+        short = 'D',
+        long = "dynamic",
+        value_name = "[BIND:]PORT",
+        help = "Dynamic SOCKS port forward, chosen after connect (ssh -D)"
+    )]
+    pub dynamic: Vec<String>,
+
+    /// Tie stdin/stdout to a remote destination with no pty and no shell (ssh -W).
+    #[arg(
+        short = 'W',
+        long = "stdio-forward",
+        value_name = "HOST:PORT",
+        conflicts_with = "no_pty",
+        help = "Forward stdio to host:port without a remote shell (ssh -W)"
+    )]
+    pub stdio_forward: Option<String>,
+
     #[arg(long = "jumphost")]
     pub jumphost: Option<String>,
 
@@ -399,6 +419,17 @@ mod tests {
         assert!(!off.close_on_hangup);
         let on = ClientArgs::try_parse_from(["et", "host", "--close-on-hangup"]).unwrap();
         assert!(on.close_on_hangup);
+    }
+
+    #[test]
+    fn dynamic_and_stdio_forwards_parse_and_w_conflicts_with_no_pty() {
+        let dynamic =
+            ClientArgs::try_parse_from(["et", "host", "-D", "1080", "-D", "[::1]:1081"]).unwrap();
+        assert_eq!(dynamic.dynamic, ["1080", "[::1]:1081"]);
+        assert!(dynamic.stdio_forward.is_none());
+        let stdio = ClientArgs::try_parse_from(["et", "host", "-W", "127.0.0.1:9"]).unwrap();
+        assert_eq!(stdio.stdio_forward.as_deref(), Some("127.0.0.1:9"));
+        assert!(ClientArgs::try_parse_from(["et", "host", "-W", "h:1", "-T", "-c", "id"]).is_err());
     }
 
     #[test]

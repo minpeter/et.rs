@@ -15,8 +15,9 @@ use crossbeam_channel as channel;
 use crate::forward::{ForwardError, Outbound};
 use crate::forward_endpoint::ForwardStream;
 use crate::forward_io::{
-    abort_io, close_write, commit_reservation, spawn_connector, spawn_io, spawn_listener, stop_io,
-    subtract_saturating, ActiveIo, BoundSource, FlowWindow, ListenerStop, WriteCommand,
+    abort_io, close_write, commit_reservation, spawn_connector, spawn_io, spawn_listener,
+    spawn_socks_listener, stop_io, subtract_saturating, ActiveIo, BoundSource, FlowWindow,
+    ListenerStop, WriteCommand,
 };
 use et_core::packet::Packet;
 use et_core::proto::SocketEndpoint;
@@ -36,6 +37,10 @@ pub(crate) enum Command {
         client_fd: i32,
         destination: SocketEndpoint,
         stream: ForwardStream,
+        early: Vec<u8>,
+        socks_version: Option<u8>,
+        half_close_on_eof: bool,
+        stdio: bool,
     },
     Connected {
         client_fd: i32,
@@ -252,6 +257,7 @@ pub(crate) struct WorkerChannels {
     pub(crate) priority: channel::Sender<Outbound>,
     pub(crate) cancel: channel::Receiver<()>,
     pub(crate) abandoned: Arc<AtomicBool>,
+    pub(crate) stdio_open: Option<Arc<AtomicBool>>,
 }
 
 pub(crate) fn run(
@@ -267,6 +273,7 @@ pub(crate) fn run(
         priority,
         cancel,
         abandoned,
+        stdio_open,
     } = channels;
     let (listener_stop, session_user, shutdown) = control;
     #[cfg(unix)]
@@ -278,7 +285,7 @@ pub(crate) fn run(
         cancel.clone(),
         abandoned,
     )
-    .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user));
+    .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user, stdio_open));
     #[cfg(windows)]
     let result = Worker::new(
         command_sender,
@@ -287,7 +294,7 @@ pub(crate) fn run(
         cancel.clone(),
         abandoned,
     )
-    .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user));
+    .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user, stdio_open));
     if let Err(error) = result {
         if !shutdown.load(Ordering::Acquire) {
             channel::select! {
@@ -308,7 +315,7 @@ struct Worker {
     abandoned: Arc<AtomicBool>,
     #[cfg(unix)]
     outbound_wake: UnixStream,
-    pending: HashMap<i32, ForwardStream>,
+    pending: HashMap<i32, PendingAccept>,
     connecting: HashSet<i32>,
     sources: HashMap<i32, ActiveIo>,
     destinations: HashMap<i32, ActiveIo>,
@@ -318,6 +325,16 @@ struct Worker {
     threads: Vec<JoinHandle<()>>,
     next_socket_id: i32,
     session_user: Option<(u32, u32)>,
+    stdio_open: Option<Arc<AtomicBool>>,
+    stdio_socket: Option<i32>,
+}
+
+struct PendingAccept {
+    stream: ForwardStream,
+    early: Vec<u8>,
+    socks_version: Option<u8>,
+    half_close_on_eof: bool,
+    stdio: bool,
 }
 
 impl Worker {
@@ -351,6 +368,8 @@ impl Worker {
             threads: Vec::new(),
             next_socket_id: 1,
             session_user: None,
+            stdio_open: None,
+            stdio_socket: None,
         })
     }
 
@@ -360,15 +379,45 @@ impl Worker {
         commands: CommandReceiver,
         listener_stop: ListenerStop,
         session_user: Option<(u32, u32)>,
+        stdio_open: Option<Arc<AtomicBool>>,
     ) -> Result<(), ForwardError> {
         self.session_user = session_user;
+        self.stdio_open = stdio_open;
         let next_client_fd = Arc::new(AtomicI32::new(1));
         for source in sources {
+            if source.stdio {
+                #[cfg(unix)]
+                {
+                    let destination = source.destination;
+                    self.threads.push(
+                        crate::forward_io::spawn_stdio(
+                            destination,
+                            self.commands.clone(),
+                            self.cancel.clone(),
+                            next_client_fd.clone(),
+                        )
+                        .map_err(ForwardError::Io)?,
+                    );
+                    continue;
+                }
+                #[cfg(windows)]
+                {
+                    let _ = source;
+                    return Err(ForwardError::Protocol(
+                        "-W/--stdio-forward is not supported on Windows",
+                    ));
+                }
+            }
             #[cfg(unix)]
             let stop = listener_stop.try_clone().map_err(ForwardError::Io)?;
             #[cfg(windows)]
             let stop = listener_stop.clone();
-            self.threads.push(spawn_listener(
+            let spawn = if source.socks {
+                spawn_socks_listener
+            } else {
+                spawn_listener
+            };
+            self.threads.push(spawn(
                 source,
                 self.commands.clone(),
                 self.cancel.clone(),
@@ -386,7 +435,21 @@ impl Worker {
                     client_fd,
                     destination,
                     stream,
-                } => self.accepted(client_fd, destination, stream),
+                    early,
+                    socks_version,
+                    half_close_on_eof,
+                    stdio,
+                } => self.accepted(
+                    client_fd,
+                    destination,
+                    PendingAccept {
+                        stream,
+                        early,
+                        socks_version,
+                        half_close_on_eof,
+                        stdio,
+                    },
+                ),
                 Command::Connected {
                     client_fd,
                     socket_id,
@@ -433,8 +496,8 @@ impl Worker {
         let _ = listener_stop.shutdown(std::net::Shutdown::Both);
         #[cfg(windows)]
         listener_stop.store(true, std::sync::atomic::Ordering::Release);
-        for (_, stream) in self.pending.drain() {
-            stream.shutdown();
+        for (_, pending) in self.pending.drain() {
+            pending.stream.shutdown();
         }
         let hard_cancelled = !matches!(self.cancel.try_recv(), Err(channel::TryRecvError::Empty));
         for (_, io) in self.sources.drain().chain(self.destinations.drain()) {

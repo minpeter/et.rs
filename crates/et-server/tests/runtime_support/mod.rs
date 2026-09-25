@@ -121,6 +121,8 @@ pub fn default_payload() -> InitialPayload {
 
         no_pty: None,
         command: None,
+        supports_exit_status: None,
+        no_shell: None,
     }
 }
 

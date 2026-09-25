@@ -96,6 +96,9 @@ pub(crate) struct PumpOptions<'a> {
     pub(crate) binary_stdio: bool,
     pub(crate) terminal_modes: &'a mut TerminalModeState,
     pub(crate) hangup: &'a crate::client_hangup::HangupClose,
+    pub(crate) remote_exit: &'a crate::client_terminal::RemoteExit,
+    /// `et -W`: leave when the stdio bridge closes, and do not own stdout.
+    pub(crate) stdio_forward: bool,
 }
 
 #[cfg(unix)]
@@ -105,7 +108,7 @@ pub fn pump<F>(
     options: PumpOptions<'_>,
     forwarder: &mut Forwarder,
     mut reconnect: F,
-) -> Result<(), ClientError>
+) -> Result<i32, ClientError>
 where
     F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
 {
@@ -118,10 +121,16 @@ where
         binary_stdio,
         terminal_modes,
         hangup,
+        remote_exit,
+        stdio_forward,
     } = options;
     let stdin = io::stdin();
-    let mut console_output = crate::client_output::ConsoleOutput::stdout(flow_control)
-        .map_err(|error| terminal_io("starting console output worker", error))?;
+    let mut console_output = if stdio_forward {
+        crate::client_output::ConsoleOutput::new(flow_control, Box::new(io::sink()))
+    } else {
+        crate::client_output::ConsoleOutput::stdout(flow_control)
+    }
+    .map_err(|error| terminal_io("starting console output worker", error))?;
     let interval = Duration::from_secs(u64::from(keepalive_seconds.max(1)));
     let silence = interval.saturating_mul(MISSED_KEEPALIVES);
     let mut last_received = Instant::now();
@@ -146,7 +155,42 @@ where
     let mut pump_probe = PumpProbe::connect()?;
     loop {
         if crate::client_hangup::take_hangup_close(connection, hangup) {
-            return Ok(());
+            return Ok(remote_exit.finish_code());
+        }
+        if stdio_forward && !forwarder.stdio_bridge_open() {
+            let _ = write_owned(
+                connection,
+                TerminalPacketType::TerminalClose as u8,
+                &[],
+                &mut reconnect,
+                &mut stream,
+                terminal_enabled,
+            )?;
+            return finish_remote_completion(
+                console_output,
+                pending_output,
+                pending_forward,
+                terminal_enabled,
+                binary_stdio,
+                terminal_modes,
+                forwarder,
+                None,
+                remote_exit,
+            )
+            .map(|_code| 0);
+        }
+        if command_status_drained(remote_exit, &console_output, &pending_output)? {
+            return finish_remote_completion(
+                console_output,
+                pending_output,
+                pending_forward,
+                terminal_enabled,
+                binary_stdio,
+                terminal_modes,
+                forwarder,
+                None,
+                remote_exit,
+            );
         }
         if let Some(probe) = pump_probe.as_mut() {
             probe.arm()?;
@@ -162,6 +206,7 @@ where
                 binary_stdio,
                 terminal_modes,
                 &console_output,
+                remote_exit,
             )? {
                 DisplayOutcome::Displayed { cursor_report }
                     if cursor_report && auto_cursor_report && !console_output.is_async() =>
@@ -184,6 +229,7 @@ where
                             terminal_modes,
                             forwarder,
                             None,
+                            remote_exit,
                         );
                     }
                 }
@@ -268,9 +314,7 @@ where
             console_output
                 .drain_wake()
                 .map_err(|error| terminal_io("draining console output wakeup", error))?;
-            console_output
-                .check_error()
-                .map_err(|error| terminal_io("writing terminal output", error))?;
+            check_live_console(&console_output, remote_exit)?;
             if auto_cursor_report {
                 for _ in 0..console_output
                     .take_cursor_reports()
@@ -294,6 +338,7 @@ where
                             terminal_modes,
                             forwarder,
                             None,
+                            remote_exit,
                         );
                     }
                 }
@@ -303,9 +348,7 @@ where
             console_output
                 .drain_status_wake()
                 .map_err(|error| terminal_io("draining console status wakeup", error))?;
-            console_output
-                .check_error()
-                .map_err(|error| terminal_io("writing terminal output", error))?;
+            check_live_console(&console_output, remote_exit)?;
         }
         if resize.intersects(PollFlags::IN | PollFlags::HUP) {
             drain(wake)?;
@@ -324,6 +367,7 @@ where
                             terminal_modes,
                             forwarder,
                             None,
+                            remote_exit,
                         );
                     }
                 }
@@ -352,6 +396,7 @@ where
                             binary_stdio,
                             terminal_modes,
                             &console_output,
+                            remote_exit,
                         )? {
                             DisplayOutcome::Displayed { cursor_report }
                                 if cursor_report
@@ -376,6 +421,7 @@ where
                                         terminal_modes,
                                         forwarder,
                                         None,
+                                        remote_exit,
                                     );
                                 }
                             }
@@ -420,6 +466,7 @@ where
                             terminal_modes,
                             forwarder,
                             Some(packet),
+                            remote_exit,
                         );
                     }
                 }
@@ -440,6 +487,7 @@ where
                     terminal_modes,
                     forwarder,
                     None,
+                    remote_exit,
                 );
             }
             last_received = Instant::now();
@@ -453,9 +501,10 @@ where
                 .read(&mut bytes)
                 .map_err(|error| terminal_io("reading terminal input", error))?;
             if count == 0 {
-                return console_output
+                console_output
                     .complete(ConsoleCompletion::LocalInputClosed)
-                    .map_err(|error| terminal_io("stopping terminal output", error));
+                    .map_err(|error| terminal_io("stopping terminal output", error))?;
+                return Ok(remote_exit.finish_code());
             }
             if !binary_stdio && interrupt_input.feed(&bytes[..count]) {
                 console_output
@@ -486,14 +535,16 @@ where
                         terminal_modes,
                         forwarder,
                         None,
+                        remote_exit,
                     );
                 }
             }
         }
         if input.intersects(PollFlags::HUP | PollFlags::ERR) {
-            return console_output
+            console_output
                 .complete(ConsoleCompletion::LocalInputClosed)
-                .map_err(|error| terminal_io("stopping terminal output", error));
+                .map_err(|error| terminal_io("stopping terminal output", error))?;
+            return Ok(remote_exit.finish_code());
         }
         let now = Instant::now();
         if now >= next_keepalive {
@@ -520,6 +571,7 @@ where
                     terminal_modes,
                     forwarder,
                     None,
+                    remote_exit,
                 );
             }
             next_keepalive = Instant::now() + interval;
@@ -573,6 +625,54 @@ fn network_poll_flags(output_pending: bool, forwarding_backlog_full: bool) -> Po
     flags
 }
 
+#[cfg(unix)]
+fn check_live_console(
+    output: &crate::client_output::ConsoleOutput,
+    remote_exit: &crate::client_terminal::RemoteExit,
+) -> Result<(), ClientError> {
+    match output.check_error() {
+        Ok(()) => Ok(()),
+        Err(error)
+            if remote_exit.ready() && crate::client_terminal::console_pipe_closed(&error) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(terminal_io("writing terminal output", error)),
+    }
+}
+
+#[cfg(unix)]
+fn command_status_drained(
+    remote_exit: &crate::client_terminal::RemoteExit,
+    output: &crate::client_output::ConsoleOutput,
+    pending_output: &Option<et_core::packet::Packet>,
+) -> Result<bool, ClientError> {
+    if !remote_exit.ready() || pending_output.is_some() {
+        return Ok(false);
+    }
+    let pending = output
+        .has_pending_data()
+        .map_err(|error| terminal_io("checking console output", error))?;
+    Ok(!pending)
+}
+
+#[cfg(unix)]
+fn finish_console_drain(
+    result: io::Result<()>,
+    remote_exit: &crate::client_terminal::RemoteExit,
+    operation: &str,
+) -> Result<i32, ClientError> {
+    match result {
+        Ok(()) => Ok(remote_exit.finish_code()),
+        Err(error)
+            if remote_exit.ready() && crate::client_terminal::console_pipe_closed(&error) =>
+        {
+            Ok(remote_exit.finish_code())
+        }
+        Err(error) => Err(terminal_io(operation, error)),
+    }
+}
+
 /// Returns `true` when a cursor position report must be sent back.
 #[cfg(unix)]
 fn route_server_packet(
@@ -581,7 +681,14 @@ fn route_server_packet(
     binary_stdio: bool,
     terminal_modes: &mut TerminalModeState,
     output: &crate::client_output::ConsoleOutput,
+    remote_exit: &crate::client_terminal::RemoteExit,
 ) -> Result<DisplayOutcome, ClientError> {
+    if packet.header() == TerminalPacketType::TerminalExitStatus as u8 {
+        crate::client_terminal::note_exit_status(remote_exit, &packet);
+        return Ok(DisplayOutcome::Displayed {
+            cursor_report: false,
+        });
+    }
     if terminal_enabled || packet.header() == TerminalPacketType::KeepAlive as u8 {
         let outcome = crate::client_terminal::display_packet_with(packet, |bytes, is_stderr| {
             if binary_stdio || is_stderr {
@@ -621,16 +728,22 @@ fn finish_remote_completion(
     terminal_modes: &mut TerminalModeState,
     forwarder: &mut Forwarder,
     current_outbound: Option<et_core::packet::Packet>,
-) -> Result<(), ClientError> {
+    remote_exit: &crate::client_terminal::RemoteExit,
+) -> Result<i32, ClientError> {
     let mut retained = RetainedCompletion::new(pending_output, pending_forward.pop_front());
     let mut output_progress = output
         .worker_progress()
         .map_err(|error| terminal_io("tracking retained terminal output", error))?;
     let mut output_deadline = Instant::now() + GRACEFUL_DRAIN_STALL_TIMEOUT;
     loop {
-        output
-            .check_error()
-            .map_err(|error| terminal_io("writing retained terminal output", error))?;
+        match output.check_error() {
+            Ok(()) => {}
+            Err(error)
+                if remote_exit.ready() && crate::client_terminal::console_pipe_closed(&error) => {}
+            Err(error) => {
+                return Err(terminal_io("writing retained terminal output", error));
+            }
+        }
         if retained.advance(
             |packet| match route_server_packet(
                 packet,
@@ -638,6 +751,7 @@ fn finish_remote_completion(
                 binary_stdio,
                 terminal_modes,
                 &output,
+                remote_exit,
             )? {
                 DisplayOutcome::Displayed { .. } => Ok(None),
                 DisplayOutcome::Pending(packet) => Ok(Some(packet)),
@@ -656,9 +770,11 @@ fn finish_remote_completion(
                 .shutdown_hard()
                 .map_err(|error| terminal_text(error.to_string()))?;
             classify_forward_completion(current_outbound, abandoned)?;
-            return output
-                .complete(ConsoleCompletion::RemoteSessionEnded)
-                .map_err(|error| terminal_io("draining terminal output", error));
+            return finish_console_drain(
+                output.complete(ConsoleCompletion::RemoteSessionEnded),
+                remote_exit,
+                "draining terminal output",
+            );
         }
         if retained.terminal_pending() {
             let progress = output
@@ -672,9 +788,11 @@ fn finish_remote_completion(
                     .shutdown_hard()
                     .map_err(|error| terminal_text(error.to_string()))?;
                 classify_forward_completion(current_outbound, abandoned)?;
-                return output
-                    .finish_gracefully_after_stall()
-                    .map_err(|error| terminal_io("cancelling stalled terminal output", error));
+                return finish_console_drain(
+                    output.finish_gracefully_after_stall(),
+                    remote_exit,
+                    "cancelling stalled terminal output",
+                );
             }
         }
         if let Some(packet) = forwarder

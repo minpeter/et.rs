@@ -60,6 +60,8 @@ fn close_on_hangup_sends_terminal_close_and_exits_the_loop() {
             binary_stdio: false,
             terminal_modes: &mut modes,
             hangup: &hangup,
+            remote_exit: &crate::client_terminal::RemoteExit::new(false),
+            stdio_forward: false,
         },
         &mut et_net::forward::Forwarder::start(Vec::new()).unwrap(),
         |_| panic!("hangup close must not reconnect"),
@@ -125,7 +127,15 @@ fn pending_console_output_does_not_block_terminal_input() {
     );
     let mut modes = TerminalModeState::default();
     assert!(matches!(
-        route_server_packet(packet, true, false, &mut modes, &output).unwrap(),
+        route_server_packet(
+            packet,
+            true,
+            false,
+            &mut modes,
+            &output,
+            &crate::client_terminal::RemoteExit::new(false),
+        )
+        .unwrap(),
         DisplayOutcome::Pending(_)
     ));
 
@@ -194,6 +204,7 @@ fn remote_completion_bounds_a_retained_packet_behind_stalled_output() {
                 &mut terminal_modes,
                 &mut forwarder,
                 None,
+                &crate::client_terminal::RemoteExit::new(false),
             ))
             .unwrap();
     });
@@ -238,6 +249,7 @@ fn remote_completion_attempts_retained_output_before_draining() {
         &mut terminal_modes,
         &mut forwarder,
         None,
+        &crate::client_terminal::RemoteExit::new(false),
     )
     .unwrap_err();
 

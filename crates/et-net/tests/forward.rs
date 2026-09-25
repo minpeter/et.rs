@@ -293,6 +293,8 @@ fn hard_shutdown_reports_admitted_socket_bytes_abandoned() {
                 error: None,
                 closed: None,
                 window: None,
+
+                half_close: None,
             }
             .encode_to_vec(),
         )
@@ -427,6 +429,8 @@ fn imported_local_bind_failure_obeys_strict_policy_transactionally() {
             environmentvariable: None,
         },
         origin: ForwardOrigin::SshConfig { strict },
+        socks: false,
+        stdio: false,
     };
 
     // When: nonfatal import contains one occupied row.
@@ -574,6 +578,8 @@ fn imported_local_wildcard_is_externally_reachable_while_loopback_is_not() {
     let (wildcard, skipped) = Forwarder::start_with_origins(vec![ForwardSource {
         request,
         origin: ForwardOrigin::SshConfig { strict: false },
+        socks: false,
+        stdio: false,
     }])
     .unwrap();
     assert!(skipped.is_empty());

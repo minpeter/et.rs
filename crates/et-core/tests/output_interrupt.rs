@@ -3,7 +3,7 @@
 use et_core::flow_control::{FlowControlMode, OutputQueue};
 use et_core::output_interrupt::InterruptInput;
 use et_core::packet::Packet;
-use et_core::proto::{TerminalBuffer, TerminalPacketType};
+use et_core::proto::{TerminalBuffer, TerminalExitStatus, TerminalPacketType};
 use prost::Message;
 
 fn terminal(bytes: &[u8]) -> Packet {
@@ -15,6 +15,30 @@ fn terminal(bytes: &[u8]) -> Packet {
         }
         .encode_to_vec(),
     )
+}
+
+#[test]
+fn exit_status_survives_an_interrupt_flush_of_terminal_flood() {
+    let mut queue = queue();
+    let status = Packet::new(
+        TerminalPacketType::TerminalExitStatus as u8,
+        TerminalExitStatus {
+            exitcode: Some(143),
+        }
+        .encode_to_vec(),
+    );
+    queue.push(status.clone()).unwrap();
+    queue.push(terminal(&vec![b'x'; 80 * 1024])).unwrap();
+    assert!(queue.flush_terminal_on_interrupt() > 0);
+    let mut saw_status = false;
+    while let Some(packet) = queue.pop() {
+        if packet.header() == TerminalPacketType::TerminalExitStatus as u8 {
+            let decoded = TerminalExitStatus::decode(packet.payload()).unwrap();
+            assert_eq!(decoded.exitcode, Some(143));
+            saw_status = true;
+        }
+    }
+    assert!(saw_status);
 }
 
 fn queue() -> OutputQueue {

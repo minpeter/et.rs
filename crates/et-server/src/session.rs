@@ -84,6 +84,9 @@ pub(crate) struct ActiveSession {
     /// Raw pipe session (`InitialPayload.no_pty`). Binary stdin must not be
     /// treated as a terminal interrupt.
     pipe_mode: bool,
+    /// Client set `InitialPayload.supports_exit_status`. Packet type 12 is
+    /// forwarded only then; older clients abort on an unknown type.
+    forward_exit_status: AtomicBool,
 }
 
 pub(crate) enum SessionConnection {
@@ -187,7 +190,16 @@ impl ActiveSession {
             bridge_generation: Mutex::new(0),
             bridge_changed: Condvar::new(),
             pipe_mode,
+            forward_exit_status: AtomicBool::new(false),
         })
+    }
+
+    pub(crate) fn set_forward_exit_status(&self, enabled: bool) {
+        self.forward_exit_status.store(enabled, Ordering::Relaxed);
+    }
+
+    pub(crate) fn forwards_exit_status(&self) -> bool {
+        self.forward_exit_status.load(Ordering::Relaxed)
     }
 
     pub(crate) fn start_flow_writer(self: &Arc<Self>) {

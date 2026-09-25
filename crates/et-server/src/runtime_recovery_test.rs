@@ -80,6 +80,9 @@ fn terminal_hup_after_returning_status_delivers_final_output_only_to_recovered_c
 
         no_pty: None,
         command: None,
+
+        supports_exit_status: None,
+        no_shell: None,
     };
     client.write_packet(253, &payload.encode_to_vec()).unwrap();
     let initial = client.read_packet().unwrap();

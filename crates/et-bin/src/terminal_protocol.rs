@@ -2,8 +2,10 @@ use et_net::local::LocalStream;
 use std::io::{self, Read, Write};
 
 use et_core::packet::Packet;
-use et_core::proto::{FlowControlMode, TermInit, TerminalBuffer, TerminalInfo, TerminalPacketType};
-use et_net::local_packet::{read_local_packet, LocalPacketDecoder};
+use et_core::proto::{
+    FlowControlMode, TermInit, TerminalBuffer, TerminalExitStatus, TerminalInfo, TerminalPacketType,
+};
+use et_net::local_packet::{read_local_packet, write_local_packet, LocalPacketDecoder};
 use portable_pty::{MasterPty, PtySize};
 use prost::Message;
 
@@ -11,12 +13,29 @@ pub(crate) const MAX_ENVIRONMENT: usize = 128;
 pub(crate) const MAX_ENV_VALUE: usize = 4096;
 const READ_BUFFER: usize = 16 * 1024;
 
+#[derive(Debug)]
 pub struct TerminalInitialization {
     pub environment: Vec<(String, String)>,
     pub flow_control: FlowControlMode,
     /// `TermInit.no_pty`: run `command` on pipes instead of a login pty.
     pub no_pty: bool,
     pub command: Option<String>,
+    /// `TermInit.no_shell`: session without a pty or a shell (`et -W`).
+    pub no_shell: bool,
+}
+
+/// OpenSSH-style status: the exit code, or `128 + signal` when signaled.
+///
+/// Windows pipe status has no signal number, so only the Unix path calls this.
+#[cfg(unix)]
+pub(crate) fn openssh_exit_code(exited: Option<i32>, signal: Option<i32>) -> i32 {
+    if let Some(code) = exited {
+        return code;
+    }
+    if let Some(signal) = signal {
+        return 128i32.saturating_add(signal);
+    }
+    0
 }
 
 pub fn read_initialization(router: &mut LocalStream) -> Result<TerminalInitialization, String> {
@@ -48,12 +67,35 @@ pub fn read_initialization(router: &mut LocalStream) -> Result<TerminalInitializ
             Ok((name, value))
         })
         .collect::<Result<_, _>>()?;
+    let no_pty = init.no_pty.unwrap_or(false);
+    let no_shell = init.no_shell.unwrap_or(false);
+    if no_pty && no_shell {
+        return Err("no_pty and no_shell cannot both be set".to_owned());
+    }
     Ok(TerminalInitialization {
         environment,
         flow_control,
-        no_pty: init.no_pty.unwrap_or(false),
+        no_pty,
         command: init.command,
+        no_shell,
     })
+}
+
+/// Send `TERMINAL_EXIT_STATUS` once, before the terminal router closes.
+///
+/// A write failure is returned to the caller, which logs it and still exits.
+/// The packet must not be dropped on the floor when the write itself succeeds.
+pub(crate) fn write_terminal_exit_status(
+    router: &mut LocalStream,
+    code: i32,
+) -> Result<(), String> {
+    let payload = TerminalExitStatus {
+        exitcode: Some(code),
+    }
+    .encode_to_vec();
+    let packet = Packet::new(TerminalPacketType::TerminalExitStatus as u8, payload);
+    write_local_packet(router, &packet)
+        .map_err(|error| format!("could not write terminal exit status: {error}"))
 }
 
 pub fn read_ready_packet(
@@ -106,36 +148,59 @@ pub(crate) fn local_packet_effect(packet: &Packet) -> Result<LocalPacketEffect, 
     }
 }
 
+/// Protocol mistakes stay fatal. A dead pty is not: the child may already
+/// have exited, and `TERMINAL_EXIT_STATUS` still has to be written.
+#[derive(Debug)]
+pub(crate) enum TerminalPacketError {
+    Protocol(String),
+    Pty(io::Error),
+}
+
+impl std::fmt::Display for TerminalPacketError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Protocol(error) => formatter.write_str(error),
+            Self::Pty(error) => write!(formatter, "could not apply PTY input: {error}"),
+        }
+    }
+}
+
 pub fn handle_packet(
     packet: Packet,
     master: &dyn MasterPty,
     writer: &mut dyn Write,
-) -> Result<LocalPacketEffect, String> {
-    if local_packet_effect(&packet)? == LocalPacketEffect::Close {
+) -> Result<LocalPacketEffect, TerminalPacketError> {
+    if local_packet_effect(&packet).map_err(TerminalPacketError::Protocol)?
+        == LocalPacketEffect::Close
+    {
         return Ok(LocalPacketEffect::Close);
     }
     match packet.header() {
         header if header == TerminalPacketType::TerminalBuffer as u8 => {
-            let message = TerminalBuffer::decode(packet.payload())
-                .map_err(|_| "TERMINAL_BUFFER protobuf is malformed".to_owned())?;
-            let bytes = message
-                .buffer
-                .ok_or_else(|| "TERMINAL_BUFFER is missing bytes".to_owned())?;
+            let message = TerminalBuffer::decode(packet.payload()).map_err(|_| {
+                TerminalPacketError::Protocol("TERMINAL_BUFFER protobuf is malformed".to_owned())
+            })?;
+            let bytes = message.buffer.ok_or_else(|| {
+                TerminalPacketError::Protocol("TERMINAL_BUFFER is missing bytes".to_owned())
+            })?;
             writer
                 .write_all(&bytes)
                 .and_then(|()| writer.flush())
-                .map_err(|error| format!("could not write PTY input: {error}"))?;
+                .map_err(TerminalPacketError::Pty)?;
             Ok(LocalPacketEffect::Continue)
         }
         header if header == TerminalPacketType::TerminalInfo as u8 => {
-            let info = TerminalInfo::decode(packet.payload())
-                .map_err(|_| "TERMINAL_INFO protobuf is malformed".to_owned())?;
+            let info = TerminalInfo::decode(packet.payload()).map_err(|_| {
+                TerminalPacketError::Protocol("TERMINAL_INFO protobuf is malformed".to_owned())
+            })?;
             master
                 .resize(terminal_size(&info))
-                .map_err(|error| format!("could not resize PTY: {error}"))?;
+                .map_err(|error| TerminalPacketError::Pty(io::Error::other(error)))?;
             Ok(LocalPacketEffect::Continue)
         }
-        _ => Err("unsupported local terminal packet type".to_owned()),
+        _ => Err(TerminalPacketError::Protocol(
+            "unsupported local terminal packet type".to_owned(),
+        )),
     }
 }
 
@@ -235,6 +300,7 @@ mod tests {
 
                 no_pty: None,
                 command: None,
+                no_shell: None,
             },
             TermInit {
                 environmentnames: vec!["BAD-NAME".to_owned()],
@@ -243,6 +309,7 @@ mod tests {
 
                 no_pty: None,
                 command: None,
+                no_shell: None,
             },
             TermInit {
                 environmentnames: vec!["VALID".to_owned()],
@@ -251,6 +318,7 @@ mod tests {
 
                 no_pty: None,
                 command: None,
+                no_shell: None,
             },
             TermInit {
                 environmentnames: vec!["VALID".to_owned()],
@@ -259,6 +327,7 @@ mod tests {
 
                 no_pty: None,
                 command: None,
+                no_shell: None,
             },
         ] {
             let packet = Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec());
@@ -303,6 +372,7 @@ mod tests {
 
             no_pty: None,
             command: None,
+            no_shell: None,
         };
         write_local_packet(
             &mut server,
@@ -312,5 +382,35 @@ mod tests {
 
         let initialization = read_initialization(&mut terminal).unwrap();
         assert_eq!(initialization.flow_control, FlowControlMode::Discard);
+        assert!(!initialization.no_shell);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn openssh_exit_code_prefers_exit_status_then_signal() {
+        assert_eq!(openssh_exit_code(Some(0), None), 0);
+        assert_eq!(openssh_exit_code(Some(2), Some(15)), 2);
+        assert_eq!(openssh_exit_code(None, Some(15)), 143);
+        assert_eq!(openssh_exit_code(None, None), 0);
+    }
+
+    #[test]
+    fn no_shell_and_no_pty_together_are_rejected() {
+        let (mut terminal, mut server) = et_net::local::wake_pair().unwrap();
+        let init = TermInit {
+            environmentnames: Vec::new(),
+            environmentvalues: Vec::new(),
+            flowcontrol: None,
+            no_pty: Some(true),
+            command: Some("true".to_owned()),
+            no_shell: Some(true),
+        };
+        write_local_packet(
+            &mut server,
+            &Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec()),
+        )
+        .unwrap();
+        let error = read_initialization(&mut terminal).unwrap_err();
+        assert!(error.contains("no_pty and no_shell"));
     }
 }

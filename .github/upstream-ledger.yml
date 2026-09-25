@@ -13,7 +13,7 @@
 # Classified 2026-09-21. #804 passed independent review in et.rs #100.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-09-24"
+classified: "2026-09-25"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -300,3 +300,27 @@ commits:
     status: skip
     note: "#855 etserver --disconnect-timeout closes disconnected etterminal sessions. Product/cfg; existing TERMINAL_CLOSE covers explicit close. Not a protocol bump. PROTOCOL_VERSION stays 6."
     et_pr: 855
+  - sha: 2088bc4607e5239fe782b51a3b1f6f4bc375d9d6
+    date: "2026-09-24"
+    kind: product
+    status: skip
+    note: "#852 local OpenSSH -V and -G queries. Client-local CLI only; et.rs already resolves SSH config via real OpenSSH ssh -G. Not wire/auth. PROTOCOL_VERSION stays 6."
+    et_pr: 852
+  - sha: ce4963edfccf3ea38dbd320cc7751a2c8af4d882
+    date: "2026-09-24"
+    kind: protocol
+    status: ported
+    note: "#851 TERMINAL_EXIT_STATUS=12 and InitialPayload.supports_exit_status. etserver forwards type 12 only when the client sets the flag. et.rs flowcontrol moved from InitialPayload field 6 to field 8. Command sessions exit with the remote status; interactive sessions stay 0. PROTOCOL_VERSION stays 6."
+    et_pr: 851
+  - sha: 6f53869473a16407b59f1f3382d291ab97b4f64f
+    date: "2026-09-24"
+    kind: protocol
+    status: ported
+    note: "#849 runtime -D SOCKS and -W stdio forward. PortForwardData.half_close=6, InitialPayload.no_shell=7, TermInit.no_shell=5. et.rs flowcontrol moved to TermInit field 6 and PortForwardData.window to field 7. Existing -t/-r unchanged. PROTOCOL_VERSION stays 6."
+    et_pr: 849
+  - sha: f90c6f4715f8f7e72afaf8085248ed7305c8aa6a
+    date: "2026-09-24"
+    kind: product
+    status: skip
+    note: "#857 drop journald wall text from tmux -CC streams. Product/HTM filter only; et.rs has its own HTM path. Not protocol/wire/auth. Pin tip. PROTOCOL_VERSION stays 6."
+    et_pr: 857

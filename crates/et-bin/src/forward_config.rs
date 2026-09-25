@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 
 use et_cli::client::ClientArgs;
-use et_cli::tunnel::parse_tunnels;
+#[cfg(unix)]
+use et_cli::tunnel::parse_stdio_forward;
+use et_cli::tunnel::{parse_dynamic_forward, parse_tunnels};
 use et_core::proto::{InitialPayload, PortForwardSourceRequest, SocketEndpoint};
 use et_net::forward::ForwardSource;
 
@@ -117,10 +119,19 @@ pub fn build(
     args: &ClientArgs,
     environment_agent: Option<&str>,
 ) -> Result<ForwardConfig, ForwardConfigError> {
-    let local_sources = parse_tunnels(&args.tunnel)?
+    let mut local_sources: Vec<_> = parse_tunnels(&args.tunnel)?
         .into_iter()
         .map(ForwardSource::explicit)
         .collect();
+    for spec in &args.dynamic {
+        local_sources.push(ForwardSource::dynamic(parse_dynamic_forward(spec)?));
+    }
+    // `-W` is rejected on Windows before connect. Unix ties stdio to the
+    // destination with no listen socket.
+    #[cfg(unix)]
+    if let Some(spec) = args.stdio_forward.as_deref() {
+        local_sources.push(ForwardSource::stdio(parse_stdio_forward(spec)?));
+    }
     let mut reverse_tunnels = parse_tunnels(&args.reverse_tunnel)?;
     if args.forward_ssh_agent {
         // Upstream sends a reverse tunnel with no source: the server creates
@@ -152,6 +163,8 @@ pub fn build(
             command: args
                 .no_pty
                 .then(|| args.command.clone().unwrap_or_default()),
+            supports_exit_status: Some(true),
+            no_shell: args.stdio_forward.is_some().then_some(true),
             flowcontrol: args.flow_control.protocol_value(),
         },
     })

@@ -15,6 +15,10 @@ enum TerminalPacketType {
   TERMINAL_INIT = 9;
   JUMPHOST_INIT = 10;
   TERMINAL_CLOSE = 11;
+  // Wait status of the remote shell/command, sent once when the session ends.
+  // etserver forwards this only when InitialPayload.supports_exit_status is set.
+  // Older clients (et-v7.0.0) abort on unknown type 12.
+  TERMINAL_EXIT_STATUS = 12;
 }
 
 enum FlowControlMode {
@@ -28,6 +32,12 @@ message TerminalBuffer {
   // When true, buffer is remote stderr (raw pipe / -T sessions only).
   // Named is_stderr (not stderr): musl #defines stderr as a macro.
   optional bool is_stderr = 2 [default = false];
+}
+
+// Process status for the remote terminal child (OpenSSH-style exit code).
+message TerminalExitStatus {
+  // Normalized status: WEXITSTATUS when exited, or 128+signal when signaled.
+  optional int32 exitcode = 1;
 }
 
 message TerminalInfo {
@@ -75,8 +85,13 @@ message PortForwardData {
   optional bytes buffer = 3;
   optional string error = 4;
   optional bool closed = 5;
+  // Source finished writing. Keep the destination open for the reply direction.
+  // Field 6 matches EternalTerminal #849. et.rs previously used this tag for
+  // PortForwardWindow; that message moved to field 7 so a half-close is not
+  // decoded as window credit. PROTOCOL_VERSION stays 6.
+  optional bool half_close = 6;
   // Credit returned to the peer as this side's local socket drains.
-  optional PortForwardWindow window = 6;
+  optional PortForwardWindow window = 7;
 }
 
 message InitialPayload {
@@ -84,12 +99,19 @@ message InitialPayload {
   repeated PortForwardSourceRequest reversetunnels = 2;
   map<string, string> environmentvariables = 3;
   // When true, etterminal runs `command` on pipes instead of a login pty.
-  // Field 4 matches EternalTerminal #854. et.rs flow control previously used
-  // this tag; it moved to field 6 so Backpressure (varint 1) is not decoded
-  // as no_pty=true. PROTOCOL_VERSION stays 6.
+  // Field 4 matches EternalTerminal #854. PROTOCOL_VERSION stays 6.
   optional bool no_pty = 4 [default = false];
   optional string command = 5;
-  optional FlowControlMode flowcontrol = 6 [default = NONE];
+  // Set by clients that understand TERMINAL_EXIT_STATUS. Older clients leave
+  // this unset, and etserver must not forward that packet to them.
+  // Field 6 matches EternalTerminal #851. et.rs flow control previously used
+  // this tag; it moved to field 8 (after no_shell=7) so Backpressure (varint 1)
+  // is not decoded as supports_exit_status=true. PROTOCOL_VERSION stays 6.
+  optional bool supports_exit_status = 6 [default = false];
+  // ssh -W: keep the session without a pty or a shell.
+  // Field 7 matches EternalTerminal #849.
+  optional bool no_shell = 7 [default = false];
+  optional FlowControlMode flowcontrol = 8 [default = NONE];
 }
 
 message InitialResponse {
@@ -104,11 +126,13 @@ message ConfigParams {
 message TermInit {
   repeated string environmentnames = 1;
   repeated string environmentvalues = 2;
-  // Field 3 matches EternalTerminal #854 no_pty. Flow control moved to field 5
-  // so it does not collide with that bool. PROTOCOL_VERSION stays 6.
+  // Field 3 matches EternalTerminal #854 no_pty. PROTOCOL_VERSION stays 6.
   optional bool no_pty = 3 [default = false];
   optional string command = 4;
-  optional FlowControlMode flowcontrol = 5 [default = NONE];
+  // Field 5 matches EternalTerminal #849 no_shell. et.rs flow control previously
+  // used this tag; it moved to field 6 so it is not decoded as no_shell=true.
+  optional bool no_shell = 5 [default = false];
+  optional FlowControlMode flowcontrol = 6 [default = NONE];
 }
 
 message TerminalUserInfo {

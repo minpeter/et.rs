@@ -281,6 +281,10 @@ pub enum ForwardOrigin {
 pub struct ForwardSource {
     pub request: PortForwardSourceRequest,
     pub origin: ForwardOrigin,
+    /// SOCKS dynamic listen (`et -D`). The destination is chosen per connection.
+    pub socks: bool,
+    /// Bridge an already-open stdio pair (`et -W`) instead of listening.
+    pub stdio: bool,
 }
 
 impl ForwardSource {
@@ -288,6 +292,8 @@ impl ForwardSource {
         Self {
             request,
             origin: ForwardOrigin::Explicit,
+            socks: false,
+            stdio: false,
         }
     }
 
@@ -295,6 +301,36 @@ impl ForwardSource {
         Self {
             request,
             origin: ForwardOrigin::SshConfig { strict },
+            socks: false,
+            stdio: false,
+        }
+    }
+
+    /// Listen for SOCKS clients. `listen` is the local bind endpoint.
+    pub const fn dynamic(listen: et_core::proto::SocketEndpoint) -> Self {
+        Self {
+            request: PortForwardSourceRequest {
+                source: Some(listen),
+                destination: None,
+                environmentvariable: None,
+            },
+            origin: ForwardOrigin::Explicit,
+            socks: true,
+            stdio: false,
+        }
+    }
+
+    /// Tie a later stdio bridge to `destination` (`et -W`). Unix only.
+    pub const fn stdio(destination: et_core::proto::SocketEndpoint) -> Self {
+        Self {
+            request: PortForwardSourceRequest {
+                source: None,
+                destination: Some(destination),
+                environmentvariable: None,
+            },
+            origin: ForwardOrigin::Explicit,
+            socks: false,
+            stdio: true,
         }
     }
 }
@@ -318,6 +354,8 @@ pub struct Forwarder {
     shutdown: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     abandoned: Arc<AtomicBool>,
+    /// Set while an `et -W` stdio bridge still has its local socket.
+    stdio_open: Option<Arc<AtomicBool>>,
 }
 
 impl Forwarder {
@@ -433,6 +471,11 @@ fn start_forwarder_hook(
     #[cfg(windows)]
     let listener_stop_reader = listener_stop.clone();
     let worker_commands = commands_tx.clone();
+    let stdio_open = sources
+        .iter()
+        .any(|source| source.stdio)
+        .then(|| Arc::new(AtomicBool::new(true)));
+    let worker_stdio = stdio_open.clone();
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = shutdown.clone();
     let worker = std::thread::Builder::new()
@@ -448,6 +491,7 @@ fn start_forwarder_hook(
                     priority: priority_tx,
                     cancel: cancel_rx,
                     abandoned: worker_abandoned,
+                    stdio_open: worker_stdio.clone(),
                 },
                 #[cfg(unix)]
                 wake_writer,
@@ -469,6 +513,7 @@ fn start_forwarder_hook(
         shutdown,
         worker: Some(worker),
         abandoned,
+        stdio_open,
     };
     before_publish();
     ensure_setup_deadline(deadline)?;
@@ -480,6 +525,13 @@ impl Forwarder {
     #[cfg(unix)]
     pub fn wake(&self) -> Result<&UnixStream, ForwardError> {
         Ok(&self.wake)
+    }
+
+    /// True while `et -W` still has an active local stdio socket.
+    pub fn stdio_bridge_open(&self) -> bool {
+        self.stdio_open
+            .as_ref()
+            .is_some_and(|open| open.load(Ordering::Acquire))
     }
 
     /// Hand a forwarding packet to the worker, blocking when its command
@@ -642,6 +694,11 @@ enum PlannedSource {
         destination: et_core::proto::SocketEndpoint,
         original: PortForwardSourceRequest,
         origin: ForwardOrigin,
+        socks: bool,
+    },
+    #[cfg(unix)]
+    Stdio {
+        destination: et_core::proto::SocketEndpoint,
     },
     #[cfg(unix)]
     Environment {
@@ -662,11 +719,32 @@ fn bind_sources(
     for source in sources {
         ensure_setup_deadline(deadline)?;
         let origin = source.origin;
+        let socks = source.socks;
+        let stdio = source.stdio;
         let original = source.request.clone();
         let request = source.request;
+        if socks && stdio {
+            return Err(ForwardError::Protocol(
+                "a forward cannot be both dynamic SOCKS and stdio",
+            ));
+        }
         // The destination is passed through verbatim in the
         // PORT_FORWARD_DESTINATION_REQUEST and parsed by the remote side.
-        let destination = request.destination.unwrap_or_default();
+        let destination = request.destination.clone().unwrap_or_default();
+        if stdio {
+            #[cfg(unix)]
+            {
+                plans.push(PlannedSource::Stdio { destination });
+                continue;
+            }
+            #[cfg(windows)]
+            {
+                let _ = destination;
+                return Err(ForwardError::Protocol(
+                    "-W/--stdio-forward is not supported on Windows",
+                ));
+            }
+        }
         let (plan, additional_listeners) = if let Some(variable) = request.environmentvariable {
             if request.source.is_some() {
                 return Err(ForwardError::Protocol(
@@ -726,6 +804,7 @@ fn bind_sources(
                     destination,
                     original,
                     origin,
+                    socks,
                 },
                 listener_count,
             )
@@ -749,6 +828,7 @@ fn bind_sources(
                 destination,
                 original,
                 origin,
+                socks,
             } => match (
                 source.bind_with_user_deadline_resolver(owner, deadline, resolver.clone()),
                 origin,
@@ -756,8 +836,10 @@ fn bind_sources(
                 (Ok(listeners), _) => {
                     for listener in listeners {
                         bound.push(BoundSource {
-                            listener,
+                            listener: Some(listener),
                             destination: destination.clone(),
+                            socks,
+                            stdio: false,
                         });
                     }
                 }
@@ -787,10 +869,21 @@ fn bind_sources(
                 for mut listener in listeners.drain(..) {
                     listener.also_remove_dir(directory.clone());
                     bound.push(BoundSource {
-                        listener,
+                        listener: Some(listener),
                         destination: destination.clone(),
+                        socks: false,
+                        stdio: false,
                     });
                 }
+            }
+            #[cfg(unix)]
+            PlannedSource::Stdio { destination } => {
+                bound.push(BoundSource {
+                    listener: None,
+                    destination,
+                    socks: false,
+                    stdio: true,
+                });
             }
         }
     }
@@ -1209,6 +1302,8 @@ mod tests {
                         error: None,
                         closed: Some(true),
                         window: None,
+
+                        half_close: None,
                     }
                     .encode_to_vec(),
                 );
@@ -1226,6 +1321,8 @@ mod tests {
                     error: None,
                     closed: Some(true),
                     window: None,
+
+                    half_close: None,
                 }
                 .encode_to_vec(),
             );

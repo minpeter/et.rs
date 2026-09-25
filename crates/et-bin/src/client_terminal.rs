@@ -1,11 +1,12 @@
 use std::io::{self, IsTerminal, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+use std::sync::Mutex;
 #[cfg(unix)]
 use std::thread;
 
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
-use et_core::proto::{TerminalBuffer, TerminalInfo, TerminalPacketType};
+use et_core::proto::{TerminalBuffer, TerminalExitStatus, TerminalInfo, TerminalPacketType};
 use et_net::connection::{ConnError, Connection, WritePacketError};
 use et_net::forward::Forwarder;
 use prost::Message;
@@ -55,6 +56,73 @@ pub struct TerminalOptions<'a> {
     pub close_on_hangup: bool,
     /// `et -T`: binary stdio, no pty, no shell-injected command.
     pub no_pty: bool,
+    /// `et -W`: stdio is owned by the forwarder, not the console.
+    pub stdio_forward: bool,
+}
+
+/// Whether a finished command's remote status should become the process code.
+///
+/// Interactive sessions, `--no-exit`, and `et -W` stay at 0.
+pub(crate) fn wants_remote_exit_status(command: Option<&str>, no_exit: bool, stdio: bool) -> bool {
+    command.is_some() && !no_exit && !stdio
+}
+
+/// Exit status carried by `TERMINAL_EXIT_STATUS`, when this session wants it.
+pub(crate) struct RemoteExit {
+    want: bool,
+    code: Mutex<Option<i32>>,
+}
+
+impl RemoteExit {
+    pub(crate) fn new(want: bool) -> Self {
+        Self {
+            want,
+            code: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn record(&self, code: i32) {
+        if !self.want {
+            return;
+        }
+        if let Ok(mut slot) = self.code.lock() {
+            if slot.is_none() {
+                *slot = Some(code);
+            }
+        }
+    }
+
+    /// A command session has received its status.
+    pub(crate) fn ready(&self) -> bool {
+        self.want && self.code.lock().map(|slot| slot.is_some()).unwrap_or(false)
+    }
+
+    pub(crate) fn finish_code(&self) -> i32 {
+        self.code.lock().ok().and_then(|slot| *slot).unwrap_or(0)
+    }
+}
+
+pub(crate) fn note_exit_status(remote_exit: &RemoteExit, packet: &et_core::packet::Packet) {
+    if packet.header() != TerminalPacketType::TerminalExitStatus as u8 {
+        return;
+    }
+    let Ok(message) = TerminalExitStatus::decode(packet.payload()) else {
+        return;
+    };
+    if let Some(code) = message.exitcode {
+        remote_exit.record(code);
+    }
+}
+
+pub(crate) fn console_pipe_closed(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::NotConnected
+    )
 }
 
 pub fn run<F>(
@@ -62,7 +130,7 @@ pub fn run<F>(
     options: TerminalOptions<'_>,
     mut forwarder: Forwarder,
     mut reconnect: F,
-) -> Result<(), ClientError>
+) -> Result<i32, ClientError>
 where
     F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
 {
@@ -76,7 +144,9 @@ where
         connection_name,
         close_on_hangup,
         no_pty,
+        stdio_forward,
     } = options;
+    let remote_exit = RemoteExit::new(wants_remote_exit_status(command, no_exit, stdio_forward));
     let hangup = if close_on_hangup {
         crate::client_hangup::HangupClose::install()
             .map_err(|error| terminal_io("installing hangup close handler", error))?
@@ -106,7 +176,7 @@ where
                 write_terminal_size_recovering(&mut connection, &initial_size, &mut reconnect)?,
                 OwnedWriteOutcome::SessionEnded
             ) {
-                return raw_mode.finish(Ok(()), close_message, terminal_modes.alternate_screen());
+                return raw_mode.finish(Ok(0), close_message, terminal_modes.alternate_screen());
             }
         }
     }
@@ -125,7 +195,7 @@ where
                 )?,
                 OwnedWriteOutcome::SessionEnded
             ) {
-                return raw_mode.finish(Ok(()), close_message, terminal_modes.alternate_screen());
+                return raw_mode.finish(Ok(0), close_message, terminal_modes.alternate_screen());
             }
         }
     }
@@ -181,6 +251,8 @@ where
                 binary_stdio: no_pty,
                 terminal_modes: &mut terminal_modes,
                 hangup: &hangup,
+                remote_exit: &remote_exit,
+                stdio_forward,
             },
             &mut forwarder,
             reconnect,
@@ -201,6 +273,8 @@ where
             binary_stdio: no_pty,
             terminal_modes: &mut terminal_modes,
             hangup: &hangup,
+            remote_exit: &remote_exit,
+            stdio_forward,
         },
         &mut forwarder,
         reconnect,
@@ -300,6 +374,11 @@ where
         value if value == TerminalPacketType::KeepAlive as u8 => Ok(DisplayOutcome::Displayed {
             cursor_report: false,
         }),
+        value if value == TerminalPacketType::TerminalExitStatus as u8 => {
+            Ok(DisplayOutcome::Displayed {
+                cursor_report: false,
+            })
+        }
         _ => Err(terminal_text("server sent an unsupported terminal packet")),
     }
 }
@@ -696,10 +775,10 @@ impl RawMode {
 
     fn finish(
         mut self,
-        result: Result<(), ClientError>,
+        result: Result<i32, ClientError>,
         connection_name: Option<&str>,
         alternate_screen: bool,
-    ) -> Result<(), ClientError> {
+    ) -> Result<i32, ClientError> {
         self.reset = TerminalReset::for_alternate_screen(alternate_screen);
         drop(self);
         if result.is_ok() {

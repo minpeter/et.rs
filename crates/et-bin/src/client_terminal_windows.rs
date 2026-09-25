@@ -39,7 +39,7 @@ pub fn pump<F>(
     options: crate::client_terminal_loop::PumpOptions<'_>,
     forwarder: &mut Forwarder,
     mut reconnect: F,
-) -> Result<(), ClientError>
+) -> Result<i32, ClientError>
 where
     F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
 {
@@ -52,9 +52,15 @@ where
         binary_stdio,
         terminal_modes,
         hangup,
+        remote_exit,
+        stdio_forward,
     } = options;
-    let console_output = crate::client_output::ConsoleOutput::stdout(flow_control)
-        .map_err(|error| terminal_io("starting console output worker", error))?;
+    let console_output = if stdio_forward {
+        crate::client_output::ConsoleOutput::new(flow_control, Box::new(std::io::sink()))
+    } else {
+        crate::client_output::ConsoleOutput::stdout(flow_control)
+    }
+    .map_err(|error| terminal_io("starting console output worker", error))?;
     let interval = Duration::from_secs(u64::from(keepalive_seconds.max(1)));
     let silence = interval.saturating_mul(MISSED_KEEPALIVES);
     let mut last_received = Instant::now();
@@ -67,11 +73,53 @@ where
     let mut interrupt_input = et_core::output_interrupt::InterruptInput::default();
     loop {
         if crate::client_hangup::take_hangup_close(connection, hangup) {
-            return Ok(());
+            return Ok(remote_exit.finish_code());
         }
-        console_output
-            .check_error()
-            .map_err(|error| terminal_io("writing terminal output", error))?;
+        if stdio_forward && !forwarder.stdio_bridge_open() {
+            let _ = write_owned_recovering(
+                connection,
+                TerminalPacketType::TerminalClose as u8,
+                &[],
+                &mut reconnect,
+                terminal_enabled,
+            )?;
+            return finish_remote_completion(
+                console_output,
+                pending_output,
+                pending_forward,
+                terminal_enabled,
+                binary_stdio,
+                terminal_modes,
+                forwarder,
+                None,
+                remote_exit,
+            )
+            .map(|_code| 0);
+        }
+        if remote_exit.ready() && pending_output.is_none() {
+            let pending = console_output
+                .has_pending_data()
+                .map_err(|error| terminal_io("checking console output", error))?;
+            if !pending {
+                return finish_remote_completion(
+                    console_output,
+                    pending_output,
+                    pending_forward,
+                    terminal_enabled,
+                    binary_stdio,
+                    terminal_modes,
+                    forwarder,
+                    None,
+                    remote_exit,
+                );
+            }
+        }
+        match console_output.check_error() {
+            Ok(()) => {}
+            Err(error)
+                if remote_exit.ready() && crate::client_terminal::console_pipe_closed(&error) => {}
+            Err(error) => return Err(terminal_io("writing terminal output", error)),
+        }
         if auto_cursor_report {
             for _ in 0..console_output
                 .take_cursor_reports()
@@ -90,6 +138,7 @@ where
                         terminal_modes,
                         forwarder,
                         None,
+                        remote_exit,
                     );
                 }
             }
@@ -111,6 +160,7 @@ where
                 binary_stdio,
                 terminal_modes,
                 &console_output,
+                remote_exit,
             )? {
                 DisplayOutcome::Displayed { cursor_report }
                     if cursor_report && auto_cursor_report && !console_output.is_async() =>
@@ -128,6 +178,7 @@ where
                             terminal_modes,
                             forwarder,
                             None,
+                            remote_exit,
                         );
                     }
                 }
@@ -174,6 +225,7 @@ where
                                     terminal_modes,
                                     forwarder,
                                     None,
+                                    remote_exit,
                                 );
                             }
                         }
@@ -197,6 +249,7 @@ where
                                         terminal_modes,
                                         forwarder,
                                         None,
+                                        remote_exit,
                                     );
                                 }
                             }
@@ -233,6 +286,7 @@ where
                             binary_stdio,
                             terminal_modes,
                             &console_output,
+                            remote_exit,
                         )? {
                             DisplayOutcome::Displayed { cursor_report }
                                 if cursor_report
@@ -256,6 +310,7 @@ where
                                         terminal_modes,
                                         forwarder,
                                         None,
+                                        remote_exit,
                                     );
                                 }
                             }
@@ -297,6 +352,7 @@ where
                         terminal_modes,
                         forwarder,
                         Some(packet),
+                        remote_exit,
                     );
                 }
             }
@@ -317,6 +373,7 @@ where
                     terminal_modes,
                     forwarder,
                     None,
+                    remote_exit,
                 );
             }
             last_received = Instant::now();
@@ -346,6 +403,7 @@ where
                     terminal_modes,
                     forwarder,
                     None,
+                    remote_exit,
                 );
             }
             next_keepalive = Instant::now() + interval;
@@ -371,16 +429,22 @@ fn finish_remote_completion(
     terminal_modes: &mut TerminalModeState,
     forwarder: &mut Forwarder,
     current_outbound: Option<et_core::packet::Packet>,
-) -> Result<(), ClientError> {
+    remote_exit: &crate::client_terminal::RemoteExit,
+) -> Result<i32, ClientError> {
     let mut retained = RetainedCompletion::new(pending_output, pending_forward.pop_front());
     let mut output_progress = output
         .worker_progress()
         .map_err(|error| terminal_io("tracking retained terminal output", error))?;
     let mut output_deadline = Instant::now() + GRACEFUL_DRAIN_STALL_TIMEOUT;
     loop {
-        output
-            .check_error()
-            .map_err(|error| terminal_io("writing retained terminal output", error))?;
+        match output.check_error() {
+            Ok(()) => {}
+            Err(error)
+                if remote_exit.ready() && crate::client_terminal::console_pipe_closed(&error) => {}
+            Err(error) => {
+                return Err(terminal_io("writing retained terminal output", error));
+            }
+        }
         if retained.advance(
             |packet| match route_server_packet(
                 packet,
@@ -388,6 +452,7 @@ fn finish_remote_completion(
                 binary_stdio,
                 terminal_modes,
                 &output,
+                remote_exit,
             )? {
                 DisplayOutcome::Displayed { .. } => Ok(None),
                 DisplayOutcome::Pending(packet) => Ok(Some(packet)),
@@ -406,9 +471,16 @@ fn finish_remote_completion(
                 .shutdown_hard()
                 .map_err(|error| terminal_text(error.to_string()))?;
             classify_forward_completion(current_outbound, abandoned)?;
-            return output
-                .complete(ConsoleCompletion::RemoteSessionEnded)
-                .map_err(|error| terminal_io("draining terminal output", error));
+            return match output.complete(ConsoleCompletion::RemoteSessionEnded) {
+                Ok(()) => Ok(remote_exit.finish_code()),
+                Err(error)
+                    if remote_exit.ready()
+                        && crate::client_terminal::console_pipe_closed(&error) =>
+                {
+                    Ok(remote_exit.finish_code())
+                }
+                Err(error) => Err(terminal_io("draining terminal output", error)),
+            };
         }
         if retained.terminal_pending() {
             let progress = output
@@ -422,9 +494,16 @@ fn finish_remote_completion(
                     .shutdown_hard()
                     .map_err(|error| terminal_text(error.to_string()))?;
                 classify_forward_completion(current_outbound, abandoned)?;
-                return output
-                    .finish_gracefully_after_stall()
-                    .map_err(|error| terminal_io("cancelling stalled terminal output", error));
+                return match output.finish_gracefully_after_stall() {
+                    Ok(()) => Ok(remote_exit.finish_code()),
+                    Err(error)
+                        if remote_exit.ready()
+                            && crate::client_terminal::console_pipe_closed(&error) =>
+                    {
+                        Ok(remote_exit.finish_code())
+                    }
+                    Err(error) => Err(terminal_io("cancelling stalled terminal output", error)),
+                };
             }
         }
         if let Some(packet) = forwarder
@@ -465,7 +544,14 @@ fn route_server_packet(
     binary_stdio: bool,
     terminal_modes: &mut TerminalModeState,
     output: &crate::client_output::ConsoleOutput,
+    remote_exit: &crate::client_terminal::RemoteExit,
 ) -> Result<DisplayOutcome, ClientError> {
+    if packet.header() == TerminalPacketType::TerminalExitStatus as u8 {
+        crate::client_terminal::note_exit_status(remote_exit, &packet);
+        return Ok(DisplayOutcome::Displayed {
+            cursor_report: false,
+        });
+    }
     if terminal_enabled || packet.header() == TerminalPacketType::KeepAlive as u8 {
         let outcome = crate::client_terminal::display_packet_with(packet, |bytes, is_stderr| {
             if binary_stdio || is_stderr {

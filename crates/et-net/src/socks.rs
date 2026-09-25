@@ -29,7 +29,7 @@ pub(crate) enum SocksParseStatus {
     Error,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct SocksHandshake {
     pub(crate) input: Vec<u8>,
     pub(crate) reply: Vec<u8>,
@@ -39,21 +39,6 @@ pub(crate) struct SocksHandshake {
     pub(crate) complete: bool,
     pub(crate) version: u8,
     pub(crate) early_data: Vec<u8>,
-}
-
-impl Default for SocksHandshake {
-    fn default() -> Self {
-        Self {
-            input: Vec::new(),
-            reply: Vec::new(),
-            destination: SocketEndpoint::default(),
-            error: None,
-            socks5_auth_done: false,
-            complete: false,
-            version: 0,
-            early_data: Vec::new(),
-        }
-    }
 }
 
 impl SocksHandshake {

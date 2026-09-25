@@ -55,7 +55,7 @@ where
         remote_exit,
         stdio_forward,
     } = options;
-    let mut console_output = if stdio_forward {
+    let console_output = if stdio_forward {
         crate::client_output::ConsoleOutput::new(flow_control, Box::new(std::io::sink()))
     } else {
         crate::client_output::ConsoleOutput::stdout(flow_control)
@@ -352,6 +352,7 @@ where
                         terminal_modes,
                         forwarder,
                         Some(packet),
+                        remote_exit,
                     );
                 }
             }

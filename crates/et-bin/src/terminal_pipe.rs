@@ -335,6 +335,9 @@ fn pump(
         }
 
         let accept_input = stdin.is_some() && !stdout_done && pending.len() < MAX_PENDING_INPUT;
+        // Windows polls on a timer, so this readiness flag is only consumed by
+        // the Unix `poll_pipe` call below.
+        #[cfg(unix)]
         let want_write = stdin.is_some() && !pending.is_empty();
         #[cfg(unix)]
         if !poll_pipe(

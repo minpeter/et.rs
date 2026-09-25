@@ -158,7 +158,6 @@ impl ConsoleOutput {
         Self::new_with_lifecycle(mode, writer, cancel, Box::new(|| Ok(())))
     }
 
-    #[cfg(any(unix, test))]
     pub(crate) fn new_with_lifecycle(
         mode: FlowControlMode,
         writer: Box<dyn Write + Send>,

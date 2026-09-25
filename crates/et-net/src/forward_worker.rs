@@ -398,6 +398,7 @@ impl Worker {
                         )
                         .map_err(ForwardError::Io)?,
                     );
+                    continue;
                 }
                 #[cfg(windows)]
                 {
@@ -406,7 +407,6 @@ impl Worker {
                         "-W/--stdio-forward is not supported on Windows",
                     ));
                 }
-                continue;
             }
             #[cfg(unix)]
             let stop = listener_stop.try_clone().map_err(ForwardError::Io)?;

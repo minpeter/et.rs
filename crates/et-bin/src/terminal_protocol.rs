@@ -25,6 +25,9 @@ pub struct TerminalInitialization {
 }
 
 /// OpenSSH-style status: the exit code, or `128 + signal` when signaled.
+///
+/// Windows pipe status has no signal number, so only the Unix path calls this.
+#[cfg(unix)]
 pub(crate) fn openssh_exit_code(exited: Option<i32>, signal: Option<i32>) -> i32 {
     if let Some(code) = exited {
         return code;
@@ -382,6 +385,7 @@ mod tests {
         assert!(!initialization.no_shell);
     }
 
+    #[cfg(unix)]
     #[test]
     fn openssh_exit_code_prefers_exit_status_then_signal() {
         assert_eq!(openssh_exit_code(Some(0), None), 0);

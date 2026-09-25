@@ -156,7 +156,7 @@ where
                         .take()
                         .ok_or_else(|| "terminal shell is not owned".to_owned())
                 })
-                .and_then(|child| reap_shell(child));
+                .and_then(reap_shell);
             let _ = events_tx.send(WorkerEvent::Child(result));
             signal(wake_writer);
         }) {
@@ -610,10 +610,13 @@ fn reap_shell(child: Box<dyn portable_pty::Child + Send + Sync>) -> Result<u32, 
         // waitpid so the wire status is 128+signal, and do not let Drop wait
         // a second time.
         std::mem::forget(child);
-        return reap_unix_pid(pid);
+        reap_unix_pid(pid)
     }
     #[cfg(not(unix))]
     {
+        // `Child::wait` needs `&mut self`. Keep the binding immutable on Unix,
+        // where this path is not compiled and `mut` would be unused.
+        let mut child = child;
         child
             .wait()
             .map(|status| status.exit_code())

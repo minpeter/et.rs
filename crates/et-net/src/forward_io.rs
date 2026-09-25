@@ -205,12 +205,7 @@ pub(crate) fn spawn_socks_listener(
     next_client_fd: Arc<AtomicI32>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let BoundSource {
-            listener,
-            socks: _,
-            stdio: _,
-            ..
-        } = source;
+        let BoundSource { listener, .. } = source;
         let Some(listener) = listener else {
             return;
         };
@@ -287,10 +282,10 @@ fn finish_socks_handshake(
                 break false;
             }
             SocksParseStatus::NeedMore => {
-                if !state.reply.is_empty() {
-                    if stream.write_all(&std::mem::take(&mut state.reply)).is_err() {
-                        break false;
-                    }
+                if !state.reply.is_empty()
+                    && stream.write_all(&std::mem::take(&mut state.reply)).is_err()
+                {
+                    break false;
                 }
                 match stream.read(&mut buffer) {
                     Ok(0) => break false,
@@ -315,7 +310,6 @@ fn finish_socks_handshake(
     loop {
         match stream.read(&mut buffer) {
             Ok(0) | Err(_) => break,
-            Ok(count) if count == 0 => break,
             Ok(count) => state.early_data.extend_from_slice(&buffer[..count]),
         }
     }

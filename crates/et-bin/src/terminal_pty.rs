@@ -812,7 +812,13 @@ mod tests {
         let status = read_local_packet(&mut peer).unwrap();
         assert_eq!(status.header(), STARTUP_STATUS);
         let mut output = Vec::new();
+        let mut exit_code = None;
         while let Ok(packet) = read_local_packet(&mut peer) {
+            if packet.header() == TerminalPacketType::TerminalExitStatus as u8 {
+                let status = et_core::proto::TerminalExitStatus::decode(packet.payload()).unwrap();
+                exit_code = status.exitcode;
+                continue;
+            }
             assert_eq!(packet.header(), TerminalPacketType::TerminalBuffer as u8);
             output.extend(
                 TerminalBuffer::decode(packet.payload())
@@ -821,6 +827,7 @@ mod tests {
                     .unwrap(),
             );
         }
+        assert_eq!(exit_code, Some(0));
         assert!(
             output
                 .windows(b"FINAL-OUTPUT-MARKER".len())

@@ -835,16 +835,6 @@ fn read_terminal_packet(
     }
 }
 
-fn validate_terminal_output(packet: &Packet) -> Result<(), SessionError> {
-    if packet.is_encrypted() || packet.header() != TerminalPacketType::TerminalBuffer as u8 {
-        return Err(SessionError::Io(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "terminal emitted an invalid packet",
-        )));
-    }
-    Ok(())
-}
-
 /// Terminal packets etserver may forward.
 ///
 /// `TERMINAL_EXIT_STATUS` is dropped when the client did not set

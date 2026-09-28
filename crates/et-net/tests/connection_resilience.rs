@@ -215,6 +215,8 @@ fn recover_does_not_displace_live_session_on_bad_sequence() {
             et_net::framing_io::read_proto_limited(&mut stream, 4 * 1024).unwrap();
         let bad = et_core::proto::SequenceHeader {
             sequence_number: Some(999_999),
+            reset: None,
+            reset_salt: None,
         };
         et_net::framing_io::write_proto(&mut stream, &bad).unwrap();
         stream

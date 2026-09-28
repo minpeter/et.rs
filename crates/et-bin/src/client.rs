@@ -95,7 +95,20 @@ fn run_client(
             "-W/--stdio-forward is not supported on Windows",
         ));
     }
-    let destination = parse_positional_host(&args.host, args.port)?;
+    if args.list_sessions {
+        return crate::session_store::print_sessions();
+    }
+    if let Some(name) = args.attach.as_deref() {
+        return crate::session_store::attach(name, args, resolver, deadline);
+    }
+    if let Some(name) = args.kill_named.as_deref() {
+        return crate::session_store::kill(name, resolver, deadline);
+    }
+    let host = args
+        .host
+        .as_deref()
+        .ok_or(ClientError::Unsupported("a destination host is required"))?;
+    let destination = parse_positional_host(host, args.port)?;
     let requested_user = command_user(destination.user, args.username.clone());
     validate_ssh_destination(&destination.host, requested_user.as_deref())?;
     let ssh_config = selected_ssh_config(args)?;
@@ -382,6 +395,17 @@ fn run_client(
         resolver,
         deadline,
     )?;
+    if let Some(name) = args.session_name.as_deref() {
+        if args.jumphost.is_none() && !args.no_pty {
+            crate::session_store::save_direct(
+                name,
+                &endpoint.host,
+                endpoint.port,
+                &credentials.id,
+                &credentials.passkey,
+            )?;
+        }
+    }
     et_cli::logging::verbose(1, format!("Client created with id: {}", credentials.id));
     if args.no_terminal && !has_forwarding {
         return Ok(0);

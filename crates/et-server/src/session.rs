@@ -3,7 +3,7 @@ use std::io;
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use et_core::backed_writer::{
     MAX_BACKUP_PACKETS, MAX_DISCONNECT_PACKETS, MAX_RECOVERY_BACKUP_BYTES,
@@ -22,6 +22,71 @@ use et_net::connection::{ConnError, Connection};
 /// *without* the connection mutex (see [`ActiveSession::recover_body`]).
 const RECOVERY_LOCK_TIMEOUT: Duration = et_net::connection::DEFAULT_RECOVERY_TIMEOUT;
 const FLOW_CONTROL_BUFFER_BYTES: usize = 64 * 1024;
+
+pub(crate) fn disconnect_deadline_reached(
+    started: &mut Option<Instant>,
+    now: Instant,
+    connected: bool,
+    timeout: Option<Duration>,
+) -> bool {
+    if timeout.is_none_or(|timeout| timeout.is_zero()) || connected {
+        *started = None;
+        return false;
+    }
+    let timeout = timeout.expect("checked above");
+    match *started {
+        None => {
+            *started = Some(now);
+            false
+        }
+        Some(since) => now.saturating_duration_since(since) >= timeout,
+    }
+}
+
+#[cfg(test)]
+mod disconnect_deadline_tests {
+    use super::disconnect_deadline_reached;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn first_disconnected_observation_does_not_fire() {
+        let now = Instant::now();
+        let mut started = None;
+        assert!(!disconnect_deadline_reached(
+            &mut started,
+            now,
+            false,
+            Some(Duration::from_secs(30))
+        ));
+        assert!(started.is_some());
+        assert!(!disconnect_deadline_reached(
+            &mut started,
+            now,
+            false,
+            Some(Duration::from_secs(30))
+        ));
+        assert!(disconnect_deadline_reached(
+            &mut started,
+            now + Duration::from_secs(30),
+            false,
+            Some(Duration::from_secs(30))
+        ));
+        assert!(!disconnect_deadline_reached(
+            &mut started,
+            now,
+            true,
+            Some(Duration::from_secs(30))
+        ));
+        assert!(started.is_none());
+        assert!(!disconnect_deadline_reached(&mut started, now, false, None));
+        assert!(!disconnect_deadline_reached(
+            &mut started,
+            now,
+            false,
+            Some(Duration::ZERO)
+        ));
+    }
+}
 
 #[cfg(test)]
 #[path = "session_output_interrupt_test.rs"]
@@ -87,6 +152,12 @@ pub(crate) struct ActiveSession {
     /// Client set `InitialPayload.supports_exit_status`. Packet type 12 is
     /// forwarded only then; older clients abort on an unknown type.
     forward_exit_status: AtomicBool,
+    /// Per-session disconnect timeout. `None` never fires (unset or 0).
+    disconnect_timeout: Mutex<Option<Duration>>,
+    /// First observation that the client was disconnected. Cleared on connect.
+    disconnected_since: Mutex<Option<Instant>>,
+    /// `TERMINAL_INFO` kill v1 was forwarded to etterminal.
+    kill_requested: AtomicBool,
 }
 
 pub(crate) enum SessionConnection {
@@ -191,7 +262,41 @@ impl ActiveSession {
             bridge_changed: Condvar::new(),
             pipe_mode,
             forward_exit_status: AtomicBool::new(false),
+            disconnect_timeout: Mutex::new(None),
+            disconnected_since: Mutex::new(None),
+            kill_requested: AtomicBool::new(false),
         })
+    }
+
+    pub(crate) fn set_disconnect_timeout(&self, seconds: Option<i32>) {
+        let timeout = seconds
+            .filter(|seconds| *seconds > 0)
+            .and_then(|seconds| u64::try_from(seconds).ok())
+            .map(Duration::from_secs);
+        if let Ok(mut slot) = self.disconnect_timeout.lock() {
+            *slot = timeout;
+        }
+    }
+
+    pub(crate) fn request_kill(&self) {
+        self.kill_requested.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn kill_requested(&self) -> bool {
+        self.kill_requested.load(Ordering::Acquire)
+    }
+
+    /// Upstream `disconnectDeadlineReached`: a non-positive timeout never
+    /// fires, a connected client clears the stamp, and the first disconnected
+    /// observation records `now` without firing.
+    pub(crate) fn disconnect_deadline_reached(&self, connected: bool) -> bool {
+        let Ok(timeout) = self.disconnect_timeout.lock() else {
+            return false;
+        };
+        let Ok(mut since) = self.disconnected_since.lock() else {
+            return false;
+        };
+        disconnect_deadline_reached(&mut since, Instant::now(), connected, *timeout)
     }
 
     pub(crate) fn set_forward_exit_status(&self, enabled: bool) {

@@ -59,6 +59,10 @@ fn fresh_bootstrap_rejects_returning_status() {
     let response = ConnectResponse {
         status: Some(ConnectStatus::ReturningClient as i32),
         error: None,
+        auth_challenge: None,
+        reset_proof: None,
+        reset_required: None,
+        reset_salt: None,
     };
     assert!(matches!(
         accept_response(response),
@@ -72,14 +76,22 @@ fn reconnect_accepts_only_returning_or_ended_sessions() {
         accept_reconnect_response(ConnectResponse {
             status: Some(ConnectStatus::ReturningClient as i32),
             error: None,
+            auth_challenge: None,
+            reset_proof: None,
+            reset_required: None,
+            reset_salt: None,
         })
         .unwrap(),
-        ReconnectStatus::Recover
+        ReconnectStatus::Recover { salt: None }
     );
     assert_eq!(
         accept_reconnect_response(ConnectResponse {
             status: Some(ConnectStatus::InvalidKey as i32),
             error: None,
+            auth_challenge: None,
+            reset_proof: None,
+            reset_required: None,
+            reset_salt: None,
         })
         .unwrap(),
         ReconnectStatus::SessionEnded
@@ -88,6 +100,10 @@ fn reconnect_accepts_only_returning_or_ended_sessions() {
         accept_reconnect_response(ConnectResponse {
             status: Some(ConnectStatus::NewClient as i32),
             error: None,
+            auth_challenge: None,
+            reset_proof: None,
+            reset_required: None,
+            reset_salt: None,
         }),
         Err(ClientError::ServerRejected { .. })
     ));
@@ -95,6 +111,10 @@ fn reconnect_accepts_only_returning_or_ended_sessions() {
         accept_reconnect_response(ConnectResponse {
             status: Some(ConnectStatus::MismatchedProtocol as i32),
             error: Some("wrong".to_owned()),
+            auth_challenge: None,
+            reset_proof: None,
+            reset_required: None,
+            reset_salt: None,
         }),
         Err(ClientError::ProtocolMismatch(_))
     ));

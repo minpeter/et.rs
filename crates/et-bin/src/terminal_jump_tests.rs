@@ -56,6 +56,10 @@ fn assert_destination_clamped(flow_control: Option<i32>) {
             &ConnectResponse {
                 status: Some(ConnectStatus::NewClient as i32),
                 error: None,
+                auth_challenge: None,
+                reset_proof: None,
+                reset_required: None,
+                reset_salt: None,
             },
         )
         .unwrap();
@@ -355,6 +359,10 @@ fn jumphost_run_bounds_router_sender_before_destination_output() {
             &ConnectResponse {
                 status: Some(ConnectStatus::NewClient as i32),
                 error: None,
+                auth_challenge: None,
+                reset_proof: None,
+                reset_required: None,
+                reset_salt: None,
             },
         )
         .unwrap();

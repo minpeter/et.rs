@@ -208,6 +208,8 @@ mod tests {
         let mut buffer = Vec::new();
         let message = SequenceHeader {
             sequence_number: Some(42),
+            reset: None,
+            reset_salt: None,
         };
         write_proto(&mut buffer, &message).unwrap();
         let back: SequenceHeader = read_proto(&mut std::io::Cursor::new(&buffer)).unwrap();
@@ -228,6 +230,8 @@ mod tests {
         let mut buffer = Vec::new();
         let message = SequenceHeader {
             sequence_number: Some(42),
+            reset: None,
+            reset_salt: None,
         };
         assert!(write_proto_limited(&mut buffer, &message, 0).is_err());
         assert!(buffer.is_empty());

@@ -3,13 +3,19 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use et_core::proto::{
-    ConnectResponse, ConnectStatus, EtPacketType, InitialPayload, InitialResponse, TermInit,
-    TerminalPacketType,
+use et_core::crypto::{
+    random_bytes, reset_decision_proof, verify_connection_proof, AUTH_CHALLENGE_BYTES,
+    EPOCH_SALT_BYTES, KEY_LEN,
 };
-use et_net::connection::Connection;
+use et_core::proto::{
+    ConnectAuth, ConnectResponse, ConnectStatus, EtPacketType, InitialPayload, InitialResponse,
+    TermInit, TerminalBuffer, TerminalPacketType,
+};
+use et_core::PROTOCOL_VERSION;
+use et_net::connection::{Connection, RecoveryExchange, DEFAULT_RECOVERY_TIMEOUT};
 use et_net::handshake::{
-    protocol_matches, read_request_deadline, write_response, HANDSHAKE_TIMEOUT,
+    protocol_matches, read_request_deadline, reset_intent, supports_challenge, write_response,
+    HANDSHAKE_TIMEOUT, MAX_HANDSHAKE_PROTO_LEN,
 };
 use et_net::local_packet::{write_local_packet, write_local_packet_cancelled};
 use prost::Message;
@@ -45,6 +51,8 @@ pub(crate) fn terminal_init_from_payload(
         no_pty: pipe_mode.then_some(true),
         command: pipe_mode.then(|| payload.command.clone().unwrap_or_default()),
         no_shell: no_shell.then_some(true),
+        hadreversetunnels: (!payload.reversetunnels.is_empty()).then_some(true),
+        disconnect_timeout_seconds: payload.disconnect_timeout_seconds,
         flowcontrol: payload.flowcontrol,
     })
 }
@@ -104,6 +112,8 @@ pub(crate) fn handle(
         crate::diag::info(format!("drop {peer}: initialization deadline expired"));
         return;
     }
+    let legacy = !supports_challenge(&request);
+    let wants_reset = reset_intent(&request);
     let Some(id) = request.client_id.filter(|id| valid_id(id)) else {
         reject(
             &mut stream,
@@ -114,12 +124,19 @@ pub(crate) fn handle(
         );
         return;
     };
-    let registration = match core.registry.get(&id) {
+    let mut registration = match core.registry.get(&id) {
         Ok(Some(registration)) => registration,
         Ok(None) | Err(_) => {
+            let retry = !legacy
+                && core.started.elapsed() < et_core::RECOVERY_GRACE
+                && !core.registry.was_removed(&id).unwrap_or(true);
             reject(
                 &mut stream,
-                ConnectStatus::InvalidKey,
+                if retry {
+                    ConnectStatus::RetryLater
+                } else {
+                    ConnectStatus::InvalidKey
+                },
                 "client is not registered",
                 &peer,
                 Some(&id),
@@ -127,6 +144,54 @@ pub(crate) fn handle(
             return;
         }
     };
+    let challenge = if legacy {
+        None
+    } else {
+        match authenticate_client(
+            &mut stream,
+            &id,
+            &registration.key,
+            wants_reset,
+            handshake_deadline,
+        ) {
+            Ok(challenge) => Some(challenge),
+            Err(AuthError::Rejected) => {
+                reject(
+                    &mut stream,
+                    ConnectStatus::InvalidKey,
+                    "Client authentication failed",
+                    &peer,
+                    Some(&id),
+                );
+                return;
+            }
+            Err(AuthError::Io) => {
+                crate::diag::info(format!(
+                    "id={id}: authentication exchange failed for {peer}"
+                ));
+                return;
+            }
+        }
+    };
+    if !legacy {
+        match core.registry.get(&id) {
+            Ok(Some(current)) if current.key == registration.key => registration = current,
+            _ => {
+                reject(
+                    &mut stream,
+                    ConnectStatus::InvalidKey,
+                    "Client authentication failed",
+                    &peer,
+                    Some(&id),
+                );
+                return;
+            }
+        }
+    }
+    let decision = challenge.map(|challenge| ConnectDecision {
+        challenge,
+        key: registration.key,
+    });
     let registration_identity = registration.identity();
     #[cfg(test)]
     run_before_raw_assignment_hook(&registration_identity);
@@ -146,6 +211,29 @@ pub(crate) fn handle(
         core.sessions.state(&id),
         Ok(Some(crate::session_table::SessionState::Active))
     ) {
+        if registration.pty_active {
+            if legacy {
+                reject(
+                    &mut stream,
+                    ConnectStatus::InvalidKey,
+                    "Client is not registered",
+                    &peer,
+                    Some(&id),
+                );
+                return;
+            }
+            crate::diag::info(format!("id={id}: resuming pty session from {peer}"));
+            resume_pty_session(
+                stream,
+                registration,
+                &core,
+                &peer,
+                pre_auth_guard,
+                &mut guard,
+                decision.as_ref(),
+            );
+            return;
+        }
         crate::diag::info(format!("id={id}: new client session from {peer}"));
         handle_new(
             stream,
@@ -155,6 +243,7 @@ pub(crate) fn handle(
             pre_auth_guard,
             initialization_deadline,
             &mut guard,
+            decision.as_ref(),
         );
         return;
     }
@@ -212,7 +301,22 @@ pub(crate) fn handle(
                 ));
                 return;
             }
-            if send_status(&mut stream, ConnectStatus::ReturningClient).is_err() {
+            let reset_salt = wants_reset.then(random_bytes::<EPOCH_SALT_BYTES>);
+            let salt_bytes: &[u8] = reset_salt
+                .as_ref()
+                .map(|salt| salt.as_slice())
+                .unwrap_or(&[]);
+            if send_decision(
+                &mut stream,
+                ConnectStatus::ReturningClient,
+                None,
+                decision.as_ref(),
+                &id,
+                reset_salt.is_some(),
+                salt_bytes,
+            )
+            .is_err()
+            {
                 crate::diag::info(format!(
                     "id={id}: failed to send ReturningClient status to {peer}"
                 ));
@@ -220,7 +324,18 @@ pub(crate) fn handle(
             }
             #[cfg(test)]
             run_after_returning_status_hook(&id);
-            match permit.complete(stream) {
+            let recovered = if let Some(salt) = reset_salt {
+                permit.complete_with(
+                    stream,
+                    RecoveryExchange {
+                        read_peer_catchup_first: false,
+                        reset_salt: Some(salt),
+                    },
+                )
+            } else {
+                permit.complete(stream)
+            };
+            match recovered {
                 Ok(()) => {
                     crate::diag::info(format!("id={id}: session recover accepted from {peer}"))
                 }
@@ -232,6 +347,7 @@ pub(crate) fn handle(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_new(
     mut stream: TcpStream,
     registration: crate::registry::Registration,
@@ -240,9 +356,20 @@ fn handle_new(
     pre_auth_guard: PreAuthGuard,
     initialization_deadline: Instant,
     raw_guard: &mut RawSocketGuard,
+    decision: Option<&ConnectDecision>,
 ) {
     let id = registration.id.clone();
-    if send_status(&mut stream, ConnectStatus::NewClient).is_err() {
+    if send_decision(
+        &mut stream,
+        ConnectStatus::NewClient,
+        None,
+        decision,
+        &id,
+        false,
+        &[],
+    )
+    .is_err()
+    {
         crate::diag::info(format!(
             "id={id}: failed to send NewClient status to {peer}"
         ));
@@ -470,6 +597,7 @@ fn handle_new(
     };
     let active = Arc::new(active);
     active.set_forward_exit_status(payload.supports_exit_status.unwrap_or(false));
+    active.set_disconnect_timeout(payload.disconnect_timeout_seconds);
     active.start_flow_writer();
     if start.activate(active.clone()).is_err() {
         crate::diag::info(format!("id={id}: could not activate session for {peer}"));
@@ -622,6 +750,7 @@ fn run_jumphost(
     };
     let active = Arc::new(active);
     active.set_forward_exit_status(payload.supports_exit_status.unwrap_or(false));
+    active.set_disconnect_timeout(payload.disconnect_timeout_seconds);
     active.start_flow_writer();
     if start.activate(active.clone()).is_err() {
         crate::diag::info(format!("id={id}: jumphost could not activate session"));
@@ -679,14 +808,200 @@ fn send_initial_error(connection: &mut Connection, message: &str) {
     );
 }
 
-fn send_status(stream: &mut TcpStream, status: ConnectStatus) -> std::io::Result<()> {
+struct ConnectDecision {
+    challenge: Vec<u8>,
+    key: [u8; KEY_LEN],
+}
+
+enum AuthError {
+    Rejected,
+    Io,
+}
+
+fn authenticate_client(
+    stream: &mut TcpStream,
+    id: &str,
+    key: &[u8; KEY_LEN],
+    reset_intent: bool,
+    deadline: Instant,
+) -> Result<Vec<u8>, AuthError> {
+    let challenge = random_bytes::<AUTH_CHALLENGE_BYTES>().to_vec();
     write_response(
         stream,
         &ConnectResponse {
-            status: Some(status as i32),
+            status: None,
             error: None,
+            auth_challenge: Some(challenge.clone()),
+            reset_required: None,
+            reset_proof: None,
+            reset_salt: None,
         },
     )
+    .map_err(|_| AuthError::Io)?;
+    let auth: ConnectAuth =
+        et_net::framing_io::read_proto_limited_deadline(stream, MAX_HANDSHAKE_PROTO_LEN, deadline)
+            .map_err(|_| AuthError::Io)?;
+    let proof = auth.proof.unwrap_or_default();
+    if verify_connection_proof(&proof, key, id, PROTOCOL_VERSION, &challenge, reset_intent) {
+        Ok(challenge)
+    } else {
+        Err(AuthError::Rejected)
+    }
+}
+
+fn send_decision(
+    stream: &mut TcpStream,
+    status: ConnectStatus,
+    error: Option<String>,
+    decision: Option<&ConnectDecision>,
+    id: &str,
+    reset_required: bool,
+    salt: &[u8],
+) -> std::io::Result<()> {
+    let mut response = ConnectResponse {
+        status: Some(status as i32),
+        error,
+        auth_challenge: None,
+        reset_required: None,
+        reset_proof: None,
+        reset_salt: None,
+    };
+    if let Some(decision) = decision {
+        let proof = reset_decision_proof(
+            &decision.key,
+            id,
+            PROTOCOL_VERSION,
+            &decision.challenge,
+            status as i32,
+            reset_required,
+            salt,
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+        response.reset_required = Some(reset_required);
+        if !salt.is_empty() {
+            response.reset_salt = Some(salt.to_vec());
+        }
+        response.reset_proof = Some(proof.to_vec());
+    }
+    write_response(stream, &response)
+}
+
+fn resume_pty_session(
+    mut stream: TcpStream,
+    registration: crate::registry::Registration,
+    core: &RuntimeCore,
+    peer: &str,
+    pre_auth_guard: PreAuthGuard,
+    raw_guard: &mut RawSocketGuard,
+    decision: Option<&ConnectDecision>,
+) {
+    let id = registration.id.clone();
+    let salt = random_bytes::<EPOCH_SALT_BYTES>();
+    if send_decision(
+        &mut stream,
+        ConnectStatus::ReturningClient,
+        None,
+        decision,
+        &id,
+        true,
+        &salt,
+    )
+    .is_err()
+    {
+        crate::diag::info(format!("id={id}: failed to send resume status to {peer}"));
+        return;
+    }
+    if raw_guard.authenticate().is_err() {
+        return;
+    }
+    drop(pre_auth_guard);
+    let claim_stream = match stream.try_clone() {
+        Ok(stream) => stream,
+        Err(error) => {
+            crate::diag::info(format!("id={id}: could not clone resume socket: {error}"));
+            return;
+        }
+    };
+    let mut connection = Connection::new_server(stream, &registration.key);
+    if let Err(error) = connection.establish_reset(
+        DEFAULT_RECOVERY_TIMEOUT,
+        RecoveryExchange {
+            read_peer_catchup_first: false,
+            reset_salt: Some(salt),
+        },
+    ) {
+        crate::diag::info(format!("id={id}: resume reset failed for {peer}: {error}"));
+        return;
+    }
+    if registration.had_reverse_tunnels {
+        let notice = TerminalBuffer {
+            buffer: Some(
+                b"et: port forwards were not restored across the server restart; reconnect to re-establish\r\n"
+                    .to_vec(),
+            ),
+            is_stderr: None,
+        };
+        if connection
+            .write_packet(
+                TerminalPacketType::TerminalBuffer as u8,
+                &notice.encode_to_vec(),
+            )
+            .is_err()
+        {
+            crate::diag::info(format!("id={id}: could not write restart forward notice"));
+        }
+    }
+    let start = match core
+        .sessions
+        .claim(registration.clone(), &claim_stream, &core.registry)
+    {
+        Ok(SessionClaim::New {
+            start,
+            replaced: None,
+        }) => start,
+        Ok(_) => {
+            crate::diag::info(format!("id={id}: session changed during resume"));
+            return;
+        }
+        Err(error) => {
+            crate::diag::info(format!("id={id}: resume claim failed: {error}"));
+            return;
+        }
+    };
+    if raw_guard.own_session().is_err() {
+        return;
+    }
+    let terminal = match core.registry.clone_stream(&registration) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            crate::diag::info(format!(
+                "id={id}: could not clone resumed terminal: {error}"
+            ));
+            return;
+        }
+    };
+    let active = match ActiveSession::new(connection, &terminal, None) {
+        Ok(active) => active,
+        Err(error) => {
+            crate::diag::info(format!("id={id}: could not resume session: {error}"));
+            return;
+        }
+    };
+    let active = Arc::new(active);
+    active.set_disconnect_timeout(registration.disconnect_timeout_seconds);
+    active.start_flow_writer();
+    if start.activate(active.clone()).is_err() {
+        return;
+    }
+    let Ok(forwarder) = et_net::forward::Forwarder::start(Vec::new()) else {
+        let _ = active.shutdown();
+        return;
+    };
+    crate::diag::info(format!(
+        "id={id}: resumed terminal bridge running for {peer}"
+    ));
+    let _ = crate::terminal_bridge::run(active.clone(), terminal, forwarder);
+    let _ = active.finish_terminal();
 }
 
 fn reject(
@@ -705,6 +1020,10 @@ fn reject(
         &ConnectResponse {
             status: Some(status as i32),
             error: Some(message.to_owned()),
+            auth_challenge: None,
+            reset_required: None,
+            reset_proof: None,
+            reset_salt: None,
         },
     );
 }
@@ -826,6 +1145,9 @@ mod tests {
                 uid: Some(i64::from(rustix::process::getuid().as_raw())),
                 gid: Some(i64::from(rustix::process::getgid().as_raw())),
                 fd: None,
+                ptyactive: None,
+                hadreversetunnels: None,
+                disconnect_timeout_seconds: None,
             }
             .encode_to_vec(),
         );

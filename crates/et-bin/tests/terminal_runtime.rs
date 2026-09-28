@@ -89,6 +89,8 @@ fn assert_motd_prompt_spacing(
             command: None,
 
             no_shell: None,
+            disconnect_timeout_seconds: None,
+            hadreversetunnels: None,
         },
     );
     expect_startup(&mut router);
@@ -157,6 +159,8 @@ fn framed_terminal_close_shuts_the_pty_down_successfully() {
             command: None,
 
             no_shell: None,
+            disconnect_timeout_seconds: None,
+            hadreversetunnels: None,
         },
     );
     expect_startup(&mut router);
@@ -224,6 +228,8 @@ fn bootstrap_parent_reports_marker_and_leaves_registered_session_running() {
             command: None,
 
             no_shell: None,
+            disconnect_timeout_seconds: None,
+            hadreversetunnels: None,
         },
     );
     expect_startup(&mut router);
@@ -345,6 +351,8 @@ fn new_terminal_uses_legacy_sequence_with_old_router() {
             command: None,
 
             no_shell: None,
+            disconnect_timeout_seconds: None,
+            hadreversetunnels: None,
         },
     );
     send(
@@ -391,6 +399,8 @@ fn real_terminal_registers_runs_shell_and_resizes_pty() {
             command: None,
 
             no_shell: None,
+            disconnect_timeout_seconds: None,
+            hadreversetunnels: None,
         },
     );
     expect_startup(&mut router);
@@ -403,6 +413,8 @@ fn real_terminal_registers_runs_shell_and_resizes_pty() {
             column: Some(100),
             width: Some(800),
             height: Some(600),
+            command: None,
+            commandversion: None,
         },
     );
     send(
@@ -456,6 +468,8 @@ fn pty_output_backpressure_longer_than_two_seconds_preserves_session_and_order()
             command: None,
 
             no_shell: None,
+            disconnect_timeout_seconds: None,
+            hadreversetunnels: None,
         },
     );
     expect_startup(&mut router);
@@ -551,7 +565,7 @@ fn bootstrap_parent_reports_terminal_child_startup_failure() {
 }
 
 #[test]
-fn router_disconnect_terminates_the_shell() {
+fn router_disconnect_keeps_the_shell_and_reregisters() {
     let fixture = Fixture::new("disconnect");
     let mut child = fixture.spawn();
     write_credentials(&mut child);
@@ -571,12 +585,25 @@ fn router_disconnect_terminates_the_shell() {
             command: None,
 
             no_shell: None,
+            disconnect_timeout_seconds: None,
+            hadreversetunnels: None,
         },
     );
     expect_startup(&mut router);
     drop(router);
-    let status = child.wait_timeout(TIMEOUT).unwrap().unwrap();
-    assert!(!status.success());
+    // #793: a live pty survives the router socket dying and re-registers with
+    // ptyactive so a replacement etserver can resume the same shell.
+    let mut recovered = fixture.accept();
+    let packet = read_local_packet(&mut recovered).unwrap();
+    assert_eq!(packet.header(), TerminalPacketType::TerminalUserInfo as u8);
+    let info = TerminalUserInfo::decode(packet.payload()).unwrap();
+    assert_eq!(info.ptyactive, Some(true));
+    assert!(child
+        .wait_timeout(Duration::from_millis(200))
+        .unwrap()
+        .is_none());
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[test]
@@ -602,6 +629,8 @@ fn real_terminal_starts_login_shell_and_loads_profile_color() {
             command: None,
 
             no_shell: None,
+            disconnect_timeout_seconds: None,
+            hadreversetunnels: None,
         },
     );
     expect_startup(&mut router);
@@ -654,6 +683,8 @@ fn real_terminal_login_shell_preserves_term_without_colorterm() {
             command: None,
 
             no_shell: None,
+            disconnect_timeout_seconds: None,
+            hadreversetunnels: None,
         },
     );
     expect_startup(&mut router);
@@ -729,6 +760,8 @@ fn real_terminal_emits_motd_before_login_shell_output() {
             command: None,
 
             no_shell: None,
+            disconnect_timeout_seconds: None,
+            hadreversetunnels: None,
         },
     );
     expect_startup(&mut router);
@@ -836,6 +869,8 @@ fn real_terminal_emits_last_login_between_motd_and_prompt() {
             command: None,
 
             no_shell: None,
+            disconnect_timeout_seconds: None,
+            hadreversetunnels: None,
         },
     );
     expect_startup(&mut router);
@@ -909,6 +944,8 @@ fn real_terminal_suppresses_motd_when_home_has_hushlogin() {
             command: None,
 
             no_shell: None,
+            disconnect_timeout_seconds: None,
+            hadreversetunnels: None,
         },
     );
     expect_startup(&mut router);

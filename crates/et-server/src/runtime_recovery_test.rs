@@ -83,6 +83,7 @@ fn terminal_hup_after_returning_status_delivers_final_output_only_to_recovered_c
 
         supports_exit_status: None,
         no_shell: None,
+        disconnect_timeout_seconds: None,
     };
     client.write_packet(253, &payload.encode_to_vec()).unwrap();
     let initial = client.read_packet().unwrap();
@@ -208,6 +209,9 @@ fn register(
             uid: Some(i64::from(rustix::process::getuid().as_raw())),
             gid: Some(i64::from(rustix::process::getgid().as_raw())),
             fd: None,
+            ptyactive: None,
+            hadreversetunnels: None,
+            disconnect_timeout_seconds: None,
         }
         .encode_to_vec(),
     );

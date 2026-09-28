@@ -58,7 +58,6 @@ pub(crate) struct ActiveIo {
     pub(crate) cancel: channel::Receiver<()>,
     pub(crate) pending_bytes: Arc<AtomicUsize>,
     pub(crate) abandoned: Arc<AtomicBool>,
-    pub(crate) read_closed: bool,
     pub(crate) write_closed: bool,
     /// Stdio (`-W`) EOF shuts the remote write side and keeps the reply open.
     pub(crate) half_close_on_eof: bool,
@@ -332,7 +331,38 @@ pub(crate) fn spawn_stdio(
     commands: CommandSender,
     cancel: channel::Receiver<()>,
     next_client_fd: Arc<AtomicI32>,
+    bridge: (
+        Option<Arc<AtomicBool>>,
+        Option<std::os::unix::net::UnixStream>,
+    ),
 ) -> io::Result<JoinHandle<()>> {
+    spawn_stdio_with(
+        destination,
+        commands,
+        cancel,
+        next_client_fd,
+        bridge,
+        (io::stdin(), io::stdout()),
+    )
+}
+
+#[cfg(unix)]
+fn spawn_stdio_with<I, O>(
+    destination: SocketEndpoint,
+    commands: CommandSender,
+    cancel: channel::Receiver<()>,
+    next_client_fd: Arc<AtomicI32>,
+    bridge: (
+        Option<Arc<AtomicBool>>,
+        Option<std::os::unix::net::UnixStream>,
+    ),
+    (mut stdin, mut stdout): (I, O),
+) -> io::Result<JoinHandle<()>>
+where
+    I: Read + Send + 'static,
+    O: Write + Send + 'static,
+{
+    let (bridge_open, mut bridge_wake) = bridge;
     let (worker_end, app_end) = std::os::unix::net::UnixStream::pair()?;
     let client_fd = next_client_fd.fetch_add(1, Ordering::Relaxed);
     if client_fd <= 0 {
@@ -341,7 +371,6 @@ pub(crate) fn spawn_stdio(
     let mut inbound = app_end.try_clone()?;
     let mut outbound = app_end;
     thread::spawn(move || {
-        let mut stdin = io::stdin();
         let mut buffer = [0u8; READ_CHUNK];
         loop {
             if cancellation_requested(&cancel) {
@@ -367,7 +396,6 @@ pub(crate) fn spawn_stdio(
         }
     });
     thread::spawn(move || {
-        let mut stdout = io::stdout();
         let mut buffer = [0u8; READ_CHUNK];
         loop {
             match outbound.read(&mut buffer) {
@@ -380,6 +408,15 @@ pub(crate) fn spawn_stdio(
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => break,
             }
+        }
+        // Upstream writes stdout synchronously before it closes the stdio
+        // forward. Report the bridge closed only after every reply byte the
+        // worker queued has reached stdout, then wake the session loop.
+        if let Some(open) = &bridge_open {
+            open.store(false, Ordering::Release);
+        }
+        if let Some(wake) = bridge_wake.as_mut() {
+            let _ = wake.write(&[1]);
         }
     });
     Ok(thread::spawn(move || {
@@ -700,7 +737,6 @@ fn spawn_io_inner(
             cancel,
             pending_bytes,
             abandoned,
-            read_closed: false,
             write_closed: false,
             half_close_on_eof: false,
             in_flight,
@@ -793,17 +829,19 @@ pub(crate) fn abort_io(io: ActiveIo) {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::io::{self, Write};
+    use std::io::{self, Read, Write};
+    use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
 
     use crossbeam_channel as channel;
+    use et_core::proto::SocketEndpoint;
 
     use super::{
-        commit_reservation, spawn_io, spawn_io_with_read_limit, stop_io, FlowWindow, ForwardStream,
-        Role, WriteCommand, READ_CHUNK,
+        commit_reservation, spawn_io, spawn_io_with_read_limit, spawn_stdio_with, stop_io,
+        FlowWindow, ForwardStream, Role, WriteCommand, READ_CHUNK,
     };
     use crate::forward_worker::state::apply_delivery;
     use crate::forward_worker::{command_channel, Command};
@@ -1140,5 +1178,56 @@ mod tests {
             completed_before_abort,
             "stop_io remained blocked behind the full writer queue after cancellation"
         );
+    }
+
+    #[test]
+    fn stdio_bridge_reports_closed_only_after_the_final_reply_reaches_stdout() {
+        // Given: an `et -W` stdio bridge whose stdin stays open.
+        let (_stdin_writer, stdin) = UnixStream::pair().unwrap();
+        let (stdout, mut stdout_reader) = UnixStream::pair().unwrap();
+        stdout_reader.set_read_timeout(Some(EVENT_TIMEOUT)).unwrap();
+        let (wake_writer, mut wake_reader) = UnixStream::pair().unwrap();
+        wake_reader.set_read_timeout(Some(EVENT_TIMEOUT)).unwrap();
+        let open = Arc::new(AtomicBool::new(true));
+        let (commands, command_receiver) = command_channel(8);
+        // The test receiver reports Disconnected once every sender is gone.
+        let _sender = commands.clone();
+        let (_cancel, cancel_receiver) = channel::bounded(1);
+        spawn_stdio_with(
+            SocketEndpoint::default(),
+            commands,
+            cancel_receiver,
+            Arc::new(AtomicI32::new(1)),
+            (Some(open.clone()), Some(wake_writer)),
+            (stdin, stdout),
+        )
+        .unwrap()
+        .join()
+        .unwrap();
+        let Command::Accepted {
+            stream: ForwardStream::Unix(mut worker_end),
+            ..
+        } = command_receiver.recv_timeout(EVENT_TIMEOUT).unwrap()
+        else {
+            panic!("stdio bridge did not announce its socket");
+        };
+
+        // When: the remote side closes first. The worker flushes the last
+        // reply, then shuts its write half, while stdin is still open.
+        worker_end.write_all(b"final-reply").unwrap();
+        let mut reply = [0u8; 11];
+        stdout_reader.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"final-reply");
+        assert!(
+            open.load(Ordering::Acquire),
+            "bridge reported closed before its reply direction ended"
+        );
+        worker_end.shutdown(Shutdown::Write).unwrap();
+
+        // Then: with every reply byte on stdout, the bridge reports closed
+        // and wakes the session loop, as upstream closes the stdio forward.
+        let mut byte = [0u8; 1];
+        assert_eq!(wake_reader.read(&mut byte).unwrap(), 1);
+        assert!(!open.load(Ordering::Acquire));
     }
 }

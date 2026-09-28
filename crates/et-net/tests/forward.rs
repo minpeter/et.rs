@@ -73,21 +73,18 @@ fn two_forwarders_relay_a_real_tcp_round_trip() {
 }
 
 #[test]
-fn forwarded_tcp_delivers_reply_after_client_write_shutdown() {
-    // Given: a real forwarded TCP stream to an echo server that replies only
-    // after it observes EOF, then half-closes its own write side.
+fn forwarded_tcp_write_shutdown_closes_the_tunnel_like_upstream() {
+    // Given: a real forwarded TCP stream to a server that reads until EOF.
     const PAYLOAD_LEN: usize = 20 * 1024;
     let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|index| index as u8).collect();
     let destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let destination_port = destination.local_addr().unwrap().port();
-    let echo = thread::spawn(move || {
+    let server = thread::spawn(move || {
         let (mut stream, _) = destination.accept().unwrap();
         stream.set_read_timeout(Some(TIMEOUT)).unwrap();
-        stream.set_write_timeout(Some(TIMEOUT)).unwrap();
         let mut received = Vec::new();
         stream.read_to_end(&mut received).unwrap();
-        stream.write_all(&received).unwrap();
-        stream.shutdown(Shutdown::Write).unwrap();
+        received
     });
     let source_port = reserve_port();
     let source = Forwarder::start(vec![request(source_port, destination_port)]).unwrap();
@@ -106,16 +103,16 @@ fn forwarded_tcp_delivers_reply_after_client_write_shutdown() {
     application.write_all(&payload).unwrap();
     application.shutdown(Shutdown::Write).unwrap();
     relay_forward_data_until_close(&source, &destination);
-    relay_forward_data_until_close(&destination, &source);
 
-    // Then: the echoed bytes arrive byte-exact before EOF.
+    // Then: as in upstream ET, the bytes sent before EOF arrive, then both
+    // ends close in full. `-t`/`-r` do not keep a reply direction open.
+    assert_eq!(server.join().unwrap(), payload);
     let mut reply = Vec::new();
     application.read_to_end(&mut reply).unwrap();
-    assert_eq!(reply, payload);
+    assert!(reply.is_empty());
 
     source.shutdown().unwrap();
     destination.shutdown().unwrap();
-    echo.join().unwrap();
 }
 
 #[test]

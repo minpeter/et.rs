@@ -395,6 +395,7 @@ impl Worker {
                             self.commands.clone(),
                             self.cancel.clone(),
                             next_client_fd.clone(),
+                            (self.stdio_open.clone(), self.outbound_wake.try_clone().ok()),
                         )
                         .map_err(ForwardError::Io)?,
                     );
@@ -518,20 +519,24 @@ pub(crate) mod state;
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
     use crossbeam_channel as channel;
     use et_core::packet::Packet;
     use et_core::proto::{
-        PortForwardDestinationRequest, PortForwardDestinationResponse, SocketEndpoint,
-        TerminalPacketType,
+        PortForwardData, PortForwardDestinationRequest, PortForwardDestinationResponse,
+        SocketEndpoint, TerminalPacketType,
     };
     use prost::Message;
 
-    use super::{command_channel, Command, CommandReceiver, Worker, MAX_ACTIVE_SOCKETS};
+    use super::{
+        command_channel, Command, CommandReceiver, PendingAccept, Role, Worker, MAX_ACTIVE_SOCKETS,
+    };
+    use crate::forward_endpoint::ForwardStream;
 
     const EVENT_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -600,6 +605,140 @@ mod tests {
             TerminalPacketType::PortForwardDestinationResponse as u8
         );
         PortForwardDestinationResponse::decode(packet.payload()).unwrap()
+    }
+
+    fn forward_data(to_destination: bool, socket_id: i32, data: PortForwardData) -> Packet {
+        Packet::new(
+            TerminalPacketType::PortForwardData as u8,
+            PortForwardData {
+                sourcetodestination: Some(to_destination),
+                socketid: Some(socket_id),
+                ..data
+            }
+            .encode_to_vec(),
+        )
+    }
+
+    fn closed() -> PortForwardData {
+        PortForwardData {
+            closed: Some(true),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn peer_close_fully_closes_the_stdio_source_and_leaves_the_bridge_to_stdout() {
+        // Given: an active `et -W` source whose stdin is still open.
+        let (mut worker, _commands, outbound, _cancel) = worker();
+        let open = Arc::new(AtomicBool::new(true));
+        worker.stdio_open = Some(open.clone());
+        let (worker_end, mut application) = UnixStream::pair().unwrap();
+        application.set_read_timeout(Some(EVENT_TIMEOUT)).unwrap();
+        worker
+            .accepted(
+                1,
+                SocketEndpoint::default(),
+                PendingAccept {
+                    stream: ForwardStream::Unix(worker_end),
+                    early: Vec::new(),
+                    socks_version: None,
+                    half_close_on_eof: true,
+                    stdio: true,
+                },
+            )
+            .unwrap();
+        let _request = outbound.recv_timeout(EVENT_TIMEOUT).unwrap().unwrap();
+        worker
+            .handle_packet(Packet::new(
+                TerminalPacketType::PortForwardDestinationResponse as u8,
+                PortForwardDestinationResponse {
+                    clientfd: Some(1),
+                    socketid: Some(5),
+                    error: None,
+                    window: None,
+                }
+                .encode_to_vec(),
+            ))
+            .unwrap();
+        assert_eq!(worker.sources.len(), 1);
+
+        // When: the remote destination closes before stdin reaches EOF.
+        worker
+            .handle_packet(forward_data(false, 5, closed()))
+            .unwrap();
+
+        // Then: like upstream `closeSourceSocketId`, the source closes in full
+        // and its reply side ends. The stdout copier, not the worker, reports
+        // the bridge closed once that reply is flushed.
+        assert!(worker.sources.is_empty());
+        let mut rest = Vec::new();
+        application.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty());
+        assert!(open.load(Ordering::Acquire));
+        drop(application);
+        for thread in worker.threads.drain(..) {
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn destination_half_close_keeps_the_reply_and_drops_later_writes() {
+        // Given: an active destination socket.
+        let (mut worker, commands, outbound, _cancel) = worker();
+        let (stream, mut application) = UnixStream::pair().unwrap();
+        application.set_read_timeout(Some(EVENT_TIMEOUT)).unwrap();
+        worker
+            .connected(1, 7, Ok(ForwardStream::Unix(stream)), None)
+            .unwrap();
+        let _response = outbound.recv_timeout(EVENT_TIMEOUT).unwrap().unwrap();
+
+        // When: the source half-closes (`et -W` stdin EOF), then a stray
+        // write for the same socket follows.
+        let half_close = PortForwardData {
+            half_close: Some(true),
+            ..closed()
+        };
+        worker
+            .handle_packet(forward_data(true, 7, half_close))
+            .unwrap();
+        let mut received = Vec::new();
+        application.read_to_end(&mut received).unwrap();
+        assert!(received.is_empty());
+        let late = PortForwardData {
+            buffer: Some(b"late".to_vec()),
+            ..Default::default()
+        };
+        worker.handle_packet(forward_data(true, 7, late)).unwrap();
+
+        // Then: like upstream `shutdownWrite`, the late write is dropped
+        // without failing the forwarder and the reply direction still reads.
+        assert_eq!(worker.destinations.len(), 1);
+        application.write_all(b"reply").unwrap();
+        let Command::Read { buffer, .. } = commands.recv_timeout(EVENT_TIMEOUT).unwrap() else {
+            panic!("reply direction stopped reading after half-close");
+        };
+        assert_eq!(buffer, b"reply");
+        worker
+            .handle_packet(forward_data(true, 7, closed()))
+            .unwrap();
+        assert!(worker.destinations.is_empty());
+        drop(application);
+        for thread in worker.threads.drain(..) {
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn eof_for_a_socket_the_peer_already_closed_emits_nothing() {
+        // Given: a socket id the peer's close already removed.
+        let (mut worker, _commands, outbound, _cancel) = worker();
+
+        // When: its reader reports EOF afterwards.
+        worker.read_closed(Role::Source, 42).unwrap();
+
+        // Then: no second close reaches the peer, as upstream only reports
+        // EOF for a socket it still owns.
+        assert!(outbound.try_recv().is_err());
     }
 
     #[test]

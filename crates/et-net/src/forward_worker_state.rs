@@ -262,8 +262,10 @@ impl Worker {
                 return Ok(());
             }
         }
-        if data.half_close.unwrap_or(false) {
-            // Source finished writing. Keep this socket readable for the reply.
+        if role == Role::Destination && data.half_close.unwrap_or(false) {
+            // Upstream `ForwardDestinationHandler::shutdownWrite`: the source
+            // finished writing (`et -W` stdin EOF). Keep this socket readable
+            // so the reply still flows back.
             let Some(active) = self.map(role).get_mut(&socket_id) else {
                 return Ok(());
             };
@@ -273,16 +275,11 @@ impl Worker {
             return Ok(());
         }
         if data.closed.unwrap_or(false) {
-            let Some(active) = self.map(role).get_mut(&socket_id) else {
-                return Ok(());
-            };
-            if !close_write(active) {
-                return Err(ForwardError::Unavailable);
-            }
-            let fully_closed = active.read_closed;
-            if fully_closed {
-                self.remove(role, socket_id);
-            }
+            // Upstream closes the local socket in full on a peer close, in
+            // either role (`destinationHandlers.erase`, `closeSourceSocketId`).
+            // Writes already queued still flush first: upstream wrote them
+            // synchronously before it handled this packet.
+            self.remove(role, socket_id);
             return Ok(());
         }
         if buffer.is_empty() {
@@ -298,6 +295,10 @@ impl Worker {
         let Some(active) = self.map_ref(role).get(&socket_id) else {
             return Ok(());
         };
+        if active.write_closed {
+            // Upstream drops writes after `shutdownWrite`.
+            return Ok(());
+        }
         let byte_count = buffer.len();
         active
             .pending_bytes
@@ -379,25 +380,20 @@ impl Worker {
     }
 
     pub(super) fn read_closed(&mut self, role: Role, socket_id: i32) -> Result<(), ForwardError> {
-        let half_close = self
-            .map(role)
-            .get(&socket_id)
-            .is_some_and(|active| active.half_close_on_eof);
-        if half_close {
-            if let Some(active) = self.map(role).get_mut(&socket_id) {
-                active.read_closed = true;
-                active.half_close_on_eof = false;
-            }
+        // A socket the peer already closed reports nothing: upstream only
+        // emits EOF for a socket it still owns.
+        let Some(active) = self.map(role).get_mut(&socket_id) else {
+            return Ok(());
+        };
+        if active.half_close_on_eof {
+            // Upstream stdio mode: half-close the request direction and keep
+            // the reply open until the remote side closes.
+            active.half_close_on_eof = false;
             return self.send_half_close(role, socket_id);
         }
-        let fully_closed = self.map(role).get_mut(&socket_id).is_some_and(|active| {
-            active.read_closed = true;
-            active.write_closed
-        });
+        // Upstream sends `closed` and closes the socket in full.
         self.send_data(role, socket_id, Vec::new(), true, None)?;
-        if fully_closed {
-            self.remove(role, socket_id);
-        }
+        self.remove(role, socket_id);
         Ok(())
     }
 
@@ -480,7 +476,9 @@ impl Worker {
 
     pub(super) fn remove(&mut self, role: Role, socket_id: i32) {
         if role == Role::Source && self.stdio_socket == Some(socket_id) {
-            self.clear_stdio();
+            // The stdout copier clears the bridge flag once every queued byte
+            // is flushed, so `et -W` cannot exit ahead of its trailing output.
+            self.stdio_socket = None;
         }
         if let Some(active) = self.map(role).remove(&socket_id) {
             super::stop_io(active);

@@ -598,7 +598,10 @@ fn router_disconnect_keeps_the_shell_and_reregisters() {
     assert_eq!(packet.header(), TerminalPacketType::TerminalUserInfo as u8);
     let info = TerminalUserInfo::decode(packet.payload()).unwrap();
     assert_eq!(info.ptyactive, Some(true));
-    assert!(child.wait_timeout(Duration::from_millis(200)).unwrap().is_none());
+    assert!(child
+        .wait_timeout(Duration::from_millis(200))
+        .unwrap()
+        .is_none());
     let _ = child.kill();
     let _ = child.wait();
 }

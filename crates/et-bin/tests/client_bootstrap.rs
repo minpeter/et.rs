@@ -1655,7 +1655,7 @@ fn fresh_bootstrap_rejects_returning_without_sending_initial_payload() {
         .unwrap();
     server.join().unwrap();
     assert_eq!(output.status.code(), Some(1));
-    assert!(stderr(&output).contains("returning recovery belongs to a live reconnect"));
+    assert!(stderr(&output).contains("Server does not support session reattach; upgrade etserver"));
 }
 
 #[test]

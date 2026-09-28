@@ -565,7 +565,7 @@ fn bootstrap_parent_reports_terminal_child_startup_failure() {
 }
 
 #[test]
-fn router_disconnect_terminates_the_shell() {
+fn router_disconnect_reregisters_without_killing_the_shell() {
     let fixture = Fixture::new("disconnect");
     let mut child = fixture.spawn();
     write_credentials(&mut child);
@@ -580,18 +580,30 @@ fn router_disconnect_terminates_the_shell() {
             environmentnames: Vec::new(),
             environmentvalues: Vec::new(),
             flowcontrol: None,
-
             no_pty: None,
             command: None,
-
             no_shell: None,
-
             ..Default::default()
         },
     );
     expect_startup(&mut router);
     drop(router);
-    let status = child.wait_timeout(TIMEOUT).unwrap().unwrap();
+    let mut resumed = fixture.accept();
+    let packet = read_local_packet(&mut resumed).unwrap();
+    assert_eq!(packet.header(), TerminalPacketType::TerminalUserInfo as u8);
+    let user = TerminalUserInfo::decode(packet.payload()).unwrap();
+    assert_eq!(user.ptyactive, Some(true));
+    acknowledge_registration(&mut resumed);
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the shell stays up while etterminal re-registers"
+    );
+    std::fs::remove_file(&fixture.socket).unwrap();
+    drop(resumed);
+    let status = child
+        .wait_timeout(TIMEOUT)
+        .unwrap()
+        .expect("terminal exits once the router cannot be reached again");
     assert!(!status.success());
 }
 

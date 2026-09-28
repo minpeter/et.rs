@@ -45,20 +45,6 @@ enum WorkerEvent {
     Child(Result<u32, String>),
 }
 
-pub fn run_with_startup<F>(router: LocalStream, term: &str, started: F) -> Result<i32, String>
-where
-    F: FnOnce(&mut LocalStream) -> Result<(), String>,
-{
-    let command = CommandBuilder::new(default_shell());
-    #[cfg(unix)]
-    let command = {
-        let mut command = command;
-        command.arg("-l");
-        command
-    };
-    run_with_command(router, term, command, Duration::ZERO, None, started)
-}
-
 pub fn run_resuming<F>(
     router: LocalStream,
     term: &str,

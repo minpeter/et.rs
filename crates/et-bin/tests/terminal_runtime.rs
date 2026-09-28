@@ -565,7 +565,7 @@ fn bootstrap_parent_reports_terminal_child_startup_failure() {
 }
 
 #[test]
-fn router_disconnect_terminates_the_shell() {
+fn router_disconnect_keeps_the_shell_and_reregisters() {
     let fixture = Fixture::new("disconnect");
     let mut child = fixture.spawn();
     write_credentials(&mut child);
@@ -591,8 +591,16 @@ fn router_disconnect_terminates_the_shell() {
     );
     expect_startup(&mut router);
     drop(router);
-    let status = child.wait_timeout(TIMEOUT).unwrap().unwrap();
-    assert!(!status.success());
+    // #793: a live pty survives the router socket dying and re-registers with
+    // ptyactive so a replacement etserver can resume the same shell.
+    let mut recovered = fixture.accept();
+    let packet = read_local_packet(&mut recovered).unwrap();
+    assert_eq!(packet.header(), TerminalPacketType::TerminalUserInfo as u8);
+    let info = TerminalUserInfo::decode(packet.payload()).unwrap();
+    assert_eq!(info.ptyactive, Some(true));
+    assert!(child.wait_timeout(Duration::from_millis(200)).unwrap().is_none());
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[test]

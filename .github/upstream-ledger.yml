@@ -13,7 +13,7 @@
 # Classified 2026-09-21. #804 passed independent review in et.rs #100.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-09-25"
+classified: "2026-09-28"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -310,17 +310,89 @@ commits:
     date: "2026-09-24"
     kind: protocol
     status: ported
-    note: "#851 TERMINAL_EXIT_STATUS=12 and InitialPayload.supports_exit_status. etserver forwards type 12 only when the client sets the flag. et.rs flowcontrol moved from InitialPayload field 6 to field 8. Command sessions exit with the remote status; interactive sessions stay 0. PROTOCOL_VERSION stays 6."
+    note: "#851 TERMINAL_EXIT_STATUS=12 and InitialPayload.supports_exit_status. etserver forwards type 12 only when the client sets the flag. et.rs flowcontrol left InitialPayload field 6; it now lives at field 9 after #858 took field 8. Command sessions exit with the remote status; interactive sessions stay 0. PROTOCOL_VERSION stays 6."
     et_pr: 851
   - sha: 6f53869473a16407b59f1f3382d291ab97b4f64f
     date: "2026-09-24"
     kind: protocol
     status: ported
-    note: "#849 runtime -D SOCKS and -W stdio forward. PortForwardData.half_close=6, InitialPayload.no_shell=7, TermInit.no_shell=5. et.rs flowcontrol moved to TermInit field 6 and PortForwardData.window to field 7. Existing -t/-r unchanged. PROTOCOL_VERSION stays 6."
+    note: "#849 runtime -D SOCKS and -W stdio forward. PortForwardData.half_close=6, InitialPayload.no_shell=7, TermInit.no_shell=5. et.rs flowcontrol left TermInit field 5; it now lives at field 8 after #793 took fields 6-7. PortForwardData.window stays at field 7. Existing -t/-r unchanged. PROTOCOL_VERSION stays 6."
     et_pr: 849
   - sha: f90c6f4715f8f7e72afaf8085248ed7305c8aa6a
     date: "2026-09-24"
     kind: product
     status: skip
-    note: "#857 drop journald wall text from tmux -CC streams. Product/HTM filter only; et.rs has its own HTM path. Not protocol/wire/auth. Pin tip. PROTOCOL_VERSION stays 6."
+    note: "#857 drop journald wall text from tmux -CC streams. Product/HTM filter only; et.rs has its own HTM path. Not protocol/wire/auth. PROTOCOL_VERSION stays 6."
     et_pr: 857
+  - sha: b834d6ebbd0ba4742f5278cc562bba551800c0c0
+    date: "2026-09-25"
+    kind: ci
+    status: skip
+    note: "#859 CI cache. Not protocol/wire/auth. PROTOCOL_VERSION stays 6."
+    et_pr: 859
+  - sha: 9a2d23092584606f8d0c55b111ed7416ca71d5ea
+    date: "2026-09-25"
+    kind: product
+    status: skip
+    note: "#853 local OpenSSH ControlMaster mux. Not ET wire. PROTOCOL_VERSION stays 6."
+    et_pr: 853
+  - sha: c5ddae79be824944df0e423cb49c032c60cf3394
+    date: "2026-09-25"
+    kind: ci
+    status: skip
+    note: "#865 HTM e2e harness. CI/product only. PROTOCOL_VERSION stays 6."
+    et_pr: 865
+  - sha: 64fa9006142cc63e936445fb908d07338ae9009e
+    date: "2026-09-25"
+    kind: product
+    status: ported
+    note: "#863 etterminal bootstrap splits id/passkey_TERM at the first underscore so TERM values containing '_' do not abort session start. PROTOCOL_VERSION stays 6."
+    et_pr: 863
+  - sha: 99ac1972c21f68c141d66f967ded231fc2903c7b
+    date: "2026-09-25"
+    kind: product
+    status: skip
+    note: "#843/#769 SSH banner stderr UX. Product only. PROTOCOL_VERSION stays 6."
+    et_pr: 843
+  - sha: fe0795c1dc6c42d13b50445681bf6a5b341ca64e
+    date: "2026-09-25"
+    kind: protocol
+    status: ported
+    note: "#858 InitialPayload.disconnect_timeout_seconds field 8 (0 = no timeout). etserver and etterminal honor the per-session override. et.rs flowcontrol moved to InitialPayload field 9. The et1 wrapper script is not packaged. PROTOCOL_VERSION stays 6."
+    et_pr: 858
+  - sha: a4bed0cfabe64cc307bc0afb63c6512e4e85d4e8
+    date: "2026-09-25"
+    kind: protocol
+    status: ported
+    note: "#864 client reads the peer CatchupBuffer before writing its own. Server order stays write-then-read, so a patched client recovers against an old or new server. PROTOCOL_VERSION stays 6."
+    et_pr: 864
+  - sha: f3137cee7b805284d7c76a7a5538884946576fd1
+    date: "2026-09-26"
+    kind: product
+    status: skip
+    note: "#867 OpenSSH short-flag CLI remap. Breaking product CLI; et.rs short flags stay unchanged (-x remains --kill-other-sessions). PROTOCOL_VERSION stays 6."
+    et_pr: 867
+  - sha: 540367ac4509be41714769cf511d8c0aa90cde7a
+    date: "2026-09-26"
+    kind: security
+    status: ported
+    note: "#793 named sessions, authenticated connect handshake, and etserver restart survival. Challenge/reset fields, ConnectAuth, RETRY_LATER, session kill, and TermInit/TerminalUserInfo resume fields. Legacy peers without supportsChallenge keep the one-round handshake. et.rs flowcontrol moved to TermInit field 8. PROTOCOL_VERSION stays 6."
+    et_pr: 793
+  - sha: da977ba0fa212b775774c7e58a0f6d8f4c6ea175
+    date: "2026-09-27"
+    kind: product
+    status: skip
+    note: "#870 ssh_config forwards and SendEnv. Product only, not ET wire. PROTOCOL_VERSION stays 6."
+    et_pr: 870
+  - sha: ca91fb5d5eaccaa464f1106cb946586ebc7789f9
+    date: "2026-09-27"
+    kind: protocol
+    status: ported
+    note: "#868 connect/recover fixes: failed initial connect exits after three attempts, a second connect() on the same connection recovers instead of resetting sequences, and the client still reads catchup first. PROTOCOL_VERSION stays 6."
+    et_pr: 868
+  - sha: 044bcb5ae7960445a8bffb6fed4d3589f1aa8fc4
+    date: "2026-09-27"
+    kind: product
+    status: skip
+    note: "#827/#448 PTY/session teardown when a background process holds the slave. Uses already-ported TERMINAL_EXIT_STATUS=12; product/lifecycle only. Pin tip. Pin does not mean every product backlog item is finished. PROTOCOL_VERSION stays 6."
+    et_pr: 827

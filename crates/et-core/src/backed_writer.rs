@@ -188,6 +188,18 @@ impl BackedWriter {
         self.disconnected_packets = 0;
     }
 
+    /// Zero sequence history and rekey from the original passkey.
+    pub fn reset(&mut self, salt: &[u8]) -> Result<(), crate::crypto::ProofError> {
+        self.crypto.rekey(salt)?;
+        self.backup.clear();
+        self.backup_size = 0;
+        self.disconnected_bytes = 0;
+        self.disconnected_packets = 0;
+        self.sequence = 0;
+        self.connected = false;
+        Ok(())
+    }
+
     pub fn invalidate(&mut self) {
         self.connected = false;
     }

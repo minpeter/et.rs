@@ -52,6 +52,13 @@ pub enum ClientError {
     MalformedInitialResponse(prost::DecodeError),
     InitialResponseRejected(String),
     Terminal(String),
+    /// The server asked a challenge-capable client to retry during startup.
+    RetryLater,
+    /// The initial TCP/handshake attempts failed.
+    InitialConnect {
+        endpoint: String,
+        message: String,
+    },
 }
 
 impl From<HostError> for ClientError {
@@ -156,6 +163,10 @@ impl std::fmt::Display for ClientError {
                 write!(f, "ET server rejected the initial payload: {message}")
             }
             Self::Terminal(message) => write!(f, "{message}"),
+            Self::RetryLater => write!(f, "ET server asked the client to retry"),
+            Self::InitialConnect { endpoint, message } => {
+                write!(f, "Could not make initial connection to {endpoint}: {message}")
+            }
         }
     }
 }
@@ -172,6 +183,21 @@ impl ClientError {
     /// laptop waking from sleep before Wi-Fi is back, a DNS outage, a
     /// half-restored link). A live session should retry the reconnect
     /// instead of exiting, mirroring upstream ET.
+    /// Failures of the TCP connect or the pre-payload handshake. A socket that
+    /// already carried `INITIAL_PAYLOAD` is not in this set.
+    pub fn is_retryable_initial_connect(&self) -> bool {
+        matches!(
+            self,
+            Self::DnsTimeout(_)
+                | Self::DnsWorker(_)
+                | Self::DnsWorkerPanicked
+                | Self::UnreachableEndpoint { .. }
+                | Self::BootstrapTimeout(_)
+                | Self::ConnectIo { .. }
+                | Self::RetryLater
+        )
+    }
+
     pub fn is_transient_reconnect(&self) -> bool {
         matches!(
             self,
@@ -182,6 +208,7 @@ impl ClientError {
                 | Self::BootstrapTimeout(_)
                 | Self::ConnectIo { .. }
                 | Self::Transport(ConnError::Io(_))
+                | Self::RetryLater
         )
     }
 

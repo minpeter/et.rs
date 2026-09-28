@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use et_net::listener::{bind_tcp_with_backlog, DEFAULT_LISTEN_BACKLOG};
 
@@ -106,6 +107,7 @@ impl Runtime {
             pre_auth_slots: Arc::new(PreAuthSlots::new(MAX_PRE_AUTH_CONNECTIONS)),
             shutdown: AtomicBool::new(false),
             forward_resolver,
+            started: Instant::now(),
         });
         let router_name = router_path.path().to_path_buf();
         let (lifecycle_sender, lifecycle_events) = mpsc::channel();
@@ -411,6 +413,9 @@ mod tests {
                 uid: Some(uid),
                 gid: Some(gid),
                 fd: None,
+                ptyactive: None,
+                hadreversetunnels: None,
+                disconnect_timeout_seconds: None,
             }
             .encode_to_vec(),
         );

@@ -99,6 +99,16 @@ impl BackedReader {
         Ok(packet)
     }
 
+    /// Zero sequence history and rekey. Used by authenticated reset recovery.
+    pub fn reset(&mut self, salt: &[u8]) -> Result<(), crate::crypto::ProofError> {
+        self.crypto.rekey(salt)?;
+        self.partial.clear();
+        self.replay.clear();
+        self.sequence = 0;
+        self.connected = false;
+        Ok(())
+    }
+
     pub fn revive(&mut self, catchup: Vec<Vec<u8>>) -> Result<(), ReadError> {
         let mut crypto = self.crypto.clone();
         let mut decoded = VecDeque::with_capacity(catchup.len());

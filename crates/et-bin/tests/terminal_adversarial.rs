@@ -66,6 +66,8 @@ fn malformed_initialization_and_shell_spawn_failure_are_typed() {
             command: None,
 
             no_shell: None,
+            disconnect_timeout_seconds: None,
+            hadreversetunnels: None,
         },
     );
     assert!(!failed_child
@@ -108,6 +110,8 @@ fn shell_exit_reaps_background_process_group() {
             command: None,
 
             no_shell: None,
+            disconnect_timeout_seconds: None,
+            hadreversetunnels: None,
         },
     );
     let mut output = String::new();

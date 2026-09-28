@@ -41,11 +41,18 @@ message TerminalExitStatus {
 }
 
 message TerminalInfo {
+  enum Command {
+    NONE = 0;
+    KILL_SESSION = 1;
+  }
+
   optional string id = 1;
   optional int32 row = 2;
   optional int32 column = 3;
   optional int32 width = 4;
   optional int32 height = 5;
+  optional Command command = 6 [default = NONE];
+  optional int32 commandversion = 7 [default = 0];
 }
 
 message PortForwardSourceRequest {
@@ -105,13 +112,18 @@ message InitialPayload {
   // Set by clients that understand TERMINAL_EXIT_STATUS. Older clients leave
   // this unset, and etserver must not forward that packet to them.
   // Field 6 matches EternalTerminal #851. et.rs flow control previously used
-  // this tag; it moved to field 8 (after no_shell=7) so Backpressure (varint 1)
-  // is not decoded as supports_exit_status=true. PROTOCOL_VERSION stays 6.
+  // this tag; it moved to field 9 (after disconnect_timeout_seconds=8) so
+  // Backpressure (varint 1) is not decoded as supports_exit_status=true.
+  // PROTOCOL_VERSION stays 6.
   optional bool supports_exit_status = 6 [default = false];
   // ssh -W: keep the session without a pty or a shell.
   // Field 7 matches EternalTerminal #849.
   optional bool no_shell = 7 [default = false];
-  optional FlowControlMode flowcontrol = 8 [default = NONE];
+  // When set, overrides etserver's disconnect timeout for this session.
+  // Seconds a disconnected etterminal may stay alive. 0 means no timeout.
+  // Field 8 matches EternalTerminal #858. et.rs flow control moved to field 9.
+  optional int32 disconnect_timeout_seconds = 8;
+  optional FlowControlMode flowcontrol = 9 [default = NONE];
 }
 
 message InitialResponse {
@@ -129,10 +141,14 @@ message TermInit {
   // Field 3 matches EternalTerminal #854 no_pty. PROTOCOL_VERSION stays 6.
   optional bool no_pty = 3 [default = false];
   optional string command = 4;
-  // Field 5 matches EternalTerminal #849 no_shell. et.rs flow control previously
-  // used this tag; it moved to field 6 so it is not decoded as no_shell=true.
+  // Field 5 matches EternalTerminal #849 no_shell.
   optional bool no_shell = 5 [default = false];
-  optional FlowControlMode flowcontrol = 6 [default = NONE];
+  // Field 6 matches EternalTerminal #793. et.rs flow control moved to field 8.
+  optional bool hadreversetunnels = 6 [default = false];
+  // Copied from InitialPayload so etterminal can re-advertise it after an
+  // etserver restart.
+  optional int32 disconnect_timeout_seconds = 7;
+  optional FlowControlMode flowcontrol = 8 [default = NONE];
 }
 
 message TerminalUserInfo {
@@ -141,4 +157,12 @@ message TerminalUserInfo {
   optional int64 uid = 3;
   optional int64 gid = 4;
   optional int64 fd = 5;
+  // Set when a terminal re-registers after its router went away: the pty and
+  // its shell are already running, so the server must resume the session
+  // instead of bootstrapping a fresh one.
+  optional bool ptyactive = 6;
+  optional bool hadreversetunnels = 7 [default = false];
+  // Preserved from TermInit so a resumed pump keeps the client's per-session
+  // disconnect timeout across etserver restart.
+  optional int32 disconnect_timeout_seconds = 8;
 }

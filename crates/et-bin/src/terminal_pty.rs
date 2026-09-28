@@ -1,5 +1,6 @@
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
@@ -28,6 +29,17 @@ use crate::terminal_protocol::{
     LocalPacketEffect, TerminalPacketError,
 };
 
+/// Enough state to re-register a live pty after the router socket dies.
+#[derive(Clone)]
+pub struct RouterResume {
+    pub path: PathBuf,
+    pub id: String,
+    pub passkey: String,
+    pub registration_ack: bool,
+    pub had_reverse_tunnels: bool,
+    pub disconnect_timeout_seconds: Option<i32>,
+}
+
 enum WorkerEvent {
     Output(Result<(), String>),
     Child(Result<u32, String>),
@@ -44,7 +56,26 @@ where
         command.arg("-l");
         command
     };
-    run_with_command(router, term, command, Duration::ZERO, started)
+    run_with_command(router, term, command, Duration::ZERO, None, started)
+}
+
+pub fn run_resuming<F>(
+    router: LocalStream,
+    term: &str,
+    resume: RouterResume,
+    started: F,
+) -> Result<i32, String>
+where
+    F: FnOnce(&mut LocalStream) -> Result<(), String>,
+{
+    let command = CommandBuilder::new(default_shell());
+    #[cfg(unix)]
+    let command = {
+        let mut command = command;
+        command.arg("-l");
+        command
+    };
+    run_with_command(router, term, command, Duration::ZERO, Some(resume), started)
 }
 
 fn run_with_command<F>(
@@ -52,12 +83,17 @@ fn run_with_command<F>(
     term: &str,
     mut command: CommandBuilder,
     output_delay: Duration,
+    mut resume: Option<RouterResume>,
     started: F,
 ) -> Result<i32, String>
 where
     F: FnOnce(&mut LocalStream) -> Result<(), String>,
 {
     let initialization = read_initialization(&mut router)?;
+    if let Some(resume) = resume.as_mut() {
+        resume.had_reverse_tunnels = initialization.had_reverse_tunnels;
+        resume.disconnect_timeout_seconds = initialization.disconnect_timeout_seconds;
+    }
     if initialization.no_shell {
         return run_idle(router, started);
     }
@@ -211,6 +247,8 @@ where
             pair.master.as_ref(),
             &mut pty_writer,
             &events_rx,
+            resume.as_ref(),
+            &router_writer,
         )
     });
     if let Ok(completion) = result.as_ref() {
@@ -444,11 +482,29 @@ fn pump(
     master: &dyn portable_pty::MasterPty,
     pty_writer: &mut dyn Write,
     events: &mpsc::Receiver<WorkerEvent>,
+    resume: Option<&RouterResume>,
+    router_writer: &Arc<Mutex<LocalStream>>,
 ) -> Result<PumpCompletion, String> {
     #[cfg(unix)]
-    return pump_poll(router, wake_reader, master, pty_writer, events);
+    return pump_poll(
+        router,
+        wake_reader,
+        master,
+        pty_writer,
+        events,
+        resume,
+        router_writer,
+    );
     #[cfg(windows)]
-    return pump_windows(router, wake_reader, master, pty_writer, events);
+    return pump_windows(
+        router,
+        wake_reader,
+        master,
+        pty_writer,
+        events,
+        resume,
+        router_writer,
+    );
 }
 
 #[cfg(unix)]
@@ -458,6 +514,8 @@ fn pump_poll(
     master: &dyn portable_pty::MasterPty,
     pty_writer: &mut dyn Write,
     events: &mpsc::Receiver<WorkerEvent>,
+    resume: Option<&RouterResume>,
+    router_writer: &Arc<Mutex<LocalStream>>,
 ) -> Result<PumpCompletion, String> {
     let mut decoder = LocalPacketDecoder::new();
     let mut completion = CompletionState::default();
@@ -498,6 +556,11 @@ fn pump_poll(
             return Ok(status);
         }
         if router_events.intersects(PollFlags::HUP | PollFlags::ERR) {
+            if let Some(resume) = resume {
+                *router = reconnect_router(resume, router_writer)?;
+                decoder = LocalPacketDecoder::new();
+                continue;
+            }
             return Err("terminal router disconnected".to_owned());
         }
         if router_events.contains(PollFlags::IN) {
@@ -524,6 +587,8 @@ fn pump_windows(
     master: &dyn portable_pty::MasterPty,
     pty_writer: &mut dyn Write,
     events: &mpsc::Receiver<WorkerEvent>,
+    resume: Option<&RouterResume>,
+    router_writer: &Arc<Mutex<LocalStream>>,
 ) -> Result<PumpCompletion, String> {
     const IDLE: std::time::Duration = std::time::Duration::from_millis(10);
     let mut decoder = LocalPacketDecoder::new();
@@ -552,12 +617,68 @@ fn pump_windows(
                 decoder = LocalPacketDecoder::new();
             }
             Ok(None) => {}
+            Err(error) if error == "terminal router disconnected" => {
+                if let Some(resume) = resume {
+                    *router = reconnect_router(resume, router_writer)?;
+                    decoder = LocalPacketDecoder::new();
+                    continue;
+                }
+                return Err(error);
+            }
             Err(error) => return Err(error),
         }
         if !progress {
             std::thread::sleep(IDLE);
         }
     }
+}
+
+fn reconnect_router(
+    resume: &RouterResume,
+    router_writer: &Arc<Mutex<LocalStream>>,
+) -> Result<LocalStream, String> {
+    let mut delay = Duration::from_secs(1);
+    loop {
+        match try_reconnect(resume) {
+            Ok(stream) => {
+                let cloned = stream
+                    .try_clone()
+                    .map_err(|error| format!("could not clone the recovered router: {error}"))?;
+                let mut writer = router_writer
+                    .lock()
+                    .map_err(|_| "terminal router writer is unavailable".to_owned())?;
+                *writer = cloned;
+                drop(writer);
+                stream.set_nonblocking(true).map_err(|error| {
+                    format!("could not configure the recovered router: {error}")
+                })?;
+                return Ok(stream);
+            }
+            Err(error) => {
+                et_cli::logging::info(format!("terminal router reconnect failed: {error}"));
+                thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+fn try_reconnect(resume: &RouterResume) -> Result<LocalStream, String> {
+    let mut router = et_net::local::connect(&resume.path)
+        .map_err(|error| format!("could not connect terminal router: {error}"))?;
+    crate::terminal::register(
+        &mut router,
+        &crate::terminal_credentials::CredentialInput {
+            id: resume.id.clone(),
+            passkey: resume.passkey.clone(),
+            term: String::new(),
+        },
+        resume.registration_ack,
+        true,
+        resume.had_reverse_tunnels,
+        resume.disconnect_timeout_seconds,
+    )?;
+    Ok(router)
 }
 
 /// `TERMINAL_CLOSE` ends the PTY session successfully.
@@ -803,6 +924,7 @@ mod tests {
                 "xterm",
                 command,
                 Duration::from_millis(250),
+                None,
                 |writer| {
                     write_local_packet(writer, &status_packet(STARTUP_STATUS, Ok(())))
                         .map_err(|error| error.to_string())

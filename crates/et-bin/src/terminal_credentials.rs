@@ -50,6 +50,14 @@ mod tests {
     const KEY: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
 
     #[test]
+    fn term_with_underscores_splits_at_the_first_underscore() {
+        let parsed = parse_credential_input(&format!("{ID}/{KEY}_xterm_256color")).unwrap();
+        assert_eq!(parsed.term, "xterm_256color");
+        assert_eq!(parsed.id, ID);
+        assert_eq!(parsed.passkey, KEY);
+    }
+
+    #[test]
     fn parses_bootstrap_input() {
         assert_eq!(
             parse_credential_input(&format!("{ID}/{KEY}_xterm-256color")).unwrap(),

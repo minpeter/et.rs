@@ -4,7 +4,7 @@ use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use et_core::proto::TerminalPacketType;
-use et_net::connection::{WritePacketError, DEFAULT_RECOVERY_TIMEOUT};
+use et_net::connection::{RecoveryExchange, WritePacketError, DEFAULT_RECOVERY_TIMEOUT};
 
 use super::{ActiveSession, SessionError, RECOVERY_LOCK_TIMEOUT};
 
@@ -54,6 +54,14 @@ impl ActiveSession {
     /// The connection mutex is held only for soft-disconnect/snapshot and for
     /// installing the new stream, not for sequence exchange or peer auth.
     fn recover_body(&self, stream: TcpStream) -> Result<(), SessionError> {
+        self.recover_body_with(stream, RecoveryExchange::default())
+    }
+
+    fn recover_body_with(
+        &self,
+        stream: TcpStream,
+        exchange: RecoveryExchange,
+    ) -> Result<(), SessionError> {
         // Phase 1: soft-disconnect and snapshot under a short lock.
         let mut candidate = {
             let connection = lock_timeout(&self.connection, RECOVERY_LOCK_TIMEOUT)?;
@@ -74,7 +82,7 @@ impl ActiveSession {
 
         // Phase 2: recovery network I/O without the session connection lock.
         candidate
-            .run_recovery_handshake(DEFAULT_RECOVERY_TIMEOUT)
+            .run_recovery_handshake_with(DEFAULT_RECOVERY_TIMEOUT, exchange)
             .map_err(SessionError::Connection)?;
         // Any packet that decrypts with the session key authenticates the
         // returning client; it is requeued and handled by the session loop.
@@ -191,6 +199,15 @@ impl RecoverPermit<'_> {
         // `self` drops after this returns (or panics), clearing `recovering`
         // and flushing any straggler hold packets.
         self.session.recover_body(stream)
+    }
+
+    /// Recover, optionally zeroing sequence history with a negotiated salt.
+    pub(crate) fn complete_with(
+        self,
+        stream: TcpStream,
+        exchange: RecoveryExchange,
+    ) -> Result<(), SessionError> {
+        self.session.recover_body_with(stream, exchange)
     }
 }
 

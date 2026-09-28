@@ -17,8 +17,11 @@ pub const MAX_KEEPALIVE: u32 = 5;
     long_about = "Connect to a remote shell over a persistent, reconnectable session."
 )]
 pub struct ClientArgs {
-    #[arg(help = "[user@]host[:port] destination")]
-    pub host: String,
+    #[arg(
+        help = "[user@]host[:port] destination",
+        required_unless_present_any = ["list_sessions", "attach", "kill_named"]
+    )]
+    pub host: Option<String>,
 
     #[arg(short = 'u', long = "username")]
     pub username: Option<String>,
@@ -77,6 +80,41 @@ pub struct ClientArgs {
 
     #[arg(short = 'x', long = "kill-other-sessions")]
     pub kill_other_sessions: bool,
+
+    /// Save this direct session under `~/.et/sessions/<name>`.
+    #[arg(long = "name", value_name = "NAME")]
+    pub session_name: Option<String>,
+
+    /// Reattach a saved session without SSH bootstrap.
+    #[arg(
+        long = "attach",
+        value_name = "NAME",
+        conflicts_with_all = ["session_name", "list_sessions", "kill_named"]
+    )]
+    pub attach: Option<String>,
+
+    /// List saved sessions. The passkey is not printed.
+    #[arg(
+        long = "list",
+        conflicts_with_all = ["session_name", "attach", "kill_named"]
+    )]
+    pub list_sessions: bool,
+
+    /// Ask etterminal to end a saved session.
+    #[arg(
+        long = "kill",
+        value_name = "NAME",
+        conflicts_with_all = ["session_name", "attach", "list_sessions"]
+    )]
+    pub kill_named: Option<String>,
+
+    /// Per-session disconnect timeout in minutes. 0 disables the timeout.
+    #[arg(
+        long = "disconnect-timeout",
+        value_name = "MINUTES",
+        value_parser = parse_disconnect_minutes
+    )]
+    pub disconnect_timeout: Option<i64>,
 
     /// Terminate the remote session when this terminal receives SIGHUP or closes.
     ///
@@ -186,6 +224,30 @@ pub struct ClientArgs {
     pub telemetry: bool,
 }
 
+fn parse_disconnect_minutes(raw: &str) -> Result<i64, String> {
+    let minutes: i64 = raw
+        .parse()
+        .map_err(|_| "disconnect timeout must be a number of minutes".to_owned())?;
+    if minutes < 0 {
+        return Err("disconnect timeout cannot be negative".to_owned());
+    }
+    let seconds = minutes
+        .checked_mul(60)
+        .ok_or_else(|| "disconnect timeout overflows".to_owned())?;
+    i32::try_from(seconds).map_err(|_| "disconnect timeout overflows".to_owned())?;
+    Ok(minutes)
+}
+
+impl ClientArgs {
+    /// Seconds to put in `InitialPayload.disconnect_timeout_seconds`.
+    ///
+    /// `None` leaves the field unset. `Some(0)` is an explicit "no timeout".
+    pub fn disconnect_timeout_seconds(&self) -> Option<i32> {
+        self.disconnect_timeout
+            .map(|minutes| i32::try_from(minutes * 60).expect("parser rejected overflow"))
+    }
+}
+
 /// Remote login-shell grammar.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RemoteShellKind {
@@ -270,7 +332,7 @@ mod tests {
     #[test]
     fn host_only_uses_default_port() {
         let a = ClientArgs::try_parse_from(["et", "host"]).unwrap();
-        assert_eq!(a.host, "host");
+        assert_eq!(a.host.as_deref(), Some("host"));
         assert_eq!(a.port, DEFAULT_PORT);
     }
 
@@ -457,6 +519,14 @@ mod tests {
     #[test]
     fn requires_host_without_explicit_mode() {
         assert!(ClientArgs::try_parse_from(["et"]).is_err());
+        assert!(ClientArgs::try_parse_from(["et", "--list"]).is_ok());
+        let named = ClientArgs::try_parse_from(["et", "--kill", "work"]).unwrap();
+        assert_eq!(named.kill_named.as_deref(), Some("work"));
+        assert!(!named.kill_other_sessions);
+        let timeout =
+            ClientArgs::try_parse_from(["et", "host", "--disconnect-timeout", "2"]).unwrap();
+        assert_eq!(timeout.disconnect_timeout_seconds(), Some(120));
+        assert!(ClientArgs::try_parse_from(["et", "host", "--disconnect-timeout", "-1"]).is_err());
     }
 
     #[test]

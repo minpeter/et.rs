@@ -19,6 +19,10 @@ pub struct Registration {
     pub uid: u32,
     pub gid: u32,
     pub(crate) startup_ack: bool,
+    /// The terminal re-registered with a live pty after its router socket died.
+    pub(crate) pty_active: bool,
+    pub(crate) had_reverse_tunnels: bool,
+    pub(crate) disconnect_timeout_seconds: Option<i32>,
     pub(crate) identity: Arc<()>,
 }
 
@@ -29,6 +33,9 @@ impl PartialEq for Registration {
             && self.uid == other.uid
             && self.gid == other.gid
             && self.startup_ack == other.startup_ack
+            && self.pty_active == other.pty_active
+            && self.had_reverse_tunnels == other.had_reverse_tunnels
+            && self.disconnect_timeout_seconds == other.disconnect_timeout_seconds
     }
 }
 
@@ -62,6 +69,10 @@ enum StartupState {
 #[derive(Default)]
 struct RegistryState {
     registrations: HashMap<String, StoredRegistration>,
+    /// Ids removed in this process. A challenge client that returns during
+    /// the post-start grace window must not be told to retry a session that
+    /// already ended.
+    removed: HashMap<String, Instant>,
 }
 
 #[derive(Default)]
@@ -146,7 +157,31 @@ impl Registry {
                     startup_ack,
                 })
             }
-            Entry::Occupied(_) => Err(RegistrationError::Duplicate),
+            Entry::Occupied(mut entry) => {
+                // A terminal that lost its router socket re-registers the same
+                // id. Replace only a peer that has already closed; a live
+                // duplicate stays rejected.
+                if !peer_closed(&entry.get().stream) {
+                    return Err(RegistrationError::Duplicate);
+                }
+                let startup_ack = registration.startup_ack;
+                let startup = if startup_ack {
+                    StartupState::Pending
+                } else {
+                    StartupState::Legacy
+                };
+                entry.insert(StoredRegistration {
+                    info: registration,
+                    stream,
+                    startup,
+                });
+                self.inner.changed.notify_all();
+                Ok(RegisteredTerminal {
+                    identity,
+                    watcher,
+                    startup_ack,
+                })
+            }
         }
     }
 
@@ -213,10 +248,22 @@ impl Registry {
             .get(identity.id())
             .is_some_and(|stored| identity.matches(&stored.info));
         if matches {
-            state.registrations.remove(identity.id());
+            let id = identity.id().to_owned();
+            state.registrations.remove(&id);
+            let now = Instant::now();
+            prune_removed(&mut state.removed, now);
+            state.removed.insert(id, now);
             self.inner.changed.notify_all();
         }
         Ok(matches)
+    }
+
+    /// True when this process removed `id` inside the recovery grace window.
+    pub(crate) fn was_removed(&self, id: &str) -> Result<bool, RegistrationError> {
+        let mut state = self.lock()?;
+        let now = Instant::now();
+        prune_removed(&mut state.removed, now);
+        Ok(state.removed.contains_key(id))
     }
 
     pub(crate) fn contains(
@@ -321,6 +368,70 @@ impl Registry {
             .lock()
             .map_err(|_| RegistrationError::Unavailable)
     }
+}
+
+fn prune_removed(removed: &mut HashMap<String, Instant>, now: Instant) {
+    removed.retain(|_, removed_at| {
+        now.saturating_duration_since(*removed_at) <= et_core::RECOVERY_GRACE
+    });
+}
+
+/// True when the registered terminal socket is already closed.
+///
+/// A blocking peek is only attempted after `poll` reports readability, so a
+/// live idle session is not stalled.
+#[cfg(unix)]
+fn peer_closed(stream: &LocalStream) -> bool {
+    use std::os::fd::AsRawFd;
+
+    use nix::sys::socket::{recv, MsgFlags};
+    use rustix::event::{poll, PollFd, PollFlags};
+
+    let mut descriptors = [PollFd::new(
+        stream,
+        PollFlags::IN | PollFlags::HUP | PollFlags::ERR,
+    )];
+    let Ok(timeout) = rustix::time::Timespec::try_from(Duration::ZERO) else {
+        return false;
+    };
+    if poll(&mut descriptors, Some(&timeout)).is_err() {
+        return false;
+    }
+    let events = descriptors[0].revents();
+    if events.intersects(PollFlags::ERR) {
+        return true;
+    }
+    if !events.intersects(PollFlags::IN | PollFlags::HUP) {
+        return false;
+    }
+    let mut byte = [0u8; 1];
+    match recv(stream.as_raw_fd(), &mut byte, MsgFlags::MSG_PEEK) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(_) => events.intersects(PollFlags::HUP),
+    }
+}
+
+#[cfg(windows)]
+fn peer_closed(stream: &LocalStream) -> bool {
+    let previous = stream.set_nonblocking(true);
+    if previous.is_err() {
+        return false;
+    }
+    let mut byte = [0u8; 1];
+    let closed = match stream.peek(&mut byte) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(error)
+            if error.kind() == io::ErrorKind::WouldBlock
+                || error.kind() == io::ErrorKind::Interrupted =>
+        {
+            false
+        }
+        Err(_) => true,
+    };
+    let _ = stream.set_nonblocking(false);
+    closed
 }
 
 impl Registration {

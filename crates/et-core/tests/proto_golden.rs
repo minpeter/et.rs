@@ -27,6 +27,8 @@ fn connect_request_minimal() {
     let r = et::ConnectRequest {
         client_id: Some("client-1".into()),
         version: Some(6),
+        reset_intent: None,
+        supports_challenge: None,
     };
     assert_eq!(enc(&r), *f.get("proto_connectrequest_minimal").unwrap());
 }
@@ -37,6 +39,8 @@ fn connect_request_empty_id_serializes_field() {
     let r = et::ConnectRequest {
         client_id: Some(String::new()),
         version: Some(6),
+        reset_intent: None,
+        supports_challenge: None,
     };
     assert_eq!(enc(&r), *f.get("proto_connectrequest_emptyid").unwrap());
 }
@@ -47,6 +51,10 @@ fn connect_response_statuses() {
     let s = |status| et::ConnectResponse {
         status: Some(status as i32),
         error: None,
+        auth_challenge: None,
+        reset_proof: None,
+        reset_required: None,
+        reset_salt: None,
     };
     assert_eq!(
         enc(&s(et::ConnectStatus::NewClient)),
@@ -56,6 +64,10 @@ fn connect_response_statuses() {
         enc(&et::ConnectResponse {
             status: Some(et::ConnectStatus::ReturningClient as i32),
             error: Some("ok".into()),
+            auth_challenge: None,
+            reset_proof: None,
+            reset_required: None,
+            reset_salt: None,
         }),
         *f.get("proto_connectresponse_returning_err").unwrap()
     );
@@ -74,6 +86,8 @@ fn sequence_header_boundaries() {
     let f = fixtures();
     let h = |n| et::SequenceHeader {
         sequence_number: Some(n),
+        reset: None,
+        reset_salt: None,
     };
     assert_eq!(enc(&h(0)), *f.get("proto_sequenceheader_0").unwrap());
     assert_eq!(enc(&h(42)), *f.get("proto_sequenceheader_42").unwrap());
@@ -131,11 +145,25 @@ fn flow_control_opt_in_modes_use_additive_proto_fields() {
         ..Default::default()
     };
 
-    // Field 6/5 are upstream supports_exit_status and no_shell (#851/#849).
-    // Flow control lives at InitialPayload field 8 and TermInit field 6 so
-    // Backpressure (varint 1) is not the same bytes as those bools.
-    assert_eq!(enc(&initial), [0x40, 0x01]);
-    assert_eq!(enc(&term), [0x30, 0x02]);
+    // Field 6/7/8 of InitialPayload are supports_exit_status, no_shell, and
+    // disconnect_timeout_seconds. Flow control lives at field 9.
+    // TermInit field 6 is hadreversetunnels and field 7 is the timeout, so
+    // flow control lives at field 8.
+    let fixtures = fixtures();
+    // InitialPayload field 9 Backpressure: tag (9<<3)|0 = 0x48, value 1.
+    assert_eq!(enc(&initial), [0x48, 0x01]);
+    assert_eq!(
+        enc(&initial),
+        *fixtures
+            .get("proto_initialpayload_flowcontrol_backpressure")
+            .unwrap()
+    );
+    // TermInit field 8 Discard: tag (8<<3)|0 = 0x40, value 2.
+    assert_eq!(enc(&term), [0x40, 0x02]);
+    assert_eq!(
+        enc(&term),
+        *fixtures.get("proto_terminit_flowcontrol_discard").unwrap()
+    );
 }
 
 #[test]
@@ -245,4 +273,91 @@ fn upstream_exit_status_and_stdio_fields_use_upstream_tags() {
     };
     // Field 2 varint 3, field 5 bool true, field 6 bool true.
     assert_eq!(enc(&half), [0x10, 0x03, 0x28, 0x01, 0x30, 0x01]);
+}
+
+#[test]
+fn challenge_reset_and_session_fields_use_upstream_tags() {
+    assert_eq!(et_core::PROTOCOL_VERSION, 6);
+    assert_eq!(et::ConnectStatus::RetryLater as i32, 5);
+    assert_eq!(et_core::SESSION_KILL_COMMAND_VERSION, 1);
+    let fixtures = fixtures();
+    let expect = |name: &str, encoded: &[u8]| {
+        assert_eq!(
+            fixtures.get(name).map(Vec::as_slice),
+            Some(encoded),
+            "{name}"
+        );
+    };
+
+    let request = et::ConnectRequest {
+        client_id: Some("client-1".into()),
+        version: Some(6),
+        reset_intent: Some(true),
+        supports_challenge: Some(true),
+    };
+    // Existing minimal request bytes, then field 3 bool and field 4 bool.
+    let request_bytes = [
+        0x0a, 0x08, b'c', b'l', b'i', b'e', b'n', b't', b'-', b'1', 0x10, 0x06, 0x18, 0x01, 0x20,
+        0x01,
+    ];
+    assert_eq!(enc(&request), request_bytes);
+    expect("proto_connectrequest_challenge_reset", &request_bytes);
+
+    let retry = et::ConnectResponse {
+        status: Some(et::ConnectStatus::RetryLater as i32),
+        ..Default::default()
+    };
+    assert_eq!(enc(&retry), [0x08, 0x05]);
+    expect("proto_connectresponse_retry_later", &enc(&retry));
+
+    let auth = et::ConnectAuth {
+        proof: Some(vec![0xab, 0xcd]),
+    };
+    assert_eq!(enc(&auth), [0x0a, 0x02, 0xab, 0xcd]);
+    expect("proto_connectauth_proof", &enc(&auth));
+
+    let header = et::SequenceHeader {
+        sequence_number: Some(0),
+        reset: Some(true),
+        reset_salt: Some(vec![0x11, 0x22]),
+    };
+    assert_eq!(
+        enc(&header),
+        [0x08, 0x00, 0x10, 0x01, 0x1a, 0x02, 0x11, 0x22]
+    );
+    expect("proto_sequenceheader_reset", &enc(&header));
+
+    let initial = et::InitialPayload {
+        disconnect_timeout_seconds: Some(30),
+        ..Default::default()
+    };
+    // Field 8 int32 30: tag 0x40.
+    assert_eq!(enc(&initial), [0x40, 0x1e]);
+    expect("proto_initialpayload_disconnect_timeout", &enc(&initial));
+
+    let term = et::TermInit {
+        hadreversetunnels: Some(true),
+        disconnect_timeout_seconds: Some(30),
+        ..Default::default()
+    };
+    // Field 6 bool, field 7 int32 30.
+    assert_eq!(enc(&term), [0x30, 0x01, 0x38, 0x1e]);
+    expect("proto_terminit_resume_timeout", &enc(&term));
+
+    let user = et::TerminalUserInfo {
+        ptyactive: Some(true),
+        hadreversetunnels: Some(true),
+        disconnect_timeout_seconds: Some(30),
+        ..Default::default()
+    };
+    assert_eq!(enc(&user), [0x30, 0x01, 0x38, 0x01, 0x40, 0x1e]);
+    expect("proto_terminaluserinfo_resume", &enc(&user));
+
+    let info = et::TerminalInfo {
+        command: Some(et::terminal_info::Command::KillSession as i32),
+        commandversion: Some(1),
+        ..Default::default()
+    };
+    assert_eq!(enc(&info), [0x30, 0x01, 0x38, 0x01]);
+    expect("proto_terminalinfo_kill_v1", &enc(&info));
 }

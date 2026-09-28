@@ -10,7 +10,7 @@ Canonical machine files:
 - Ledger (every `master` commit after baseline):
   [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml)
 
-Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-25.
+Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-28.
 `#784` marked `ported` after et.rs [#31](https://github.com/minpeter/et.rs/pull/31) / `906a7ca86691f00a82f88b99b21d7afceb07bf97`.
 `#798` marked `ported` after et.rs [#77](https://github.com/minpeter/et.rs/pull/77).
 
@@ -20,13 +20,13 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-25.
 | Baseline / latest release tag | [`et-v7.0.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.0.0) |
 | Baseline / release commit | [`7656a32a5bc15c6746726a27a5a4ba1e468fab6e`](https://github.com/MisterTea/EternalTerminal/commit/7656a32a5bc15c6746726a27a5a4ba1e468fab6e) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`f90c6f4`](https://github.com/MisterTea/EternalTerminal/commit/f90c6f4715f8f7e72afaf8085248ed7305c8aa6a) (#857 tip, tmux -CC filter skip, reviewed 2026-09-25) |
+| Pin tip (last classified) | [`044bcb5`](https://github.com/MisterTea/EternalTerminal/commit/044bcb5ae7960445a8bffb6fed4d3589f1aa8fc4) (#827 tip, PTY teardown skip, reviewed 2026-09-28) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
 | ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.0.0` and `master`) |
 
-The reviewed baseline-to-tip range contains 53 classified commits. Unclassified commits would be drift. `#854` (raw pipe command channel) is `ported`. `#851` (remote exit status) and `#849` (`-D`/`-W` forwards) are `ported` for wire parity. `#837` (`TERMINAL_CLOSE` / `--close-on-hangup`) is `ported`. Pin ≠ a claim that every product backlog item past the wire port is finished.
+The reviewed baseline-to-tip range contains 65 classified commits. Unclassified commits would be drift. `#854` (raw pipe command channel) is `ported`. `#851` (remote exit status) and `#849` (`-D`/`-W` forwards) are `ported` for wire parity. `#858` (per-session disconnect timeout), `#864`/`#868` (catchup order and connect/recover), `#793` (named sessions and the authenticated handshake), and `#863` (TERM split) are `ported`. `#837` (`TERMINAL_CLOSE` / `--close-on-hangup`) is `ported`. Pin ≠ a claim that every product backlog item past the wire port is finished.
 
-## Ledger (classified 2026-09-25)
+## Ledger (classified 2026-09-28)
 
 | sha | date | kind | status | note |
 | --- | --- | --- | --- | --- |
@@ -82,7 +82,19 @@ The reviewed baseline-to-tip range contains 53 classified commits. Unclassified 
 | [`2088bc4`](https://github.com/MisterTea/EternalTerminal/commit/2088bc4607e5239fe782b51a3b1f6f4bc375d9d6) | 2026-09-24 | product | skip | #852 local OpenSSH `-V`/`-G`. Client-local CLI only; et.rs already uses real `ssh -G`. Not wire/auth. |
 | [`ce4963e`](https://github.com/MisterTea/EternalTerminal/commit/ce4963edfccf3ea38dbd320cc7751a2c8af4d882) | 2026-09-24 | protocol | **ported** | #851 `TERMINAL_EXIT_STATUS=12` and `supports_exit_status`. Forwarded only when the client opts in. PROTOCOL_VERSION stays 6. |
 | [`6f53869`](https://github.com/MisterTea/EternalTerminal/commit/6f53869473a16407b59f1f3382d291ab97b4f64f) | 2026-09-24 | protocol | **ported** | #849 `et -D` / `et -W`: `half_close`, `no_shell`. Existing `-t`/`-r` unchanged. PROTOCOL_VERSION stays 6. |
-| [`f90c6f4`](https://github.com/MisterTea/EternalTerminal/commit/f90c6f4715f8f7e72afaf8085248ed7305c8aa6a) | 2026-09-24 | product | skip | #857 journald wall text filter for tmux `-CC`. Product/HTM only. Pin tip. PROTOCOL_VERSION stays 6. |
+| [`f90c6f4`](https://github.com/MisterTea/EternalTerminal/commit/f90c6f4715f8f7e72afaf8085248ed7305c8aa6a) | 2026-09-24 | product | skip | #857 journald wall text filter for tmux `-CC`. Product/HTM only. PROTOCOL_VERSION stays 6. |
+| [`b834d6e`](https://github.com/MisterTea/EternalTerminal/commit/b834d6ebbd0ba4742f5278cc562bba551800c0c0) | 2026-09-25 | ci | skip | #859 CI cache. Not protocol/wire/auth. |
+| [`9a2d230`](https://github.com/MisterTea/EternalTerminal/commit/9a2d23092584606f8d0c55b111ed7416ca71d5ea) | 2026-09-25 | product | skip | #853 local OpenSSH ControlMaster mux. Not ET wire. |
+| [`c5ddae7`](https://github.com/MisterTea/EternalTerminal/commit/c5ddae79be824944df0e423cb49c032c60cf3394) | 2026-09-25 | ci | skip | #865 HTM e2e harness. CI/product only. |
+| [`64fa900`](https://github.com/MisterTea/EternalTerminal/commit/64fa9006142cc63e936445fb908d07338ae9009e) | 2026-09-25 | product | **ported** | #863 split `id/passkey_TERM` at the first underscore. |
+| [`99ac197`](https://github.com/MisterTea/EternalTerminal/commit/99ac1972c21f68c141d66f967ded231fc2903c7b) | 2026-09-25 | product | skip | #843/#769 SSH banner stderr UX. Product only. |
+| [`fe0795c`](https://github.com/MisterTea/EternalTerminal/commit/fe0795c1dc6c42d13b50445681bf6a5b341ca64e) | 2026-09-25 | protocol | **ported** | #858 `disconnect_timeout_seconds` field 8. et.rs `flowcontrol` moved to field 9. |
+| [`a4bed0c`](https://github.com/MisterTea/EternalTerminal/commit/a4bed0cfabe64cc307bc0afb63c6512e4e85d4e8) | 2026-09-25 | protocol | **ported** | #864 client reads peer catchup before writing its own. |
+| [`f3137ce`](https://github.com/MisterTea/EternalTerminal/commit/f3137cee7b805284d7c76a7a5538884946576fd1) | 2026-09-26 | product | skip | #867 OpenSSH short-flag remap. et.rs short flags unchanged. |
+| [`540367a`](https://github.com/MisterTea/EternalTerminal/commit/540367ac4509be41714769cf511d8c0aa90cde7a) | 2026-09-26 | security | **ported** | #793 named sessions, challenge handshake, restart survival. |
+| [`da977ba`](https://github.com/MisterTea/EternalTerminal/commit/da977ba0fa212b775774c7e58a0f6d8f4c6ea175) | 2026-09-27 | product | skip | #870 ssh_config forwards and SendEnv. Product only. |
+| [`ca91fb5`](https://github.com/MisterTea/EternalTerminal/commit/ca91fb5d5eaccaa464f1106cb946586ebc7789f9) | 2026-09-27 | protocol | **ported** | #868 failed connect exits, second connect recovers, catchup read-first. |
+| [`044bcb5`](https://github.com/MisterTea/EternalTerminal/commit/044bcb5ae7960445a8bffb6fed4d3589f1aa8fc4) | 2026-09-27 | product | skip | #827 PTY teardown when a background process holds the slave. Pin tip. |
 
 
 ## Ported and residual
@@ -244,8 +256,10 @@ telemetry. Not wire or auth. No Rust port. `PROTOCOL_VERSION` stays 6.
 fields on `TermInit`. et.rs previously used those field numbers for
 `flowcontrol`; those tags first moved off `no_pty`. `#851`/`#849` then took
 `InitialPayload` field 6 (`supports_exit_status`) and `TermInit` field 5
-(`no_shell`), so et.rs `flowcontrol` now lives at `InitialPayload` field 8 and
-`TermInit` field 6. `PortForwardData.window` moved from field 6 to 7 so it is
+(`no_shell`). `#858` then took `InitialPayload` field 8
+(`disconnect_timeout_seconds`) and `#793` took `TermInit` fields 6–7, so et.rs
+`flowcontrol` now lives at `InitialPayload` field 9 and `TermInit` field 8.
+`PortForwardData.window` moved from field 6 to 7 so it is
 not `half_close`. `PROTOCOL_VERSION` stays 6.
 
 [`7a0fe09`](https://github.com/MisterTea/EternalTerminal/commit/7a0fe09bc92eb80e7441c9d974daa9665c596113)
@@ -269,7 +283,7 @@ connect. et.rs already resolves SSH config with real `ssh -G`. Not wire or auth.
 `InitialPayload.supports_exit_status` is field 6 (default unset). etserver
 forwards packet 12 only when the client set it, because et-v7.0.0 aborts on
 unknown type 12. `et -c` / command sessions exit with that status; interactive
-sessions and `et -W` stay 0. et.rs `flowcontrol` moved from field 6 to field 8.
+sessions and `et -W` stay 0. et.rs `flowcontrol` left field 6 and now lives at field 9.
 `PROTOCOL_VERSION` stays 6. This pin does not claim every product follow-up
 beyond that wire behavior is finished.
 
@@ -278,17 +292,76 @@ beyond that wire behavior is finished.
 (SOCKS4/4a and SOCKS5 no-auth, including post-CONNECT early data). `et -W host:port`
 ties stdio to the remote destination with `no_shell` and no pty. `half_close`
 keeps the destination open for the reply after the source finishes writing.
-`TermInit.no_shell` is field 5, so et.rs `flowcontrol` moved to field 6.
+`TermInit.no_shell` is field 5. et.rs `flowcontrol` left that tag and now lives at field 8.
 `PortForwardData.half_close` is field 6, so et.rs `window` moved to field 7.
 Existing `-t`/`-r` still fully close. Windows rejects `-W`. `PROTOCOL_VERSION` stays 6.
 
 [`f90c6f4`](https://github.com/MisterTea/EternalTerminal/commit/f90c6f4715f8f7e72afaf8085248ed7305c8aa6a)
-(`#857`) is the pin tip and stays `status: skip`. It drops journald wall text
+(`#857`) stays `status: skip`. It drops journald wall text
 from tmux `-CC` streams. Product/HTM only; et.rs has its own HTM path. Not
 protocol, wire, or auth. `PROTOCOL_VERSION` stays 6.
 
+[`b834d6e`](https://github.com/MisterTea/EternalTerminal/commit/b834d6ebbd0ba4742f5278cc562bba551800c0c0)
+(`#859`) stays `status: skip`. CI cache only.
+
+[`9a2d230`](https://github.com/MisterTea/EternalTerminal/commit/9a2d23092584606f8d0c55b111ed7416ca71d5ea)
+(`#853`) stays `status: skip`. Local OpenSSH ControlMaster mux. Not ET wire.
+
+[`c5ddae7`](https://github.com/MisterTea/EternalTerminal/commit/c5ddae79be824944df0e423cb49c032c60cf3394)
+(`#865`) stays `status: skip`. HTM end-to-end harness. CI/product only.
+
+[`64fa900`](https://github.com/MisterTea/EternalTerminal/commit/64fa9006142cc63e936445fb908d07338ae9009e)
+(`#863`) is `status: ported`. etterminal splits `id/passkey_TERM` at the first
+underscore, so a TERM such as `xterm_256color` does not abort session start.
+
+[`99ac197`](https://github.com/MisterTea/EternalTerminal/commit/99ac1972c21f68c141d66f967ded231fc2903c7b)
+(`#843` / `#769`) stays `status: skip`. SSH banner stderr UX. Product only.
+
+[`fe0795c`](https://github.com/MisterTea/EternalTerminal/commit/fe0795c1dc6c42d13b50445681bf6a5b341ca64e)
+(`#858`) is `status: ported` for the wire field and the etserver/etterminal
+honor path. `InitialPayload.disconnect_timeout_seconds` is field 8 (seconds;
+0 means no timeout). The client `--disconnect-timeout` flag is minutes.
+et.rs `flowcontrol` moved to `InitialPayload` field 9. The `et1` wrapper
+script is not packaged. `PROTOCOL_VERSION` stays 6.
+
+[`a4bed0c`](https://github.com/MisterTea/EternalTerminal/commit/a4bed0cfabe64cc307bc0afb63c6512e4e85d4e8)
+(`#864`) is `status: ported`. The client reads the peer `CatchupBuffer` before
+writing its own. The server still writes first, so a patched client recovers
+against an old or new server.
+
+[`f3137ce`](https://github.com/MisterTea/EternalTerminal/commit/f3137cee7b805284d7c76a7a5538884946576fd1)
+(`#867`) stays `status: skip`. OpenSSH short-flag remap is a breaking product
+CLI. et.rs keeps its existing short flags; `-x` remains `--kill-other-sessions`.
+Named-session kill is the long flag `--kill` only.
+
+[`540367a`](https://github.com/MisterTea/EternalTerminal/commit/540367ac4509be41714769cf511d8c0aa90cde7a)
+(`#793`) is `status: ported` for the wire, auth, and named-session behavior.
+`ConnectRequest` gains `resetIntent` and `supportsChallenge`. Peers that omit
+`supportsChallenge` keep the one-round protocol-6 handshake. Challenge-capable
+clients prove possession of the passkey with `ConnectAuth` and verify the
+server's reset decision. `RETRY_LATER` covers the post-restart grace window.
+Named sessions live in owner-only `~/.et/sessions` (`--name`, `--attach`,
+`--list`, `--kill`). `TermInit` fields 6–7 and `TerminalUserInfo` fields 6–8
+are the upstream resume tags, so et.rs `flowcontrol` on `TermInit` lives at
+field 8. `PROTOCOL_VERSION` stays 6.
+
+[`da977ba`](https://github.com/MisterTea/EternalTerminal/commit/da977ba0fa212b775774c7e58a0f6d8f4c6ea175)
+(`#870`) stays `status: skip`. ssh_config forwards and SendEnv. Product only.
+
+[`ca91fb5`](https://github.com/MisterTea/EternalTerminal/commit/ca91fb5d5eaccaa464f1106cb946586ebc7789f9)
+(`#868`, including `#866` / `#862` / `#861`) is `status: ported`. A failed
+initial connect exits after three attempts. A second `connect()` on the same
+connection runs recover instead of installing sequence 0. The client still
+reads catchup first.
+
+[`044bcb5`](https://github.com/MisterTea/EternalTerminal/commit/044bcb5ae7960445a8bffb6fed4d3589f1aa8fc4)
+(`#827` / `#448`) is the pin tip and stays `status: skip`. It tears down a PTY
+session when a background process still holds the slave, using the
+already-ported type 12 exit status. Product/lifecycle only. Pin ≠ a claim that
+every product backlog item is finished. `PROTOCOL_VERSION` stays 6.
+
 et.rs still claims **protocol v6**. EternalTerminal’s latest product release is
-**v7.0.0**, and the reviewed tip is fifty-three classified commits past that tag.
+**v7.0.0**, and the reviewed tip is sixty-five classified commits past that tag.
 
 Review ports against the conflict policy in
 [`docs/upstream-factory.md`](upstream-factory.md). Gate any later port with

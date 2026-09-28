@@ -100,6 +100,7 @@ mod error;
 mod forward_config;
 mod initial_connect;
 mod resolver;
+mod session_store;
 mod ssh_config;
 mod ssh_process;
 

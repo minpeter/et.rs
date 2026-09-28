@@ -2,13 +2,13 @@ use std::io;
 use std::net::TcpStream;
 use std::time::Duration;
 
+use et_core::crypto::EPOCH_SALT_BYTES;
 use et_core::keys::passkey_to_key;
 use et_core::proto::{
     ConnectResponse, ConnectStatus, EtPacketType, InitialPayload, InitialResponse,
 };
-use et_net::connection::Connection;
-use et_net::framing_io::{read_proto_limited, write_proto};
-use et_net::handshake::{client_request, MAX_HANDSHAKE_PROTO_LEN};
+use et_net::connection::{Connection, RecoveryExchange};
+use et_net::handshake::client_handshake;
 use prost::Message;
 
 use crate::bootstrap::Credentials;
@@ -18,6 +18,8 @@ use crate::resolver::EndpointResolver;
 
 const MAX_ENDPOINT_ADDRESSES: usize = 16;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Upstream `et` retries the first TCP/handshake three times, then exits.
+const INITIAL_CONNECT_ATTEMPTS: usize = 3;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Server owns an eight-second absolute initialization budget. Do not admit a
 /// connection unless the outer budget leaves an additional propagation margin.
@@ -59,6 +61,66 @@ pub fn connect_initial(
     resolver: &dyn EndpointResolver,
     deadline: Deadline,
 ) -> Result<Connection, ClientError> {
+    connect_initial_with_intent(
+        endpoint,
+        credentials,
+        initial_payload,
+        resolver,
+        deadline,
+        false,
+    )
+}
+
+pub fn connect_initial_with_intent(
+    endpoint: &Endpoint,
+    credentials: &Credentials,
+    initial_payload: &InitialPayload,
+    resolver: &dyn EndpointResolver,
+    deadline: Deadline,
+    reset_intent: bool,
+) -> Result<Connection, ClientError> {
+    let mut last = String::from("Connect Timeout");
+    for attempt in 0..INITIAL_CONNECT_ATTEMPTS {
+        match connect_once(
+            endpoint,
+            credentials,
+            initial_payload,
+            resolver,
+            deadline,
+            reset_intent,
+        ) {
+            Ok(connection) => return Ok(connection),
+            Err(error) if error.is_retryable_initial_connect() => {
+                last = error.to_string();
+                if attempt + 1 == INITIAL_CONNECT_ATTEMPTS {
+                    break;
+                }
+                // Sleep only while the caller's deadline still has room. A
+                // live socket that already sent INITIAL_PAYLOAD is not retried.
+                if deadline
+                    .remaining()
+                    .is_some_and(|left| left > Duration::from_secs(1))
+                {
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(ClientError::InitialConnect {
+        endpoint: endpoint.to_string(),
+        message: last,
+    })
+}
+
+fn connect_once(
+    endpoint: &Endpoint,
+    credentials: &Credentials,
+    initial_payload: &InitialPayload,
+    resolver: &dyn EndpointResolver,
+    deadline: Deadline,
+    reset_intent: bool,
+) -> Result<Connection, ClientError> {
     let admission_deadline = initialization_admission_deadline(deadline)?;
     let key = passkey_to_key(&credentials.passkey).ok_or(ClientError::InvalidPasskey)?;
     let mut stream = connect_endpoint(endpoint, resolver, admission_deadline)?;
@@ -67,12 +129,27 @@ pub fn connect_initial(
     // Resolution/connect may consume their entire admission slice. Revalidate
     // the reserved server-response margin at the actual admission boundary.
     ensure_initialization_budget(deadline)?;
-    write_proto(&mut stream, &client_request(&credentials.id))
-        .map_err(|source| connect_error(deadline, "sending ConnectRequest", source))?;
-    set_stream_timeout(&stream, deadline)?;
-    let response: ConnectResponse = read_proto_limited(&mut stream, MAX_HANDSHAKE_PROTO_LEN)
-        .map_err(|source| connect_error(deadline, "reading ConnectResponse", source))?;
-    accept_response(response)?;
+    let response = client_handshake(
+        &mut stream,
+        &credentials.id,
+        &key,
+        reset_intent,
+        deadline.expires_at(),
+    )
+    .map_err(|source| classify_handshake_io(deadline, source))?;
+    if let InitialStatus::Reset(salt) = accept_response(response)? {
+        let mut connection = Connection::new_client(stream, &key);
+        let remaining = deadline
+            .remaining()
+            .ok_or(ClientError::BootstrapTimeout("recovering ET session"))?;
+        connection
+            .establish_reset(remaining, RecoveryExchange::client(Some(salt)))
+            .map_err(|error| transport_error(deadline, "recovering ET session", error))?;
+        connection
+            .set_io_timeout(None)
+            .map_err(ClientError::Transport)?;
+        return Ok(connection);
+    }
 
     ensure_deadline(deadline, "sending INITIAL_PAYLOAD")?;
     let mut connection = Connection::new_client(stream, &key);
@@ -206,17 +283,42 @@ fn accept_initial_response(response: InitialResponse) -> Result<(), ClientError>
     }
 }
 
-fn accept_response(response: ConnectResponse) -> Result<(), ClientError> {
+enum InitialStatus {
+    Fresh,
+    Reset([u8; EPOCH_SALT_BYTES]),
+}
+
+fn classify_handshake_io(deadline: Deadline, source: io::Error) -> ClientError {
+    if source.kind() == io::ErrorKind::InvalidData {
+        return ClientError::ServerRejected {
+            status: None,
+            message: Some(source.to_string()),
+        };
+    }
+    connect_error(deadline, "completing the ET handshake", source)
+}
+
+fn accept_response(response: ConnectResponse) -> Result<InitialStatus, ClientError> {
     let status = response
         .status
         .and_then(|raw| ConnectStatus::try_from(raw).ok());
     match status {
-        Some(ConnectStatus::NewClient) => Ok(()),
+        Some(ConnectStatus::NewClient) => Ok(InitialStatus::Fresh),
+        Some(ConnectStatus::ReturningClient) if response.reset_required.unwrap_or(false) => {
+            let salt = response.reset_salt.unwrap_or_default();
+            let salt: [u8; EPOCH_SALT_BYTES] =
+                salt.try_into().map_err(|_| ClientError::ServerRejected {
+                    status: response.status,
+                    message: Some("invalid reset decision salt".to_owned()),
+                })?;
+            Ok(InitialStatus::Reset(salt))
+        }
         Some(ConnectStatus::ReturningClient) => Err(ClientError::ReturningSessionRequiresRecovery),
         Some(ConnectStatus::InvalidKey) => Err(ClientError::ServerInvalidKey(response.error)),
         Some(ConnectStatus::MismatchedProtocol) => {
             Err(ClientError::ProtocolMismatch(response.error))
         }
+        Some(ConnectStatus::RetryLater) => Err(ClientError::RetryLater),
         None => Err(ClientError::ServerRejected {
             status: response.status,
             message: response.error,

@@ -31,6 +31,9 @@ fn register(
         uid: Some(i64::from(rustix::process::getuid().as_raw())),
         gid: Some(i64::from(rustix::process::getgid().as_raw())),
         fd: None,
+        ptyactive: None,
+        hadreversetunnels: None,
+        disconnect_timeout_seconds: None,
     };
     let packet = Packet::new(
         TerminalPacketType::TerminalUserInfo as u8,

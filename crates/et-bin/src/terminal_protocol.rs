@@ -22,6 +22,10 @@ pub struct TerminalInitialization {
     pub command: Option<String>,
     /// `TermInit.no_shell`: session without a pty or a shell (`et -W`).
     pub no_shell: bool,
+    /// The originating session had reverse tunnels before an etserver restart.
+    pub had_reverse_tunnels: bool,
+    /// Per-session disconnect timeout, in seconds, preserved across restart.
+    pub disconnect_timeout_seconds: Option<i32>,
 }
 
 /// OpenSSH-style status: the exit code, or `128 + signal` when signaled.
@@ -78,6 +82,8 @@ pub fn read_initialization(router: &mut LocalStream) -> Result<TerminalInitializ
         no_pty,
         command: init.command,
         no_shell,
+        had_reverse_tunnels: init.hadreversetunnels.unwrap_or(false),
+        disconnect_timeout_seconds: init.disconnect_timeout_seconds,
     })
 }
 
@@ -193,6 +199,12 @@ pub fn handle_packet(
             let info = TerminalInfo::decode(packet.payload()).map_err(|_| {
                 TerminalPacketError::Protocol("TERMINAL_INFO protobuf is malformed".to_owned())
             })?;
+            if info.command == Some(et_core::proto::terminal_info::Command::KillSession as i32) {
+                if info.commandversion == Some(et_core::SESSION_KILL_COMMAND_VERSION) {
+                    return Ok(LocalPacketEffect::Close);
+                }
+                // An unsupported command version is ignored. Resize still applies.
+            }
             master
                 .resize(terminal_size(&info))
                 .map_err(|error| TerminalPacketError::Pty(io::Error::other(error)))?;
@@ -301,6 +313,8 @@ mod tests {
                 no_pty: None,
                 command: None,
                 no_shell: None,
+                disconnect_timeout_seconds: None,
+                hadreversetunnels: None,
             },
             TermInit {
                 environmentnames: vec!["BAD-NAME".to_owned()],
@@ -310,6 +324,8 @@ mod tests {
                 no_pty: None,
                 command: None,
                 no_shell: None,
+                disconnect_timeout_seconds: None,
+                hadreversetunnels: None,
             },
             TermInit {
                 environmentnames: vec!["VALID".to_owned()],
@@ -319,6 +335,8 @@ mod tests {
                 no_pty: None,
                 command: None,
                 no_shell: None,
+                disconnect_timeout_seconds: None,
+                hadreversetunnels: None,
             },
             TermInit {
                 environmentnames: vec!["VALID".to_owned()],
@@ -328,6 +346,8 @@ mod tests {
                 no_pty: None,
                 command: None,
                 no_shell: None,
+                disconnect_timeout_seconds: None,
+                hadreversetunnels: None,
             },
         ] {
             let packet = Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec());
@@ -373,6 +393,8 @@ mod tests {
             no_pty: None,
             command: None,
             no_shell: None,
+            disconnect_timeout_seconds: None,
+            hadreversetunnels: None,
         };
         write_local_packet(
             &mut server,
@@ -404,6 +426,8 @@ mod tests {
             no_pty: Some(true),
             command: Some("true".to_owned()),
             no_shell: Some(true),
+            disconnect_timeout_seconds: None,
+            hadreversetunnels: None,
         };
         write_local_packet(
             &mut server,

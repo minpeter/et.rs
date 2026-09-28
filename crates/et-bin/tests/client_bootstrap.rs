@@ -1147,6 +1147,8 @@ fn effective_setenv_shares_terminal_and_jumphost_packet_budgets() {
                 command: None,
 
                 no_shell: None,
+                disconnect_timeout_seconds: None,
+                hadreversetunnels: None,
             };
             assert!(
                 Packet::new(TerminalPacketType::TerminalInit as u8, term.encode_to_vec())
@@ -1459,6 +1461,8 @@ fn posix_client_bounds_locale_to_local_terminal_packet() {
         command: None,
 
         no_shell: None,
+        disconnect_timeout_seconds: None,
+        hadreversetunnels: None,
     };
     let packet = Packet::new(
         TerminalPacketType::TerminalInit as u8,

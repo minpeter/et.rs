@@ -166,6 +166,7 @@ pub fn build(
             supports_exit_status: Some(true),
             no_shell: args.stdio_forward.is_some().then_some(true),
             flowcontrol: args.flow_control.protocol_value(),
+            disconnect_timeout_seconds: args.disconnect_timeout_seconds(),
         },
     })
 }

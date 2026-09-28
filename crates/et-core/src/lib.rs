@@ -18,6 +18,11 @@ pub mod packet;
 pub mod proto;
 
 pub const PROTOCOL_VERSION: i32 = 6;
+/// `--kill` rides in `TERMINAL_INFO` so older peers ignore it.
+pub const SESSION_KILL_COMMAND_VERSION: i32 = 1;
+pub const SESSION_KILL_ACK: &str = "ET_SESSION_KILLED_V1";
+/// Unknown ids get `RETRY_LATER` for this long after etserver starts.
+pub const RECOVERY_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[cfg(test)]
 mod flow_control_tests;

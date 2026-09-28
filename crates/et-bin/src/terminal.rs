@@ -106,7 +106,7 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
         let registration_ack = et_net::local::supports_registration_ack(router_path.path());
         let mut router = et_net::local::connect(router_path.path())
             .map_err(|error| clap_error(format!("could not connect terminal router: {error}")))?;
-        register(&mut router, &input, registration_ack).map_err(clap_error)?;
+        register(&mut router, &input, registration_ack, false, false, None).map_err(clap_error)?;
         let ready_socket = parsed
             .ready_socket
             .as_deref()
@@ -115,7 +115,15 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
         let mut startup = router
             .try_clone()
             .map_err(|error| clap_error(format!("could not clone startup channel: {error}")))?;
-        let result = terminal_pty::run_with_startup(router, &input.term, |router| {
+        let resume = terminal_pty::RouterResume {
+            path: router_path.path().to_path_buf(),
+            id: input.id.clone(),
+            passkey: input.passkey.clone(),
+            registration_ack,
+            had_reverse_tunnels: false,
+            disconnect_timeout_seconds: None,
+        };
+        let result = terminal_pty::run_resuming(router, &input.term, resume, |router| {
             if registration_ack {
                 report_startup(router, Ok(()))?;
             }
@@ -168,7 +176,7 @@ fn run_jump(
         let registration_ack = et_net::local::supports_registration_ack(router_path);
         let mut router = et_net::local::connect(router_path)
             .map_err(|error| clap_error(format!("could not connect terminal router: {error}")))?;
-        register(&mut router, input, registration_ack).map_err(clap_error)?;
+        register(&mut router, input, registration_ack, false, false, None).map_err(clap_error)?;
         let ready_socket = parsed_ready_socket(args)?;
         crate::terminal_daemon::signal(ready_socket).map_err(clap_error)?;
         let mut startup = router
@@ -245,10 +253,13 @@ fn load_credentials(args: &TerminalArgs) -> Result<CredentialInput, String> {
     parse_credential_input(text.trim())
 }
 
-fn register(
+pub(crate) fn register(
     router: &mut LocalStream,
     input: &CredentialInput,
     registration_ack: bool,
+    pty_active: bool,
+    had_reverse_tunnels: bool,
+    disconnect_timeout_seconds: Option<i32>,
 ) -> Result<(), String> {
     // Upstream uses these to chown forwarded named pipes; Windows has no
     // POSIX ids, so the session reports zero there.
@@ -262,6 +273,9 @@ fn register(
         // support out of band. Old routers and old terminals therefore retain
         // their original packet sequence in both mixed-version directions.
         fd: registration_ack.then_some(-6),
+        disconnect_timeout_seconds,
+        hadreversetunnels: had_reverse_tunnels.then_some(true),
+        ptyactive: pty_active.then_some(true),
     };
     let packet = Packet::new(
         TerminalPacketType::TerminalUserInfo as u8,

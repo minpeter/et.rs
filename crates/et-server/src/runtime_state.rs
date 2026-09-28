@@ -3,6 +3,7 @@ use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use crate::registry::{RegistrationIdentity, Registry};
 use crate::runtime_error::RuntimeError;
@@ -16,6 +17,8 @@ pub(crate) struct RuntimeCore {
     pub(crate) pre_auth_slots: Arc<PreAuthSlots>,
     pub(crate) shutdown: AtomicBool,
     pub(crate) forward_resolver: Arc<dyn et_net::forward::ForwardResolver>,
+    /// Process start, for the post-restart `RETRY_LATER` grace window.
+    pub(crate) started: Instant,
 }
 
 pub(crate) const MAX_PRE_AUTH_CONNECTIONS: usize = 128;

@@ -13,13 +13,18 @@ use std::time::Duration;
 
 use et_core::keys::passkey_to_key;
 use et_core::packet::Packet;
+#[cfg(test)]
+use et_core::proto::ConnectResponse;
 use et_core::proto::{
-    ConnectResponse, ConnectStatus, EtPacketType, FlowControlMode, InitialPayload, InitialResponse,
+    ConnectStatus, EtPacketType, FlowControlMode, InitialPayload, InitialResponse,
     TerminalPacketType,
 };
 use et_net::connection::Connection;
+#[cfg(test)]
 use et_net::framing_io::{read_proto_limited, write_proto};
-use et_net::handshake::{client_request, MAX_HANDSHAKE_PROTO_LEN};
+use et_net::handshake::client_handshake;
+#[cfg(test)]
+use et_net::handshake::MAX_HANDSHAKE_PROTO_LEN;
 use et_net::local_packet::{encode_local_packet, write_local_packet, LocalPacketDecoder};
 use prost::Message;
 #[cfg(unix)]
@@ -188,10 +193,14 @@ where
         .set_read_timeout(Some(CONNECT_TIMEOUT))
         .and_then(|()| stream.set_write_timeout(Some(CONNECT_TIMEOUT)))
         .map_err(|error| format!("could not configure the destination socket: {error}"))?;
-    write_proto(&mut stream, &client_request(id))
-        .map_err(|error| format!("could not send ConnectRequest: {error}"))?;
-    let response: ConnectResponse = read_proto_limited(&mut stream, MAX_HANDSHAKE_PROTO_LEN)
-        .map_err(|error| format!("could not read ConnectResponse: {error}"))?;
+    let response = client_handshake(
+        &mut stream,
+        id,
+        key,
+        false,
+        std::time::Instant::now() + CONNECT_TIMEOUT,
+    )
+    .map_err(|error| format!("could not complete the destination handshake: {error}"))?;
     match response
         .status
         .and_then(|raw| ConnectStatus::try_from(raw).ok())

@@ -12,7 +12,7 @@ use socket2::SockRef;
 #[path = "connection_recovery.rs"]
 mod recovery;
 
-pub use recovery::{DEFAULT_RECOVERY_TIMEOUT, MAX_RECOVERY_PROTO_LEN};
+pub use recovery::{RecoveryExchange, DEFAULT_RECOVERY_TIMEOUT, MAX_RECOVERY_PROTO_LEN};
 
 /// Upper bound on how long a live socket write may block.
 ///

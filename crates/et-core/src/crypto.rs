@@ -206,6 +206,7 @@ pub fn reset_decision_proof(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn verify_reset_decision_proof(
     proof: &[u8],
     key: &[u8; KEY_LEN],

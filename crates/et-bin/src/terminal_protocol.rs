@@ -199,12 +199,12 @@ pub fn handle_packet(
             let info = TerminalInfo::decode(packet.payload()).map_err(|_| {
                 TerminalPacketError::Protocol("TERMINAL_INFO protobuf is malformed".to_owned())
             })?;
-            if info.command == Some(et_core::proto::terminal_info::Command::KillSession as i32) {
-                if info.commandversion == Some(et_core::SESSION_KILL_COMMAND_VERSION) {
-                    return Ok(LocalPacketEffect::Close);
-                }
-                // An unsupported command version is ignored. Resize still applies.
+            if info.command == Some(et_core::proto::terminal_info::Command::KillSession as i32)
+                && info.commandversion == Some(et_core::SESSION_KILL_COMMAND_VERSION)
+            {
+                return Ok(LocalPacketEffect::Close);
             }
+            // An unsupported command version is ignored. Resize still applies.
             master
                 .resize(terminal_size(&info))
                 .map_err(|error| TerminalPacketError::Pty(io::Error::other(error)))?;

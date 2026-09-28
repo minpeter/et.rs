@@ -301,7 +301,7 @@ pub(crate) fn handle(
                 ));
                 return;
             }
-            let reset_salt = wants_reset.then(|| random_bytes::<EPOCH_SALT_BYTES>());
+            let reset_salt = wants_reset.then(random_bytes::<EPOCH_SALT_BYTES>);
             let salt_bytes: &[u8] = reset_salt
                 .as_ref()
                 .map(|salt| salt.as_slice())
@@ -347,6 +347,7 @@ pub(crate) fn handle(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_new(
     mut stream: TcpStream,
     registration: crate::registry::Registration,

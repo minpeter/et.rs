@@ -24,19 +24,10 @@ pub const DEFAULT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// bidirectional catchup cannot fill both socket buffers and deadlock. The
 /// server keeps the historical write-first order, so a patched client also
 /// recovers against an older server.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct RecoveryExchange {
     pub read_peer_catchup_first: bool,
     pub reset_salt: Option<[u8; EPOCH_SALT_BYTES]>,
-}
-
-impl Default for RecoveryExchange {
-    fn default() -> Self {
-        Self {
-            read_peer_catchup_first: false,
-            reset_salt: None,
-        }
-    }
 }
 
 impl RecoveryExchange {

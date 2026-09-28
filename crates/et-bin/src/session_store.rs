@@ -167,7 +167,7 @@ pub fn kill(
             TerminalPacketType::TerminalInfo as u8,
             &info.encode_to_vec(),
         )
-        .map_err(|error| ClientError::Transport(error))?;
+        .map_err(ClientError::Transport)?;
     loop {
         if deadline.remaining().is_none() {
             return Err(ClientError::BootstrapTimeout(
@@ -188,7 +188,7 @@ fn list() -> Result<Vec<SavedSession>, String> {
     if !directory.exists() {
         return Ok(Vec::new());
     }
-    verify_dir(&directory.parent().unwrap_or(directory.as_path()), true)?;
+    verify_dir(directory.parent().unwrap_or(directory.as_path()), true)?;
     verify_dir(&directory, true)?;
     let mut sessions = Vec::new();
     for entry in fs::read_dir(&directory).map_err(|_| "could not list sessions".to_owned())? {
@@ -197,7 +197,7 @@ fn list() -> Result<Vec<SavedSession>, String> {
         if !valid_name(&name) {
             continue;
         }
-        if let Some(session) = load(&name).ok() {
+        if let Ok(session) = load(&name) {
             sessions.push(session);
         }
     }

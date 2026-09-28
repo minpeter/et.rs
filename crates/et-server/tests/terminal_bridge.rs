@@ -97,6 +97,8 @@ fn encrypted_client_and_registered_terminal_exchange_packets() {
         column: Some(100),
         width: Some(800),
         height: Some(600),
+
+        ..Default::default()
     };
     client
         .write_packet(

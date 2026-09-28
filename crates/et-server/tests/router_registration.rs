@@ -51,6 +51,7 @@ fn info_with_capability(
         uid,
         gid,
         fd: startup_ack.then_some(-6),
+        ..Default::default()
     }
 }
 

@@ -115,7 +115,13 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
         let mut startup = router
             .try_clone()
             .map_err(|error| clap_error(format!("could not clone startup channel: {error}")))?;
-        let result = terminal_pty::run_with_startup(router, &input.term, |router| {
+        let resume = terminal_pty::ResumeTarget {
+            router_path: router_path.path().to_path_buf(),
+            id: input.id.clone(),
+            passkey: input.passkey.clone(),
+            term: input.term.clone(),
+        };
+        let result = terminal_pty::run_with_startup_resume(router, &input.term, resume, |router| {
             if registration_ack {
                 report_startup(router, Ok(()))?;
             }
@@ -250,6 +256,35 @@ fn register(
     input: &CredentialInput,
     registration_ack: bool,
 ) -> Result<(), String> {
+    register_with(router, input, registration_ack, false, false, None)
+}
+
+/// Re-register after the router socket died. The pty is still alive.
+pub(crate) fn register_live(
+    router: &mut LocalStream,
+    input: &CredentialInput,
+    registration_ack: bool,
+    had_reverse_tunnels: bool,
+    disconnect_timeout_seconds: Option<i32>,
+) -> Result<(), String> {
+    register_with(
+        router,
+        input,
+        registration_ack,
+        true,
+        had_reverse_tunnels,
+        disconnect_timeout_seconds,
+    )
+}
+
+fn register_with(
+    router: &mut LocalStream,
+    input: &CredentialInput,
+    registration_ack: bool,
+    pty_active: bool,
+    had_reverse_tunnels: bool,
+    disconnect_timeout_seconds: Option<i32>,
+) -> Result<(), String> {
     // Upstream uses these to chown forwarded named pipes; Windows has no
     // POSIX ids, so the session reports zero there.
     let (uid, gid) = registration_identity();
@@ -262,6 +297,9 @@ fn register(
         // support out of band. Old routers and old terminals therefore retain
         // their original packet sequence in both mixed-version directions.
         fd: registration_ack.then_some(-6),
+        ptyactive: pty_active.then_some(true),
+        hadreversetunnels: had_reverse_tunnels.then_some(true),
+        disconnect_timeout_seconds,
     };
     let packet = Packet::new(
         TerminalPacketType::TerminalUserInfo as u8,

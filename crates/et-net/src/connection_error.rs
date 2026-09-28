@@ -45,6 +45,12 @@ impl std::fmt::Display for ConnError {
             Self::InvalidRecoverySequence(sequence) => {
                 write!(f, "invalid recovery sequence {sequence:?}")
             }
+            Self::UnexpectedReset => {
+                write!(f, "peer requested a reset the handshake did not select")
+            }
+            Self::ResetSaltMismatch => {
+                write!(f, "reset salt does not match the authenticated handshake")
+            }
         }
     }
 }

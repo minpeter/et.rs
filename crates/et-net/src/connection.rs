@@ -36,6 +36,8 @@ pub enum ConnError {
     PacketTooLarge,
     SequenceOutOfRange(i64),
     InvalidRecoverySequence(Option<i32>),
+    UnexpectedReset,
+    ResetSaltMismatch,
 }
 
 pub struct Connection {
@@ -43,6 +45,11 @@ pub struct Connection {
     writer: BackedWriter,
     reader: BackedReader,
     live_write_timeout: Duration,
+    /// Client recover reads the peer CatchupBuffer before writing its own.
+    /// The server still writes first. Exactly one side reads first, so a
+    /// catchup larger than the socket buffers cannot stall both writers
+    /// (EternalTerminal #864 / #861).
+    read_peer_catchup_first: bool,
 }
 
 pub struct PreparedWrite {
@@ -98,6 +105,7 @@ impl Connection {
             writer: BackedWriter::new(CryptoHandler::new(key, encrypt), true),
             reader: BackedReader::new(CryptoHandler::new(key, decrypt), true),
             live_write_timeout: DEFAULT_LIVE_WRITE_TIMEOUT,
+            read_peer_catchup_first: encrypt == DIR_CLIENT_TO_SERVER,
         }
     }
 

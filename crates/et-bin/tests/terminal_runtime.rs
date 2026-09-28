@@ -89,6 +89,8 @@ fn assert_motd_prompt_spacing(
             command: None,
 
             no_shell: None,
+
+            ..Default::default()
         },
     );
     expect_startup(&mut router);
@@ -157,6 +159,8 @@ fn framed_terminal_close_shuts_the_pty_down_successfully() {
             command: None,
 
             no_shell: None,
+
+            ..Default::default()
         },
     );
     expect_startup(&mut router);
@@ -224,6 +228,8 @@ fn bootstrap_parent_reports_marker_and_leaves_registered_session_running() {
             command: None,
 
             no_shell: None,
+
+            ..Default::default()
         },
     );
     expect_startup(&mut router);
@@ -345,6 +351,8 @@ fn new_terminal_uses_legacy_sequence_with_old_router() {
             command: None,
 
             no_shell: None,
+
+            ..Default::default()
         },
     );
     send(
@@ -391,6 +399,8 @@ fn real_terminal_registers_runs_shell_and_resizes_pty() {
             command: None,
 
             no_shell: None,
+
+            ..Default::default()
         },
     );
     expect_startup(&mut router);
@@ -403,6 +413,8 @@ fn real_terminal_registers_runs_shell_and_resizes_pty() {
             column: Some(100),
             width: Some(800),
             height: Some(600),
+
+            ..Default::default()
         },
     );
     send(
@@ -456,6 +468,8 @@ fn pty_output_backpressure_longer_than_two_seconds_preserves_session_and_order()
             command: None,
 
             no_shell: None,
+
+            ..Default::default()
         },
     );
     expect_startup(&mut router);
@@ -571,6 +585,8 @@ fn router_disconnect_terminates_the_shell() {
             command: None,
 
             no_shell: None,
+
+            ..Default::default()
         },
     );
     expect_startup(&mut router);
@@ -602,6 +618,8 @@ fn real_terminal_starts_login_shell_and_loads_profile_color() {
             command: None,
 
             no_shell: None,
+
+            ..Default::default()
         },
     );
     expect_startup(&mut router);
@@ -654,6 +672,8 @@ fn real_terminal_login_shell_preserves_term_without_colorterm() {
             command: None,
 
             no_shell: None,
+
+            ..Default::default()
         },
     );
     expect_startup(&mut router);
@@ -729,6 +749,8 @@ fn real_terminal_emits_motd_before_login_shell_output() {
             command: None,
 
             no_shell: None,
+
+            ..Default::default()
         },
     );
     expect_startup(&mut router);
@@ -836,6 +858,8 @@ fn real_terminal_emits_last_login_between_motd_and_prompt() {
             command: None,
 
             no_shell: None,
+
+            ..Default::default()
         },
     );
     expect_startup(&mut router);
@@ -909,6 +933,8 @@ fn real_terminal_suppresses_motd_when_home_has_hushlogin() {
             command: None,
 
             no_shell: None,
+
+            ..Default::default()
         },
     );
     expect_startup(&mut router);

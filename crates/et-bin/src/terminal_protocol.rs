@@ -22,6 +22,8 @@ pub struct TerminalInitialization {
     pub command: Option<String>,
     /// `TermInit.no_shell`: session without a pty or a shell (`et -W`).
     pub no_shell: bool,
+    pub had_reverse_tunnels: bool,
+    pub disconnect_timeout_seconds: Option<i32>,
 }
 
 /// OpenSSH-style status: the exit code, or `128 + signal` when signaled.
@@ -78,6 +80,8 @@ pub fn read_initialization(router: &mut LocalStream) -> Result<TerminalInitializ
         no_pty,
         command: init.command,
         no_shell,
+        had_reverse_tunnels: init.hadreversetunnels.unwrap_or(false),
+        disconnect_timeout_seconds: init.disconnect_timeout_seconds,
     })
 }
 
@@ -137,10 +141,18 @@ pub(crate) fn local_packet_effect(packet: &Packet) -> Result<LocalPacketEffect, 
         return Err("encrypted local terminal packet rejected".to_owned());
     }
     match packet.header() {
-        header
-            if header == TerminalPacketType::TerminalBuffer as u8
-                || header == TerminalPacketType::TerminalInfo as u8 =>
-        {
+        header if header == TerminalPacketType::TerminalInfo as u8 => {
+            if let Ok(info) = TerminalInfo::decode(packet.payload()) {
+                let kill = info.command
+                    == Some(et_core::proto::terminal_info::Command::KillSession as i32)
+                    && info.commandversion == Some(et_core::SESSION_KILL_COMMAND_VERSION);
+                if kill {
+                    return Ok(LocalPacketEffect::Close);
+                }
+            }
+            Ok(LocalPacketEffect::Continue)
+        }
+        header if header == TerminalPacketType::TerminalBuffer as u8 => {
             Ok(LocalPacketEffect::Continue)
         }
         header if header == TerminalPacketType::TerminalClose as u8 => Ok(LocalPacketEffect::Close),
@@ -301,6 +313,8 @@ mod tests {
                 no_pty: None,
                 command: None,
                 no_shell: None,
+
+                ..Default::default()
             },
             TermInit {
                 environmentnames: vec!["BAD-NAME".to_owned()],
@@ -310,6 +324,8 @@ mod tests {
                 no_pty: None,
                 command: None,
                 no_shell: None,
+
+                ..Default::default()
             },
             TermInit {
                 environmentnames: vec!["VALID".to_owned()],
@@ -319,6 +335,8 @@ mod tests {
                 no_pty: None,
                 command: None,
                 no_shell: None,
+
+                ..Default::default()
             },
             TermInit {
                 environmentnames: vec!["VALID".to_owned()],
@@ -328,6 +346,8 @@ mod tests {
                 no_pty: None,
                 command: None,
                 no_shell: None,
+
+                ..Default::default()
             },
         ] {
             let packet = Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec());
@@ -373,6 +393,8 @@ mod tests {
             no_pty: None,
             command: None,
             no_shell: None,
+
+            ..Default::default()
         };
         write_local_packet(
             &mut server,
@@ -404,6 +426,8 @@ mod tests {
             no_pty: Some(true),
             command: Some("true".to_owned()),
             no_shell: Some(true),
+
+            ..Default::default()
         };
         write_local_packet(
             &mut server,

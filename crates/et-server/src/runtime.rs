@@ -106,6 +106,7 @@ impl Runtime {
             pre_auth_slots: Arc::new(PreAuthSlots::new(MAX_PRE_AUTH_CONNECTIONS)),
             shutdown: AtomicBool::new(false),
             forward_resolver,
+            started_at: std::time::Instant::now(),
         });
         let router_name = router_path.path().to_path_buf();
         let (lifecycle_sender, lifecycle_events) = mpsc::channel();
@@ -411,6 +412,8 @@ mod tests {
                 uid: Some(uid),
                 gid: Some(gid),
                 fd: None,
+
+                ..Default::default()
             }
             .encode_to_vec(),
         );

@@ -3,6 +3,7 @@ use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use crate::registry::{RegistrationIdentity, Registry};
 use crate::runtime_error::RuntimeError;
@@ -16,7 +17,13 @@ pub(crate) struct RuntimeCore {
     pub(crate) pre_auth_slots: Arc<PreAuthSlots>,
     pub(crate) shutdown: AtomicBool,
     pub(crate) forward_resolver: Arc<dyn et_net::forward::ForwardResolver>,
+    /// Process start, for the post-restart `RETRY_LATER` grace window (#793).
+    pub(crate) started_at: Instant,
 }
+
+/// How long after etserver start an unknown modern client is asked to retry
+/// while terminals re-register. Matches upstream `recoveryGraceSeconds`.
+pub(crate) const RECOVERY_GRACE: Duration = Duration::from_secs(60);
 
 pub(crate) const MAX_PRE_AUTH_CONNECTIONS: usize = 128;
 

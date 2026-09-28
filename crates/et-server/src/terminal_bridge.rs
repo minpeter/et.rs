@@ -10,6 +10,7 @@ use et_core::proto::TerminalPacketType;
 use et_net::connection::ConnError;
 use et_net::forward::{is_forward_packet, Forwarder};
 use et_net::local_packet::{encode_local_packet, LocalPacketDecoder};
+use prost::Message;
 #[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags};
 #[cfg(unix)]
@@ -122,6 +123,11 @@ fn run_mode_poll(
     let mut client_buffered = false;
     loop {
         if session.is_shutting_down() {
+            return Ok(());
+        }
+        if session.disconnect_expired() {
+            crate::diag::info("client disconnect timeout elapsed; closing terminal");
+            let _ = write_local_terminal_close(&mut terminal, &mut pending_local)?;
             return Ok(());
         }
         // Retry the held packet first: draining the forwarder's outbound
@@ -241,6 +247,7 @@ fn run_mode_poll(
             }
         }
         if terminal_eof && pending_terminal.is_none() {
+            acknowledge_session_kill(&session)?;
             return Ok(());
         }
         // Recovery authentication may read more than its proof packet into
@@ -390,6 +397,11 @@ fn run_mode_windows(
         if session.is_shutting_down() {
             return Ok(());
         }
+        if session.disconnect_expired() {
+            crate::diag::info("client disconnect timeout elapsed; closing terminal");
+            let _ = write_local_terminal_close(&mut terminal, &mut pending_local)?;
+            return Ok(());
+        }
         let mut progress = false;
 
         if let Some(frame) = pending_local.as_mut() {
@@ -458,6 +470,10 @@ fn run_mode_windows(
                         send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
                 }
                 Ok(None) => {}
+                Err(SessionError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                    acknowledge_session_kill(&session)?;
+                    return Ok(());
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -946,7 +962,19 @@ fn forward_client_packet(
     packet: Packet,
 ) -> Result<ClientForward, SessionError> {
     match client_terminal_disposition(packet.header()) {
-        ClientTerminalDisposition::Relay => Ok(ClientForward::ToTerminal(packet)),
+        ClientTerminalDisposition::Relay => {
+            if packet.header() == TerminalPacketType::TerminalInfo as u8 {
+                if let Ok(info) = et_core::proto::TerminalInfo::decode(packet.payload()) {
+                    let kill = info.command
+                        == Some(et_core::proto::terminal_info::Command::KillSession as i32)
+                        && info.commandversion == Some(et_core::SESSION_KILL_COMMAND_VERSION);
+                    if kill {
+                        session.request_session_kill();
+                    }
+                }
+            }
+            Ok(ClientForward::ToTerminal(packet))
+        }
         ClientTerminalDisposition::KeepAlive => {
             if let Some(ack) = et_core::keepalive::decode_ack(packet.payload()) {
                 session.acknowledge_delivery(ack)?;
@@ -979,6 +1007,16 @@ enum LocalClose {
 
 /// Write a framed local `TERMINAL_CLOSE`. et.rs local sockets use framed
 /// packets, not the raw C++ type byte.
+fn acknowledge_session_kill(session: &ActiveSession) -> Result<(), SessionError> {
+    if !session.session_kill_requested() {
+        return Ok(());
+    }
+    session.send_packet(
+        TerminalPacketType::KeepAlive as u8,
+        et_core::SESSION_KILL_ACK.as_bytes(),
+    )
+}
+
 fn write_local_terminal_close(
     terminal: &mut LocalStream,
     pending_local: &mut Option<PendingLocalFrame>,

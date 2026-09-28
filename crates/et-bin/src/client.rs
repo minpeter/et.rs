@@ -4,6 +4,7 @@ use std::time::Duration;
 use clap::Parser;
 use et_cli::client::{ClientArgs, RemoteShellKind};
 use et_cli::host::parse_positional_host;
+use prost::Message;
 
 use et_net::connection::Connection;
 
@@ -95,7 +96,20 @@ fn run_client(
             "-W/--stdio-forward is not supported on Windows",
         ));
     }
-    let destination = parse_positional_host(&args.host, args.port)?;
+    if args.list_sessions {
+        return list_named_sessions();
+    }
+    if let Some(name) = args.attach.as_deref() {
+        return attach_named_session(name, resolver, deadline);
+    }
+    if let Some(name) = args.kill.as_deref() {
+        return kill_named_session(name, resolver, deadline);
+    }
+    let host = args
+        .host
+        .clone()
+        .ok_or(ClientError::Unsupported("a destination host is required"))?;
+    let destination = parse_positional_host(&host, args.port)?;
     let requested_user = command_user(destination.user, args.username.clone());
     validate_ssh_destination(&destination.host, requested_user.as_deref())?;
     let ssh_config = selected_ssh_config(args)?;
@@ -364,6 +378,11 @@ fn run_client(
         // to the jump terminal instead of starting a shell.
         initial_payload.jumphost = Some(true);
     }
+    if let Some(minutes) = args.disconnect_timeout {
+        let seconds = u64::from(minutes).saturating_mul(60);
+        initial_payload.disconnect_timeout_seconds =
+            Some(i32::try_from(seconds).unwrap_or(i32::MAX));
+    }
     initial_payload
         .environmentvariables
         .extend(locale_environment);
@@ -374,6 +393,7 @@ fn run_client(
                 .insert("COLORTERM".to_owned(), value.to_owned());
         }
     }
+    maybe_save_session(args, &endpoint, &credentials)?;
     et_cli::logging::info(format!("Connecting to {endpoint}"));
     let connection = connect_initial(
         &endpoint,
@@ -570,6 +590,165 @@ fn selected_ssh_config(args: &ClientArgs) -> Result<Option<String>, ClientError>
         Some(path) => {
             validate_ssh_config_file(path)?;
             Ok(Some(path.to_owned()))
+        }
+    }
+}
+
+fn maybe_save_session(
+    args: &ClientArgs,
+    endpoint: &Endpoint,
+    credentials: &Credentials,
+) -> Result<(), ClientError> {
+    let Some(name) = args.name.as_deref() else {
+        return Ok(());
+    };
+    if args.no_persist || args.no_pty || args.jumphost.is_some() || args.stdio_forward.is_some() {
+        return Ok(());
+    }
+    if !crate::session_store::valid_name(name) {
+        return Err(ClientError::Unsupported(
+            "session name must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$",
+        ));
+    }
+    let title = args
+        .command
+        .clone()
+        .unwrap_or_else(|| endpoint.host.clone());
+    crate::session_store::save(&crate::session_store::SessionRecord {
+        name: name.to_owned(),
+        host: endpoint.host.clone(),
+        port: endpoint.port,
+        id: credentials.id.clone(),
+        passkey: credentials.passkey.clone(),
+        saved_at: crate::session_store::now_saved_at(),
+        title,
+    })
+    .map_err(ClientError::Terminal)
+}
+
+fn list_named_sessions() -> Result<i32, ClientError> {
+    let records = crate::session_store::list().map_err(ClientError::Terminal)?;
+    if records.is_empty() {
+        println!("no named sessions");
+        return Ok(0);
+    }
+    for record in records {
+        println!(
+            "{}\t{}:{}\t{}",
+            record.name, record.host, record.port, record.title
+        );
+    }
+    Ok(0)
+}
+
+fn attach_named_session(
+    name: &str,
+    resolver: &dyn EndpointResolver,
+    deadline: Deadline,
+) -> Result<i32, ClientError> {
+    let record = crate::session_store::load(name).map_err(ClientError::Terminal)?;
+    let endpoint = Endpoint {
+        host: record.host,
+        port: record.port,
+    };
+    let credentials = Credentials {
+        id: record.id,
+        passkey: record.passkey,
+    };
+    let connection =
+        crate::initial_connect::connect_existing(&endpoint, &credentials, resolver, deadline)?;
+    let (forwarder, _) = et_net::forward::Forwarder::start_with_origins_deadline(
+        Vec::new(),
+        deadline.expires_at(),
+        std::sync::Arc::new(et_net::forward::SystemForwardResolver),
+    )
+    .map_err(|error| ClientError::Terminal(error.to_string()))?;
+    let endpoint_for_retry = endpoint.clone();
+    let credentials_for_retry = credentials.clone();
+    crate::client_terminal::run(
+        connection,
+        crate::client_terminal::TerminalOptions {
+            command: None,
+            no_exit: false,
+            keepalive: et_cli::client::MAX_KEEPALIVE,
+            flow_control: et_cli::client::FlowControlMode::None,
+            terminal_enabled: true,
+            lines: crate::client_terminal::RemoteLines::Posix,
+            connection_name: name,
+            close_on_hangup: false,
+            no_pty: false,
+            stdio_forward: false,
+        },
+        forwarder,
+        move |connection| {
+            reconnect_with_retry(
+                connection,
+                &endpoint_for_retry,
+                &credentials_for_retry,
+                resolver,
+            )
+        },
+    )
+}
+
+fn kill_named_session(
+    name: &str,
+    resolver: &dyn EndpointResolver,
+    deadline: Deadline,
+) -> Result<i32, ClientError> {
+    let record = crate::session_store::load(name).map_err(ClientError::Terminal)?;
+    let endpoint = Endpoint {
+        host: record.host.clone(),
+        port: record.port,
+    };
+    let credentials = Credentials {
+        id: record.id,
+        passkey: record.passkey,
+    };
+    let connection =
+        match crate::initial_connect::connect_existing(&endpoint, &credentials, resolver, deadline)
+        {
+            Ok(connection) => connection,
+            Err(ClientError::ServerInvalidKey(_)) => {
+                let _ = crate::session_store::delete(name);
+                return Err(ClientError::Terminal(
+                    "named session is no longer registered".to_owned(),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+    send_session_kill(connection).map_err(ClientError::Terminal)?;
+    crate::session_store::delete(name).map_err(ClientError::Terminal)?;
+    Ok(0)
+}
+
+fn send_session_kill(mut connection: Connection) -> Result<(), String> {
+    let message = et_core::proto::TerminalInfo {
+        command: Some(et_core::proto::terminal_info::Command::KillSession as i32),
+        commandversion: Some(et_core::SESSION_KILL_COMMAND_VERSION),
+        ..Default::default()
+    };
+    connection
+        .write_packet_live(
+            et_core::proto::TerminalPacketType::TerminalInfo as u8,
+            &message.encode_to_vec(),
+        )
+        .map_err(|error| format!("could not send session kill: {error}"))?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    connection
+        .set_io_timeout(Some(Duration::from_secs(15)))
+        .map_err(|error| format!("could not wait for session kill: {error}"))?;
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err("timed out waiting for session kill acknowledgement".to_owned());
+        }
+        let packet = connection
+            .read_packet()
+            .map_err(|error| format!("could not read session kill acknowledgement: {error}"))?;
+        if packet.header() == et_core::proto::TerminalPacketType::KeepAlive as u8
+            && packet.payload() == et_core::SESSION_KILL_ACK.as_bytes()
+        {
+            return Ok(());
         }
     }
 }

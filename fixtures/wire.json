@@ -30,5 +30,16 @@
   "backedwriter_be4_h0_empty_dir1": "0000001201005051647db88d428264e39f255f4456f1",
   "proto_portforward_request_window": "10071a06088080201020",
   "proto_portforward_response_window": "080710092206088080201020",
-  "proto_portforward_credit": "080110093a06088080081008"
+  "proto_portforward_credit": "080110093a06088080081008",
+  "proto_connectrequest_challenge": "0a106162636465666768696a6b6c6d6e6f70100618012001",
+  "proto_connectresponse_challenge": "1a021122",
+  "proto_connectauth_proof": "0a0570726f6f66",
+  "proto_sequenceheader_reset": "080010011a01aa",
+  "proto_connectresponse_retrylater": "0805",
+  "proto_initialpayload_disconnect_timeout_0": "4000",
+  "proto_terminit_resume_fields": "30013878",
+  "proto_terminaluserinfo_ptyactive": "30013801403c",
+  "proto_terminalinfo_kill_session": "30013801",
+  "proto_initialpayload_flowcontrol_field9": "4801",
+  "proto_terminit_flowcontrol_field8": "4002"
 }

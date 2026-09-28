@@ -84,6 +84,8 @@ impl TestRuntime {
             uid: Some(uid),
             gid: Some(gid),
             fd: startup_ack.then_some(-6),
+
+            ..Default::default()
         };
         let packet = Packet::new(
             TerminalPacketType::TerminalUserInfo as u8,
@@ -123,6 +125,7 @@ pub fn default_payload() -> InitialPayload {
         command: None,
         supports_exit_status: None,
         no_shell: None,
+        ..Default::default()
     }
 }
 

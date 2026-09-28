@@ -14,12 +14,11 @@ use std::time::Duration;
 use et_core::keys::passkey_to_key;
 use et_core::packet::Packet;
 use et_core::proto::{
-    ConnectResponse, ConnectStatus, EtPacketType, FlowControlMode, InitialPayload, InitialResponse,
+    ConnectStatus, EtPacketType, FlowControlMode, InitialPayload, InitialResponse,
     TerminalPacketType,
 };
 use et_net::connection::Connection;
-use et_net::framing_io::{read_proto_limited, write_proto};
-use et_net::handshake::{client_request, MAX_HANDSHAKE_PROTO_LEN};
+use et_net::handshake::{client_handshake, LEGACY_SERVER_REATTACH};
 use et_net::local_packet::{encode_local_packet, write_local_packet, LocalPacketDecoder};
 use prost::Message;
 #[cfg(unix)]
@@ -188,25 +187,56 @@ where
         .set_read_timeout(Some(CONNECT_TIMEOUT))
         .and_then(|()| stream.set_write_timeout(Some(CONNECT_TIMEOUT)))
         .map_err(|error| format!("could not configure the destination socket: {error}"))?;
-    write_proto(&mut stream, &client_request(id))
-        .map_err(|error| format!("could not send ConnectRequest: {error}"))?;
-    let response: ConnectResponse = read_proto_limited(&mut stream, MAX_HANDSHAKE_PROTO_LEN)
-        .map_err(|error| format!("could not read ConnectResponse: {error}"))?;
-    match response
-        .status
-        .and_then(|raw| ConnectStatus::try_from(raw).ok())
-    {
-        Some(ConnectStatus::NewClient) => {}
-        Some(status) => {
+    let handshake = client_handshake(
+        &mut stream,
+        id,
+        key,
+        false,
+        std::time::Instant::now() + CONNECT_TIMEOUT,
+    )
+    .map_err(|error| {
+        if error.to_string() == LEGACY_SERVER_REATTACH {
+            LEGACY_SERVER_REATTACH.to_owned()
+        } else {
+            format!("could not complete destination handshake: {error}")
+        }
+    })?;
+    if handshake.status == ConnectStatus::RetryLater {
+        return Err("Server is recovering; retry later".to_owned());
+    }
+    match handshake.status {
+        ConnectStatus::NewClient => {}
+        ConnectStatus::ReturningClient => {
+            let mut connection = Connection::new_client(stream, key);
+            if handshake.reset_required {
+                connection
+                    .reset_in_place(&handshake.reset_salt, CONNECT_TIMEOUT)
+                    .map_err(|error| format!("could not reset destination session: {error}"))?;
+            } else {
+                // A second connect on this destination is recover, not a new
+                // sequence epoch (#862).
+                connection
+                    .run_recovery_handshake(CONNECT_TIMEOUT)
+                    .map_err(|error| format!("could not recover destination session: {error}"))?;
+            }
+            connection
+                .set_io_timeout(None)
+                .map_err(|error| format!("could not configure destination session: {error}"))?;
+            let response = InitialResponse { error: None }.encode_to_vec();
+            return Ok(DestinationHandshake {
+                connection,
+                response_payload: response,
+            });
+        }
+        status => {
             return Err(format!(
                 "destination rejected the session: {status:?}{}",
-                response
+                handshake
                     .error
                     .map(|error| format!(": {error}"))
                     .unwrap_or_default()
             ))
         }
-        None => return Err("destination sent an unknown connect status".to_owned()),
     }
     let mut connection = Connection::new_client(stream, key);
     match payload

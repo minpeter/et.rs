@@ -1,5 +1,9 @@
 use super::*;
 use std::net::{Ipv4Addr, TcpListener};
+
+use et_core::proto::ConnectResponse;
+use et_net::framing_io::{read_proto_limited, write_proto};
+use et_net::handshake::MAX_HANDSHAKE_PROTO_LEN;
 use std::sync::mpsc;
 use std::thread;
 
@@ -56,6 +60,8 @@ fn assert_destination_clamped(flow_control: Option<i32>) {
             &ConnectResponse {
                 status: Some(ConnectStatus::NewClient as i32),
                 error: None,
+
+                ..Default::default()
             },
         )
         .unwrap();
@@ -355,6 +361,8 @@ fn jumphost_run_bounds_router_sender_before_destination_output() {
             &ConnectResponse {
                 status: Some(ConnectStatus::NewClient as i32),
                 error: None,
+
+                ..Default::default()
             },
         )
         .unwrap();

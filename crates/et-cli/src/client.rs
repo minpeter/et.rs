@@ -17,8 +17,33 @@ pub const MAX_KEEPALIVE: u32 = 5;
     long_about = "Connect to a remote shell over a persistent, reconnectable session."
 )]
 pub struct ClientArgs {
-    #[arg(help = "[user@]host[:port] destination")]
-    pub host: String,
+    #[arg(
+        help = "[user@]host[:port] destination",
+        required_unless_present_any = ["list_sessions", "attach", "kill"]
+    )]
+    pub host: Option<String>,
+
+    /// Minutes until etserver closes a disconnected session. `0` disables the
+    /// timeout. Long flag only: `-D` is dynamic SOCKS.
+    #[arg(long = "disconnect-timeout", value_name = "MINUTES")]
+    pub disconnect_timeout: Option<u32>,
+
+    /// Save this direct session under `~/.et/sessions` for `--attach`.
+    #[arg(long = "name", value_name = "NAME", conflicts_with_all = ["attach", "kill", "list_sessions"])]
+    pub name: Option<String>,
+
+    /// Do not write a named session file.
+    #[arg(long = "no-persist")]
+    pub no_persist: bool,
+
+    #[arg(long = "list", conflicts_with_all = ["attach", "kill", "name"])]
+    pub list_sessions: bool,
+
+    #[arg(long = "attach", value_name = "NAME", conflicts_with_all = ["list_sessions", "kill", "name"])]
+    pub attach: Option<String>,
+
+    #[arg(long = "kill", value_name = "NAME", conflicts_with_all = ["list_sessions", "attach", "name"])]
+    pub kill: Option<String>,
 
     #[arg(short = 'u', long = "username")]
     pub username: Option<String>,
@@ -270,7 +295,7 @@ mod tests {
     #[test]
     fn host_only_uses_default_port() {
         let a = ClientArgs::try_parse_from(["et", "host"]).unwrap();
-        assert_eq!(a.host, "host");
+        assert_eq!(a.host.as_deref(), Some("host"));
         assert_eq!(a.port, DEFAULT_PORT);
     }
 

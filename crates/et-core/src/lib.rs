@@ -18,6 +18,11 @@ pub mod packet;
 pub mod proto;
 
 pub const PROTOCOL_VERSION: i32 = 6;
+/// `TerminalInfo.commandversion` for `KILL_SESSION`. Matches upstream
+/// `SESSION_KILL_COMMAND_VERSION`. Protocol stays 6.
+pub const SESSION_KILL_COMMAND_VERSION: i32 = 1;
+/// Payload of the `KEEP_ALIVE` etserver sends once a killed terminal exits.
+pub const SESSION_KILL_ACK: &str = "ET_SESSION_KILLED_V1";
 
 #[cfg(test)]
 mod flow_control_tests;

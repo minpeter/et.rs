@@ -127,6 +127,8 @@ fn version_mismatch_rejected_by_server() {
         let bad = et_core::proto::ConnectRequest {
             client_id: Some("x".into()),
             version: Some(5),
+
+            ..Default::default()
         };
         et_net::framing_io::write_proto(&mut client_stream, &bad).unwrap();
         let resp: et_core::proto::ConnectResponse =

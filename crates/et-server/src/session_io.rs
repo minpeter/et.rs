@@ -142,6 +142,8 @@ impl ActiveSession {
         if let Some(state) = self.output_flow() {
             state.disconnected();
         }
+        drop(connection);
+        self.note_client_absence();
         Ok(true)
     }
 

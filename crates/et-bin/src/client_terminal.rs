@@ -581,6 +581,7 @@ fn terminal_size_payload_with(
         column: Some(i32::from(columns)),
         width: Some(0),
         height: Some(0),
+        ..Default::default()
     };
     Some(message.encode_to_vec())
 }

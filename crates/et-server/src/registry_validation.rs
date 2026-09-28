@@ -91,6 +91,9 @@ pub(crate) fn validate(
         uid,
         gid,
         startup_ack,
+        pty_active: user_info.ptyactive.unwrap_or(false),
+        had_reverse_tunnels: user_info.hadreversetunnels.unwrap_or(false),
+        disconnect_timeout_seconds: user_info.disconnect_timeout_seconds,
         identity: Arc::new(()),
     })
 }
@@ -106,6 +109,7 @@ mod tests {
             uid: Some(501),
             gid: Some(20),
             fd: None,
+            ..Default::default()
         }
     }
 

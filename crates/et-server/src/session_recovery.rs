@@ -53,7 +53,11 @@ impl ActiveSession {
     ///
     /// The connection mutex is held only for soft-disconnect/snapshot and for
     /// installing the new stream, not for sequence exchange or peer auth.
-    fn recover_body(&self, stream: TcpStream) -> Result<(), SessionError> {
+    fn recover_body(
+        &self,
+        stream: TcpStream,
+        reset_salt: Option<Vec<u8>>,
+    ) -> Result<(), SessionError> {
         // Phase 1: soft-disconnect and snapshot under a short lock.
         let mut candidate = {
             let connection = lock_timeout(&self.connection, RECOVERY_LOCK_TIMEOUT)?;
@@ -74,13 +78,17 @@ impl ActiveSession {
 
         // Phase 2: recovery network I/O without the session connection lock.
         candidate
-            .run_recovery_handshake(DEFAULT_RECOVERY_TIMEOUT)
+            .run_recovery_handshake_planned(DEFAULT_RECOVERY_TIMEOUT, reset_salt.as_deref())
             .map_err(SessionError::Connection)?;
-        // Any packet that decrypts with the session key authenticates the
-        // returning client; it is requeued and handled by the session loop.
-        candidate
-            .authenticate_peer(DEFAULT_RECOVERY_TIMEOUT)
-            .map_err(SessionError::Connection)?;
+        // Reset recovery already proved both sides in the challenge handshake.
+        // Waiting for a live packet here deadlocks: the client also skips it.
+        if reset_salt.is_none() {
+            // Any packet that decrypts with the session key authenticates the
+            // returning client; it is requeued and handled by the session loop.
+            candidate
+                .authenticate_peer(DEFAULT_RECOVERY_TIMEOUT)
+                .map_err(SessionError::Connection)?;
+        }
         if self.output_flow().is_some() {
             candidate
                 .minimize_output_buffering()
@@ -109,6 +117,7 @@ impl ActiveSession {
             let _ = old_control.shutdown(Shutdown::Both);
             *connection = candidate;
             self.connection_generation.fetch_add(1, Ordering::Release);
+            self.clear_client_absence();
         }
 
         // Phase 4: drain terminal output queued while the handshake ran.
@@ -188,9 +197,19 @@ pub(crate) struct RecoverPermit<'a> {
 impl RecoverPermit<'_> {
     /// Run the recovery handshake and install the new stream.
     pub(crate) fn complete(self, stream: TcpStream) -> Result<(), SessionError> {
+        self.complete_with(stream, None)
+    }
+
+    /// `reset_salt` is set only when the authenticated handshake selected
+    /// reset recovery. The permit still drops on failure.
+    pub(crate) fn complete_with(
+        self,
+        stream: TcpStream,
+        reset_salt: Option<Vec<u8>>,
+    ) -> Result<(), SessionError> {
         // `self` drops after this returns (or panics), clearing `recovering`
         // and flushing any straggler hold packets.
-        self.session.recover_body(stream)
+        self.session.recover_body(stream, reset_salt)
     }
 }
 

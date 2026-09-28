@@ -1,11 +1,11 @@
+use et_core::keys::passkey_to_key;
 use et_core::proto::{ConnectResponse, ConnectStatus, TerminalPacketType};
 use et_net::connection::Connection;
-use et_net::framing_io::{read_proto_limited_deadline, write_proto};
-use et_net::handshake::client_request;
+use et_net::handshake::{client_handshake, LEGACY_SERVER_REATTACH};
 
 use super::{
     connect_endpoint, connect_error, ensure_deadline, set_stream_timeout, transport_error,
-    Endpoint, ReconnectOutcome, MAX_HANDSHAKE_PROTO_LEN,
+    Endpoint, ReconnectOutcome,
 };
 use crate::bootstrap::Credentials;
 use crate::deadline::Deadline;
@@ -28,15 +28,43 @@ pub fn reconnect(
     let mut stream = connect_endpoint(endpoint, resolver, deadline)?;
     set_stream_timeout(&stream, deadline)?;
     ensure_deadline(deadline, "sending reconnect ConnectRequest")?;
-    write_proto(&mut stream, &client_request(&credentials.id))
-        .map_err(|source| connect_error(deadline, "sending reconnect ConnectRequest", source))?;
-    set_stream_timeout(&stream, deadline)?;
-    let response: ConnectResponse =
-        read_proto_limited_deadline(&mut stream, MAX_HANDSHAKE_PROTO_LEN, deadline.expires_at())
-            .map_err(|source| {
-                connect_error(deadline, "reading reconnect ConnectResponse", source)
-            })?;
+    let key = passkey_to_key(&credentials.passkey).ok_or(ClientError::InvalidPasskey)?;
+    // Same-process reconnect keeps sequence history: resetIntent stays false
+    // so the server runs recover instead of an epoch reset (#862).
+    let handshake = client_handshake(
+        &mut stream,
+        &credentials.id,
+        &key,
+        false,
+        deadline.expires_at(),
+    )
+    .map_err(|source| {
+        if source.to_string() == LEGACY_SERVER_REATTACH {
+            ClientError::Terminal(LEGACY_SERVER_REATTACH.to_owned())
+        } else {
+            connect_error(deadline, "completing the reconnect handshake", source)
+        }
+    })?;
+    if handshake.status == ConnectStatus::RetryLater {
+        return Err(ClientError::RetryLater);
+    }
+    let response = ConnectResponse {
+        status: Some(handshake.status as i32),
+        error: handshake.error,
+        ..Default::default()
+    };
     match accept_reconnect_response(response)? {
+        ReconnectStatus::Recover if handshake.reset_required => {
+            // The authenticated handshake selected reset. Rekey this socket
+            // instead of replaying the previous epoch.
+            let mut reset = Connection::new_client(stream, &key);
+            let remaining = remaining_time(deadline, "resetting ET session")?;
+            reset
+                .reset_in_place(&handshake.reset_salt, remaining)
+                .map_err(|error| transport_error(deadline, "resetting ET session", error))?;
+            *connection = reset;
+            Ok(ReconnectOutcome::Recovered)
+        }
         ReconnectStatus::Recover => recover_connection(connection, stream, deadline),
         ReconnectStatus::SessionEnded => Ok(ReconnectOutcome::SessionEnded),
     }
@@ -92,6 +120,7 @@ pub(super) fn accept_reconnect_response(
         Some(ConnectStatus::MismatchedProtocol) => {
             Err(ClientError::ProtocolMismatch(response.error))
         }
+        Some(ConnectStatus::RetryLater) => Err(ClientError::RetryLater),
         _ => Err(ClientError::ServerRejected {
             status: response.status,
             message: response.error,

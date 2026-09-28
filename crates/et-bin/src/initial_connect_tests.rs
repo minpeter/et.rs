@@ -59,6 +59,8 @@ fn fresh_bootstrap_rejects_returning_status() {
     let response = ConnectResponse {
         status: Some(ConnectStatus::ReturningClient as i32),
         error: None,
+
+        ..Default::default()
     };
     assert!(matches!(
         accept_response(response),
@@ -72,6 +74,8 @@ fn reconnect_accepts_only_returning_or_ended_sessions() {
         accept_reconnect_response(ConnectResponse {
             status: Some(ConnectStatus::ReturningClient as i32),
             error: None,
+
+            ..Default::default()
         })
         .unwrap(),
         ReconnectStatus::Recover
@@ -80,6 +84,8 @@ fn reconnect_accepts_only_returning_or_ended_sessions() {
         accept_reconnect_response(ConnectResponse {
             status: Some(ConnectStatus::InvalidKey as i32),
             error: None,
+
+            ..Default::default()
         })
         .unwrap(),
         ReconnectStatus::SessionEnded
@@ -88,6 +94,8 @@ fn reconnect_accepts_only_returning_or_ended_sessions() {
         accept_reconnect_response(ConnectResponse {
             status: Some(ConnectStatus::NewClient as i32),
             error: None,
+
+            ..Default::default()
         }),
         Err(ClientError::ServerRejected { .. })
     ));
@@ -95,6 +103,8 @@ fn reconnect_accepts_only_returning_or_ended_sessions() {
         accept_reconnect_response(ConnectResponse {
             status: Some(ConnectStatus::MismatchedProtocol as i32),
             error: Some("wrong".to_owned()),
+
+            ..Default::default()
         }),
         Err(ClientError::ProtocolMismatch(_))
     ));

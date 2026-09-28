@@ -641,6 +641,8 @@ fn failed_recover_leaves_live_session_intact() {
             &mut stream,
             &SequenceHeader {
                 sequence_number: Some(999_999),
+
+                ..Default::default()
             },
         )
         .unwrap();

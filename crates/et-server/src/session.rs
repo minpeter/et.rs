@@ -3,7 +3,7 @@ use std::io;
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use et_core::backed_writer::{
     MAX_BACKUP_PACKETS, MAX_DISCONNECT_PACKETS, MAX_RECOVERY_BACKUP_BYTES,
@@ -87,6 +87,12 @@ pub(crate) struct ActiveSession {
     /// Client set `InitialPayload.supports_exit_status`. Packet type 12 is
     /// forwarded only then; older clients abort on an unknown type.
     forward_exit_status: AtomicBool,
+    /// Per-session override from `InitialPayload.disconnect_timeout_seconds`.
+    /// `None` and zero mean the session is not closed for client absence.
+    disconnect_timeout: Mutex<Option<Duration>>,
+    disconnected_at: Mutex<Option<Instant>>,
+    /// `TERMINAL_INFO` `KILL_SESSION` at `SESSION_KILL_COMMAND_VERSION`.
+    kill_requested: AtomicBool,
 }
 
 pub(crate) enum SessionConnection {
@@ -191,11 +197,70 @@ impl ActiveSession {
             bridge_changed: Condvar::new(),
             pipe_mode,
             forward_exit_status: AtomicBool::new(false),
+            disconnect_timeout: Mutex::new(None),
+            disconnected_at: Mutex::new(None),
+            kill_requested: AtomicBool::new(false),
         })
     }
 
     pub(crate) fn set_forward_exit_status(&self, enabled: bool) {
         self.forward_exit_status.store(enabled, Ordering::Relaxed);
+    }
+
+    /// `Some(0)` and `None` leave the session up across a client drop.
+    /// A positive value is how long the bridge waits before `TERMINAL_CLOSE`.
+    pub(crate) fn set_disconnect_timeout_seconds(&self, seconds: Option<i32>) {
+        let timeout = seconds.and_then(|seconds| {
+            u64::try_from(seconds)
+                .ok()
+                .filter(|seconds| *seconds > 0)
+                .map(Duration::from_secs)
+        });
+        if let Ok(mut slot) = self.disconnect_timeout.lock() {
+            *slot = timeout;
+        }
+    }
+
+    pub(crate) fn note_client_absence(&self) {
+        let armed = self
+            .disconnect_timeout
+            .lock()
+            .ok()
+            .is_some_and(|timeout| timeout.is_some());
+        if !armed {
+            return;
+        }
+        if let Ok(mut since) = self.disconnected_at.lock() {
+            if since.is_none() {
+                *since = Some(Instant::now());
+            }
+        }
+    }
+
+    pub(crate) fn clear_client_absence(&self) {
+        if let Ok(mut since) = self.disconnected_at.lock() {
+            *since = None;
+        }
+    }
+
+    /// True once a disconnected client has been gone for the session override.
+    pub(crate) fn disconnect_expired(&self) -> bool {
+        let Some(limit) = self.disconnect_timeout.lock().ok().and_then(|slot| *slot) else {
+            return false;
+        };
+        self.disconnected_at
+            .lock()
+            .ok()
+            .and_then(|since| *since)
+            .is_some_and(|start| start.elapsed() >= limit)
+    }
+
+    pub(crate) fn request_session_kill(&self) {
+        self.kill_requested.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn session_kill_requested(&self) -> bool {
+        self.kill_requested.load(Ordering::Acquire)
     }
 
     pub(crate) fn forwards_exit_status(&self) -> bool {

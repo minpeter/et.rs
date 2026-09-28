@@ -43,6 +43,10 @@ pub enum ClientError {
     ServerInvalidKey(Option<String>),
     ProtocolMismatch(Option<String>),
     ReturningSessionRequiresRecovery,
+    /// Modern server asked the client to wait out the post-restart grace window.
+    RetryLater,
+    /// Initial connect failed `#866` times and must not hang.
+    ConnectGaveUp,
     ServerRejected {
         status: Option<i32>,
         message: Option<String>,
@@ -135,6 +139,8 @@ impl std::fmt::Display for ClientError {
                 f,
                 "server reported a returning session; returning recovery belongs to a live reconnect"
             ),
+            Self::RetryLater => write!(f, "Server is recovering; retry later"),
+            Self::ConnectGaveUp => write!(f, "Connect Timeout"),
             Self::ServerRejected { status, message } => {
                 write!(f, "ET server rejected the connection")?;
                 if let Some(status) = status {
@@ -182,6 +188,7 @@ impl ClientError {
                 | Self::BootstrapTimeout(_)
                 | Self::ConnectIo { .. }
                 | Self::Transport(ConnError::Io(_))
+                | Self::RetryLater
         )
     }
 

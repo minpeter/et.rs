@@ -19,6 +19,10 @@ pub struct Registration {
     pub uid: u32,
     pub gid: u32,
     pub(crate) startup_ack: bool,
+    /// `TerminalUserInfo.ptyactive`: the shell is already running.
+    pub(crate) pty_active: bool,
+    pub(crate) had_reverse_tunnels: bool,
+    pub(crate) disconnect_timeout_seconds: Option<i32>,
     pub(crate) identity: Arc<()>,
 }
 
@@ -29,6 +33,9 @@ impl PartialEq for Registration {
             && self.uid == other.uid
             && self.gid == other.gid
             && self.startup_ack == other.startup_ack
+            && self.pty_active == other.pty_active
+            && self.had_reverse_tunnels == other.had_reverse_tunnels
+            && self.disconnect_timeout_seconds == other.disconnect_timeout_seconds
     }
 }
 
@@ -62,6 +69,9 @@ enum StartupState {
 #[derive(Default)]
 struct RegistryState {
     registrations: HashMap<String, StoredRegistration>,
+    /// Ids whose terminal unregistered. During the post-start grace window an
+    /// unknown id that is *not* here gets `RETRY_LATER` instead of `INVALID_KEY`.
+    removed_at: HashMap<String, Instant>,
 }
 
 #[derive(Default)]
@@ -126,6 +136,13 @@ impl Registry {
             .map_err(RegistrationError::Io)?;
         let identity = registration.identity();
         let mut state = self.lock()?;
+        let replace_live_pty = state
+            .registrations
+            .get(&registration.id)
+            .is_some_and(|stored| registration.pty_active && stored.info.key == registration.key);
+        // A live re-register clears the "recently removed" mark so a later
+        // unknown id is not confused with this session leaving.
+        state.removed_at.remove(&registration.id);
         match state.registrations.entry(registration.id.clone()) {
             Entry::Vacant(entry) => {
                 let startup_ack = registration.startup_ack;
@@ -146,8 +163,39 @@ impl Registry {
                     startup_ack,
                 })
             }
+            Entry::Occupied(mut entry) if replace_live_pty => {
+                let startup_ack = registration.startup_ack;
+                let startup = if startup_ack {
+                    StartupState::Pending
+                } else {
+                    StartupState::Legacy
+                };
+                entry.insert(StoredRegistration {
+                    info: registration,
+                    stream,
+                    startup,
+                });
+                self.inner.changed.notify_all();
+                Ok(RegisteredTerminal {
+                    identity,
+                    watcher,
+                    startup_ack,
+                })
+            }
             Entry::Occupied(_) => Err(RegistrationError::Duplicate),
         }
+    }
+
+    /// True when this id's terminal left recently, so a restart grace window
+    /// must not answer `RETRY_LATER`.
+    pub(crate) fn was_removed_recently(&self, id: &str, grace: Duration) -> bool {
+        let Ok(state) = self.lock() else {
+            return false;
+        };
+        state
+            .removed_at
+            .get(id)
+            .is_some_and(|removed| removed.elapsed() < grace)
     }
 
     pub(crate) fn report_startup(
@@ -214,6 +262,9 @@ impl Registry {
             .is_some_and(|stored| identity.matches(&stored.info));
         if matches {
             state.registrations.remove(identity.id());
+            state
+                .removed_at
+                .insert(identity.id().to_owned(), Instant::now());
             self.inner.changed.notify_all();
         }
         Ok(matches)

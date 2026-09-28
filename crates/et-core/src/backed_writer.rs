@@ -182,6 +182,18 @@ impl BackedWriter {
         }
     }
 
+    /// Drop replay history and rekey. Used by reset recovery (#793).
+    pub fn reset_epoch(&mut self, salt: &[u8]) -> Result<(), crate::crypto::RekeyError> {
+        self.crypto.rekey(salt)?;
+        self.backup.clear();
+        self.backup_size = 0;
+        self.disconnected_bytes = 0;
+        self.disconnected_packets = 0;
+        self.sequence = 0;
+        self.connected = true;
+        Ok(())
+    }
+
     pub fn revive(&mut self) {
         self.connected = true;
         self.disconnected_bytes = 0;

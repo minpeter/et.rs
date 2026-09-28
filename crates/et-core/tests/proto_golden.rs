@@ -27,6 +27,7 @@ fn connect_request_minimal() {
     let r = et::ConnectRequest {
         client_id: Some("client-1".into()),
         version: Some(6),
+        ..Default::default()
     };
     assert_eq!(enc(&r), *f.get("proto_connectrequest_minimal").unwrap());
 }
@@ -37,6 +38,7 @@ fn connect_request_empty_id_serializes_field() {
     let r = et::ConnectRequest {
         client_id: Some(String::new()),
         version: Some(6),
+        ..Default::default()
     };
     assert_eq!(enc(&r), *f.get("proto_connectrequest_emptyid").unwrap());
 }
@@ -47,6 +49,7 @@ fn connect_response_statuses() {
     let s = |status| et::ConnectResponse {
         status: Some(status as i32),
         error: None,
+        ..Default::default()
     };
     assert_eq!(
         enc(&s(et::ConnectStatus::NewClient)),
@@ -56,6 +59,7 @@ fn connect_response_statuses() {
         enc(&et::ConnectResponse {
             status: Some(et::ConnectStatus::ReturningClient as i32),
             error: Some("ok".into()),
+            ..Default::default()
         }),
         *f.get("proto_connectresponse_returning_err").unwrap()
     );
@@ -74,6 +78,7 @@ fn sequence_header_boundaries() {
     let f = fixtures();
     let h = |n| et::SequenceHeader {
         sequence_number: Some(n),
+        ..Default::default()
     };
     assert_eq!(enc(&h(0)), *f.get("proto_sequenceheader_0").unwrap());
     assert_eq!(enc(&h(42)), *f.get("proto_sequenceheader_42").unwrap());
@@ -131,11 +136,19 @@ fn flow_control_opt_in_modes_use_additive_proto_fields() {
         ..Default::default()
     };
 
-    // Field 6/5 are upstream supports_exit_status and no_shell (#851/#849).
-    // Flow control lives at InitialPayload field 8 and TermInit field 6 so
-    // Backpressure (varint 1) is not the same bytes as those bools.
-    assert_eq!(enc(&initial), [0x40, 0x01]);
-    assert_eq!(enc(&term), [0x30, 0x02]);
+    // Upstream #858/#793 took InitialPayload field 8 and TermInit fields 6 and 7.
+    // Flow control lives at InitialPayload field 9 and TermInit field 8 so
+    // Backpressure (varint 1) is not a disconnect timeout or hadreversetunnels.
+    assert_eq!(
+        enc(&initial),
+        *fixtures()
+            .get("proto_initialpayload_flowcontrol_field9")
+            .unwrap()
+    );
+    assert_eq!(
+        enc(&term),
+        *fixtures().get("proto_terminit_flowcontrol_field8").unwrap()
+    );
 }
 
 #[test]
@@ -245,4 +258,93 @@ fn upstream_exit_status_and_stdio_fields_use_upstream_tags() {
     };
     // Field 2 varint 3, field 5 bool true, field 6 bool true.
     assert_eq!(enc(&half), [0x10, 0x03, 0x28, 0x01, 0x30, 0x01]);
+}
+
+#[test]
+fn challenge_reset_and_session_fields_match_upstream_tags() {
+    let f = fixtures();
+    assert_eq!(et_core::PROTOCOL_VERSION, 6);
+    let request = et::ConnectRequest {
+        client_id: Some("abcdefghijklmnop".into()),
+        version: Some(6),
+        reset_intent: Some(true),
+        supports_challenge: Some(true),
+    };
+    // Field 1 string, field 2 varint 6, field 3 bool true, field 4 bool true.
+    assert_eq!(
+        enc(&request),
+        *f.get("proto_connectrequest_challenge").unwrap()
+    );
+
+    let challenge = et::ConnectResponse {
+        auth_challenge: Some(vec![0x11, 0x22]),
+        ..Default::default()
+    };
+    assert_eq!(
+        enc(&challenge),
+        *f.get("proto_connectresponse_challenge").unwrap()
+    );
+
+    let auth = et::ConnectAuth {
+        proof: Some(b"proof".to_vec()),
+    };
+    assert_eq!(enc(&auth), *f.get("proto_connectauth_proof").unwrap());
+
+    let header = et::SequenceHeader {
+        sequence_number: Some(0),
+        reset: Some(true),
+        reset_salt: Some(vec![0xaa]),
+    };
+    assert_eq!(enc(&header), *f.get("proto_sequenceheader_reset").unwrap());
+
+    let retry = et::ConnectResponse {
+        status: Some(et::ConnectStatus::RetryLater as i32),
+        ..Default::default()
+    };
+    assert_eq!(
+        enc(&retry),
+        *f.get("proto_connectresponse_retrylater").unwrap()
+    );
+
+    let payload = et::InitialPayload {
+        disconnect_timeout_seconds: Some(0),
+        ..Default::default()
+    };
+    // Field 8 varint 0.
+    assert_eq!(
+        enc(&payload),
+        *f.get("proto_initialpayload_disconnect_timeout_0").unwrap()
+    );
+
+    let term = et::TermInit {
+        hadreversetunnels: Some(true),
+        disconnect_timeout_seconds: Some(120),
+        ..Default::default()
+    };
+    // Field 6 bool true, field 7 varint 120.
+    assert_eq!(enc(&term), *f.get("proto_terminit_resume_fields").unwrap());
+
+    let user = et::TerminalUserInfo {
+        ptyactive: Some(true),
+        hadreversetunnels: Some(true),
+        disconnect_timeout_seconds: Some(60),
+        ..Default::default()
+    };
+    // Field 6 bool true, field 7 bool true, field 8 varint 60.
+    assert_eq!(
+        enc(&user),
+        *f.get("proto_terminaluserinfo_ptyactive").unwrap()
+    );
+
+    let kill = et::TerminalInfo {
+        command: Some(et::terminal_info::Command::KillSession as i32),
+        commandversion: Some(et_core::SESSION_KILL_COMMAND_VERSION),
+        ..Default::default()
+    };
+    // Field 6 enum 1, field 7 varint 1.
+    assert_eq!(
+        enc(&kill),
+        *f.get("proto_terminalinfo_kill_session").unwrap()
+    );
+    assert_eq!(et_core::SESSION_KILL_ACK, "ET_SESSION_KILLED_V1");
 }

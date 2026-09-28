@@ -108,6 +108,7 @@ mod ssh_process;
 // native on Windows too (ConPTY plus a loopback router).
 mod server;
 mod server_daemon;
+mod session_store;
 mod terminal;
 mod terminal_credentials;
 mod terminal_daemon;

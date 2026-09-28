@@ -10,6 +10,112 @@ use crate::client_terminal::send_buffer;
 use et_core::proto::TerminalBuffer;
 use prost::Message;
 
+thread_local! {
+    static FORWARD_WRITE_STARTED: std::cell::RefCell<Option<mpsc::SyncSender<()>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+pub(super) fn note_forward_write(packet: &et_core::packet::Packet) {
+    if packet.payload().len() < 16 * 1024 {
+        return;
+    }
+    FORWARD_WRITE_STARTED.with(|observer| {
+        if let Some(observer) = observer.borrow_mut().take() {
+            observer.send(()).unwrap();
+        }
+    });
+}
+
+#[test]
+fn pump_services_inbound_while_forwarding_peer_refuses_to_read() {
+    use et_core::proto::{PortForwardDestinationRequest, SocketEndpoint};
+    use std::net::Shutdown;
+
+    // Given: real TCP with a tiny negotiated receive window and a real
+    // forwarder producing more responses than that window can absorb.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    socket2::SockRef::from(&listener)
+        .set_recv_buffer_size(4096)
+        .unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    let control = client.try_clone().unwrap();
+    let mut connection = Connection::new_client(client, &[19; 32]);
+    connection.shrink_transport_window_for_tests(4096).unwrap();
+    let mut peer = Connection::new_server(server, &[19; 32]);
+    peer.set_io_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut forwarder = Forwarder::start(Vec::new()).unwrap();
+    let destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    forwarder
+        .receive(et_core::packet::Packet::new(
+            TerminalPacketType::PortForwardDestinationRequest as u8,
+            PortForwardDestinationRequest {
+                destination: Some(SocketEndpoint {
+                    name: Some(Ipv4Addr::LOCALHOST.to_string()),
+                    port: Some(i32::from(destination.local_addr().unwrap().port())),
+                }),
+                fd: Some(42),
+                window: None,
+            }
+            .encode_to_vec(),
+        ))
+        .unwrap();
+    let (mut application, _) = destination.accept().unwrap();
+    application
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    application.write_all(&vec![3; 1024 * 1024]).unwrap();
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let (mut wake, _wake_writer) = UnixStream::pair().unwrap();
+    wake.set_nonblocking(true).unwrap();
+    let worker = thread::spawn(move || {
+        FORWARD_WRITE_STARTED.with(|observer| *observer.borrow_mut() = Some(started_tx));
+        let mut recoveries = 0;
+        let result = pump(
+            &mut connection,
+            &mut wake,
+            PumpOptions {
+                read_stdin: false,
+                keepalive_seconds: 30,
+                flow_control: et_cli::client::FlowControlMode::None,
+                terminal_enabled: false,
+                auto_cursor_report: false,
+                binary_stdio: false,
+                terminal_modes: &mut TerminalModeState::default(),
+                hangup: &crate::client_hangup::HangupClose::disabled(),
+                remote_exit: &crate::client_terminal::RemoteExit::new(false),
+                stdio_forward: false,
+            },
+            &mut forwarder,
+            |_| {
+                recoveries += 1;
+                Ok(ReconnectOutcome::SessionEnded)
+            },
+        );
+        done_tx
+            .send((result, recoveries, connection.reader_sequence()))
+            .unwrap();
+    });
+
+    // When: after the pump begins draining forwarding output, an encrypted
+    // inbound packet requires dispatch. The peer still never reads output.
+    started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    peer.write_packet(255, b"dispatch-before-output-drain")
+        .unwrap();
+    let observed = done_rx.recv_timeout(Duration::from_secs(1));
+    control.shutdown(Shutdown::Both).unwrap();
+    worker.join().unwrap();
+
+    // Then: dispatch ended the pump, not a write timeout/reconnect. No API
+    // contract requires ordinary synchronous Connection writes to be async.
+    assert!(
+        matches!(observed, Ok((Err(_), 0, 1))),
+        "pump starved inbound dispatch behind forwarding output: {observed:?}"
+    );
+}
+
 #[test]
 fn full_forwarding_backlog_stops_polling_network_readability() {
     let flags = network_poll_flags(false, true);

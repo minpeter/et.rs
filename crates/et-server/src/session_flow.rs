@@ -317,12 +317,13 @@ pub(super) fn run_writer(session: Weak<ActiveSession>, flow: Arc<FlowControl>) {
         let Some(session) = session.upgrade() else {
             return;
         };
-        // Popping this packet may have reopened bounded queue capacity.
-        // Wake the bridge so it polls terminal output again instead of
-        // sleeping indefinitely with terminal readability disabled.
-        let _ = session.signal();
         let (result, connected) = writer::write_packet(&session, &flow, &packet);
-        if !flow.complete(packet, &result, connected) {
+        let running = flow.complete(packet, &result, connected);
+        // In-flight packets still own queue capacity until complete. Wake
+        // after releasing it, including when this was the final queued frame:
+        // a signal before the write can strand the bridge's retained packet.
+        let _ = session.signal();
+        if !running {
             return;
         }
     }

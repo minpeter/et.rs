@@ -9,6 +9,9 @@ use et_core::crypto::{
 };
 use et_core::packet::Packet;
 use socket2::SockRef;
+#[cfg(unix)]
+#[path = "connection_pending.rs"]
+mod pending;
 #[path = "connection_recovery.rs"]
 mod recovery;
 
@@ -43,6 +46,8 @@ pub struct Connection {
     writer: BackedWriter,
     reader: BackedReader,
     live_write_timeout: Duration,
+    #[cfg(unix)]
+    pending_live: Option<pending::PendingWrite>,
 }
 
 pub struct PreparedWrite {
@@ -64,6 +69,15 @@ impl WritePacketError {
 }
 
 impl PreparedWrite {
+    #[cfg(unix)]
+    pub fn send(self) -> Result<(), WritePacketError> {
+        match self.into_pending() {
+            Some(pending) => pending.finish(),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(windows)]
     pub fn send(self) -> Result<(), WritePacketError> {
         let Some((mut stream, frame, timeout)) = self.live else {
             return Ok(());
@@ -98,6 +112,8 @@ impl Connection {
             writer: BackedWriter::new(CryptoHandler::new(key, encrypt), true),
             reader: BackedReader::new(CryptoHandler::new(key, decrypt), true),
             live_write_timeout: DEFAULT_LIVE_WRITE_TIMEOUT,
+            #[cfg(unix)]
+            pending_live: None,
         }
     }
 
@@ -151,6 +167,12 @@ impl Connection {
     where
         F: FnOnce(&TcpStream) -> io::Result<TcpStream>,
     {
+        // No later frame may acquire a nonce or reach the socket ahead of a
+        // retained partial frame, including synchronous/bootstrap callers.
+        #[cfg(unix)]
+        if self.pending_live.is_some() {
+            return Err(WritePacketError::BeforeReplay(ConnError::Backpressure));
+        }
         // Probe first so a half-closed peer (laptop sleep, Wi-Fi drop) moves
         // the writer into the disconnected catch-up buffer before we try to
         // push bytes onto a dead socket.
@@ -314,6 +336,10 @@ impl Connection {
     }
 
     pub fn disconnect(&mut self) {
+        #[cfg(unix)]
+        {
+            self.pending_live = None;
+        }
         self.writer.invalidate();
         self.reader.invalidate();
     }
@@ -450,6 +476,7 @@ impl Connection {
     }
 }
 
+#[cfg(windows)]
 fn write_live_frame(stream: &mut TcpStream, frame: &[u8], timeout: Duration) -> io::Result<()> {
     let deadline = Instant::now()
         .checked_add(timeout)

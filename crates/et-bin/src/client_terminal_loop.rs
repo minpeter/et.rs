@@ -30,8 +30,8 @@ use crate::client_terminal::TerminalModeState;
 #[cfg(unix)]
 use crate::client_terminal::{
     classify_forward_completion, connection_ended, encoded_buffer, recover_transport,
-    terminal_error, terminal_io, terminal_size_payload, write_owned_recovering,
-    write_terminal_size_recovering, OwnedWriteOutcome, RetainedCompletion,
+    terminal_error, terminal_io, terminal_size_payload, write_owned_recovering_with,
+    write_owned_with_policy, OwnedWriteOutcome, OwnedWritePolicy, RetainedCompletion,
 };
 #[cfg(unix)]
 use crate::error::ClientError;
@@ -143,6 +143,12 @@ where
     // queue. Keep exact ownership and stop reading the ordered server stream,
     // while stdin, outbound forwarding, keepalive, and recovery stay live.
     let mut pending_output: Option<et_core::packet::Packet> = None;
+    // Cursor replies are identical fixed-size control packets. Retain their
+    // count while one replay-owned frame is pending, rather than interleaving
+    // synchronous bytes into it. All other producers stay at their source.
+    let mut pending_cursor_reports = 0usize;
+    let mut outbound_ready = false;
+    let mut inbound_ready = false;
     let mut interrupt_input = et_core::output_interrupt::InterruptInput::default();
     let forward_wake = forwarder
         .wake()
@@ -158,6 +164,9 @@ where
             return Ok(remote_exit.finish_code());
         }
         if stdio_forward && !forwarder.stdio_bridge_open() {
+            // Complete any retained frame first; a failure here is a lost
+            // transport, which write_owned below recovers from as usual.
+            let _ = connection.finish_pending_write();
             let _ = write_owned(
                 connection,
                 TerminalPacketType::TerminalClose as u8,
@@ -199,6 +208,25 @@ where
         // outbound queue below is what frees worker capacity, so this makes
         // progress every iteration instead of deadlocking on a blocking send.
         flush_forwarding(forwarder, &mut pending_forward)?;
+        while pending_cursor_reports > 0 && !connection.write_pending() {
+            pending_cursor_reports -= 1;
+            if matches!(
+                write_cursor_report(connection, &mut reconnect, &mut stream, terminal_enabled)?,
+                OwnedWriteOutcome::SessionEnded
+            ) {
+                return finish_remote_completion(
+                    console_output,
+                    pending_output,
+                    pending_forward,
+                    terminal_enabled,
+                    binary_stdio,
+                    terminal_modes,
+                    forwarder,
+                    None,
+                    remote_exit,
+                );
+            }
+        }
         if let Some(packet) = pending_output.take() {
             match route_server_packet(
                 packet,
@@ -211,7 +239,9 @@ where
                 DisplayOutcome::Displayed { cursor_report }
                     if cursor_report && auto_cursor_report && !console_output.is_async() =>
                 {
-                    if matches!(
+                    if connection.write_pending() {
+                        pending_cursor_reports += 1;
+                    } else if matches!(
                         write_cursor_report(
                             connection,
                             &mut reconnect,
@@ -243,24 +273,40 @@ where
         // the frame deadline elapsed. Per-socket credit throttles the peer's
         // sender instead, and `pending_output` backpressure remains because it
         // is ordered terminal output, not forwarding.
-        let network_flags = network_poll_flags(
+        let mut network_flags = network_poll_flags(
             pending_output.is_some(),
             pending_forward.len() >= FORWARD_BACKLOG_CAPACITY,
         );
-        let deadline = if pending_output.is_some() {
-            next_keepalive
+        let mut deadline = connection
+            .pending_write_deadline()
+            .unwrap_or(next_keepalive);
+        if pending_output.is_none() {
+            deadline = deadline.min(last_received + silence);
+        }
+        if connection.write_pending() {
+            network_flags |= PollFlags::OUT;
+        }
+        if (!connection.write_pending() && outbound_ready)
+            || (inbound_ready
+                && pending_output.is_none()
+                && pending_forward.len() < FORWARD_BACKLOG_CAPACITY)
+        {
+            deadline = Instant::now();
+        }
+        let producer_flags = if connection.write_pending() {
+            PollFlags::empty()
         } else {
-            next_keepalive.min(last_received + silence)
+            PollFlags::IN | PollFlags::HUP
         };
-        let (network, resize, forwarding, output_ready, output_status, input) = {
+        let (network, resize, _forwarding, output_ready, output_status, input) = {
             let mut descriptors = vec![
                 PollFd::new(&stream, network_flags),
-                PollFd::new(&*wake, PollFlags::IN | PollFlags::HUP),
-                PollFd::new(forward_wake, PollFlags::IN | PollFlags::HUP),
+                PollFd::new(&*wake, producer_flags),
+                PollFd::new(forward_wake, producer_flags),
                 PollFd::new(console_output.wake(), PollFlags::IN | PollFlags::HUP),
                 PollFd::new(console_output.status_wake(), PollFlags::IN | PollFlags::HUP),
             ];
-            if read_stdin {
+            if read_stdin && !connection.write_pending() {
                 descriptors.push(PollFd::new(
                     &stdin,
                     PollFlags::IN | PollFlags::HUP | PollFlags::ERR,
@@ -320,7 +366,9 @@ where
                     .take_cursor_reports()
                     .map_err(|error| terminal_io("reading console confirmations", error))?
                 {
-                    if matches!(
+                    if connection.write_pending() {
+                        pending_cursor_reports += 1;
+                    } else if matches!(
                         write_cursor_report(
                             connection,
                             &mut reconnect,
@@ -350,7 +398,7 @@ where
                 .map_err(|error| terminal_io("draining console status wakeup", error))?;
             check_live_console(&console_output, remote_exit)?;
         }
-        if resize.intersects(PollFlags::IN | PollFlags::HUP) {
+        if !connection.write_pending() && resize.intersects(PollFlags::IN | PollFlags::HUP) {
             drain(wake)?;
             if terminal_enabled {
                 if let Some(payload) = terminal_size_payload() {
@@ -375,10 +423,13 @@ where
         }
         // Ready input gets the interrupt onto the wire before another flood
         // batch is read. Output remains bounded even with --flow-control none.
-        while !input.contains(PollFlags::IN)
+        let mut read_batch = 0;
+        while (!input.contains(PollFlags::IN) || connection.write_pending())
             && pending_forward.len() < FORWARD_BACKLOG_CAPACITY
             && pending_output.is_none()
+            && read_batch < 64
         {
+            read_batch += 1;
             match connection.try_read_packet() {
                 Ok(Some(packet)) => {
                     last_received = Instant::now();
@@ -403,7 +454,9 @@ where
                                     && auto_cursor_report
                                     && !console_output.is_async() =>
                             {
-                                if matches!(
+                                if connection.write_pending() {
+                                    pending_cursor_reports += 1;
+                                } else if matches!(
                                     write_cursor_report(
                                         connection,
                                         &mut reconnect,
@@ -438,11 +491,30 @@ where
                 Err(error) => return Err(terminal_error(error)),
             }
         }
-        if forwarding.intersects(PollFlags::IN | PollFlags::HUP) {
-            while let Some(packet) = forwarder
-                .try_outbound()
-                .map_err(|error| terminal_text(error.to_string()))?
-            {
+        inbound_ready = read_batch == 64;
+        if connection.write_pending() {
+            if let Err(error) = connection.advance_write() {
+                let error = error.into_inner();
+                if !connection_ended(&error) {
+                    return Err(terminal_error(error));
+                }
+                reconnect_needed = true;
+            }
+        }
+        if !reconnect_needed && !connection.write_pending() {
+            // try_outbound drains its wake socket even when queue entries
+            // remain. Remember that readiness until the queue is empty.
+            for _ in 0..64 {
+                let Some(packet) = forwarder
+                    .try_outbound()
+                    .map_err(|error| terminal_text(error.to_string()))?
+                else {
+                    outbound_ready = false;
+                    break;
+                };
+                outbound_ready = true;
+                #[cfg(test)]
+                tests::note_forward_write(&packet);
                 match write_owned(
                     connection,
                     packet.header(),
@@ -470,6 +542,9 @@ where
                         );
                     }
                 }
+                if connection.write_pending() {
+                    break;
+                }
             }
         }
         let now = Instant::now();
@@ -477,6 +552,9 @@ where
             reconnect_needed = true;
         }
         if reconnect_needed {
+            // Drop only the live partial record. Replay retains the complete
+            // frame and recovery must never resubmit its plaintext.
+            connection.disconnect();
             if !recover(connection, &mut reconnect, &mut stream, terminal_enabled)? {
                 return finish_remote_completion(
                     console_output,
@@ -494,7 +572,7 @@ where
             next_keepalive = last_received + interval;
             continue;
         }
-        if input.contains(PollFlags::IN) {
+        if !connection.write_pending() && input.contains(PollFlags::IN) {
             let mut bytes = [0u8; INPUT_CHUNK];
             let count = stdin
                 .lock()
@@ -547,7 +625,7 @@ where
             return Ok(remote_exit.finish_code());
         }
         let now = Instant::now();
-        if now >= next_keepalive {
+        if !connection.write_pending() && now >= next_keepalive {
             // The payload acknowledges everything read so far, so the server
             // can trim its replay backup; legacy servers ignore it.
             let ack = connection.keepalive_ack();
@@ -874,7 +952,14 @@ fn write_terminal_size<F>(
 where
     F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
 {
-    let outcome = write_terminal_size_recovering(connection, payload, reconnect)?;
+    let outcome = write_owned_with_policy(
+        connection,
+        TerminalPacketType::TerminalInfo as u8,
+        payload,
+        OwnedWritePolicy::ReplaceableTerminalSize,
+        Connection::start_write_packet_owned,
+        |connection, _| recover_transport(connection, reconnect, true),
+    )?;
     if matches!(outcome, OwnedWriteOutcome::Recovered) {
         *stream = connection.try_clone_stream().map_err(terminal_error)?;
     }
@@ -893,8 +978,14 @@ fn write_owned<F>(
 where
     F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
 {
-    let outcome =
-        write_owned_recovering(connection, header, payload, reconnect, send_terminal_size)?;
+    let outcome = write_owned_recovering_with(
+        connection,
+        header,
+        payload,
+        reconnect,
+        send_terminal_size,
+        Connection::start_write_packet_owned,
+    )?;
     if matches!(outcome, OwnedWriteOutcome::Recovered) {
         *stream = connection.try_clone_stream().map_err(terminal_error)?;
     }

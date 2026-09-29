@@ -13,7 +13,7 @@
 # Classified 2026-09-21. #804 passed independent review in et.rs #100.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-09-28"
+classified: "2026-09-29"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -394,5 +394,35 @@ commits:
     date: "2026-09-27"
     kind: product
     status: skip
-    note: "#827/#448 PTY/session teardown when a background process holds the slave. Uses already-ported TERMINAL_EXIT_STATUS=12; product/lifecycle only. Pin tip. Pin does not mean every product backlog item is finished. PROTOCOL_VERSION stays 6."
+    note: "#827/#448 PTY/session teardown when a background process holds the slave. Uses already-ported TERMINAL_EXIT_STATUS=12; product/lifecycle only. Pin does not mean every product backlog item is finished. PROTOCOL_VERSION stays 6."
     et_pr: 827
+  - sha: 16aec0c1d49b24027057541c7bb0f967b077bc2f
+    date: "2026-09-28"
+    kind: product
+    status: skip
+    note: "#828/#506 client-local SSH agent proxy symlink retarget on reconnect/reattach. Not ET wire/auth. PROTOCOL_VERSION stays 6."
+    et_pr: 828
+  - sha: 568b7ccc043eb632462d6f51f8219f188c5a25a3
+    date: "2026-09-28"
+    kind: product
+    status: skip
+    note: "#832/#660 empty no-op close after #833 already fixed partial listen. Same skip as #669/#833 (et.rs already probes IPv6). PROTOCOL_VERSION stays 6."
+    et_pr: 832
+  - sha: 662c332ba572364265ea84d350c4065b3dc3d52e
+    date: "2026-09-28"
+    kind: product
+    status: skip
+    note: "#825/#425 export SSH_TTY for remote PTY sessions. Product env only; not wire/auth. PROTOCOL_VERSION stays 6."
+    et_pr: 825
+  - sha: f50f878d21355e986a07582b4183f47a2ca309b7
+    date: "2026-09-28"
+    kind: product
+    status: skip
+    note: "#823/#298 C++ per-connection port-forward 64KiB event-loop budget. Product/fairness; no wire change. PROTOCOL_VERSION stays 6."
+    et_pr: 823
+  - sha: 5b0f17a56e2a664ce506f3266d7cf770561e55b6
+    date: "2026-09-28"
+    kind: product
+    status: skip
+    note: "#819 et --ctl local Unix control socket (ControlProtocol local IPC, not ET wire). Product/CLI; POSIX-only. Pin tip. PROTOCOL_VERSION stays 6."
+    et_pr: 819

@@ -10,7 +10,7 @@ Canonical machine files:
 - Ledger (every `master` commit after baseline):
   [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml)
 
-Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-28.
+Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-29.
 `#784` marked `ported` after et.rs [#31](https://github.com/minpeter/et.rs/pull/31) / `906a7ca86691f00a82f88b99b21d7afceb07bf97`.
 `#798` marked `ported` after et.rs [#77](https://github.com/minpeter/et.rs/pull/77).
 
@@ -20,13 +20,13 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-28.
 | Baseline / latest release tag | [`et-v7.0.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.0.0) |
 | Baseline / release commit | [`7656a32a5bc15c6746726a27a5a4ba1e468fab6e`](https://github.com/MisterTea/EternalTerminal/commit/7656a32a5bc15c6746726a27a5a4ba1e468fab6e) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`044bcb5`](https://github.com/MisterTea/EternalTerminal/commit/044bcb5ae7960445a8bffb6fed4d3589f1aa8fc4) (#827 tip, PTY teardown skip, reviewed 2026-09-28) |
+| Pin tip (last classified) | [`5b0f17a`](https://github.com/MisterTea/EternalTerminal/commit/5b0f17a56e2a664ce506f3266d7cf770561e55b6) (#819 tip, local Unix control socket skip, reviewed 2026-09-29) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
 | ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.0.0` and `master`) |
 
-The reviewed baseline-to-tip range contains 65 classified commits. Unclassified commits would be drift. `#854` (raw pipe command channel) is `ported`. `#851` (remote exit status) and `#849` (`-D`/`-W` forwards) are `ported` for wire parity. `#858` (per-session disconnect timeout), `#864`/`#868` (catchup order and connect/recover), `#793` (named sessions and the authenticated handshake), and `#863` (TERM split) are `ported`. `#837` (`TERMINAL_CLOSE` / `--close-on-hangup`) is `ported`. Pin ≠ a claim that every product backlog item past the wire port is finished.
+The reviewed baseline-to-tip range contains 70 classified commits. Unclassified commits would be drift. `#854` (raw pipe command channel) is `ported`. `#851` (remote exit status) and `#849` (`-D`/`-W` forwards) are `ported` for wire parity. `#858` (per-session disconnect timeout), `#864`/`#868` (catchup order and connect/recover), `#793` (named sessions and the authenticated handshake), and `#863` (TERM split) are `ported`. `#837` (`TERMINAL_CLOSE` / `--close-on-hangup`) is `ported`. Pin ≠ a claim that every product backlog item past the wire port is finished.
 
-## Ledger (classified 2026-09-28)
+## Ledger (classified 2026-09-29)
 
 | sha | date | kind | status | note |
 | --- | --- | --- | --- | --- |
@@ -94,7 +94,12 @@ The reviewed baseline-to-tip range contains 65 classified commits. Unclassified 
 | [`540367a`](https://github.com/MisterTea/EternalTerminal/commit/540367ac4509be41714769cf511d8c0aa90cde7a) | 2026-09-26 | security | **ported** | #793 named sessions, challenge handshake, restart survival. |
 | [`da977ba`](https://github.com/MisterTea/EternalTerminal/commit/da977ba0fa212b775774c7e58a0f6d8f4c6ea175) | 2026-09-27 | product | skip | #870 ssh_config forwards and SendEnv. Product only. |
 | [`ca91fb5`](https://github.com/MisterTea/EternalTerminal/commit/ca91fb5d5eaccaa464f1106cb946586ebc7789f9) | 2026-09-27 | protocol | **ported** | #868 failed connect exits, second connect recovers, catchup read-first. |
-| [`044bcb5`](https://github.com/MisterTea/EternalTerminal/commit/044bcb5ae7960445a8bffb6fed4d3589f1aa8fc4) | 2026-09-27 | product | skip | #827 PTY teardown when a background process holds the slave. Pin tip. |
+| [`044bcb5`](https://github.com/MisterTea/EternalTerminal/commit/044bcb5ae7960445a8bffb6fed4d3589f1aa8fc4) | 2026-09-27 | product | skip | #827 PTY teardown when a background process holds the slave. |
+| [`16aec0c`](https://github.com/MisterTea/EternalTerminal/commit/16aec0c1d49b24027057541c7bb0f967b077bc2f) | 2026-09-28 | product | skip | #828/#506 client-local SSH agent proxy symlink retarget on reconnect/reattach. Not ET wire/auth. PROTOCOL_VERSION stays 6. |
+| [`568b7cc`](https://github.com/MisterTea/EternalTerminal/commit/568b7ccc043eb632462d6f51f8219f188c5a25a3) | 2026-09-28 | product | skip | #832/#660 empty no-op close after #833 already fixed partial listen. Same skip as #669/#833 (et.rs already probes IPv6). PROTOCOL_VERSION stays 6. |
+| [`662c332`](https://github.com/MisterTea/EternalTerminal/commit/662c332ba572364265ea84d350c4065b3dc3d52e) | 2026-09-28 | product | skip | #825/#425 export SSH_TTY for remote PTY sessions. Product env only; not wire/auth. PROTOCOL_VERSION stays 6. |
+| [`f50f878`](https://github.com/MisterTea/EternalTerminal/commit/f50f878d21355e986a07582b4183f47a2ca309b7) | 2026-09-28 | product | skip | #823/#298 C++ per-connection port-forward 64KiB event-loop budget. Product/fairness; no wire change. PROTOCOL_VERSION stays 6. |
+| [`5b0f17a`](https://github.com/MisterTea/EternalTerminal/commit/5b0f17a56e2a664ce506f3266d7cf770561e55b6) | 2026-09-28 | product | skip | #819 et --ctl local Unix control socket (ControlProtocol local IPC, not ET wire). Product/CLI; POSIX-only. Pin tip. PROTOCOL_VERSION stays 6. |
 
 
 ## Ported and residual
@@ -355,13 +360,35 @@ connection runs recover instead of installing sequence 0. The client still
 reads catchup first.
 
 [`044bcb5`](https://github.com/MisterTea/EternalTerminal/commit/044bcb5ae7960445a8bffb6fed4d3589f1aa8fc4)
-(`#827` / `#448`) is the pin tip and stays `status: skip`. It tears down a PTY
+(`#827` / `#448`) stays `status: skip`. It tears down a PTY
 session when a background process still holds the slave, using the
-already-ported type 12 exit status. Product/lifecycle only. Pin ≠ a claim that
-every product backlog item is finished. `PROTOCOL_VERSION` stays 6.
+already-ported type 12 exit status. Product/lifecycle only. `PROTOCOL_VERSION` stays 6.
+
+[`16aec0c`](https://github.com/MisterTea/EternalTerminal/commit/16aec0c1d49b24027057541c7bb0f967b077bc2f)
+(`#828` / `#506`) stays `status: skip`. Client-local SSH agent proxy symlink
+retarget on reconnect/reattach. Not ET wire/auth. `PROTOCOL_VERSION` stays 6.
+
+[`568b7cc`](https://github.com/MisterTea/EternalTerminal/commit/568b7ccc043eb632462d6f51f8219f188c5a25a3)
+(`#832` / `#660`) stays `status: skip`. Empty no-op close after `#833` already
+fixed partial listen. Same skip as `#669`/`#833` (et.rs already probes IPv6).
+`PROTOCOL_VERSION` stays 6.
+
+[`662c332`](https://github.com/MisterTea/EternalTerminal/commit/662c332ba572364265ea84d350c4065b3dc3d52e)
+(`#825` / `#425`) stays `status: skip`. Export `SSH_TTY` for remote PTY
+sessions. Product env only; not wire/auth. `PROTOCOL_VERSION` stays 6.
+
+[`f50f878`](https://github.com/MisterTea/EternalTerminal/commit/f50f878d21355e986a07582b4183f47a2ca309b7)
+(`#823` / `#298`) stays `status: skip`. C++ per-connection port-forward 64KiB
+event-loop budget. Product/fairness; no wire change. `PROTOCOL_VERSION` stays 6.
+
+[`5b0f17a`](https://github.com/MisterTea/EternalTerminal/commit/5b0f17a56e2a664ce506f3266d7cf770561e55b6)
+(`#819`) is the pin tip and stays `status: skip`. `et --ctl` is a local Unix
+control socket (`ControlProtocol` local IPC, not ET wire). Product/CLI;
+POSIX-only. Pin ≠ a claim that every product backlog item is finished.
+`PROTOCOL_VERSION` stays 6.
 
 et.rs still claims **protocol v6**. EternalTerminal’s latest product release is
-**v7.0.0**, and the reviewed tip is sixty-five classified commits past that tag.
+**v7.0.0**, and the reviewed tip is seventy classified commits past that tag.
 
 Review ports against the conflict policy in
 [`docs/upstream-factory.md`](upstream-factory.md). Gate any later port with

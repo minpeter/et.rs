@@ -122,14 +122,40 @@ ln -s et etserver && ln -s et etterminal && ln -s et htm && ln -s et htmd
 
 ```sh
 et user@host
-et -c 'uptime' user@host:2022
-et -t 8080:80 -r 9000:9000 user@host          # forward and reverse tunnels
-et -f user@host                                # forward the ssh-agent socket
+et --command 'uptime' user@host:2022
+et --tunnel 8080:80 --reversetunnel 9000:9000 user@host
+et --forward-ssh-agent user@host
 et --jumphost jump.example --jport 2022 \
    --jserverfifo /tmp/etserver.fifo1 dst:2022  # ET-native jumphost relay
 etserver --daemon --pidfile /var/run/etserver.pid
 htm                                            # headless terminal multiplexer
 ```
+
+### Client CLI migration
+
+The client follows upstream's SSH-style argument parsing. Put **all client
+options before the host**; everything after the host is the remote command,
+including words beginning with `-`. For example, `et -T host printf hello`
+runs `printf hello` remotely without a PTY.
+
+Several short options have changed meaning since et.rs 0.0.25. Use these
+long options to preserve an existing script's ET-specific behavior:
+
+| Old client invocation | Replacement | New short-option meaning |
+| --- | --- | --- |
+| `-p 2022` | `--port 2022` | SSH bootstrap port |
+| `-c 'command'` | `--command 'command'` | SSH cipher selection |
+| `-t 8080:80` | `--tunnel 8080:80` | Request a PTY |
+| `-l /path/to/logs` | `--logdir /path/to/logs` | SSH username |
+| `-e` | `--noexit` | Accept an SSH escape character argument (no local escape handling) |
+| `-f` | `--forward-ssh-agent` | Background the client |
+| `-x` | `--kill-other-sessions` | Accepted as the SSH no-X11 option |
+| `-v 2` | `--verbose 2` | Repeated SSH verbosity (`-vv`) |
+| `-N` | `--no-terminal` | No remote shell, for forwarding-only sessions |
+| `-V` | `--version` | OpenSSH-compatible version query |
+
+These are client changes; server-role options are unchanged. A wire-compatible
+connection does not make old and new client command lines interchangeable.
 
 ### SSH configuration
 
@@ -140,31 +166,74 @@ requires every byte outside the environment block to match. This prevents an
 embedded newline from becoming a routing/forwarding directive. Both queries share
 the original deadline. `Match exec` may consequently run again; changing config
 or nondeterministic Match results fail closed rather than using inconsistent data.
+`SendEnv` imports only local variables matching configured patterns; disabling SSH
+config does not implicitly send `LANG` or `LC_*`. Effective `SetEnv` still wins.
+Configured `RemoteCommand` gets its own sentinel query to reject multiline
+configuration injection; ET applies the command to the session, not bootstrap.
 
 - `ProxyJump` supplies the ET-native jumphost unless `--jumphost` is given.
   Only one `[user@]host[:sshport]` hop is supported, including bracketed IPv6;
   multi-hop and malformed/injection-shaped targets are rejected before bootstrap.
   The SSH port does not replace the ET `--jport`.
-- `-f` or `ForwardAgent yes` enables agent forwarding. Socket selection is
+- `--forward-ssh-agent` or `ForwardAgent yes` enables agent forwarding. Socket selection is
   `--ssh-socket` → `IdentityAgent` → `SSH_AUTH_SOCK`. `IdentityAgent none`
   disables forwarding unless a CLI socket overrides it; `IdentityAgent SSH_AUTH_SOCK`
   selects the environment socket. A socket option alone does not enable forwarding.
   Literal paths (including spaces and OpenSSH-expanded `~`) are supported;
   unresolved `$`/`%` substitutions and path-valued `ForwardAgent` are rejected.
+  An explicit `--ssh-socket` or `IdentityAgent` is pinned for the life of that
+  client process. Saved-session attach uses the current `SSH_AUTH_SOCK`; when it
+  is absent ET clears a stale proxy link. Use a consistent `TMPDIR` across attach;
+  secure proxy directories are retained across detach for later retargeting.
+- `LocalForward`, `RemoteForward`, and `DynamicForward` are imported from SSH
+  configuration. An ordinary imported remote bind failure is fatal because the
+  ET wire protocol has no per-row optional flag. Configured local/dynamic
+  failures follow `ExitOnForwardFailure`. Reverse SOCKS and remote allocated port
+  `0` cannot be represented by ET and are rejected or skipped with a diagnostic.
 - Effective `SetEnv` assignments enter the initial payload for every session shell.
   Values retain spaces, quotes, backslashes, empty strings, and additional `=` signs.
   OpenSSH's effective first value wins for duplicate names. `SetEnv` takes precedence
-  over inherited `LANG`/`LC_*`; ET's TERM, active Ghostty COLORTERM hint, and
+  over variables selected by `SendEnv`; ET's TERM, active Ghostty COLORTERM hint, and
   forwarding-generated environment names take precedence over `SetEnv`.
   Names must be POSIX identifiers; supported values are single-line, NUL-free,
   and at most 4096 bytes. OpenSSH's unescaped dump cannot distinguish a newline
   followed by another `setenv NAME=value` row from a separate assignment, so
   multiline values are not a supported lossless representation.
   Entries share the 128-name and 64-KiB terminal/jumphost packet budgets: explicit
-  entries are considered before inherited locale, and entries that do not fit are
-  omitted. Non-POSIX sessions receive only explicit assignments, not inherited
-  locale or the local Ghostty COLORTERM hint, with first-wins case-insensitive
+  entries are considered before `SendEnv`, and entries that do not fit are
+  omitted. Non-POSIX sessions also receive `SendEnv` but not the local Ghostty
+  COLORTERM hint, with first-wins case-insensitive
   name deduplication and reserved-name checks.
+
+### Local multiplexing and control (Unix)
+
+Use a private directory for the literal `ControlPath` (OpenSSH `%` tokens are not
+expanded). Start a master, run a passenger command, then stop the local owner:
+
+```sh
+mkdir -m 700 -p ~/.et/mux
+et -M -f -S ~/.et/mux/work -o ControlPersist=yes user@host
+et -S ~/.et/mux/work user@host uptime
+et -S ~/.et/mux/work -O exit
+```
+
+Mux v4 supports command/interactive passengers, `check`, `stop`, `exit`, and
+local TCP/Unix forwarding `forward`/`cancel`. Cancel closes the listener, not
+accepted streams. The shared shell accepts one passenger at a time; remote,
+dynamic, stdio, X11, subsystem, and per-passenger agent requests are rejected.
+`-N` starts a forwarding-only session without a remote shell; `--no-terminal`
+retains its older meaning of disabling the client terminal while starting a shell.
+
+`et --ctl --name work user@host` starts a background control session and prints
+its private local socket path. The byte protocol exposes input, resize, output
+cursors, status, a transcript with secret-input redaction, and local shutdown.
+Repeating `--ctl --name work` adopts that saved session without replaying its
+startup command. `--no-persist` disables saving and automatic adoption. Control
+shutdown and mux `exit` leave a saved remote shell attachable; `--kill work`
+explicitly ends the remote session. A definite remote end removes matching saved
+control-session credentials, allowing the same name to start a fresh session.
+Raw `-T` masters/control sessions (except forwarding-only `-NT`), stdio `-W`
+control sessions, and Windows local mux/control/background modes are unsupported.
 
 ### Connecting to a Windows host
 
@@ -201,11 +270,16 @@ terminal types are forwarded unchanged.
 - Protocol v6 handshake, `crypto_secretbox` (XSalsa20-Poly1305) framing, sequence numbers, and
   catch-up buffers, pinned to upstream bytes by golden fixtures in `fixtures/wire.json`.
 - Reconnecting client and server sessions with backed reader/writer replay.
+- Non-TTY sessions survive local input EOF (including redirected Windows handles)
+  while reporting recognizable SSH bootstrap diagnostics.
 - SSH bootstrap (`IDPASSKEY` handshake), remote PTY, window resize, keepalives, `--command`
   execution, and `--no-terminal` mode.
 - Forward, reverse, Unix-socket, port-range, environment-variable named-pipe, and ssh-style
   (`bind_address:port:host:hostport`, bracketed IPv6) tunnels.
 - SSH-agent forwarding via a server-created socket exported as `SSH_AUTH_SOCK`.
+- Remote PTYs export their actual path as `SSH_TTY`; server disconnect defaults
+  are configurable in minutes with `--disconnect-timeout` or INI
+  `[Networking] disconnect_timeout` (`0` disables the global default).
 - ET-native jumphost relay (client, `etserver` `JUMPHOST_INIT` dispatch, and `etterminal --jump`).
 - `etserver` INI configuration, daemon mode with pid file, log files honouring `--logdir`,
   `--logtostdout`, `--silent`, `--verbose`, and log rollover.

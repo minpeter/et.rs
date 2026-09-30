@@ -19,7 +19,7 @@ This is a hybrid of three real rewrite factories — not a fourth invention:
 | --- | --- |
 | [`.github/upstream-pin.yml`](../.github/upstream-pin.yml) | Last reviewed release tag/SHA, default-branch **name**, protocol versions, last classified tip. **Pin ≠ ported.** |
 | [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml) | Every ET `master` commit after baseline `et-v7.0.0` / `7656a32a5bc15c6746726a27a5a4ba1e468fab6e`. |
-| [`docs/upstream-pin.md`](upstream-pin.md) | Human record of the pin and the current ledger. `#784` / `69b3353` and `#798` / `50b961d` are `ported`. `#788`, `#801`, `#803`, and `#802` stay `skip`. |
+| [`docs/upstream-pin.md`](upstream-pin.md) | Human record of the pin, implemented behavior, intentional differences, and remaining gaps. |
 
 ## Release
 
@@ -65,6 +65,15 @@ Each commit after baseline (boring YAML, parsed without PyYAML):
 | `status` | `skip` \| `backlog` \| `porting` \| `ported` |
 | `note` | short reason |
 | `et_pr` | optional upstream PR number |
+
+Use `skip` only when the note explains an existing equivalent implementation,
+an inapplicable C++/build change, or an intentional product-policy difference.
+"Product only" or "not wire" does not explain why a missing runtime behavior
+is safe to skip. Record an applicable missing behavior as `backlog`, and work
+under implementation as `porting`; mark it `ported` only after implementation
+and verification. A partially ported commit must name its remaining behavior
+in the note rather than imply full parity. The security/protocol watch summary
+is not a complete list of runtime or CLI gaps; review product rows before release.
 
 ## Conflict policy
 

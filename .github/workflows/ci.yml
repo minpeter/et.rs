@@ -83,7 +83,9 @@ jobs:
       - if: runner.os == 'macOS'
         run: >-
           cargo test -p et
+          --test agent_forward_end_to_end
           --test htm_runtime
+          --test local_control_mux
           --test reconnect_end_to_end
           --test reconnect_outage_end_to_end
           --test server_runtime

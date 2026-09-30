@@ -14,7 +14,7 @@ use crate::forward_endpoint::Endpoint;
 
 use super::{
     close_write, spawn_connector, spawn_io, subtract_saturating, ActiveIo, FlowWindow,
-    ForwardError, ForwardStream, Role, Worker, WriteCommand, MAX_ACTIVE_SOCKETS, MAX_DATA_PACKET,
+    ForwardError, ForwardStream, Role, Worker, MAX_ACTIVE_SOCKETS, MAX_DATA_PACKET,
 };
 
 /// Per-socket receive window.
@@ -269,9 +269,7 @@ impl Worker {
             let Some(active) = self.map(role).get_mut(&socket_id) else {
                 return Ok(());
             };
-            if !close_write(active) {
-                return Err(ForwardError::Unavailable);
-            }
+            close_write(active);
             return Ok(());
         }
         if data.closed.unwrap_or(false) {
@@ -295,16 +293,16 @@ impl Worker {
         let Some(active) = self.map_ref(role).get(&socket_id) else {
             return Ok(());
         };
-        if active.write_closed {
+        let Some(writer) = &active.writer else {
             // Upstream drops writes after `shutdownWrite`.
             return Ok(());
-        }
+        };
         let byte_count = buffer.len();
         active
             .pending_bytes
             .fetch_add(byte_count, std::sync::atomic::Ordering::AcqRel);
         let admitted = channel::select! {
-            send(active.writer, WriteCommand::Data(buffer)) -> result => result.is_ok(),
+            send(writer, buffer) -> result => result.is_ok(),
             recv(self.cancel) -> _ => false,
         };
         if !admitted {

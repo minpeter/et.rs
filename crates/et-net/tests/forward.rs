@@ -26,6 +26,121 @@ const REFUSED_DESTINATION_TIMEOUT: Duration = Duration::from_secs(7);
 const HARD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[test]
+fn cancelling_local_listener_preserves_accepted_streams_and_exact_identity() {
+    for preconfigured in [false, true] {
+        let remote = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let remote_port = remote.local_addr().unwrap().port();
+        let echo = thread::spawn(move || {
+            let (mut stream, _) = remote.accept().unwrap();
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            let mut bytes = [0; 17];
+            stream.read_exact(&mut bytes).unwrap();
+            assert_eq!(&bytes, b"after-cancel-data");
+            stream.write_all(b"survived").unwrap();
+        });
+        let port = reserve_port();
+        let wanted = request(port, remote_port);
+        let mut source = Forwarder::start(if preconfigured {
+            vec![wanted.clone()]
+        } else {
+            Vec::new()
+        })
+        .unwrap();
+        source.add_local_forward(wanted.clone()).unwrap();
+        // Repeated opens must not attempt a second bind.
+        source.add_local_forward(wanted.clone()).unwrap();
+        let destination = Forwarder::start(Vec::new()).unwrap();
+        let mut application = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        application.set_read_timeout(Some(TIMEOUT)).unwrap();
+        destination
+            .receive(source.wait_outbound(TIMEOUT).unwrap())
+            .unwrap();
+        source
+            .receive(wait_for_destination_response(&destination, &source))
+            .unwrap();
+
+        let mut different = wanted.clone();
+        different.destination.as_mut().unwrap().port = Some(1);
+        assert!(source.cancel_local_forward(&different).is_err());
+        source.cancel_local_forward(&wanted).unwrap();
+        assert!(source.cancel_local_forward(&wanted).is_err());
+        assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_err());
+        // A successful cancel releases the listening address before returning.
+        let rebound = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+
+        application.write_all(b"after-cancel-data").unwrap();
+        destination
+            .receive(source.wait_outbound(TIMEOUT).unwrap())
+            .unwrap();
+        loop {
+            let packet = destination.wait_outbound(TIMEOUT).unwrap();
+            let has_reply = PortForwardData::decode(packet.payload())
+                .ok()
+                .and_then(|data| data.buffer)
+                .is_some_and(|bytes| !bytes.is_empty());
+            source.receive(packet).unwrap();
+            if has_reply {
+                break;
+            }
+        }
+        let mut reply = [0; 8];
+        application.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"survived");
+        drop(application);
+        source.shutdown().unwrap();
+        destination.shutdown().unwrap();
+        echo.join().unwrap();
+        drop(rebound);
+    }
+}
+
+#[test]
+fn added_and_preconfigured_listeners_share_client_id_allocation() {
+    let first_port = reserve_port();
+    let mut source = Forwarder::start(vec![request(first_port, 31)]).unwrap();
+    let second_port = reserve_port();
+    source.add_local_forward(request(second_port, 79)).unwrap();
+    let _first = TcpStream::connect((Ipv4Addr::LOCALHOST, first_port)).unwrap();
+    let first =
+        PortForwardDestinationRequest::decode(source.wait_outbound(TIMEOUT).unwrap().payload())
+            .unwrap();
+    let _second = TcpStream::connect((Ipv4Addr::LOCALHOST, second_port)).unwrap();
+    let second =
+        PortForwardDestinationRequest::decode(source.wait_outbound(TIMEOUT).unwrap().payload())
+            .unwrap();
+    assert_ne!(first.fd, second.fd);
+    assert_eq!(first.destination.unwrap().port, Some(31));
+    assert_eq!(second.destination.unwrap().port, Some(79));
+    source.shutdown_hard().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_unix_listener_can_be_cancelled_and_reopened() {
+    use std::os::unix::net::UnixStream;
+    let path = std::env::temp_dir().join(format!("et-mutable-forward-{}.sock", std::process::id()));
+    let mut wanted = request(1, 2);
+    wanted.source = Some(SocketEndpoint {
+        name: Some(path.to_string_lossy().into_owned()),
+        port: None,
+    });
+    let mut source = Forwarder::start(Vec::new()).unwrap();
+    for _ in 0..2 {
+        source.add_local_forward(wanted.clone()).unwrap();
+        let connection = UnixStream::connect(&path).unwrap();
+        let packet = source.wait_outbound(TIMEOUT).unwrap();
+        assert_eq!(
+            packet.header(),
+            TerminalPacketType::PortForwardDestinationRequest as u8
+        );
+        source.cancel_local_forward(&wanted).unwrap();
+        assert!(!path.exists());
+        drop(connection);
+    }
+    source.shutdown_hard().unwrap();
+}
+
+#[test]
 fn two_forwarders_relay_a_real_tcp_round_trip() {
     let destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let destination_port = destination.local_addr().unwrap().port();

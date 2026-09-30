@@ -12,7 +12,7 @@ use rustix::event::{poll, PollFd, PollFlags};
 use crate::forward_endpoint::{Endpoint, ForwardListener, ForwardStream};
 use et_core::proto::SocketEndpoint;
 
-use super::forward_worker::{Command, CommandSender, Role};
+use super::forward_worker::{Command, CommandSender, Role, TryCommandError};
 
 const READ_CHUNK: usize = 16 * 1024;
 const IO_CANCEL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -49,6 +49,7 @@ pub(crate) struct BoundSource {
     pub(crate) destination: SocketEndpoint,
     pub(crate) socks: bool,
     pub(crate) stdio: bool,
+    pub(crate) request: Option<et_core::proto::PortForwardSourceRequest>,
 }
 
 pub(crate) struct ActiveIo {
@@ -116,6 +117,7 @@ pub(crate) fn spawn_listener(
             destination,
             socks: _,
             stdio: _,
+            request: _,
         } = source;
         let Some(listener) = listener else {
             return;
@@ -159,19 +161,20 @@ pub(crate) fn spawn_listener(
                         if client_fd <= 0 {
                             return;
                         }
-                        if cancellation_requested(&cancel)
-                            || commands
-                                .send(Command::Accepted {
-                                    client_fd,
-                                    destination: destination.clone(),
-                                    stream,
-                                    early: Vec::new(),
-                                    socks_version: None,
-                                    half_close_on_eof: false,
-                                    stdio: false,
-                                })
-                                .is_err()
-                        {
+                        if !send_accepted_until_stopped(
+                            &commands,
+                            &cancel,
+                            &stop,
+                            Command::Accepted {
+                                client_fd,
+                                destination: destination.clone(),
+                                stream,
+                                early: Vec::new(),
+                                socks_version: None,
+                                half_close_on_eof: false,
+                                stdio: false,
+                            },
+                        ) {
                             return;
                         }
                     }
@@ -188,6 +191,40 @@ pub(crate) fn spawn_listener(
             let _ = accepted_any;
         }
     })
+}
+
+// Listener cancellation must not wait for the transport pump to drain a full
+// worker queue. Already admitted streams remain owned by the worker.
+fn send_accepted_until_stopped(
+    commands: &CommandSender,
+    cancel: &channel::Receiver<()>,
+    stop: &ListenerStop,
+    mut command: Command,
+) -> bool {
+    loop {
+        if cancellation_requested(cancel) {
+            return false;
+        }
+        #[cfg(windows)]
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            let mut descriptors = [PollFd::new(stop, PollFlags::IN)];
+            match poll(&mut descriptors, Some(&rustix::event::Timespec::default())) {
+                Ok(0) => {}
+                Err(rustix::io::Errno::INTR) => continue,
+                _ => return false,
+            }
+        }
+        match commands.try_send(command) {
+            Ok(()) => return true,
+            Err(TryCommandError::Closed) => return false,
+            Err(TryCommandError::Full(pending)) => command = pending,
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 pub(crate) fn spawn_socks_listener(

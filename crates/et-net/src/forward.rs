@@ -4,7 +4,7 @@ use std::io::Read;
 use std::io::{self};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
@@ -15,7 +15,7 @@ use et_core::packet::Packet;
 use et_core::proto::{PortForwardSourceRequest, TerminalPacketType};
 
 use crate::forward_endpoint::{Endpoint, ResolvedEndpoint};
-use crate::forward_io::BoundSource;
+use crate::forward_io::{spawn_listener, BoundSource, ListenerStop};
 use crate::forward_worker::{
     command_channel, run, Command, CommandSender, TryCommandError, WorkerChannels,
 };
@@ -340,6 +340,53 @@ pub struct SkippedForward {
     pub error: io::Error,
 }
 
+// A local listener can end independently of its already accepted streams.
+// Keeping ownership here avoids waiting for a busy worker to service a mux
+// control request (that same caller may be responsible for draining output).
+struct LocalListener {
+    request: PortForwardSourceRequest,
+    stop: ListenerStop,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl LocalListener {
+    fn spawn(
+        mut source: BoundSource,
+        commands: CommandSender,
+        cancel: channel::Receiver<()>,
+        next_client_fd: Arc<AtomicI32>,
+    ) -> Result<Self, ForwardError> {
+        let request = source
+            .request
+            .take()
+            .expect("local listener has an identity");
+        #[cfg(unix)]
+        let (stop, reader) = UnixStream::pair()?;
+        #[cfg(windows)]
+        let stop = Arc::new(AtomicBool::new(false));
+        #[cfg(windows)]
+        let reader = stop.clone();
+        let thread = spawn_listener(source, commands, cancel, reader, next_client_fd);
+        Ok(Self {
+            request,
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for LocalListener {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        let _ = self.stop.shutdown(std::net::Shutdown::Both);
+        #[cfg(windows)]
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 pub struct Forwarder {
     commands: CommandSender,
     outbound: channel::Receiver<Outbound>,
@@ -356,6 +403,11 @@ pub struct Forwarder {
     abandoned: Arc<AtomicBool>,
     /// Set while an `et -W` stdio bridge still has its local socket.
     stdio_open: Option<Arc<AtomicBool>>,
+    local_listeners: Vec<LocalListener>,
+    listener_cancel: channel::Receiver<()>,
+    next_client_fd: Arc<AtomicI32>,
+    resolver: Arc<dyn ForwardResolver>,
+    local_mutation_allowed: bool,
 }
 
 impl Forwarder {
@@ -445,7 +497,7 @@ fn start_forwarder_hook(
     before_publish: impl FnOnce(),
     worker_start: impl FnOnce() + Send + 'static,
 ) -> Result<(Forwarder, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
-    let (sources, environment, skipped) = bind_sources(sources, owner, deadline, resolver)?;
+    let (sources, environment, skipped) = bind_sources(sources, owner, deadline, resolver.clone())?;
     ensure_setup_deadline(deadline)?;
     let session_user = owner;
     let (commands_tx, commands_rx) = command_channel(CHANNEL_CAPACITY);
@@ -478,12 +530,29 @@ fn start_forwarder_hook(
     let worker_stdio = stdio_open.clone();
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = shutdown.clone();
+    let next_client_fd = Arc::new(AtomicI32::new(1));
+    let worker_next_client_fd = next_client_fd.clone();
+    let listener_cancel = cancel_rx.clone();
+    let mut local_listeners = Vec::new();
+    let mut worker_sources = Vec::new();
+    for source in sources {
+        if owner.is_none() && source.request.is_some() && !source.socks && !source.stdio {
+            local_listeners.push(LocalListener::spawn(
+                source,
+                commands_tx.clone(),
+                cancel_rx.clone(),
+                next_client_fd.clone(),
+            )?);
+        } else {
+            worker_sources.push(source);
+        }
+    }
     let worker = std::thread::Builder::new()
         .name("et-forwarding".to_owned())
         .spawn(move || {
             worker_start();
             run(
-                sources,
+                worker_sources,
                 WorkerChannels {
                     receiver: commands_rx,
                     sender: worker_commands,
@@ -492,6 +561,7 @@ fn start_forwarder_hook(
                     cancel: cancel_rx,
                     abandoned: worker_abandoned,
                     stdio_open: worker_stdio.clone(),
+                    next_client_fd: worker_next_client_fd,
                 },
                 #[cfg(unix)]
                 wake_writer,
@@ -514,6 +584,11 @@ fn start_forwarder_hook(
         worker: Some(worker),
         abandoned,
         stdio_open,
+        local_listeners,
+        listener_cancel,
+        next_client_fd,
+        resolver,
+        local_mutation_allowed: owner.is_none(),
     };
     before_publish();
     ensure_setup_deadline(deadline)?;
@@ -521,6 +596,97 @@ fn start_forwarder_hook(
 }
 
 impl Forwarder {
+    /// Add a local TCP/Unix forward without waiting on the worker's queues.
+    /// DNS and binding share a one-second deadline. Duplicate requests are
+    /// idempotent; changing the destination is a distinct request.
+    pub fn add_local_forward(
+        &mut self,
+        request: PortForwardSourceRequest,
+    ) -> Result<(), ForwardError> {
+        self.add_local_forward_deadline(request, Instant::now() + Duration::from_secs(1))
+    }
+
+    pub fn add_local_forward_deadline(
+        &mut self,
+        request: PortForwardSourceRequest,
+        deadline: Instant,
+    ) -> Result<(), ForwardError> {
+        self.check_local_mutation(&request)?;
+        ensure_setup_deadline(deadline)?;
+        if self
+            .local_listeners
+            .iter()
+            .any(|listener| listener.request == request)
+        {
+            return Ok(());
+        }
+        let (sources, _, _) = bind_sources(
+            vec![ForwardSource::explicit(request)],
+            None,
+            deadline,
+            self.resolver.clone(),
+        )?;
+        if self.local_listeners.len() + sources.len() > MAX_SESSION_LISTENERS {
+            return Err(ForwardError::Protocol(
+                "too many local forwarding listeners",
+            ));
+        }
+        ensure_setup_deadline(deadline)?;
+        let mut listeners = Vec::new();
+        for source in sources {
+            listeners.push(LocalListener::spawn(
+                source,
+                self.commands.clone(),
+                self.listener_cancel.clone(),
+                self.next_client_fd.clone(),
+            )?);
+        }
+        self.local_listeners.extend(listeners);
+        Ok(())
+    }
+
+    /// Stop accepting on an exact local source/destination request. Existing
+    /// accepted streams keep running. Unknown requests return NotFound.
+    pub fn cancel_local_forward(
+        &mut self,
+        request: &PortForwardSourceRequest,
+    ) -> Result<(), ForwardError> {
+        self.check_local_mutation(request)?;
+        let before = self.local_listeners.len();
+        self.local_listeners
+            .retain(|listener| &listener.request != request);
+        if self.local_listeners.len() == before {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "local forwarding listener not found",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn check_local_mutation(&self, request: &PortForwardSourceRequest) -> Result<(), ForwardError> {
+        if !self.local_mutation_allowed {
+            return Err(ForwardError::Protocol(
+                "cannot mutate user-owned reverse listeners",
+            ));
+        }
+        if self.worker.as_ref().is_none_or(JoinHandle::is_finished)
+            || self.shutdown.load(Ordering::Acquire)
+        {
+            return Err(ForwardError::Unavailable);
+        }
+        if request.source.is_none()
+            || request.destination.is_none()
+            || request.environmentvariable.is_some()
+        {
+            return Err(ForwardError::Protocol(
+                "runtime forwarding requires a local source and destination",
+            ));
+        }
+        Ok(())
+    }
+
     /// Pollable readiness handle for outbound forwarding packets (Unix only).
     #[cfg(unix)]
     pub fn wake(&self) -> Result<&UnixStream, ForwardError> {
@@ -596,6 +762,7 @@ impl Forwarder {
         let mut abandoned =
             !self.commands.is_empty() || !self.priority.is_empty() || !self.outbound.is_empty();
         self.commands.shutdown();
+        self.local_listeners.clear();
         if let Some(worker) = self.worker.take() {
             worker.join().map_err(|_| ForwardError::Unavailable)?;
         }
@@ -613,6 +780,7 @@ impl Forwarder {
     }
 
     fn stop(&mut self) -> Result<(), ForwardError> {
+        self.local_listeners.clear();
         if let Some(worker) = self.worker.take() {
             self.shutdown.store(true, Ordering::Release);
             self.commands.shutdown();
@@ -841,6 +1009,7 @@ fn bind_sources(
                             destination: destination.clone(),
                             socks,
                             stdio: false,
+                            request: Some(original.clone()),
                         });
                     }
                 }
@@ -874,6 +1043,7 @@ fn bind_sources(
                         destination: destination.clone(),
                         socks: false,
                         stdio: false,
+                        request: None,
                     });
                 }
             }
@@ -884,6 +1054,7 @@ fn bind_sources(
                     destination,
                     socks: false,
                     stdio: true,
+                    request: None,
                 });
             }
         }
@@ -992,6 +1163,61 @@ mod tests {
     use std::net::{Ipv4Addr, TcpListener};
     use std::os::unix::net::UnixListener;
     use std::sync::{Barrier, Condvar};
+
+    #[test]
+    fn cancel_listener_does_not_wait_for_full_worker_queue() {
+        let path = std::env::temp_dir().join(format!("et-cancel-full-{}.sock", std::process::id()));
+        let request = PortForwardSourceRequest {
+            source: Some(SocketEndpoint {
+                name: Some(path.to_string_lossy().into_owned()),
+                port: None,
+            }),
+            destination: Some(SocketEndpoint {
+                name: Some("localhost".to_owned()),
+                port: Some(1),
+            }),
+            environmentvariable: None,
+        };
+        let (release, gate) = mpsc::sync_channel(1);
+        let (mut forwarder, _, _) = start_forwarder_hook(
+            vec![ForwardSource::explicit(request.clone())],
+            None,
+            Instant::now() + Duration::from_secs(3),
+            Arc::new(SystemForwardResolver),
+            || {},
+            move || {
+                gate.recv().unwrap();
+            },
+        )
+        .unwrap();
+        for _ in 0..CHANNEL_CAPACITY {
+            assert!(forwarder
+                .commands
+                .try_send(Command::Packet(Packet::new(255, vec![])))
+                .is_ok());
+        }
+        let _peer = UnixStream::connect(&path).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while forwarder.next_client_fd.load(Ordering::Acquire) == 1 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(forwarder.next_client_fd.load(Ordering::Acquire), 2);
+        let emergency = forwarder.commands.clone();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let cancelling = std::thread::spawn(move || {
+            let result = forwarder.cancel_local_forward(&request);
+            done_tx.send(result).unwrap();
+            forwarder
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(3));
+        // Release both possible blockers even if the assertion will fail.
+        emergency.shutdown();
+        release.send(()).unwrap();
+        let mut forwarder = cancelling.join().unwrap();
+        forwarder.shutdown_hard().unwrap();
+        result.expect("cancel waited on full worker queue").unwrap();
+        assert!(!path.exists());
+    }
 
     #[test]
     fn disconnected_priority_does_not_mask_buffered_outbound_packet() {

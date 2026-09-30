@@ -258,6 +258,7 @@ pub(crate) struct WorkerChannels {
     pub(crate) cancel: channel::Receiver<()>,
     pub(crate) abandoned: Arc<AtomicBool>,
     pub(crate) stdio_open: Option<Arc<AtomicBool>>,
+    pub(crate) next_client_fd: Arc<AtomicI32>,
 }
 
 pub(crate) fn run(
@@ -274,6 +275,7 @@ pub(crate) fn run(
         cancel,
         abandoned,
         stdio_open,
+        next_client_fd,
     } = channels;
     let (listener_stop, session_user, shutdown) = control;
     #[cfg(unix)]
@@ -285,7 +287,16 @@ pub(crate) fn run(
         cancel.clone(),
         abandoned,
     )
-    .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user, stdio_open));
+    .and_then(|mut worker| {
+        worker.run(
+            sources,
+            commands,
+            listener_stop,
+            session_user,
+            stdio_open,
+            next_client_fd,
+        )
+    });
     #[cfg(windows)]
     let result = Worker::new(
         command_sender,
@@ -294,7 +305,16 @@ pub(crate) fn run(
         cancel.clone(),
         abandoned,
     )
-    .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user, stdio_open));
+    .and_then(|mut worker| {
+        worker.run(
+            sources,
+            commands,
+            listener_stop,
+            session_user,
+            stdio_open,
+            next_client_fd,
+        )
+    });
     if let Err(error) = result {
         if !shutdown.load(Ordering::Acquire) {
             channel::select! {
@@ -380,10 +400,10 @@ impl Worker {
         listener_stop: ListenerStop,
         session_user: Option<(u32, u32)>,
         stdio_open: Option<Arc<AtomicBool>>,
+        next_client_fd: Arc<AtomicI32>,
     ) -> Result<(), ForwardError> {
         self.session_user = session_user;
         self.stdio_open = stdio_open;
-        let next_client_fd = Arc::new(AtomicI32::new(1));
         for source in sources {
             if source.stdio {
                 #[cfg(unix)]

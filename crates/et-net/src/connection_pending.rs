@@ -37,11 +37,18 @@ impl PendingWrite {
             ));
         }
         let end = self.frame.len().min(self.offset + WRITE_QUANTUM);
-        match rustix::net::send(
-            &self.stream,
-            &self.frame[self.offset..end],
-            rustix::net::SendFlags::DONTWAIT | rustix::net::SendFlags::NOSIGNAL,
-        ) {
+        // Darwin uses a socket option rather than MSG_NOSIGNAL. Do not rely
+        // on the embedding process ignoring SIGPIPE globally.
+        #[cfg(target_vendor = "apple")]
+        let flags = {
+            if self.offset == 0 {
+                rustix::net::sockopt::set_socket_nosigpipe(&self.stream, true)?;
+            }
+            rustix::net::SendFlags::DONTWAIT
+        };
+        #[cfg(not(target_vendor = "apple"))]
+        let flags = rustix::net::SendFlags::DONTWAIT | rustix::net::SendFlags::NOSIGNAL;
+        match rustix::net::send(&self.stream, &self.frame[self.offset..end], flags) {
             Ok(0) => Err(io::ErrorKind::WriteZero.into()),
             Ok(count) => {
                 self.offset += count;

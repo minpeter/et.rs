@@ -35,6 +35,18 @@ fn drain(sender: &mut Connection) {
     }
 }
 
+#[cfg(target_vendor = "apple")]
+#[test]
+fn pending_send_enables_socket_sigpipe_suppression_on_apple() {
+    let (mut sender, _peer) = pair();
+    let stream = sender.try_clone_stream().unwrap();
+    // TcpStream may already suppress SIGPIPE; clear it to prove that our
+    // raw send path establishes its own per-socket protection.
+    rustix::net::sockopt::set_socket_nosigpipe(&stream, false).unwrap();
+    sender.start_write_packet_owned(7, b"first").unwrap();
+    assert!(rustix::net::sockopt::socket_nosigpipe(&stream).unwrap());
+}
+
 #[test]
 fn partial_frame_services_reads_and_serializes_competing_writes() {
     // Given: one encrypted forwarding frame larger than the socket capacity.

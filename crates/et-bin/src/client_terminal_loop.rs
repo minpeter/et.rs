@@ -107,10 +107,26 @@ pub fn pump<F>(
     wake: &mut UnixStream,
     options: PumpOptions<'_>,
     forwarder: &mut Forwarder,
-    mut reconnect: F,
+    reconnect: F,
 ) -> Result<i32, ClientError>
 where
     F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
+{
+    pump_with_stdin(connection, wake, options, forwarder, reconnect, io::stdin())
+}
+
+#[cfg(unix)]
+fn pump_with_stdin<F, R>(
+    connection: &mut Connection,
+    wake: &mut UnixStream,
+    options: PumpOptions<'_>,
+    forwarder: &mut Forwarder,
+    mut reconnect: F,
+    mut stdin: R,
+) -> Result<i32, ClientError>
+where
+    F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
+    R: Read + std::os::fd::AsFd,
 {
     let PumpOptions {
         read_stdin,
@@ -124,7 +140,6 @@ where
         remote_exit,
         stdio_forward,
     } = options;
-    let stdin = io::stdin();
     let mut console_output = if stdio_forward {
         crate::client_output::ConsoleOutput::new(flow_control, Box::new(io::sink()))
     } else {
@@ -164,17 +179,24 @@ where
             return Ok(remote_exit.finish_code());
         }
         if stdio_forward && !forwarder.stdio_bridge_open() {
-            // Complete any retained frame first; a failure here is a lost
-            // transport, which write_owned below recovers from as usual.
-            let _ = connection.finish_pending_write();
-            let _ = write_owned(
-                connection,
-                TerminalPacketType::TerminalClose as u8,
-                &[],
-                &mut reconnect,
-                &mut stream,
-                terminal_enabled,
-            )?;
+            // Exit only after the preceding frame and the close have been
+            // sent or replayed. Replay admission alone is not delivery.
+            if finish_pending_recovering(connection, &mut reconnect, &mut stream, terminal_enabled)?
+            {
+                let outcome = write_owned_recovering_with(
+                    connection,
+                    TerminalPacketType::TerminalClose as u8,
+                    &[],
+                    &mut reconnect,
+                    terminal_enabled,
+                    Connection::write_packet_owned,
+                )?;
+                // The connectivity probe can buffer the close without a
+                // live send. Replay owns it: recover, never submit it again.
+                if matches!(outcome, OwnedWriteOutcome::Written) && !connection.connected() {
+                    recover(connection, &mut reconnect, &mut stream, terminal_enabled)?;
+                }
+            }
             return finish_remote_completion(
                 console_output,
                 pending_output,
@@ -575,7 +597,6 @@ where
         if !connection.write_pending() && input.contains(PollFlags::IN) {
             let mut bytes = [0u8; INPUT_CHUNK];
             let count = stdin
-                .lock()
                 .read(&mut bytes)
                 .map_err(|error| terminal_io("reading terminal input", error))?;
             if count == 0 {
@@ -618,7 +639,10 @@ where
                 }
             }
         }
-        if input.intersects(PollFlags::HUP | PollFlags::ERR) {
+        // IN|HUP still owns unread pipe bytes, possibly more than one input
+        // chunk. Drain those on later turns, servicing pending writes first.
+        if !input.contains(PollFlags::IN) && input.intersects(PollFlags::HUP | PollFlags::ERR) {
+            finish_pending_recovering(connection, &mut reconnect, &mut stream, terminal_enabled)?;
             console_output
                 .complete(ConsoleCompletion::LocalInputClosed)
                 .map_err(|error| terminal_io("stopping terminal output", error))?;
@@ -990,6 +1014,28 @@ where
         *stream = connection.try_clone_stream().map_err(terminal_error)?;
     }
     Ok(outcome)
+}
+
+#[cfg(unix)]
+fn finish_pending_recovering<F>(
+    connection: &mut Connection,
+    reconnect: &mut F,
+    stream: &mut std::net::TcpStream,
+    send_terminal_size: bool,
+) -> Result<bool, ClientError>
+where
+    F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
+{
+    match connection.finish_pending_write() {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            let error = error.into_inner();
+            if !connection_ended(&error) {
+                return Err(terminal_error(error));
+            }
+            recover(connection, reconnect, stream, send_terminal_size)
+        }
+    }
 }
 
 #[cfg(unix)]

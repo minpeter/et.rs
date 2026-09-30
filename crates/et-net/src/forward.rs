@@ -527,7 +527,8 @@ impl Forwarder {
         Ok(&self.wake)
     }
 
-    /// True while `et -W` still has an active local stdio socket.
+    /// True while `et -W` still has an active local stdio socket, or reply
+    /// bytes for it have not yet been flushed to stdout.
     pub fn stdio_bridge_open(&self) -> bool {
         self.stdio_open
             .as_ref()

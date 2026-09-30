@@ -15,7 +15,6 @@ use et_core::proto::SocketEndpoint;
 use super::forward_worker::{Command, CommandSender, Role};
 
 const READ_CHUNK: usize = 16 * 1024;
-#[cfg(windows)]
 const IO_CANCEL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,13 +52,12 @@ pub(crate) struct BoundSource {
 }
 
 pub(crate) struct ActiveIo {
-    pub(crate) writer: channel::Sender<WriteCommand>,
+    // Dropping the sole sender requests shutdown after the queued data drains.
+    pub(crate) writer: Option<channel::Sender<Vec<u8>>>,
     pub(crate) control: ForwardStream,
     pub(crate) cancel: channel::Receiver<()>,
     pub(crate) pending_bytes: Arc<AtomicUsize>,
     pub(crate) abandoned: Arc<AtomicBool>,
-    pub(crate) read_closed: bool,
-    pub(crate) write_closed: bool,
     /// Stdio (`-W`) EOF shuts the remote write side and keeps the reply open.
     pub(crate) half_close_on_eof: bool,
     /// Bytes sent on this socket but not yet confirmed delivered by the peer.
@@ -86,11 +84,6 @@ pub(crate) struct ActiveIo {
     pub(crate) credit_to_return: i64,
     /// Packets received but not yet confirmed drained, batched for credit.
     pub(crate) packet_credit_to_return: i64,
-}
-
-pub(crate) enum WriteCommand {
-    Data(Vec<u8>),
-    Stop,
 }
 
 /// Signal used to stop listener threads.
@@ -332,7 +325,38 @@ pub(crate) fn spawn_stdio(
     commands: CommandSender,
     cancel: channel::Receiver<()>,
     next_client_fd: Arc<AtomicI32>,
+    bridge: (
+        Option<Arc<AtomicBool>>,
+        Option<std::os::unix::net::UnixStream>,
+    ),
 ) -> io::Result<JoinHandle<()>> {
+    spawn_stdio_with(
+        destination,
+        commands,
+        cancel,
+        next_client_fd,
+        bridge,
+        (io::stdin(), io::stdout()),
+    )
+}
+
+#[cfg(unix)]
+fn spawn_stdio_with<I, O>(
+    destination: SocketEndpoint,
+    commands: CommandSender,
+    cancel: channel::Receiver<()>,
+    next_client_fd: Arc<AtomicI32>,
+    bridge: (
+        Option<Arc<AtomicBool>>,
+        Option<std::os::unix::net::UnixStream>,
+    ),
+    (mut stdin, mut stdout): (I, O),
+) -> io::Result<JoinHandle<()>>
+where
+    I: Read + Send + 'static,
+    O: Write + Send + 'static,
+{
+    let (bridge_open, mut bridge_wake) = bridge;
     let (worker_end, app_end) = std::os::unix::net::UnixStream::pair()?;
     let client_fd = next_client_fd.fetch_add(1, Ordering::Relaxed);
     if client_fd <= 0 {
@@ -341,7 +365,6 @@ pub(crate) fn spawn_stdio(
     let mut inbound = app_end.try_clone()?;
     let mut outbound = app_end;
     thread::spawn(move || {
-        let mut stdin = io::stdin();
         let mut buffer = [0u8; READ_CHUNK];
         loop {
             if cancellation_requested(&cancel) {
@@ -367,7 +390,6 @@ pub(crate) fn spawn_stdio(
         }
     });
     thread::spawn(move || {
-        let mut stdout = io::stdout();
         let mut buffer = [0u8; READ_CHUNK];
         loop {
             match outbound.read(&mut buffer) {
@@ -380,6 +402,15 @@ pub(crate) fn spawn_stdio(
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => break,
             }
+        }
+        // Upstream writes stdout synchronously before it closes the stdio
+        // forward. Report the bridge closed only after every reply byte the
+        // worker queued has reached stdout, then wake the session loop.
+        if let Some(open) = &bridge_open {
+            open.store(false, Ordering::Release);
+        }
+        if let Some(wake) = bridge_wake.as_mut() {
+            let _ = wake.write(&[1]);
         }
     });
     Ok(thread::spawn(move || {
@@ -488,11 +519,14 @@ fn spawn_io_inner(
         // call when another handle for the same socket is shut down. Finite
         // deadlines make both sibling threads observe hard cancellation.
         stream.set_read_timeout(Some(IO_CANCEL_INTERVAL))?;
-        stream.set_write_timeout(Some(IO_CANCEL_INTERVAL))?;
     }
+    // Removed sockets can still be draining queued writes. Their controls no
+    // longer live in the worker map, so the writer must observe cancellation
+    // itself even when its peer never reads.
+    stream.set_write_timeout(Some(IO_CANCEL_INTERVAL))?;
     let mut reader = stream.try_clone()?;
     let control = stream.try_clone()?;
-    let (writer_tx, writer_rx) = channel::bounded(64);
+    let (writer_tx, writer_rx) = channel::bounded::<Vec<u8>>(64);
     let reader_commands = commands.clone();
     let reader_cancel = cancel.clone();
     let in_flight = Arc::new(AtomicI64::new(0));
@@ -643,51 +677,41 @@ fn spawn_io_inner(
     let writer_handle = thread::spawn(move || {
         let mut writer = stream;
         loop {
-            let command = channel::select! {
+            let buffer = channel::select! {
                 recv(writer_rx) -> command => match command {
                     Ok(command) => command,
-                    Err(_) => break,
+                    Err(_) => {
+                        // Disconnection is observed only after all admitted
+                        // buffers drain, without needing a spare queue slot.
+                        shutdown_write(&writer);
+                        break;
+                    }
                 },
                 recv(writer_cancel) -> _ => break,
             };
-            match command {
-                WriteCommand::Data(buffer) => {
-                    #[cfg(windows)]
-                    let result = write_all_cancellable(&mut writer, &buffer, &writer_cancel);
-                    #[cfg(not(windows))]
-                    let result = writer.write_all(&buffer).map(|()| true);
-                    let delivered = match result {
-                        Ok(delivered) => delivered,
-                        Err(error) => {
-                            if !cancellation_requested(&writer_cancel) {
-                                let _ = writer_commands.send(Command::IoFailed {
-                                    role,
-                                    socket_id,
-                                    error,
-                                });
-                            }
-                            break;
-                        }
-                    };
-                    if !delivered {
-                        break;
+            let delivered = match write_all_cancellable(&mut writer, &buffer, &writer_cancel) {
+                Ok(delivered) => delivered,
+                Err(error) => {
+                    if !cancellation_requested(&writer_cancel) {
+                        let _ = writer_commands.send(Command::IoFailed {
+                            role,
+                            socket_id,
+                            error,
+                        });
                     }
-                    writer_pending_bytes.fetch_sub(buffer.len(), Ordering::AcqRel);
-                    // The local socket absorbed these bytes; only now may the
-                    // peer's window grow back.
-                    let _ = writer_commands.send(Command::Drained {
-                        role,
-                        socket_id,
-                        bytes: buffer.len(),
-                    });
-                }
-                WriteCommand::Stop => {
-                    // Perform the final shutdown here so every Data command
-                    // queued before Stop is flushed to the socket first.
-                    shutdown_write(&writer);
                     break;
                 }
+            };
+            if !delivered {
+                break;
             }
+            writer_pending_bytes.fetch_sub(buffer.len(), Ordering::AcqRel);
+            // Return credit only after delivery to the local socket.
+            let _ = writer_commands.send(Command::Drained {
+                role,
+                socket_id,
+                bytes: buffer.len(),
+            });
         }
         if writer_pending_bytes.load(Ordering::Acquire) != 0 {
             writer_abandoned.store(true, Ordering::Release);
@@ -695,13 +719,11 @@ fn spawn_io_inner(
     });
     Ok((
         ActiveIo {
-            writer: writer_tx,
+            writer: Some(writer_tx),
             control,
             cancel,
             pending_bytes,
             abandoned,
-            read_closed: false,
-            write_closed: false,
             half_close_on_eof: false,
             in_flight,
             packets_in_flight,
@@ -729,7 +751,6 @@ fn shutdown_write(stream: &ForwardStream) {
     };
 }
 
-#[cfg(windows)]
 fn write_all_cancellable(
     writer: &mut ForwardStream,
     mut remaining: &[u8],
@@ -758,24 +779,13 @@ fn cancellation_requested(cancel: &channel::Receiver<()>) -> bool {
     !matches!(cancel.try_recv(), Err(channel::TryRecvError::Empty))
 }
 
-pub(crate) fn close_write(io: &mut ActiveIo) -> bool {
-    if io.write_closed {
-        return true;
-    }
-    let admitted = channel::select! {
-        send(io.writer, WriteCommand::Stop) -> result => result.is_ok(),
-        recv(io.cancel) -> _ => false,
-    };
-    if admitted {
-        io.write_closed = true;
-    }
-    admitted
+pub(crate) fn close_write(io: &mut ActiveIo) {
+    io.writer.take();
 }
 
 pub(crate) fn stop_io(mut io: ActiveIo) {
-    // Keep the control socket alive while Stop waits for queue capacity so
-    // hard cancellation can still abort an in-flight write and release it.
-    if close_write(&mut io) {
+    close_write(&mut io);
+    if !cancellation_requested(&io.cancel) {
         io.control.shutdown_read();
     } else {
         if io.pending_bytes.load(Ordering::Acquire) != 0 {
@@ -793,17 +803,19 @@ pub(crate) fn abort_io(io: ActiveIo) {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::io::{self, Write};
+    use std::io::{self, Read, Write};
+    use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
 
     use crossbeam_channel as channel;
+    use et_core::proto::SocketEndpoint;
 
     use super::{
-        commit_reservation, spawn_io, spawn_io_with_read_limit, stop_io, FlowWindow, ForwardStream,
-        Role, WriteCommand, READ_CHUNK,
+        commit_reservation, spawn_io, spawn_io_with_read_limit, spawn_stdio_with, stop_io,
+        FlowWindow, ForwardStream, Role, READ_CHUNK,
     };
     use crate::forward_worker::state::apply_delivery;
     use crate::forward_worker::{command_channel, Command};
@@ -1107,18 +1119,18 @@ mod tests {
         )
         .unwrap();
         for _ in 0..64 {
-            active.writer.send(WriteCommand::Data(vec![1])).unwrap();
+            active.writer.as_ref().unwrap().send(vec![1]).unwrap();
         }
-        let writer = active.writer.clone();
+        let writer = active.writer.as_ref().unwrap().clone();
         let (admitted_tx, admitted_rx) = mpsc::sync_channel(0);
         let admission = std::thread::spawn(move || {
-            writer.send(WriteCommand::Data(vec![1])).unwrap();
+            writer.send(vec![1]).unwrap();
             admitted_tx.send(()).unwrap();
         });
         admitted_rx.recv_timeout(EVENT_TIMEOUT).unwrap();
         admission.join().unwrap();
 
-        // When: hard cancellation races graceful Stop admission.
+        // When: hard cancellation races graceful writer disconnection.
         let (done_tx, done_rx) = mpsc::sync_channel(0);
         let stopping = std::thread::spawn(move || {
             stop_io(active);
@@ -1140,5 +1152,83 @@ mod tests {
             completed_before_abort,
             "stop_io remained blocked behind the full writer queue after cancellation"
         );
+    }
+
+    #[test]
+    fn stdio_bridge_reports_closed_only_after_the_final_reply_reaches_stdout() {
+        struct GatedStdout {
+            stream: UnixStream,
+            flushing: channel::Sender<()>,
+            release: Option<channel::Receiver<()>>,
+        }
+        impl Write for GatedStdout {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.stream.write(bytes)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                if let Some(release) = self.release.take() {
+                    self.flushing.send(()).unwrap();
+                    release.recv_timeout(EVENT_TIMEOUT).unwrap();
+                }
+                self.stream.flush()
+            }
+        }
+        // Given: an `et -W` stdio bridge whose stdin stays open.
+        let (_stdin_writer, stdin) = UnixStream::pair().unwrap();
+        let (stdout, mut stdout_reader) = UnixStream::pair().unwrap();
+        stdout_reader.set_read_timeout(Some(EVENT_TIMEOUT)).unwrap();
+        let (flushing, flush_started) = channel::bounded(1);
+        let (release, flush_release) = channel::bounded(1);
+        let stdout = GatedStdout {
+            stream: stdout,
+            flushing,
+            release: Some(flush_release),
+        };
+        let (wake_writer, mut wake_reader) = UnixStream::pair().unwrap();
+        wake_reader.set_read_timeout(Some(EVENT_TIMEOUT)).unwrap();
+        let open = Arc::new(AtomicBool::new(true));
+        let (commands, command_receiver) = command_channel(8);
+        // The test receiver reports Disconnected once every sender is gone.
+        let _sender = commands.clone();
+        let (_cancel, cancel_receiver) = channel::bounded(1);
+        spawn_stdio_with(
+            SocketEndpoint::default(),
+            commands,
+            cancel_receiver,
+            Arc::new(AtomicI32::new(1)),
+            (Some(open.clone()), Some(wake_writer)),
+            (stdin, stdout),
+        )
+        .unwrap()
+        .join()
+        .unwrap();
+        let Command::Accepted {
+            stream: ForwardStream::Unix(mut worker_end),
+            ..
+        } = command_receiver.recv_timeout(EVENT_TIMEOUT).unwrap()
+        else {
+            panic!("stdio bridge did not announce its socket");
+        };
+
+        // When: the remote side closes first. The worker flushes the last
+        // reply, then shuts its write half, while stdin is still open.
+        worker_end.write_all(b"final-reply").unwrap();
+        worker_end.shutdown(Shutdown::Write).unwrap();
+        flush_started.recv_timeout(EVENT_TIMEOUT).unwrap();
+        assert!(
+            open.load(Ordering::Acquire),
+            "bridge reported closed while stdout flush was still blocked"
+        );
+        release.send(()).unwrap();
+        let mut reply = [0u8; 11];
+        stdout_reader.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"final-reply");
+
+        // Then: with every reply byte on stdout, the bridge reports closed
+        // and wakes the session loop, as upstream closes the stdio forward.
+        let mut byte = [0u8; 1];
+        assert_eq!(wake_reader.read(&mut byte).unwrap(), 1);
+        assert!(!open.load(Ordering::Acquire));
     }
 }

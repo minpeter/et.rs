@@ -17,7 +17,7 @@ use crate::forward_endpoint::ForwardStream;
 use crate::forward_io::{
     abort_io, close_write, commit_reservation, spawn_connector, spawn_io, spawn_listener,
     spawn_socks_listener, stop_io, subtract_saturating, ActiveIo, BoundSource, FlowWindow,
-    ListenerStop, WriteCommand,
+    ListenerStop,
 };
 use et_core::packet::Packet;
 use et_core::proto::SocketEndpoint;
@@ -395,6 +395,7 @@ impl Worker {
                             self.commands.clone(),
                             self.cancel.clone(),
                             next_client_fd.clone(),
+                            (self.stdio_open.clone(), self.outbound_wake.try_clone().ok()),
                         )
                         .map_err(ForwardError::Io)?,
                     );
@@ -518,20 +519,24 @@ pub(crate) mod state;
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
     use crossbeam_channel as channel;
     use et_core::packet::Packet;
     use et_core::proto::{
-        PortForwardDestinationRequest, PortForwardDestinationResponse, SocketEndpoint,
-        TerminalPacketType,
+        PortForwardData, PortForwardDestinationRequest, PortForwardDestinationResponse,
+        SocketEndpoint, TerminalPacketType,
     };
     use prost::Message;
 
-    use super::{command_channel, Command, CommandReceiver, Worker, MAX_ACTIVE_SOCKETS};
+    use super::{
+        command_channel, Command, CommandReceiver, PendingAccept, Role, Worker, MAX_ACTIVE_SOCKETS,
+    };
+    use crate::forward_endpoint::ForwardStream;
 
     const EVENT_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -600,6 +605,272 @@ mod tests {
             TerminalPacketType::PortForwardDestinationResponse as u8
         );
         PortForwardDestinationResponse::decode(packet.payload()).unwrap()
+    }
+
+    fn forward_data(to_destination: bool, socket_id: i32, data: PortForwardData) -> Packet {
+        Packet::new(
+            TerminalPacketType::PortForwardData as u8,
+            PortForwardData {
+                sourcetodestination: Some(to_destination),
+                socketid: Some(socket_id),
+                ..data
+            }
+            .encode_to_vec(),
+        )
+    }
+
+    fn closed() -> PortForwardData {
+        PortForwardData {
+            closed: Some(true),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn peer_close_fully_closes_the_stdio_source_and_leaves_the_bridge_to_stdout() {
+        // Given: an active `et -W` source whose stdin is still open.
+        let (mut worker, _commands, outbound, _cancel) = worker();
+        let open = Arc::new(AtomicBool::new(true));
+        worker.stdio_open = Some(open.clone());
+        let (worker_end, mut application) = UnixStream::pair().unwrap();
+        application.set_read_timeout(Some(EVENT_TIMEOUT)).unwrap();
+        worker
+            .accepted(
+                1,
+                SocketEndpoint::default(),
+                PendingAccept {
+                    stream: ForwardStream::Unix(worker_end),
+                    early: Vec::new(),
+                    socks_version: None,
+                    half_close_on_eof: true,
+                    stdio: true,
+                },
+            )
+            .unwrap();
+        let _request = outbound.recv_timeout(EVENT_TIMEOUT).unwrap().unwrap();
+        worker
+            .handle_packet(Packet::new(
+                TerminalPacketType::PortForwardDestinationResponse as u8,
+                PortForwardDestinationResponse {
+                    clientfd: Some(1),
+                    socketid: Some(5),
+                    error: None,
+                    window: None,
+                }
+                .encode_to_vec(),
+            ))
+            .unwrap();
+        assert_eq!(worker.sources.len(), 1);
+
+        // When: the remote destination closes before stdin reaches EOF.
+        worker
+            .handle_packet(forward_data(false, 5, closed()))
+            .unwrap();
+
+        // Then: like upstream `closeSourceSocketId`, the source closes in full
+        // and its reply side ends. The stdout copier, not the worker, reports
+        // the bridge closed once that reply is flushed.
+        assert!(worker.sources.is_empty());
+        let mut rest = Vec::new();
+        application.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty());
+        assert!(open.load(Ordering::Acquire));
+        drop(application);
+        for thread in worker.threads.drain(..) {
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn destination_half_close_keeps_the_reply_and_drops_later_writes() {
+        // Given: an active destination socket.
+        let (mut worker, commands, outbound, _cancel) = worker();
+        let (stream, mut application) = UnixStream::pair().unwrap();
+        application.set_read_timeout(Some(EVENT_TIMEOUT)).unwrap();
+        worker
+            .connected(1, 7, Ok(ForwardStream::Unix(stream)), None)
+            .unwrap();
+        let _response = outbound.recv_timeout(EVENT_TIMEOUT).unwrap().unwrap();
+
+        // When: the source half-closes (`et -W` stdin EOF), then a stray
+        // write for the same socket follows.
+        let half_close = PortForwardData {
+            half_close: Some(true),
+            ..closed()
+        };
+        worker
+            .handle_packet(forward_data(true, 7, half_close))
+            .unwrap();
+        let mut received = Vec::new();
+        application.read_to_end(&mut received).unwrap();
+        assert!(received.is_empty());
+        let late = PortForwardData {
+            buffer: Some(b"late".to_vec()),
+            ..Default::default()
+        };
+        worker.handle_packet(forward_data(true, 7, late)).unwrap();
+
+        // Then: like upstream `shutdownWrite`, the late write is dropped
+        // without failing the forwarder and the reply direction still reads.
+        assert_eq!(worker.destinations.len(), 1);
+        application.write_all(b"reply").unwrap();
+        let Command::Read { buffer, .. } = commands.recv_timeout(EVENT_TIMEOUT).unwrap() else {
+            panic!("reply direction stopped reading after half-close");
+        };
+        assert_eq!(buffer, b"reply");
+        worker
+            .handle_packet(forward_data(true, 7, closed()))
+            .unwrap();
+        assert!(worker.destinations.is_empty());
+        drop(application);
+        for thread in worker.threads.drain(..) {
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn eof_for_a_socket_the_peer_already_closed_emits_nothing() {
+        // Given: a socket id the peer's close already removed.
+        let (mut worker, _commands, outbound, _cancel) = worker();
+
+        // When: its reader reports EOF afterwards.
+        worker.read_closed(Role::Source, 42).unwrap();
+
+        // Then: no second close reaches the peer, as upstream only reports
+        // EOF for a socket it still owns.
+        assert!(outbound.try_recv().is_err());
+    }
+
+    #[test]
+    fn local_eof_does_not_block_worker_behind_full_writer_queue() {
+        check_close_with_full_writer_queue(
+            |worker| worker.read_closed(Role::Destination, 7).unwrap(),
+            true,
+        );
+    }
+
+    #[test]
+    fn peer_close_drains_full_writer_queue_without_blocking_worker() {
+        check_close_with_full_writer_queue(
+            |worker| {
+                worker
+                    .handle_packet(forward_data(true, 7, closed()))
+                    .unwrap()
+            },
+            true,
+        );
+    }
+
+    #[test]
+    fn half_close_drains_full_writer_queue_without_blocking_worker() {
+        check_close_with_full_writer_queue(
+            |worker| {
+                worker
+                    .handle_packet(forward_data(
+                        true,
+                        7,
+                        PortForwardData {
+                            half_close: Some(true),
+                            ..closed()
+                        },
+                    ))
+                    .unwrap();
+                assert!(worker.destinations.contains_key(&7));
+            },
+            true,
+        );
+    }
+
+    #[test]
+    fn hard_cancel_joins_removed_socket_with_blocked_writer() {
+        check_close_with_full_writer_queue(
+            |worker| {
+                worker
+                    .handle_packet(forward_data(true, 7, closed()))
+                    .unwrap();
+                assert!(worker.destinations.is_empty());
+            },
+            false,
+        );
+    }
+
+    fn check_close_with_full_writer_queue(close: fn(&mut Worker), drain: bool) {
+        let (mut worker, _commands, outbound, cancel) = worker();
+        let abandoned = worker.abandoned.clone();
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(EVENT_TIMEOUT)).unwrap();
+        socket2::SockRef::from(&stream)
+            .set_send_buffer_size(2048)
+            .unwrap();
+        let mut saturator = stream.try_clone().unwrap();
+        saturator.set_nonblocking(true).unwrap();
+        let mut expected = Vec::new();
+        loop {
+            match saturator.write(&[0; 16 * 1024]) {
+                Ok(0) => panic!("socket closed"),
+                Ok(count) => expected.resize(expected.len() + count, 0),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("saturation failed: {error}"),
+            }
+        }
+        saturator.set_nonblocking(false).unwrap();
+        worker
+            .connected(1, 7, Ok(ForwardStream::Unix(stream)), None)
+            .unwrap();
+        let _ = outbound.recv_timeout(EVENT_TIMEOUT).unwrap();
+        // One command is held by the blocked writer and 64 fill its queue.
+        for byte in 1..=65 {
+            let active = worker.destinations.get(&7).unwrap();
+            active.pending_bytes.fetch_add(1, Ordering::AcqRel);
+            active.writer.as_ref().unwrap().send(vec![byte]).unwrap();
+            expected.push(byte);
+        }
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        let (done_tx, done_rx) = channel::bounded(1);
+        let closing = std::thread::spawn(move || {
+            close(&mut worker);
+            done_tx.send(()).unwrap();
+            worker
+        });
+        let progressed = done_rx.recv_timeout(EVENT_TIMEOUT).is_ok();
+        let mut received = Vec::new();
+        let drained = if drain && progressed {
+            peer.read_to_end(&mut received).is_ok()
+        } else {
+            false
+        };
+        // Cancellation must join even a removed writer whose peer never reads.
+        // Keep a control clone only as emergency cleanup on test failure.
+        drop(cancel);
+        if !progressed {
+            saturator.shutdown(std::net::Shutdown::Both).unwrap();
+        }
+        let mut worker = closing.join().unwrap();
+        worker.remove(Role::Destination, 7);
+        let (joined_tx, joined_rx) = channel::bounded(1);
+        let joining = std::thread::spawn(move || {
+            for thread in worker.threads.drain(..) {
+                thread.join().unwrap();
+            }
+            joined_tx.send(()).unwrap();
+        });
+        let joined = joined_rx.recv_timeout(EVENT_TIMEOUT).is_ok();
+        if !joined {
+            saturator.shutdown(std::net::Shutdown::Both).unwrap();
+        }
+        joining.join().unwrap();
+        assert!(
+            progressed,
+            "close blocked the forwarding worker behind a full writer queue"
+        );
+        assert!(joined, "removed writer did not observe hard cancellation");
+        if drain {
+            assert!(drained, "writer did not close after draining queued bytes");
+            assert_eq!(received, expected);
+            assert!(!abandoned.load(Ordering::Acquire));
+        } else {
+            assert!(abandoned.load(Ordering::Acquire));
+        }
     }
 
     #[test]

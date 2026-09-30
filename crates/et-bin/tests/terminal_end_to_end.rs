@@ -72,10 +72,10 @@ fn real_client_ghostty_fallback_bootstrap_server_bridge_and_pty_emit_color() {
         .arg(&terminal)
         .args(["--serverfifo"])
         .arg(&router)
-        .arg("-p")
+        .arg("--port")
         .arg(port.to_string())
         .args([
-            "-c",
+            "--command",
             "case \"$TERM\" in xterm-color|*-256color) printf '\\033[01;32mGHOSTTY-GREEN\\033[00m:\\033[01;34mGHOSTTY-BLUE\\033[00m\\n';; esac; printf 'FULL-PTY:%s:%s\\n' \"$TERM\" \"${COLORTERM-}\"",
             "127.0.0.1",
         ])
@@ -121,11 +121,11 @@ fn real_client_ghostty_fallback_bootstrap_server_bridge_and_pty_emit_color() {
         .arg(&terminal)
         .args(["--serverfifo"])
         .arg(&router)
-        .arg("-p")
+        .arg("--port")
         .arg(port.to_string())
         .args([
             "--no-exit",
-            "-c",
+            "--command",
             "printf 'NOEXIT:%s\\n' \"$TERM\"; exit",
             "127.0.0.1",
         ])

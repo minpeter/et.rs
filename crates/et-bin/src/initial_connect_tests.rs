@@ -10,6 +10,17 @@ use crate::deadline::Deadline;
 use crate::error::ClientError;
 
 #[test]
+fn expired_handshake_deadline_keeps_the_os_error_detail() {
+    let error = super::connect_error(
+        Deadline::after(Duration::ZERO),
+        "completing the ET handshake",
+        std::io::Error::new(std::io::ErrorKind::ConnectionReset, "peer reset detail"),
+    );
+    assert_eq!(error.to_string(), "ET connection failed while completing the ET handshake: Operation timed out: peer reset detail");
+    assert!(error.is_retryable_initial_connect());
+}
+
+#[test]
 fn short_outer_budget_is_rejected_before_connection_admission() {
     assert!(matches!(
         initialization_admission_deadline(Deadline::after(Duration::from_secs(3))),

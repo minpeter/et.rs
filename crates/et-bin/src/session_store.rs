@@ -93,6 +93,7 @@ pub fn attach(
     payload.jumphost = Some(false);
     let connection =
         connect_initial_with_intent(&endpoint, &credentials, &payload, resolver, deadline, true)?;
+    let agent_forward = crate::agent_forward::AgentForward::attach(&credentials.id)?;
     let (forwarder, _) = et_net::forward::Forwarder::start_with_origins_deadline(
         Vec::new(),
         deadline.expires_at(),
@@ -115,13 +116,14 @@ pub fn attach(
         },
         forwarder,
         |connection| {
-            crate::initial_connect::reconnect(
+            let outcome = crate::initial_connect::reconnect(
                 connection,
                 &endpoint,
                 &credentials,
                 resolver,
                 crate::deadline::Deadline::after(std::time::Duration::from_secs(10)),
-            )
+            )?;
+            agent_forward.reconnected(outcome)
         },
     )
 }

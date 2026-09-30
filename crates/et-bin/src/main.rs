@@ -85,6 +85,7 @@ fn role(name: &str, args: &[OsString]) -> Result<i32, clap::Error> {
     }
 }
 
+mod agent_forward;
 mod bootstrap;
 mod client;
 mod client_environment;

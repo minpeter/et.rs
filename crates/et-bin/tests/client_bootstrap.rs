@@ -1052,9 +1052,14 @@ fn effective_ssh_config_drives_native_jump_agent_and_environment() {
             .find(|row| row.environmentvariable.as_deref() == Some("SSH_AUTH_SOCK"))
             .unwrap();
         assert!(agent.source.is_none());
+        let proxy = fake.dir.0.join(format!("et-agent-{SERVER_ID}/agent.sock"));
         assert_eq!(
             agent.destination.as_ref().unwrap().name.as_deref(),
-            Some(if cli_override {
+            proxy.to_str()
+        );
+        assert_eq!(
+            fs::read_link(proxy).unwrap(),
+            PathBuf::from(if cli_override {
                 "/tmp/cli-agent"
             } else {
                 "/tmp/config agent"
@@ -1692,7 +1697,7 @@ fn protocol_rejection_and_unreachable_endpoint_are_typed() {
         .args(["-N".to_string(), address.to_string()])
         .output()
         .unwrap();
-    assert!(stderr(&unreachable).contains("could not reach the ET server"));
+    assert!(stderr(&unreachable).contains("Could not reach the ET server:"));
 }
 
 #[test]

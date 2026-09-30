@@ -48,7 +48,7 @@ fn ssh_config_local_tunnel_relays_while_remote_forward_is_omitted() {
         .arg(&stack.terminal)
         .args(["--serverfifo"])
         .arg(&stack.router)
-        .arg("-N")
+        .arg("--no-terminal")
         .arg(format!("tester@127.0.0.1:{}", stack.port));
     let mut client = client.spawn().unwrap();
 
@@ -88,7 +88,7 @@ fn ssh_config_destination_host_reaches_target_not_localhost_decoy() {
         .arg(&stack.terminal)
         .args(["--serverfifo"])
         .arg(&stack.router)
-        .arg("-N")
+        .arg("--no-terminal")
         .arg(format!("tester@127.0.0.1:{}", stack.port))
         .spawn()
         .unwrap();
@@ -138,7 +138,7 @@ gatewayports no
         .arg(&stack.terminal)
         .args(["--serverfifo"])
         .arg(&stack.router)
-        .arg("-N")
+        .arg("--no-terminal")
         .arg(format!("tester@127.0.0.1:{}", stack.port));
     let mut client = client.spawn().unwrap();
 
@@ -198,7 +198,7 @@ fn exit_on_forward_failure_yes_aborts_imported_bind_conflict() {
         .arg(&stack.terminal)
         .args(["--serverfifo"])
         .arg(&stack.router)
-        .arg("-N")
+        .arg("--no-terminal")
         .arg(format!("tester@127.0.0.1:{}", stack.port))
         .spawn()
         .unwrap();
@@ -253,7 +253,7 @@ fn imported_remote_rows_are_omitted_while_local_row_stays_live() {
         .arg(&stack.terminal)
         .args(["--serverfifo"])
         .arg(&stack.router)
-        .arg("-N")
+        .arg("--no-terminal")
         .arg(format!("tester@127.0.0.1:{}", stack.port))
         .spawn()
         .unwrap();
@@ -320,7 +320,7 @@ fn native_jumphost_omits_imported_remote_rows() {
         .arg(jump.port.to_string())
         .args(["--jserverfifo"])
         .arg(&jump.router)
-        .arg("-N")
+        .arg("--no-terminal")
         .arg(format!("tester@127.0.0.1:{}", destination.port))
         .spawn()
         .unwrap();
@@ -373,7 +373,7 @@ fn native_jumphost_explicit_remote_bind_failure_releases_final_sibling() {
         .arg(jump.port.to_string())
         .args(["--jserverfifo"])
         .arg(&jump.router)
-        .args(["-N", "-r"])
+        .args(["--no-terminal", "-r"])
         .arg(format!(
             "{}:{}",
             sibling_source.display(),
@@ -424,7 +424,7 @@ fn explicit_remote_bind_failure_aborts_and_releases_sibling_listener() {
         .arg(&stack.terminal)
         .args(["--serverfifo"])
         .arg(&stack.router)
-        .args(["-N", "-r"])
+        .args(["--no-terminal", "-r"])
         .arg(format!(
             "{}:{}",
             sibling_source.display(),
@@ -488,7 +488,7 @@ fn cumulative_local_forwards_deduplicate_exact_rows_but_preserve_distinct_destin
         .arg(&stack.terminal)
         .args(["--serverfifo"])
         .arg(&stack.router)
-        .args(["-N", "--tunnel", &exact, "--tunnel", &exact])
+        .args(["--no-terminal", "--tunnel", &exact, "--tunnel", &exact])
         .arg(format!("tester@127.0.0.1:{}", stack.port));
 
     // When
@@ -532,7 +532,7 @@ fn ssh_config_hardening_explicit_bind_failure_remains_fatal() {
         .arg(&stack.terminal)
         .args(["--serverfifo"])
         .arg(&stack.router)
-        .args(["-N", "--tunnel"])
+        .args(["--no-terminal", "--tunnel"])
         .arg(format!("{occupied_port}:1"))
         .arg(format!("tester@127.0.0.1:{}", stack.port))
         .spawn()
@@ -589,7 +589,7 @@ fn ssh_config_unix_local_tunnels_relay_and_remote_rows_are_omitted() {
         .arg(&stack.terminal)
         .args(["--serverfifo"])
         .arg(&stack.router)
-        .arg("-N")
+        .arg("--no-terminal")
         .arg(format!("tester@127.0.0.1:{}", stack.port));
     let mut client = client.spawn().unwrap();
 
@@ -801,7 +801,7 @@ fn spawn_client(
         .args(["--serverfifo"])
         .arg(&stack.router);
     if no_terminal {
-        process.env("ET_SSH_READY", gate).arg("-N");
+        process.env("ET_SSH_READY", gate).arg("--no-terminal");
     } else {
         process.args(["--command", &command]);
     }

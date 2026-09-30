@@ -98,9 +98,9 @@ fn client_survives_sigwinch_storm_while_polling() {
         .arg(&terminal)
         .args(["--serverfifo"])
         .arg(&router)
-        .arg("-p")
+        .arg("--port")
         .arg(port.to_string())
-        .arg("-c")
+        .arg("--command")
         .arg(format!(
             "printf x > '{}'; read _ < '{}'; printf 'SIGWINCH-%s\\n' SURVIVED",
             remote_ready.display(),

@@ -79,7 +79,7 @@ pub fn connect_initial_with_intent(
     deadline: Deadline,
     reset_intent: bool,
 ) -> Result<Connection, ClientError> {
-    let mut last = String::from("Connect Timeout");
+    let mut last = String::from("Operation timed out");
     for attempt in 0..INITIAL_CONNECT_ATTEMPTS {
         match connect_once(
             endpoint,
@@ -258,10 +258,14 @@ fn ensure_deadline(deadline: Deadline, operation: &'static str) -> Result<(), Cl
 }
 
 fn connect_error(deadline: Deadline, operation: &'static str, source: io::Error) -> ClientError {
-    match deadline.remaining() {
-        Some(_) => ClientError::ConnectIo { operation, source },
-        None => ClientError::BootstrapTimeout(operation),
-    }
+    // An expired outer deadline is a timeout even if the final OS error was
+    // different. Keep that original error as the cause instead of dropping it.
+    let source = if deadline.remaining().is_none() {
+        io::Error::new(io::ErrorKind::TimedOut, source)
+    } else {
+        source
+    };
+    ClientError::ConnectIo { operation, source }
 }
 
 fn transport_error(

@@ -387,6 +387,8 @@ fn run_client(
                 .insert("COLORTERM".to_owned(), value.to_owned());
         }
     }
+    let agent_forward =
+        crate::agent_forward::AgentForward::prepare(args, &credentials.id, &mut initial_payload)?;
     et_cli::logging::info(format!("Connecting to {endpoint}"));
     let connection = connect_initial(
         &endpoint,
@@ -444,7 +446,10 @@ fn run_client(
             stdio_forward: args.stdio_forward.is_some(),
         },
         forwarder,
-        |connection| reconnect_with_retry(connection, &endpoint, &credentials, resolver),
+        |connection| {
+            let outcome = reconnect_with_retry(connection, &endpoint, &credentials, resolver)?;
+            agent_forward.reconnected(outcome)
+        },
     )
 }
 

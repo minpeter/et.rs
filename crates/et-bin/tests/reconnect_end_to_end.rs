@@ -34,7 +34,7 @@ fn real_client_recovers_same_shell_and_once_only_buffered_output() {
         .unwrap();
     let command = format!(
         "before=$(stty -g); {} --terminal-path {} --serverfifo {} \
-         --keepalive=1 -p {} 127.0.0.1; code=$?; after=$(stty -g); restored=no; \
+         --keepalive=1 --port {} 127.0.0.1; code=$?; after=$(stty -g); restored=no; \
          [ \"$before\" = \"$after\" ] && restored=yes; \
          printf '\\nRECONNECT-TERMIOS:%s:CODE:%s:BEFORE:%s:AFTER:%s\\n' \
          \"$restored\" \"$code\" \"$before\" \"$after\"; exit \"$code\"",

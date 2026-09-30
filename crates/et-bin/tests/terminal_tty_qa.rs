@@ -18,6 +18,79 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
 #[test]
+fn heredoc_stdin_with_tty_stdout_survives_until_delayed_remote_output() {
+    let stack = Stack::start();
+    for raw in [false, true] {
+        let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+        let client = shell_quote(env!("CARGO_BIN_EXE_et"));
+        let terminal = shell_quote(stack.terminal.to_str().unwrap());
+        let router = shell_quote(stack.router.to_str().unwrap());
+        let (options, input, expected_code) = if raw {
+            (
+                format!(
+                    "-T --command {}",
+                    shell_quote(
+                        "read -r line; sleep 0.3; printf '%s:%s\\n' AFTER-EOF \"$line\"; exit 7"
+                    )
+                ),
+                "heredoc words",
+                7,
+            )
+        } else {
+            // Split the marker so echoed shell input cannot satisfy the output
+            // assertion. No explicit command: this exercises normal TTY mode.
+            (
+                String::new(),
+                "sleep 0.3; printf '%s%s:%s\\n' AFTER- EOF 'heredoc words'; exit",
+                0,
+            )
+        };
+        let command = format!(
+            "[ -t 1 ] || exit 99; {client} --terminal-path {terminal} --serverfifo {router} \
+             --port {} {options} 127.0.0.1 <<'INPUT'\n{input}\nINPUT\n\
+             code=$?; printf '\\nCLIENT-CODE:%s\\n' \"$code\"",
+            stack.port,
+        );
+        let mut shell = CommandBuilder::new("/bin/sh");
+        shell.args(["-c", &command]);
+        shell.env(
+            "PATH",
+            format!(
+                "{}:{}",
+                stack.directory.display(),
+                std::env::var("PATH").unwrap()
+            ),
+        );
+        shell.env("TERM", "xterm-256color");
+        let mut child = pair.slave.spawn_command(shell).unwrap();
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut output = String::new();
+            reader.read_to_string(&mut output).unwrap();
+            let _ = sender.send(output);
+        });
+        let output = receiver.recv_timeout(TIMEOUT);
+        if output.is_err() {
+            let _ = child.kill();
+        }
+        let status = child.wait().unwrap();
+        let output = output.expect("heredoc client did not finish after the remote command");
+        reader.join().unwrap();
+        assert!(status.success(), "raw={raw}: {output:?}");
+        assert!(
+            output.contains("AFTER-EOF:heredoc words"),
+            "raw={raw}: {output:?}"
+        );
+        assert!(
+            output.contains(&format!("CLIENT-CODE:{expected_code}")),
+            "raw={raw}: {output:?}"
+        );
+    }
+}
+
+#[test]
 fn real_tty_restores_termios_and_propagates_resize() {
     let mut last_output = String::new();
     for _ in 0..3 {
@@ -49,7 +122,7 @@ fn run_termios_resize_session() -> String {
     let router = shell_quote(stack.router.to_str().unwrap());
     let command = format!(
         "before=$(stty -g); {client} --terminal-path {terminal} --serverfifo {router} \
-         -p {} -c \"printf 'TTY-G004\\\\n'; stty size\" 127.0.0.1; \
+         --port {} --command \"printf 'TTY-G004\\\\n'; stty size\" 127.0.0.1; \
          code=$?; after=$(stty -g); restored=no; \
          [ \"$before\" = \"$after\" ] && restored=yes; \
          printf '\\nTERMIOS-RESTORED:%s:CODE:%s:BEFORE:%s:AFTER:%s\\n' \
@@ -146,7 +219,7 @@ fn real_tty_forwards_input_control_bytes_and_live_resize() {
         stack.terminal.to_str().unwrap(),
         "--serverfifo",
         stack.router.to_str().unwrap(),
-        "-p",
+        "--port",
         &stack.port.to_string(),
         "127.0.0.1",
     ]);
@@ -222,7 +295,7 @@ fn real_tty_graceful_exit_keeps_the_main_screen_and_reports_close() {
         stack.terminal.to_str().unwrap(),
         "--serverfifo",
         stack.router.to_str().unwrap(),
-        "-p",
+        "--port",
         &stack.port.to_string(),
         "127.0.0.1",
     ]);

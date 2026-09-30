@@ -263,7 +263,7 @@ where
             binary_stdio: true,
             terminal_modes: &mut TerminalModeState::default(),
             hangup: &crate::client_hangup::HangupClose::disabled(),
-            remote_exit: &crate::client_terminal::RemoteExit::new(false),
+            remote_exit: &crate::client_terminal::RemoteExit::new(true),
             stdio_forward,
         },
         &mut Forwarder::start(Vec::new()).unwrap(),
@@ -418,7 +418,7 @@ impl Read for ChunkedPipe {
 }
 
 #[test]
-fn stdin_in_hup_drains_all_chunks_and_pending_frames_before_exit() {
+fn stdin_in_hup_drains_all_chunks_and_pending_frames_then_waits_for_remote_exit() {
     let (input, mut output) = io::pipe().unwrap();
     let expected: Vec<u8> = (0..4096).map(|n| (n % 251) as u8).collect();
     output.write_all(&expected).unwrap();
@@ -463,13 +463,205 @@ fn stdin_in_hup_drains_all_chunks_and_pending_frames_before_exit() {
                 .unwrap(),
         );
     }
+    let after_eof = done_rx.recv_timeout(Duration::from_millis(200));
+    peer.write_packet(
+        TerminalPacketType::TerminalExitStatus as u8,
+        &et_core::proto::TerminalExitStatus { exitcode: Some(0) }.encode_to_vec(),
+    )
+    .unwrap();
     let completed = done_rx.recv_timeout(Duration::from_secs(3));
     let _ = control.shutdown(std::net::Shutdown::Both);
     worker.join().unwrap();
     assert!(early.is_err(), "pump abandoned a pending stdin frame");
+    assert!(after_eof.is_err(), "pipe EOF ended the remote session");
     assert!(!completed.unwrap());
     assert_eq!(received, expected);
     assert_eq!(peer.reader_sequence(), 4);
+}
+
+struct ObservedInput {
+    file: std::fs::File,
+    reads: mpsc::Sender<()>,
+}
+
+impl std::os::fd::AsFd for ObservedInput {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.file.as_fd()
+    }
+}
+
+impl Read for ObservedInput {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.reads.send(()).unwrap();
+        self.file.read(bytes)
+    }
+}
+
+#[test]
+fn non_tty_eof_or_read_error_disables_input_but_keeps_keepalive_forwarding_and_recovery() {
+    use et_core::proto::{
+        PortForwardDestinationRequest, PortForwardDestinationResponse, SocketEndpoint,
+    };
+
+    for readable in [true, false] {
+        // /dev/null is always readable to poll: a read-only fd returns EOF,
+        // while a write-only fd reports EBADF. Neither may spin or end ET.
+        let file = std::fs::OpenOptions::new()
+            .read(readable)
+            .write(!readable)
+            .open("/dev/null")
+            .unwrap();
+        let (reads, observed) = mpsc::channel();
+        let (client, server) = tcp_streams();
+        let mut peer = Connection::new_server(server, &[19; 32]);
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut connection = Connection::new_client(client, &[19; 32]);
+            let (mut wake, _writer) = UnixStream::pair().unwrap();
+            wake.set_nonblocking(true).unwrap();
+            let mut recoveries = 0;
+            let result = pump_with_stdin(
+                &mut connection,
+                &mut wake,
+                PumpOptions {
+                    read_stdin: true,
+                    keepalive_seconds: 1,
+                    flow_control: et_cli::client::FlowControlMode::None,
+                    terminal_enabled: false,
+                    auto_cursor_report: false,
+                    binary_stdio: true,
+                    terminal_modes: &mut TerminalModeState::default(),
+                    hangup: &crate::client_hangup::HangupClose::disabled(),
+                    remote_exit: &crate::client_terminal::RemoteExit::new(false),
+                    stdio_forward: false,
+                },
+                &mut Forwarder::start(Vec::new()).unwrap(),
+                |_| {
+                    recoveries += 1;
+                    Ok(ReconnectOutcome::SessionEnded)
+                },
+                ObservedInput { file, reads },
+            );
+            done_tx.send((result, recoveries)).unwrap();
+        });
+        observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        let keepalive = peer.read_packet().unwrap();
+        assert_eq!(keepalive.header(), TerminalPacketType::KeepAlive as u8);
+        peer.write_packet(TerminalPacketType::KeepAlive as u8, &[])
+            .unwrap();
+        let destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        peer.write_packet(
+            TerminalPacketType::PortForwardDestinationRequest as u8,
+            &PortForwardDestinationRequest {
+                destination: Some(SocketEndpoint {
+                    name: Some("127.0.0.1".to_owned()),
+                    port: Some(i32::from(destination.local_addr().unwrap().port())),
+                }),
+                fd: Some(93),
+                window: None,
+            }
+            .encode_to_vec(),
+        )
+        .unwrap();
+        let response = peer.read_packet().unwrap();
+        assert_eq!(
+            response.header(),
+            TerminalPacketType::PortForwardDestinationResponse as u8
+        );
+        let response = PortForwardDestinationResponse::decode(response.payload()).unwrap();
+        assert_eq!(response.clientfd, Some(93));
+        assert!(response.error.is_none(), "{response:?}");
+        let _application = destination.accept().unwrap();
+        assert!(done_rx.try_recv().is_err(), "input closure ended ET");
+        peer.shutdown().unwrap();
+        let (result, recoveries) = done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        worker.join().unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(recoveries, 1, "only the remote disconnect should finish ET");
+        assert!(
+            observed.try_recv().is_err(),
+            "closed input was polled again"
+        );
+    }
+}
+
+#[test]
+fn real_tty_eof_still_ends_the_session() {
+    let pair = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize::default())
+        .unwrap();
+    let input = std::fs::File::open(pair.master.tty_name().unwrap()).unwrap();
+    assert!(input.is_terminal());
+    // Canonical VEOF returns read(0) without closing the underlying PTY.
+    let mut master = pair.master.take_writer().unwrap();
+    master.write_all(b"\x04").unwrap();
+    let (client, _server) = tcp_streams();
+    let control = client.try_clone().unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let mut connection = Connection::new_client(client, &[19; 32]);
+        run_exit_pump(&mut connection, false, input, |_| {
+            panic!("TTY EOF must not reconnect")
+        });
+        done_tx.send(()).unwrap();
+    });
+    let completed = done_rx.recv_timeout(Duration::from_secs(3));
+    let _ = control.shutdown(std::net::Shutdown::Both);
+    worker.join().unwrap();
+    completed.expect("real TTY EOF must still end the session");
+}
+
+#[test]
+fn redirected_pipe_reader_delivers_binary_chunks_then_closes_only_input() {
+    let (input, mut output) = io::pipe().unwrap();
+    let receiver = redirected_input(input).unwrap();
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    let expected: Vec<u8> = (0..40001).map(|n| (n % 256) as u8).collect();
+    let sent = expected.clone();
+    let writer = thread::spawn(move || output.write_all(&sent).unwrap());
+    let mut received = Vec::new();
+    loop {
+        match receiver.recv_timeout(Duration::from_secs(3)) {
+            Ok(bytes) => {
+                assert!(bytes.len() <= 16 * 1024);
+                received.extend(bytes);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(error) => panic!("redirected reader stalled: {error}"),
+        }
+    }
+    writer.join().unwrap();
+    assert_eq!(received, expected);
+}
+
+#[test]
+fn redirected_reader_retries_interrupts_and_disables_unusable_handles() {
+    struct InterruptedInput(u8);
+    impl Read for InterruptedInput {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.0 += 1;
+            match self.0 {
+                1 => Err(io::ErrorKind::Interrupted.into()),
+                2 => {
+                    bytes[0] = 0xff;
+                    Ok(1)
+                }
+                _ => Err(io::ErrorKind::BrokenPipe.into()),
+            }
+        }
+    }
+    let receiver = redirected_input(InterruptedInput(0)).unwrap();
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(3)).unwrap(),
+        [0xff]
+    );
+    assert!(matches!(
+        receiver.recv_timeout(Duration::from_secs(3)),
+        Err(mpsc::RecvTimeoutError::Disconnected)
+    ));
 }
 
 struct GatedConsole {

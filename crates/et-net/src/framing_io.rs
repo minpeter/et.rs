@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 use et_core::framing::MAX_PROTO_LEN;
 use prost::Message;
 
+use crate::connection_nonblocking::{read_blocking, write_blocking};
+
 /// Idle-gap timeout used by [`read_exact_with_deadlines`] when the caller
 /// asks for EternalTerminal `readAll(..., true)` behavior. Progress resets
 /// this timer; a slow trickle can keep it from firing.
@@ -145,7 +147,7 @@ pub fn read_exact_with_deadlines(
         if let Some(next) = next {
             set_deadline_timeout(stream, next)?;
         }
-        match stream.read(buffer) {
+        match read_blocking(stream, buffer) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(count) => {
                 buffer = &mut buffer[count..];
@@ -176,7 +178,7 @@ fn write_all_deadline(
 ) -> io::Result<()> {
     while !buffer.is_empty() {
         set_deadline_timeout(stream, deadline)?;
-        match stream.write(buffer) {
+        match write_blocking(stream, buffer) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(count) => buffer = &buffer[count..],
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}

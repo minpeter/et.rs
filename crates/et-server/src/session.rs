@@ -369,6 +369,26 @@ impl ActiveSession {
         })
     }
 
+    /// Terminal-bridge output. The bridge thread is the session's only
+    /// transport reader, so once the flow writer runs, every packet it emits
+    /// (forwarding and control included) is staged in the bounded queue; a
+    /// synchronous write here would stall client input behind a peer that is
+    /// not draining. Other callers keep `send_packet_owned` semantics:
+    /// default sessions write non-terminal packets synchronously, so they
+    /// enter the replay catch-up buffer in order while disconnected.
+    pub(crate) fn send_bridge_packet_owned(
+        &self,
+        header: u8,
+        payload: &[u8],
+    ) -> Result<(), SessionWriteError> {
+        if let Some(state) = self.output_flow() {
+            return state
+                .enqueue(Packet::new(header, payload))
+                .map_err(SessionWriteError::BeforeReplay);
+        }
+        self.send_packet_owned(header, payload)
+    }
+
     fn send_packet_owned_with<W>(
         &self,
         header: u8,

@@ -1,7 +1,8 @@
-use std::io::{self, Read, Write};
+use std::io;
 use std::net::{Shutdown, TcpStream};
 use std::time::{Duration, Instant};
 
+use crate::connection_nonblocking::{read_blocking, write_blocking};
 use et_core::backed_reader::{BackedReader, ReadError, ReadItem};
 use et_core::backed_writer::{BackedWriter, RecoverError, WriterOutcome};
 use et_core::crypto::{
@@ -9,6 +10,9 @@ use et_core::crypto::{
 };
 use et_core::packet::Packet;
 use socket2::SockRef;
+#[cfg(unix)]
+#[path = "connection_pending.rs"]
+mod pending;
 #[path = "connection_recovery.rs"]
 mod recovery;
 
@@ -43,6 +47,8 @@ pub struct Connection {
     writer: BackedWriter,
     reader: BackedReader,
     live_write_timeout: Duration,
+    #[cfg(unix)]
+    pending_live: Option<pending::PendingWrite>,
 }
 
 pub struct PreparedWrite {
@@ -64,6 +70,15 @@ impl WritePacketError {
 }
 
 impl PreparedWrite {
+    #[cfg(unix)]
+    pub fn send(self) -> Result<(), WritePacketError> {
+        match self.into_pending() {
+            Some(pending) => pending.finish(),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(windows)]
     pub fn send(self) -> Result<(), WritePacketError> {
         let Some((mut stream, frame, timeout)) = self.live else {
             return Ok(());
@@ -98,6 +113,8 @@ impl Connection {
             writer: BackedWriter::new(CryptoHandler::new(key, encrypt), true),
             reader: BackedReader::new(CryptoHandler::new(key, decrypt), true),
             live_write_timeout: DEFAULT_LIVE_WRITE_TIMEOUT,
+            #[cfg(unix)]
+            pending_live: None,
         }
     }
 
@@ -151,6 +168,12 @@ impl Connection {
     where
         F: FnOnce(&TcpStream) -> io::Result<TcpStream>,
     {
+        // No later frame may acquire a nonce or reach the socket ahead of a
+        // retained partial frame, including synchronous/bootstrap callers.
+        #[cfg(unix)]
+        if self.pending_live.is_some() {
+            return Err(WritePacketError::BeforeReplay(ConnError::Backpressure));
+        }
         // Probe first so a half-closed peer (laptop sleep, Wi-Fi drop) moves
         // the writer into the disconnected catch-up buffer before we try to
         // push bytes onto a dead socket.
@@ -234,7 +257,7 @@ impl Connection {
                 }
             }
             let mut buffer = [0u8; 8192];
-            match self.stream.read(&mut buffer) {
+            match read_blocking(&self.stream, &mut buffer) {
                 Ok(0) => {
                     self.disconnect();
                     return Err(ConnError::Io(io::ErrorKind::UnexpectedEof.into()));
@@ -278,7 +301,7 @@ impl Connection {
                 .set_read_timeout(Some(remaining))
                 .map_err(ConnError::Io)?;
             let mut buffer = [0u8; 8192];
-            match self.stream.read(&mut buffer) {
+            match read_blocking(&self.stream, &mut buffer) {
                 Ok(0) => {
                     let _ = self.stream.set_read_timeout(None);
                     self.disconnect();
@@ -314,6 +337,10 @@ impl Connection {
     }
 
     pub fn disconnect(&mut self) {
+        #[cfg(unix)]
+        {
+            self.pending_live = None;
+        }
         self.writer.invalidate();
         self.reader.invalidate();
     }
@@ -327,6 +354,9 @@ impl Connection {
         }
     }
 
+    /// Clone the transport for readiness polling or shutdown. On Apple,
+    /// live sends leave the shared socket nonblocking; use Connection's
+    /// packet APIs rather than assuming blocking I/O on this raw clone.
     pub fn try_clone_stream(&self) -> Result<TcpStream, ConnError> {
         self.stream.try_clone().map_err(ConnError::Io)
     }
@@ -450,6 +480,7 @@ impl Connection {
     }
 }
 
+#[cfg(windows)]
 fn write_live_frame(stream: &mut TcpStream, frame: &[u8], timeout: Duration) -> io::Result<()> {
     let deadline = Instant::now()
         .checked_add(timeout)
@@ -492,7 +523,7 @@ fn write_all_until(stream: &mut TcpStream, mut buffer: &[u8], deadline: Instant)
                 io::Error::new(io::ErrorKind::TimedOut, "live write deadline elapsed")
             })?;
         stream.set_write_timeout(Some(remaining))?;
-        match stream.write(buffer) {
+        match write_blocking(stream, buffer) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(count) => buffer = &buffer[count..],
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}

@@ -13,7 +13,7 @@
 # Classified 2026-09-21. #804 passed independent review in et.rs #100.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-09-29"
+classified: "2026-09-30"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -424,5 +424,11 @@ commits:
     date: "2026-09-28"
     kind: product
     status: skip
-    note: "#819 et --ctl local Unix control socket (ControlProtocol local IPC, not ET wire). Product/CLI; POSIX-only. Pin tip. PROTOCOL_VERSION stays 6."
+    note: "#819 et --ctl local Unix control socket (ControlProtocol local IPC, not ET wire). Product/CLI; POSIX-only. PROTOCOL_VERSION stays 6."
     et_pr: 819
+  - sha: eb518af9f06dc338660c020cdc11fc7bede7c35e
+    date: "2026-09-29"
+    kind: product
+    status: skip
+    note: "#872 C++ per-OS platform split (Unix/Windows source files), Windows console/PollSet fixes, 64-packet server fairness bound, FdPoller descriptor lifetime. No .proto/wire change; PROTOCOL_VERSION stays 6. et.rs already has ConPTY + forbid(unsafe) and no C++ FdPoller path. Same skip family as #823/#817. Pin tip."
+    et_pr: 872

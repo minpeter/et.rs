@@ -100,6 +100,16 @@ mod detach;
 mod error;
 mod forward_config;
 mod initial_connect;
+#[cfg(unix)]
+mod local_control;
+#[cfg(unix)]
+mod local_daemon;
+#[cfg(unix)]
+mod local_ipc;
+#[cfg(unix)]
+mod local_mux;
+#[cfg(unix)]
+mod local_session;
 mod resolver;
 mod session_store;
 mod ssh_config;

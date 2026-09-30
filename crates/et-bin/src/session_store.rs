@@ -19,6 +19,51 @@ use crate::resolver::EndpointResolver;
 
 const VERSION: &str = "1";
 
+#[cfg(unix)]
+pub fn exists_for(name: &str, host: &str, port: u16) -> Result<bool, ClientError> {
+    if !valid_name(name) {
+        return Err(ClientError::Terminal("invalid session name".to_owned()));
+    }
+    let path = sessions_dir().map_err(ClientError::Terminal)?.join(name);
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            let saved = load(name).map_err(ClientError::Terminal)?;
+            if saved.host != host || saved.port != port {
+                return Err(ClientError::Terminal(format!(
+                    "session {name} belongs to a different destination; use --attach or a different --name"
+                )));
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(ClientError::Terminal(error.to_string())),
+    }
+}
+
+#[cfg(unix)]
+pub fn remove_if_matches(name: &str, id: &str) -> Result<(), ClientError> {
+    if !valid_name(name) {
+        return Err(ClientError::Terminal("invalid session name".to_owned()));
+    }
+    let path = sessions_dir().map_err(ClientError::Terminal)?.join(name);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(ClientError::Terminal(error.to_string())),
+        Ok(_) => {}
+    }
+    // A different client may have saved a new session under this name while
+    // this transport was running. Never delete that replacement's credentials.
+    let saved = load(name).map_err(ClientError::Terminal)?;
+    if saved.id == id {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ClientError::Terminal(error.to_string())),
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SavedSession {
     pub name: String,
@@ -77,6 +122,22 @@ pub fn attach(
     deadline: Deadline,
 ) -> Result<i32, ClientError> {
     let saved = load(name).map_err(ClientError::Terminal)?;
+    #[cfg(unix)]
+    let local_session = crate::local_session::prepare(args)?;
+    let reconnect_timeout = {
+        #[cfg(unix)]
+        {
+            if local_session.is_some() {
+                2
+            } else {
+                10
+            }
+        }
+        #[cfg(windows)]
+        {
+            10
+        }
+    };
     let endpoint = Endpoint {
         host: saved.host.clone(),
         port: saved.port,
@@ -100,6 +161,29 @@ pub fn attach(
         std::sync::Arc::new(et_net::forward::SystemForwardResolver),
     )
     .map_err(|error| ClientError::Terminal(error.to_string()))?;
+    let reconnect_session = |connection: &mut et_net::connection::Connection| {
+        let outcome = crate::initial_connect::reconnect(
+            connection,
+            &endpoint,
+            &credentials,
+            resolver,
+            crate::deadline::Deadline::after(std::time::Duration::from_secs(reconnect_timeout)),
+        )?;
+        agent_forward.reconnected(outcome)
+    };
+    #[cfg(unix)]
+    if let Some(prepared) = local_session {
+        let mut adopted = args.clone();
+        adopted.command = None;
+        return crate::local_session::run(
+            connection,
+            &adopted,
+            &credentials.id,
+            prepared,
+            forwarder,
+            reconnect_session,
+        );
+    }
     crate::client_terminal::run(
         connection,
         crate::client_terminal::TerminalOptions {
@@ -115,16 +199,7 @@ pub fn attach(
             stdio_forward: false,
         },
         forwarder,
-        |connection| {
-            let outcome = crate::initial_connect::reconnect(
-                connection,
-                &endpoint,
-                &credentials,
-                resolver,
-                crate::deadline::Deadline::after(std::time::Duration::from_secs(10)),
-            )?;
-            agent_forward.reconnected(outcome)
-        },
+        reconnect_session,
     )
 }
 

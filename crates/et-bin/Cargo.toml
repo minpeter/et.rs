@@ -37,8 +37,8 @@ sysinfo = { version = "0.37.2", default-features = false, features = ["system"] 
 wait-timeout = "0.2.1"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.3", default-features = false, features = ["signal"] }
-rustix = { version = "1.1.4", features = ["event", "fs", "process", "time"] }
+nix = { version = "0.31.3", default-features = false, features = ["signal", "socket", "user"] }
+rustix = { version = "1.1.4", features = ["event", "fs", "net", "process", "termios", "time"] }
 signal-hook = "0.3.18"
 
 [target.'cfg(windows)'.dependencies]

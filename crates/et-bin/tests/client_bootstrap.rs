@@ -84,6 +84,11 @@ fn resolved_config_query_is_local_and_applies_session_overrides() {
         .args(["-G", "-F"])
         .arg(&config)
         .args([
+            // Query mode must not daemonize or dispatch the mux exit operation.
+            "-f",
+            "--ctl",
+            "-O",
+            "exit",
             "--port",
             &port,
             "-p",

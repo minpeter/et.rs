@@ -1,0 +1,144 @@
+//! Safe re-exec daemonization with a private authenticated readiness channel.
+use std::ffi::OsString;
+use std::io::{self, Read, Write};
+use std::path::Path;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+
+use crate::local_ipc;
+use et_cli::client::ClientArgs;
+
+const CHILD: &str = "ET_RS_LOCAL_DAEMON_STATUS";
+
+fn nonce() -> String {
+    et_core::crypto::random_bytes::<8>()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+pub fn prepare(parsed: &mut ClientArgs, raw: &[OsString]) -> io::Result<Option<i32>> {
+    if parsed.print_config
+        || parsed.ssh_version
+        || parsed.list_sessions
+        || parsed.kill_named.is_some()
+    {
+        return Ok(None);
+    }
+    if parsed.ctl && parsed.session_name.is_none() {
+        parsed.session_name = Some(parsed.attach.clone().unwrap_or_else(|| {
+            let destination =
+                et_cli::host::parse_host_string(parsed.host.as_deref().unwrap_or("anonymous"));
+            let host: String = destination
+                .host
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .take(40)
+                .collect();
+            let host = host.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+            let host = if host.is_empty() { "anonymous" } else { host };
+            format!("{host}-{}", nonce())
+        }));
+    }
+    if !(parsed.ctl || parsed.background) || crate::local_mux::passenger(parsed) {
+        return Ok(None);
+    }
+    if std::env::var_os(CHILD).is_some() {
+        crate::detach::close_inherited_descriptors()?;
+        rustix::process::setsid()?;
+        return Ok(None);
+    }
+    let directory = std::env::temp_dir().join(format!("et-ready-{}", nonce()));
+    local_ipc::private_dir(&directory)?;
+    let path = directory.join("status");
+    let listener = local_ipc::Listener::bind(&path)?;
+    let result = (|| {
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let mut command = crate::detach::direct_command(executable.as_os_str());
+        command.arg("client");
+        if parsed.ctl && parsed.attach.is_none() {
+            command
+                .arg("--name")
+                .arg(parsed.session_name.as_deref().unwrap());
+        }
+        command
+            .args(raw)
+            .env(CHILD, &path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = crate::detach::spawn(&mut command)?;
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let startup = loop {
+            if let Some(socket) = listener.accept()? {
+                socket.set_nonblocking(false)?;
+                socket.set_read_timeout(Some(local_ipc::TIMEOUT))?;
+                let mut status = Vec::new();
+                let received = socket.take(8192).read_to_end(&mut status);
+                break received.and_then(|_| match status.split_first() {
+                    Some((0, _)) => Ok(()),
+                    Some((_, message)) => Err(io::Error::other(format!(
+                        "background client startup failed: {}",
+                        String::from_utf8_lossy(message)
+                    ))),
+                    None => Err(io::Error::other("empty daemon startup response")),
+                });
+            }
+            if child.try_wait()?.is_some() {
+                break Err(io::Error::other(
+                    "background client exited before readiness",
+                ));
+            }
+            if Instant::now() >= deadline {
+                break Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "background client startup timed out",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if startup.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        startup
+    })();
+    drop(listener);
+    let _ = std::fs::remove_dir(directory);
+    result?;
+    if parsed.ctl {
+        let name = parsed.session_name.as_deref().unwrap();
+        let path = match parsed.ctl_socket.as_deref() {
+            Some(path) => path.into(),
+            None => crate::local_control::control_dir()?.join(format!("{name}.sock")),
+        };
+        println!(
+            "et control session: {name}\ncontrol socket: {}",
+            path.display()
+        );
+    }
+    Ok(Some(0))
+}
+
+pub fn ready() -> io::Result<()> {
+    if let Some(path) = std::env::var_os(CHILD) {
+        local_ipc::connect(Path::new(&path))?.write_all(&[0])?;
+        std::env::remove_var(CHILD);
+    }
+    Ok(())
+}
+pub fn failed(message: &str) {
+    if let Some(path) = std::env::var_os(CHILD) {
+        if let Ok(mut socket) = local_ipc::connect(Path::new(&path)) {
+            let _ = socket.write_all(&[1]);
+            let bytes = message.as_bytes();
+            let _ = socket.write_all(&bytes[..bytes.len().min(8191)]);
+        }
+    }
+}

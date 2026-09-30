@@ -72,6 +72,12 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
     }
     parsed.verbose = et_cli::logging::effective_verbose(parsed.verbose);
     parsed.silent = et_cli::logging::effective_silent(parsed.silent);
+    #[cfg(unix)]
+    if let Some(code) = crate::local_daemon::prepare(&mut parsed, args)
+        .map_err(|error| clap::Error::raw(clap::error::ErrorKind::Io, error))?
+    {
+        return Ok(code);
+    }
     // `--telemetry` is accepted for upstream compatibility and ignored:
     // et.rs never collects telemetry, and upstream prints nothing here.
     init_logging(&parsed).map_err(|error| clap::Error::raw(clap::error::ErrorKind::Io, error))?;
@@ -81,6 +87,8 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
     match run_client(&parsed, &runner, &resolver, deadline) {
         Ok(code) => Ok(code),
         Err(error) => {
+            #[cfg(unix)]
+            crate::local_daemon::failed(&error.to_string());
             eprintln!("et: {error}");
             Ok(error.exit_code())
         }
@@ -99,6 +107,21 @@ fn run_client(
             env!("CARGO_PKG_VERSION")
         );
         return Ok(0);
+    }
+    #[cfg(unix)]
+    if !args.print_config && crate::local_mux::passenger(args) {
+        return crate::local_mux::run(args).map_err(|e| ClientError::Terminal(e.to_string()));
+    }
+    #[cfg(windows)]
+    if !args.print_config
+        && (args.ctl
+            || args.control_path.is_some()
+            || args.control_command.is_some()
+            || args.background)
+    {
+        return Err(ClientError::Unsupported(
+            "local mux/control/background sessions are not supported on Windows",
+        ));
     }
     #[cfg(windows)]
     if args.stdio_forward.is_some() {
@@ -156,7 +179,21 @@ fn run_client(
     }
     let effective = effective_ssh_args(args, &resolved)?;
     let args = &effective;
+    #[cfg(unix)]
+    if crate::local_mux::passenger(args) {
+        return crate::local_mux::run(args).map_err(|e| ClientError::Terminal(e.to_string()));
+    }
+    #[cfg(unix)]
+    if args.ctl && !args.no_persist {
+        if let Some(name) = args.session_name.as_deref() {
+            if crate::session_store::exists_for(name, &resolved.hostname, destination.port)? {
+                return crate::session_store::attach(name, args, resolver, deadline);
+            }
+        }
+    }
     validate_bootstrap_mode(args)?;
+    #[cfg(unix)]
+    let local_session = crate::local_session::prepare(args)?;
     let mut forward_config =
         crate::forward_config::build(args, std::env::var("SSH_AUTH_SOCK").ok().as_deref())?;
     forward_config.apply_ssh_config(&resolved)?;
@@ -429,7 +466,7 @@ fn run_client(
         deadline,
     )?;
     if let Some(name) = args.session_name.as_deref() {
-        if args.jumphost.is_none() && !args.no_pty {
+        if args.jumphost.is_none() && !args.no_pty && !args.no_persist {
             crate::session_store::save_direct(
                 name,
                 &endpoint.host,
@@ -440,7 +477,14 @@ fn run_client(
         }
     }
     et_cli::logging::verbose(1, format!("Client created with id: {}", credentials.id));
-    if args.no_terminal && !has_forwarding {
+    if args.no_terminal
+        && !has_forwarding
+        && !args.ctl
+        && args.control_path.is_none()
+        && !args.no_remote_command
+    {
+        #[cfg(unix)]
+        crate::local_daemon::ready().map_err(|e| ClientError::Terminal(e.to_string()))?;
         return Ok(0);
     }
     let (forwarder, skipped) = et_net::forward::Forwarder::start_with_origins_deadline(
@@ -462,6 +506,43 @@ fn run_client(
             skipped.error
         ));
     }
+    let local_mode = {
+        #[cfg(unix)]
+        {
+            crate::local_session::enabled(args)
+        }
+        #[cfg(windows)]
+        {
+            false
+        }
+    };
+    let reconnect_session = |connection: &mut Connection| {
+        let outcome = if local_mode {
+            reconnect(
+                connection,
+                &endpoint,
+                &credentials,
+                resolver,
+                Deadline::after(Duration::from_secs(2)),
+            )
+        } else {
+            reconnect_with_retry(connection, &endpoint, &credentials, resolver)
+        }?;
+        agent_forward.reconnected(outcome)
+    };
+    #[cfg(unix)]
+    if let Some(prepared) = local_session {
+        return crate::local_session::run(
+            connection,
+            args,
+            &credentials.id,
+            prepared,
+            forwarder,
+            reconnect_session,
+        );
+    }
+    #[cfg(unix)]
+    crate::local_daemon::ready().map_err(|e| ClientError::Terminal(e.to_string()))?;
     crate::client_terminal::run(
         connection,
         crate::client_terminal::TerminalOptions {
@@ -477,10 +558,7 @@ fn run_client(
             stdio_forward: args.stdio_forward.is_some(),
         },
         forwarder,
-        |connection| {
-            let outcome = reconnect_with_retry(connection, &endpoint, &credentials, resolver)?;
-            agent_forward.reconnected(outcome)
-        },
+        reconnect_session,
     )
 }
 

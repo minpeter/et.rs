@@ -16,6 +16,14 @@ thread_local! {
     };
 }
 
+thread_local! {
+    static POLL_RETURNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(super) fn note_poll_return() {
+    POLL_RETURNS.with(|count| count.set(count.get() + 1));
+}
+
 pub(super) fn note_forward_write(packet: &et_core::packet::Packet) {
     if packet.payload().len() < 16 * 1024 {
         return;
@@ -116,6 +124,144 @@ fn pump_services_inbound_while_forwarding_peer_refuses_to_read() {
         matches!(observed, Ok((Err(_), 0, 1))),
         "pump starved inbound dispatch behind forwarding output: {observed:?}"
     );
+}
+
+#[test]
+fn saturated_forwarding_upload_yields_to_terminal_input() {
+    use et_core::proto::{PortForwardDestinationRequest, SocketEndpoint};
+
+    // Given: a tiny transport window, a peer that keeps reading, and a
+    // forwarded application whose upload never runs dry.
+    let (client, server) = tcp_streams();
+    let control = client.try_clone().unwrap();
+    let mut connection = Connection::new_client(client, &[19; 32]);
+    connection.shrink_transport_window_for_tests(4096).unwrap();
+    let mut peer = Connection::new_server(server, &[19; 32]);
+    peer.set_io_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut forwarder = Forwarder::start(Vec::new()).unwrap();
+    let destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    forwarder
+        .receive(et_core::packet::Packet::new(
+            TerminalPacketType::PortForwardDestinationRequest as u8,
+            PortForwardDestinationRequest {
+                destination: Some(SocketEndpoint {
+                    name: Some(Ipv4Addr::LOCALHOST.to_string()),
+                    port: Some(i32::from(destination.local_addr().unwrap().port())),
+                }),
+                fd: Some(42),
+                window: None,
+            }
+            .encode_to_vec(),
+        ))
+        .unwrap();
+    let (mut application, _) = destination.accept().unwrap();
+    let feeder = thread::spawn(move || {
+        let chunk = vec![3; 64 * 1024];
+        while application.write_all(&chunk).is_ok() {}
+    });
+    let (input, mut keys) = io::pipe().unwrap();
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        FORWARD_WRITE_STARTED.with(|observer| *observer.borrow_mut() = Some(started_tx));
+        let (mut wake, _wake_writer) = UnixStream::pair().unwrap();
+        wake.set_nonblocking(true).unwrap();
+        let result = pump_with_stdin(
+            &mut connection,
+            &mut wake,
+            PumpOptions {
+                read_stdin: true,
+                keepalive_seconds: 30,
+                flow_control: et_cli::client::FlowControlMode::None,
+                terminal_enabled: false,
+                auto_cursor_report: false,
+                binary_stdio: true,
+                terminal_modes: &mut TerminalModeState::default(),
+                hangup: &crate::client_hangup::HangupClose::disabled(),
+                remote_exit: &crate::client_terminal::RemoteExit::new(false),
+                stdio_forward: false,
+            },
+            &mut forwarder,
+            |_| Ok(ReconnectOutcome::SessionEnded),
+            input,
+        );
+        drop(forwarder);
+        done_tx.send(result.is_err()).unwrap();
+    });
+
+    // When: a keystroke arrives after the upload has claimed the transport.
+    started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    keys.write_all(b"k").unwrap();
+    let mut forwarded_before_input = 0usize;
+    let keystroke = loop {
+        let packet = peer.read_packet().unwrap();
+        if packet.header() == TerminalPacketType::TerminalBuffer as u8 {
+            break Some(packet);
+        }
+        forwarded_before_input += packet.payload().len();
+        if forwarded_before_input > 8 * 1024 * 1024 {
+            break None;
+        }
+    };
+    peer.write_packet(255, b"end-pump").unwrap();
+    let ended = done_rx.recv_timeout(Duration::from_secs(5));
+    let _ = control.shutdown(std::net::Shutdown::Both);
+    worker.join().unwrap();
+    feeder.join().unwrap();
+
+    // Then: the keystroke overtakes the endless upload within a few frames.
+    let keystroke = keystroke.unwrap_or_else(|| {
+        panic!("keystroke starved behind {forwarded_before_input} forwarded bytes")
+    });
+    let buffer = TerminalBuffer::decode(keystroke.payload()).unwrap();
+    assert_eq!(buffer.buffer.as_deref(), Some(b"k".as_slice()));
+    assert!(
+        forwarded_before_input < 1024 * 1024,
+        "keystroke waited behind {forwarded_before_input} forwarded bytes"
+    );
+    assert!(ended.unwrap(), "pump did not end on the unknown packet");
+}
+
+#[test]
+fn pending_frame_does_not_spin_on_hung_up_resize_wake() {
+    // Given: a frame the peer never reads and a resize wake whose writer
+    // is gone, so poll(2) reports HUP for it on every call.
+    let (client, _server) = tcp_streams();
+    let mut connection = Connection::new_client(client, &[19; 32]);
+    connection
+        .start_write_packet_owned(7, &vec![73; 1024 * 1024])
+        .unwrap();
+    assert!(connection.write_pending());
+    let (mut wake, writer) = UnixStream::pair().unwrap();
+    wake.set_nonblocking(true).unwrap();
+    drop(writer);
+    POLL_RETURNS.with(|count| count.set(0));
+
+    // When: the pump waits out the live write deadline.
+    pump_with_stdin(
+        &mut connection,
+        &mut wake,
+        PumpOptions {
+            read_stdin: false,
+            keepalive_seconds: 30,
+            flow_control: et_cli::client::FlowControlMode::None,
+            terminal_enabled: false,
+            auto_cursor_report: false,
+            binary_stdio: true,
+            terminal_modes: &mut TerminalModeState::default(),
+            hangup: &crate::client_hangup::HangupClose::disabled(),
+            remote_exit: &crate::client_terminal::RemoteExit::new(false),
+            stdio_forward: false,
+        },
+        &mut Forwarder::start(Vec::new()).unwrap(),
+        |_| Ok(ReconnectOutcome::SessionEnded),
+        io::stdin(),
+    )
+    .unwrap();
+
+    // Then: poll slept on its caps instead of returning for the dead fd.
+    let returns = POLL_RETURNS.with(std::cell::Cell::get);
+    assert!(returns < 200, "pump spun {returns} polls during one frame");
 }
 
 #[test]

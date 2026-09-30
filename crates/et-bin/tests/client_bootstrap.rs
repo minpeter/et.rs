@@ -44,6 +44,94 @@ impl Drop for TestDir {
 }
 
 #[test]
+fn openssh_version_is_local_and_distinct_from_et_version() {
+    let fake = FakeSsh::new();
+    let output = fake
+        .command("", "", 255, "must not execute ssh")
+        .args(["-V", "--logdir", "/nonexistent/unwritable/et"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "OpenSSH_9.9p1 EternalTerminal_{}\n",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    assert!(fake.invocations().is_empty());
+    let output = fake
+        .command("", "", 255, "must not execute ssh")
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .starts_with("et version "));
+    assert!(fake.invocations().is_empty());
+}
+
+#[test]
+fn resolved_config_query_is_local_and_applies_session_overrides() {
+    let dir = TestDir::new("local-config-query");
+    let config = dir.0.join("config");
+    fs::write(&config, "Host alias.invalid\n HostName 192.0.2.9\n User from-file\n Port 2222\n RemoteCommand echo from-file\n ServerAliveInterval 4\n BatchMode no\n LocalForward 41001 localhost:80\n RemoteForward 41002 localhost:81\n DynamicForward 41003\n SendEnv APP_* LC_*\n").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    let output = Command::new(env!("CARGO_BIN_EXE_et"))
+        .args(["-G", "-F"])
+        .arg(&config)
+        .args([
+            "--port",
+            &port,
+            "-p",
+            &port,
+            "-o",
+            "Hostname = 127.0.0.1",
+            "-o",
+            "User = from-option",
+            "-oRemoteCommand=echo from-option",
+            "-oBatchMode=yes",
+            "-oControlMaster=auto",
+            "-S/tmp/et-query-only",
+            "-oControlPersist=37",
+            "-oRemoteForward=41004:localhost:82",
+            "-oSendEnv=-LC_* CUSTOM_?",
+            "-oSetEnv=APP_FIXED=override",
+            "alias.invalid",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for expected in [
+        "host alias.invalid\n",
+        "hostname 127.0.0.1\n",
+        "user from-option\n",
+        "remotecommand echo from-option\n",
+        "batchmode yes\n",
+        "serveraliveinterval 4\n",
+        "controlmaster auto\n",
+        "controlpath /tmp/et-query-only\n",
+        "controlpersist 37\n",
+        "sendenv CUSTOM_?\n",
+        "setenv APP_FIXED=override\n",
+        "dynamicforward 41003\n",
+    ] {
+        assert!(stdout.contains(expected), "missing {expected:?}: {stdout}");
+    }
+    assert!(stdout.contains(&format!("port {port}\n")));
+    assert!(stdout.contains("remoteforward localhost:41004 localhost:82\n"));
+    assert!(!stdout.contains("sendenv LC_*\n"));
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
 fn logging_initialization_errors_reach_each_role_cli_boundary() {
     let directory = TestDir::new("logging-errors");
     let blocker = directory.0.join("blocker");
@@ -172,6 +260,10 @@ if [ "$1" = "-G" ]; then
       printf "%s" "$ET_FAKE_BASELINE_CONFIG"
       exit 0
     fi
+    if [ "$arg" = "-oRemoteCommand=ET_RS_CONFIG_SENTINEL" ]; then
+      printf "%s" "$ET_FAKE_COMMAND_BASELINE"
+      exit 0
+    fi
   done
   printf "%s" "$ET_FAKE_CONFIG"
   exit 0
@@ -218,6 +310,16 @@ exit "$ET_FAKE_EXIT"
             }
         }
         let mut command = Command::new(env!("CARGO_BIN_EXE_et"));
+        let command_baseline: String = config
+            .split_inclusive('\n')
+            .map(|line| {
+                if line.starts_with("remotecommand ") {
+                    "remotecommand ET_RS_CONFIG_SENTINEL\n"
+                } else {
+                    line
+                }
+            })
+            .collect();
         command
             .env_clear()
             .env("PATH", &self.dir.0)
@@ -226,6 +328,7 @@ exit "$ET_FAKE_EXIT"
             .env("ET_FAKE_STDIN", &self.stdin)
             .env("ET_FAKE_CONFIG", config)
             .env("ET_FAKE_BASELINE_CONFIG", baseline)
+            .env("ET_FAKE_COMMAND_BASELINE", command_baseline)
             .env("ET_FAKE_STDOUT", stdout)
             .env("ET_FAKE_STDERR", stderr)
             .env("ET_FAKE_EXIT", exit.to_string())
@@ -321,7 +424,63 @@ fn initial_payload_server_with_error(
 }
 
 #[test]
-fn ssh_config_remote_forward_is_omitted_from_initial_payload() {
+fn session_environment_and_remote_command_reach_et_not_bootstrap_ssh() {
+    let (port, server) = initial_payload_server_with_error(Some("stop after payload"));
+    let fake = FakeSsh::new();
+    let config = format!("{RESOLVED_CONFIG}remotecommand printf configured\nsendenv APP_* LC_*\nsetenv APP_FIXED=file\n");
+    let output = fake
+        .command(&config, VALID_MARKER, 0, "")
+        .env("APP_FIXED", "local")
+        .env("APP_OTHER", "kept")
+        .env("LC_REMOVED", "not-forwarded")
+        .env("UNSELECTED", "secret")
+        .args([
+            "-T",
+            "-oSendEnv=-LC_*",
+            "-oSetEnv=APP_FIXED=cli",
+            &format!("server-alias:{port}"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&output).contains("stop after payload"),
+        "{}",
+        stderr(&output)
+    );
+    let payload = server.join().unwrap();
+    assert_eq!(payload.no_pty, Some(true));
+    assert_eq!(payload.command.as_deref(), Some("printf configured"));
+    assert_eq!(
+        payload
+            .environmentvariables
+            .get("APP_FIXED")
+            .map(String::as_str),
+        Some("cli")
+    );
+    assert_eq!(
+        payload
+            .environmentvariables
+            .get("APP_OTHER")
+            .map(String::as_str),
+        Some("kept")
+    );
+    assert!(!payload.environmentvariables.contains_key("LC_REMOVED"));
+    assert!(!payload.environmentvariables.contains_key("UNSELECTED"));
+    for invocation in fake
+        .invocations()
+        .into_iter()
+        .filter(|args| args.first().is_some_and(|arg| arg != "-G" && arg != "-O"))
+    {
+        assert!(invocation.contains(&"-oRemoteCommand=none".to_owned()));
+        assert!(invocation.contains(&"-oClearAllForwardings=yes".to_owned()));
+        assert!(!invocation
+            .iter()
+            .any(|arg| arg.contains("printf configured") || arg.contains("APP_FIXED=cli")));
+    }
+}
+
+#[test]
+fn ssh_config_remote_forward_reaches_initial_payload() {
     let (port, server) = initial_payload_server_with_error(Some("stop after payload"));
     let fake = FakeSsh::new();
     let config = concat!(
@@ -335,17 +494,25 @@ fn ssh_config_remote_forward_is_omitted_from_initial_payload() {
 
     let _output = fake
         .command(config, VALID_MARKER, 0, "")
-        .args(["-N", &format!("server-alias:{port}")])
+        .args(["--no-terminal", &format!("server-alias:{port}")])
         .output()
         .unwrap();
     let payload = server.join().unwrap();
 
-    assert!(payload.reversetunnels.is_empty());
+    assert_eq!(payload.reversetunnels.len(), 1);
+    assert_eq!(
+        payload.reversetunnels[0].source.as_ref().unwrap().port,
+        Some(1492)
+    );
+    assert_eq!(
+        payload.reversetunnels[0].destination.as_ref().unwrap().port,
+        Some(1492)
+    );
     assert_eq!(fake.work_invocations()[0], ["-G", "-T", "server-alias"]);
 }
 
 #[test]
-fn ssh_config_remote_forward_is_omitted_with_explicit_local_forward() {
+fn ssh_config_remote_forward_combines_with_explicit_local_forward() {
     let (port, server) = initial_payload_server_with_error(Some("stop after payload"));
     let fake = FakeSsh::new();
     let config = concat!(
@@ -359,16 +526,21 @@ fn ssh_config_remote_forward_is_omitted_with_explicit_local_forward() {
 
     let _output = fake
         .command(config, VALID_MARKER, 0, "")
-        .args(["-N", "-t", "5555:22", &format!("server-alias:{port}")])
+        .args([
+            "--no-terminal",
+            "--tunnel",
+            "5555:22",
+            &format!("server-alias:{port}"),
+        ])
         .output()
         .unwrap();
     let payload = server.join().unwrap();
 
-    assert!(payload.reversetunnels.is_empty());
+    assert_eq!(payload.reversetunnels.len(), 1);
 }
 
 #[test]
-fn ssh_config_nonlocal_local_destinations_are_accepted_and_remote_rows_omitted() {
+fn ssh_config_nonlocal_local_and_remote_destinations_are_accepted() {
     let (port, server) = initial_payload_server_with_error(Some("stop after payload"));
     let fake = FakeSsh::new();
     let config = concat!(
@@ -384,7 +556,11 @@ fn ssh_config_nonlocal_local_destinations_are_accepted_and_remote_rows_omitted()
 
     let output = fake
         .command(config, VALID_MARKER, 0, "")
-        .args(["--logtostdout", "-N", &format!("server-alias:{port}")])
+        .args([
+            "--logtostdout",
+            "--no-terminal",
+            &format!("server-alias:{port}"),
+        ])
         .output()
         .unwrap();
     if output.status.code() == Some(2) {
@@ -398,7 +574,25 @@ fn ssh_config_nonlocal_local_destinations_are_accepted_and_remote_rows_omitted()
     let payload = server.join().unwrap();
 
     assert_ne!(output.status.code(), Some(2), "{}", stderr(&output));
-    assert!(payload.reversetunnels.is_empty());
+    assert_eq!(payload.reversetunnels.len(), 3);
+    assert_eq!(
+        payload.reversetunnels[0]
+            .destination
+            .as_ref()
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("db.internal")
+    );
+    assert_eq!(
+        payload.reversetunnels[1]
+            .destination
+            .as_ref()
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("::1")
+    );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -443,7 +637,11 @@ fn ssh_config_hardening_unsupported_records_warn_and_base_session_continues() {
 
     let output = fake
         .command(config, VALID_MARKER, 0, "")
-        .args(["--logtostdout", "-N", &format!("server-alias:{port}")])
+        .args([
+            "--logtostdout",
+            "--no-terminal",
+            &format!("server-alias:{port}"),
+        ])
         .output()
         .unwrap();
     if output.status.code() == Some(2) {
@@ -458,7 +656,7 @@ fn ssh_config_hardening_unsupported_records_warn_and_base_session_continues() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert_ne!(output.status.code(), Some(2), "{}", stderr(&output));
-    assert!(payload.reversetunnels.is_empty());
+    assert_eq!(payload.reversetunnels.len(), 1);
     for reason in [
         "relative stream-local path is unsupported",
         "ambiguous stream-local path is unsupported",
@@ -481,7 +679,7 @@ fn ssh_config_malformed_forward_is_rejected() {
 
     let output = fake
         .command(config, VALID_MARKER, 0, "")
-        .args(["-N", "server-alias:1"])
+        .args(["--no-terminal", "server-alias:1"])
         .output()
         .unwrap();
 
@@ -507,7 +705,7 @@ fn ssh_config_extra_forward_field_is_rejected_before_bootstrap() {
 
     let output = fake
         .command(config, VALID_MARKER, 0, "")
-        .args(["-N", "server-alias:1"])
+        .args(["--no-terminal", "server-alias:1"])
         .output()
         .unwrap();
 
@@ -521,7 +719,7 @@ fn ssh_config_extra_forward_field_is_rejected_before_bootstrap() {
 }
 
 #[test]
-fn only_malformed_imported_local_forwards_are_rejected() {
+fn malformed_imported_local_and_remote_forwards_are_rejected() {
     // Given
     let base_config = concat!(
         "host server-alias\n",
@@ -538,7 +736,7 @@ fn only_malformed_imported_local_forwards_are_rejected() {
             0,
             "",
         )
-        .args(["-N", "-t", "5555:22", "server-alias:1"])
+        .args(["--no-terminal", "--tunnel", "5555:22", "server-alias:1"])
         .output()
         .unwrap();
     assert_eq!(local.status.code(), Some(2), "{}", stderr(&local));
@@ -552,15 +750,15 @@ fn only_malformed_imported_local_forwards_are_rejected() {
             0,
             "",
         )
-        .args(["-N", "-r", "3000:4000", "server-alias:1"])
+        .args(["--no-terminal", "-r", "3000:4000", "server-alias:1"])
         .output()
         .unwrap();
-    assert_eq!(remote.status.code(), Some(1), "{}", stderr(&remote));
-    assert!(!stderr(&remote).contains("malformed remoteforward"));
+    assert_eq!(remote.status.code(), Some(2), "{}", stderr(&remote));
+    assert!(stderr(&remote).contains("malformed remoteforward"));
 }
 
 #[test]
-fn explicit_cli_remote_forwards_are_deduplicated_while_config_rows_are_omitted() {
+fn explicit_cli_remote_forwards_are_deduplicated_with_config_rows() {
     // Given
     let (port, server) = initial_payload_server_with_error(Some("stop after payload"));
     let fake = FakeSsh::new();
@@ -579,7 +777,7 @@ fn explicit_cli_remote_forwards_are_deduplicated_while_config_rows_are_omitted()
     let _output = fake
         .command(config, VALID_MARKER, 0, "")
         .args([
-            "-N",
+            "--no-terminal",
             "-r",
             "localhost:3000:127.0.0.1:4000",
             "-r",
@@ -606,7 +804,14 @@ fn explicit_cli_remote_forwards_are_deduplicated_while_config_rows_are_omitted()
             )
         })
         .collect::<Vec<_>>();
-    assert_eq!(ports, [(Some(3000), Some(4000)), (Some(1492), Some(1492)),]);
+    assert_eq!(
+        ports,
+        [
+            (Some(3000), Some(4000)),
+            (Some(1492), Some(1492)),
+            (Some(1492), Some(1493))
+        ]
+    );
 }
 
 #[test]
@@ -615,7 +820,7 @@ fn bootstrap_ssh_invocations_share_a_private_session_control_path() {
     let fake = FakeSsh::new();
     let output = fake
         .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
-        .args(["-N", &format!("server-alias:{port}")])
+        .args(["--no-terminal", &format!("server-alias:{port}")])
         .output()
         .unwrap();
     server.join().unwrap();
@@ -682,7 +887,7 @@ fn control_master_status_is_not_forwarded_to_client_stderr() {
     let output = fake
         .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
         .env("ET_FAKE_MASTER_STDERR", "Master running (pid=1234)\n")
-        .args(["-N", &format!("server-alias:{port}")])
+        .args(["--no-terminal", &format!("server-alias:{port}")])
         .output()
         .unwrap();
     server.join().unwrap();
@@ -711,7 +916,7 @@ fn control_path_is_stable_for_a_destination_and_distinct_between_destinations() 
         let (port, server) = initial_payload_server();
         let output = fake
             .command(config, VALID_MARKER, 0, "")
-            .args(["-N", &format!("{destination}:{port}")])
+            .args(["--no-terminal", &format!("{destination}:{port}")])
             .output()
             .unwrap();
         server.join().unwrap();
@@ -794,7 +999,7 @@ fn bootstrap_falls_back_when_control_socket_path_is_not_a_socket() {
     let (probe_port, probe_server) = initial_payload_server();
     let probe = fake
         .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
-        .args(["-N", &format!("server-alias:{probe_port}")])
+        .args(["--no-terminal", &format!("server-alias:{probe_port}")])
         .output()
         .unwrap();
     probe_server.join().unwrap();
@@ -826,7 +1031,7 @@ fn bootstrap_falls_back_when_control_socket_path_is_not_a_socket() {
     let before = fake.invocations().len();
     let output = fake
         .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
-        .args(["-N", &format!("server-alias:{port}")])
+        .args(["--no-terminal", &format!("server-alias:{port}")])
         .output()
         .unwrap();
     server.join().unwrap();
@@ -861,7 +1066,7 @@ fn bootstrap_falls_back_when_private_control_master_fails() {
     let output = fake
         .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
         .env("ET_FAKE_MASTER_EXIT", "255")
-        .args(["-N", &format!("server-alias:{port}")])
+        .args(["--no-terminal", &format!("server-alias:{port}")])
         .output()
         .unwrap();
     server.join().unwrap();
@@ -894,7 +1099,7 @@ fn working_user_control_master_is_preferred_without_overriding_its_path() {
     let output = fake
         .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
         .env("ET_FAKE_USER_MASTER_EXIT", "0")
-        .args(["-N", &format!("server-alias:{port}")])
+        .args(["--no-terminal", &format!("server-alias:{port}")])
         .output()
         .unwrap();
     server.join().unwrap();
@@ -918,15 +1123,20 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
 
     let fake = FakeSsh::new();
     let output = fake
-        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
+        .command(
+            &format!("{RESOLVED_CONFIG}sendenv LANG LC_*\n"),
+            VALID_MARKER,
+            0,
+            "",
+        )
         .env("TERM", "xterm-ghostty")
         .env("COLORTERM", "truecolor")
         .env("LANG", "C.UTF-8")
         .env("LC_CTYPE", "C.UTF-8")
         .args([
-            "-N",
-            // Upstream takes an explicit verbosity level, not a repeat count.
-            "-v",
+            "--no-terminal",
+            // The long option retains the explicit ET verbosity level.
+            "--verbose",
             "2",
             "--terminal-path",
             "/opt/et terminal",
@@ -1016,7 +1226,7 @@ fn effective_ssh_config_drives_native_jump_agent_and_environment() {
             .env("LANG", "inherited-locale")
             .env("SSH_AUTH_SOCK", "/tmp/env-agent")
             .args([
-                "-N",
+                "--no-terminal",
                 "--jport",
                 &port.to_string(),
                 "--jserverfifo=/tmp/jump.fifo",
@@ -1126,7 +1336,7 @@ fn effective_setenv_shares_terminal_and_jumphost_packet_budgets() {
             let output = fake
                 .command(&config, VALID_MARKER, 0, "")
                 .args([
-                    "-N",
+                    "--no-terminal",
                     "--jport",
                     &port.to_string(),
                     &format!("destination:{port}"),
@@ -1192,7 +1402,7 @@ fn windows_sessions_receive_explicit_setenv_without_inherited_locale() {
                 "__ET_COMSPEC__C:\\Windows\\cmd.exe\r\n",
             )
             .args([
-                "-N",
+                "--no-terminal",
                 "--jport",
                 &port.to_string(),
                 "-r",
@@ -1235,7 +1445,7 @@ fn disabled_agent_config_never_falls_back_to_environment_socket() {
         let output = fake
             .command(&format!("{RESOLVED_CONFIG}{options}"), VALID_MARKER, 0, "")
             .env("SSH_AUTH_SOCK", "/tmp/env-agent")
-            .args(["-N", &format!("destination:{port}")])
+            .args(["--no-terminal", &format!("destination:{port}")])
             .output()
             .unwrap();
         let payload = server.join().unwrap();
@@ -1257,7 +1467,7 @@ fn unsupported_effective_config_fails_before_bootstrap() {
         let fake = FakeSsh::new();
         let output = fake
             .command(&format!("{RESOLVED_CONFIG}{row}\n"), VALID_MARKER, 0, "")
-            .args(["-N", "destination"])
+            .args(["--no-terminal", "destination"])
             .output()
             .unwrap();
         assert!(!output.status.success(), "{row}");
@@ -1270,13 +1480,18 @@ fn posix_client_forwards_only_ssh_locale_environment() {
     let (port, server) = initial_payload_server();
     let fake = FakeSsh::new();
     let output = fake
-        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
+        .command(
+            &format!("{RESOLVED_CONFIG}sendenv LANG LC_*\n"),
+            VALID_MARKER,
+            0,
+            "",
+        )
         .env("TERM", "xterm-test")
         .env("LANG", "ko_KR.UTF-8")
         .env("LC_TEST_SENTINEL", "C.UTF-8")
         .env("LANGUAGE", "do-not-forward")
         .env("ET_SECRET", "do-not-forward")
-        .args(["-N", &format!("server-alias:{port}")])
+        .args(["--no-terminal", &format!("server-alias:{port}")])
         .output()
         .unwrap();
     let payload = server.join().unwrap();
@@ -1303,7 +1518,11 @@ fn posix_client_forwards_only_ssh_locale_environment() {
         .env("TERM", "xterm256color")
         .env("LANG", "ko_KR.UTF-8")
         .env("LC_TEST_SENTINEL", "C.UTF-8")
-        .args(["-N", "--winserver", &format!("server-alias:{windows_port}")])
+        .args([
+            "--no-terminal",
+            "--winserver",
+            &format!("server-alias:{windows_port}"),
+        ])
         .output()
         .unwrap();
     let windows_payload = windows_server.join().unwrap();
@@ -1319,7 +1538,12 @@ fn posix_client_forwards_only_ssh_locale_environment() {
 fn posix_client_filters_locale_to_terminal_environment_limits() {
     let (port, server) = initial_payload_server();
     let fake = FakeSsh::new();
-    let mut command = fake.command(RESOLVED_CONFIG, VALID_MARKER, 0, "");
+    let mut command = fake.command(
+        &format!("{RESOLVED_CONFIG}sendenv LANG LC_*\n"),
+        VALID_MARKER,
+        0,
+        "",
+    );
     command
         .env("TERM", "xterm-ghostty")
         .env("COLORTERM", "truecolor")
@@ -1331,7 +1555,7 @@ fn posix_client_filters_locale_to_terminal_environment_limits() {
         command.env(format!("LC_BOUNDARY_{index:03}"), "C.UTF-8");
     }
     let output = command
-        .args(["-N", &format!("server-alias:{port}")])
+        .args(["--no-terminal", &format!("server-alias:{port}")])
         .output()
         .unwrap();
     let payload = server.join().unwrap();
@@ -1370,7 +1594,12 @@ fn posix_client_filters_locale_to_terminal_environment_limits() {
 fn posix_client_counts_duplicate_tunnel_environment_names_once() {
     let (port, server) = initial_payload_server_with_error(Some("stop after payload"));
     let fake = FakeSsh::new();
-    let mut command = fake.command(RESOLVED_CONFIG, VALID_MARKER, 0, "");
+    let mut command = fake.command(
+        &format!("{RESOLVED_CONFIG}sendenv LANG LC_*\n"),
+        VALID_MARKER,
+        0,
+        "",
+    );
     command
         .env("TERM", "xterm-ghostty")
         .env("COLORTERM", "truecolor")
@@ -1379,7 +1608,7 @@ fn posix_client_counts_duplicate_tunnel_environment_names_once() {
     for index in 0..130 {
         command.env(format!("LC_BOUNDARY_{index:03}"), "C.UTF-8");
     }
-    let mut arguments = vec!["-N".to_owned()];
+    let mut arguments = vec!["--no-terminal".to_owned()];
     for index in 0..128 {
         arguments.extend([
             "--reversetunnel".to_owned(),
@@ -1422,7 +1651,12 @@ fn posix_client_counts_duplicate_tunnel_environment_names_once() {
 fn posix_client_bounds_locale_to_local_terminal_packet() {
     let (port, server) = initial_payload_server();
     let fake = FakeSsh::new();
-    let mut command = fake.command(RESOLVED_CONFIG, VALID_MARKER, 0, "");
+    let mut command = fake.command(
+        &format!("{RESOLVED_CONFIG}sendenv LANG LC_*\n"),
+        VALID_MARKER,
+        0,
+        "",
+    );
     command
         .env("TERM", "xterm-256color")
         .env("LANG", "ko_KR.UTF-8")
@@ -1432,7 +1666,7 @@ fn posix_client_bounds_locale_to_local_terminal_packet() {
         command.env(format!("LC_000_{index:03}"), "x".repeat(4096));
     }
     let output = command
-        .args(["-N", &format!("server-alias:{port}")])
+        .args(["--no-terminal", &format!("server-alias:{port}")])
         .output()
         .unwrap();
     let payload = server.join().unwrap();
@@ -1510,7 +1744,7 @@ fn bare_windows_login_shell_is_detected_before_bootstrap() {
             "__ET_COMSPEC__C:\\WINDOWS\\system32\\cmd.exe\r\n",
         )
         .env("ET_FAKE_PROBE_EXIT", "0")
-        .args(["-N".to_owned(), address.to_string()])
+        .args(["--no-terminal".to_owned(), address.to_string()])
         .output()
         .unwrap();
     server.join().unwrap();
@@ -1557,7 +1791,7 @@ fn explicit_posix_shell_skips_probe_and_uses_exact_posix_bootstrap() {
             "__ET_COMSPEC__C:\\WINDOWS\\system32\\cmd.exe\r\n",
         )
         .args([
-            "-N".to_owned(),
+            "--no-terminal".to_owned(),
             "--remote-shell=posix".to_owned(),
             address.to_string(),
         ])
@@ -1596,7 +1830,7 @@ fn ssh_process_failures_are_typed() {
     let no_ssh = TestDir::new("no-ssh");
     let output = Command::new(env!("CARGO_BIN_EXE_et"))
         .env("PATH", &no_ssh.0)
-        .args(["-N", "127.0.0.1:1"])
+        .args(["--no-terminal", "127.0.0.1:1"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
@@ -1605,7 +1839,7 @@ fn ssh_process_failures_are_typed() {
     let fake = FakeSsh::new();
     let output = fake
         .command(RESOLVED_CONFIG, "", 42, "fake ssh failure\n")
-        .args(["-N", "127.0.0.1:1"])
+        .args(["--no-terminal", "127.0.0.1:1"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
@@ -1630,7 +1864,7 @@ fn marker_id_and_key_errors_are_distinct() {
         let fake = FakeSsh::new();
         let output = fake
             .command(RESOLVED_CONFIG, stdout, 0, "")
-            .args(["-N", "127.0.0.1:1"])
+            .args(["--no-terminal", "127.0.0.1:1"])
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(1));
@@ -1657,7 +1891,7 @@ fn fresh_bootstrap_rejects_returning_without_sending_initial_payload() {
     let fake = FakeSsh::new();
     let output = fake
         .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
-        .args(["-N".to_string(), address.to_string()])
+        .args(["--no-terminal".to_string(), address.to_string()])
         .output()
         .unwrap();
     server.join().unwrap();
@@ -1682,7 +1916,7 @@ fn protocol_rejection_and_unreachable_endpoint_are_typed() {
     let fake = FakeSsh::new();
     let rejected = fake
         .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
-        .args(["-N".to_string(), address.to_string()])
+        .args(["--no-terminal".to_string(), address.to_string()])
         .output()
         .unwrap();
     server.join().unwrap();
@@ -1694,7 +1928,7 @@ fn protocol_rejection_and_unreachable_endpoint_are_typed() {
     let fake = FakeSsh::new();
     let unreachable = fake
         .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
-        .args(["-N".to_string(), address.to_string()])
+        .args(["--no-terminal".to_string(), address.to_string()])
         .output()
         .unwrap();
     assert!(stderr(&unreachable).contains("Could not reach the ET server:"));
@@ -1704,8 +1938,12 @@ fn protocol_rejection_and_unreachable_endpoint_are_typed() {
 fn leading_hyphen_destination_components_are_rejected_before_spawn() {
     let no_ssh = TestDir::new("invalid-destination");
     for args in [
-        vec!["-N", "--", "-oProxyCommand=bad"],
-        vec!["-N", "--username=-oProxyCommand=bad", "server-alias"],
+        vec!["--no-terminal", "--", "-oProxyCommand=bad"],
+        vec![
+            "--no-terminal",
+            "--username=-oProxyCommand=bad",
+            "server-alias",
+        ],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_et"))
             .env("PATH", &no_ssh.0)
@@ -1722,7 +1960,7 @@ fn invalid_client_modes_fail_before_ssh_bootstrap() {
     let fake = FakeSsh::new();
     for (args, message) in [
         (
-            vec!["-N", "-t", "0:80", "example.test"],
+            vec!["--no-terminal", "--tunnel", "0:80", "example.test"],
             "invalid tunnel endpoint",
         ),
         (
@@ -1730,7 +1968,7 @@ fn invalid_client_modes_fail_before_ssh_bootstrap() {
             "--no-exit requires --command",
         ),
         (
-            vec!["-N", "-r", "BAD-NAME:remote", "example.test"],
+            vec!["--no-terminal", "-r", "BAD-NAME:remote", "example.test"],
             "invalid reverse-tunnel environment variable name",
         ),
     ] {
@@ -1748,7 +1986,7 @@ fn invalid_client_modes_fail_before_ssh_bootstrap() {
 #[test]
 fn excessive_unique_tunnel_environment_names_fail_before_ssh_bootstrap() {
     let fake = FakeSsh::new();
-    let mut arguments = vec!["-N".to_owned()];
+    let mut arguments = vec!["--no-terminal".to_owned()];
     for index in 0..129 {
         arguments.extend([
             "-r".to_owned(),
@@ -1773,7 +2011,7 @@ fn excessive_unique_tunnel_environment_names_fail_before_ssh_bootstrap() {
 #[test]
 fn colorterm_counts_toward_the_tunnel_environment_limit() {
     let fake = FakeSsh::new();
-    let mut arguments = vec!["-N".to_owned()];
+    let mut arguments = vec!["--no-terminal".to_owned()];
     for index in 0..128 {
         arguments.extend([
             "-r".to_owned(),
@@ -1801,7 +2039,7 @@ fn colorterm_counts_toward_the_tunnel_environment_limit() {
 fn non_posix_colorterm_does_not_reserve_an_unsent_environment_name() {
     let no_ssh = TestDir::new("honest");
     let mut arguments = vec![
-        "-N".to_owned(),
+        "--no-terminal".to_owned(),
         "--winserver".to_owned(),
         "--jumphost".to_owned(),
         "jump-alias".to_owned(),
@@ -1838,7 +2076,7 @@ fn oversized_tunnel_environment_name_exceeds_local_packet_limit() {
         .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
         .env("TERM", "xterm-256color")
         .args([
-            "-N",
+            "--no-terminal",
             "-r",
             &format!("{environment_name}:remote"),
             "server-alias:1",
@@ -1858,7 +2096,7 @@ fn oversized_tunnel_environment_name_exceeds_local_packet_limit() {
 fn oversized_jumphost_initialization_fails_before_ssh_bootstrap() {
     let fake = FakeSsh::new();
     let mut arguments = vec![
-        "-N".to_owned(),
+        "--no-terminal".to_owned(),
         "--jumphost".to_owned(),
         "jump-alias".to_owned(),
     ];
@@ -1886,7 +2124,7 @@ fn oversized_jumphost_initialization_fails_before_ssh_bootstrap() {
 fn non_posix_jumphost_ignores_unsent_colorterm_in_packet_budget() {
     let no_ssh = TestDir::new("honest");
     let mut arguments = vec![
-        "-N".to_owned(),
+        "--no-terminal".to_owned(),
         "--winserver".to_owned(),
         "--jumphost".to_owned(),
         "jump-alias".to_owned(),
@@ -1952,7 +2190,7 @@ fn jumphost_starts_a_jump_terminal_and_connects_to_the_jumphost() {
             "__ET_COMSPEC__C:\\WINDOWS\\system32\\cmd.exe\r\n",
         )
         .args([
-            "-N",
+            "--no-terminal",
             "--jumphost",
             "jump.example",
             "--jport",
@@ -2078,7 +2316,7 @@ fn destination_ssh_options_stay_off_jumphost_and_ssh_config_reaches_both() {
     let output = fake
         .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
         .args([
-            "-N",
+            "--no-terminal",
             "--jumphost",
             "jump.example",
             "--jport",
@@ -2164,7 +2402,7 @@ fn no_ssh_config_disables_config_on_destination_and_jumphost() {
     let output = fake
         .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
         .args([
-            "-N",
+            "--no-terminal",
             "--jumphost",
             "jump.example",
             "--jport",
@@ -2208,16 +2446,21 @@ fn ssh_config_path_validation_fails_closed_before_ssh() {
     let fake = FakeSsh::new();
     let cases: &[(&[&str], &str)] = &[
         (
-            &["-N", "--ssh-config", "relative", "example.test"],
+            &["--no-terminal", "--ssh-config", "relative", "example.test"],
             "must be an absolute path or 'none'",
         ),
         (
-            &["-N", "--ssh-config", "/tmp/et config", "example.test"],
+            &[
+                "--no-terminal",
+                "--ssh-config",
+                "/tmp/et config",
+                "example.test",
+            ],
             "must contain only ASCII letters, digits",
         ),
         (
             &[
-                "-N",
+                "--no-terminal",
                 "--ssh-config",
                 missing.to_str().unwrap(),
                 "example.test",
@@ -2226,7 +2469,7 @@ fn ssh_config_path_validation_fails_closed_before_ssh() {
         ),
         (
             &[
-                "-N",
+                "--no-terminal",
                 "--ssh-config",
                 not_file.to_str().unwrap(),
                 "example.test",
@@ -2234,7 +2477,12 @@ fn ssh_config_path_validation_fails_closed_before_ssh() {
             "must name a readable, non-symlink regular file",
         ),
         (
-            &["-N", "--ssh-config", link.to_str().unwrap(), "example.test"],
+            &[
+                "--no-terminal",
+                "--ssh-config",
+                link.to_str().unwrap(),
+                "example.test",
+            ],
             "must name a readable, non-symlink regular file",
         ),
     ];
@@ -2264,20 +2512,24 @@ fn malformed_jumphost_and_jserverfifo_fail_before_ssh_bootstrap() {
     // Use `--jumphost=value` form so values starting with `-` reach validation.
     let cases: &[(&[&str], &str)] = &[
         (
-            &["-N", "--jumphost=", "example.test"],
+            &["--no-terminal", "--jumphost=", "example.test"],
             "empty --jumphost value",
         ),
         (
-            &["-N", "--jumphost=-oProxyCommand=bad", "example.test"],
+            &[
+                "--no-terminal",
+                "--jumphost=-oProxyCommand=bad",
+                "example.test",
+            ],
             "must not begin with a hyphen",
         ),
         (
-            &["-N", "--jumphost=good,-evil", "example.test"],
+            &["--no-terminal", "--jumphost=good,-evil", "example.test"],
             "multi-hop jumphost is unsupported",
         ),
         (
             // `--jserverfifo` only makes sense together with `--jumphost`.
-            &["-N", "--jserverfifo=/tmp/fifo", "example.test"],
+            &["--no-terminal", "--jserverfifo=/tmp/fifo", "example.test"],
             "--jserverfifo requires --jumphost",
         ),
     ];

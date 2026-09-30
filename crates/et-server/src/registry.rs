@@ -57,6 +57,7 @@ struct StoredRegistration {
     info: Registration,
     stream: LocalStream,
     startup: StartupState,
+    registered_at: Instant,
 }
 
 #[derive(Clone)]
@@ -149,6 +150,7 @@ impl Registry {
                     info: registration,
                     stream,
                     startup,
+                    registered_at: Instant::now(),
                 });
                 self.inner.changed.notify_all();
                 Ok(RegisteredTerminal {
@@ -174,6 +176,7 @@ impl Registry {
                     info: registration,
                     stream,
                     startup,
+                    registered_at: Instant::now(),
                 });
                 self.inner.changed.notify_all();
                 Ok(RegisteredTerminal {
@@ -290,6 +293,16 @@ impl Registry {
             .registrations
             .get(id)
             .map(|stored| stored.info.clone()))
+    }
+
+    pub(crate) fn resumed(&self) -> Result<Vec<(Registration, Instant)>, RegistrationError> {
+        Ok(self
+            .lock()?
+            .registrations
+            .values()
+            .filter(|stored| stored.info.pty_active)
+            .map(|stored| (stored.info.clone(), stored.registered_at))
+            .collect())
     }
 
     pub(crate) fn clone_stream(

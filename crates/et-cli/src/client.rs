@@ -3,14 +3,16 @@
 //! The `--telemetry` flag is accepted for script compatibility but is a no-op:
 //! et.rs never collects telemetry regardless of its value.
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
 pub const DEFAULT_PORT: u16 = 2022;
 pub const MAX_KEEPALIVE: u32 = 5;
 
-#[derive(Parser, Debug, Clone)]
+#[derive(clap::Args, Debug, Clone)]
 #[command(
     name = "et",
+    disable_version_flag = true,
+    args_override_self = true,
     version = crate::VERSION,
     long_version = crate::LONG_VERSION,
     about = "Remote shell for the busy and impatient",
@@ -19,30 +21,106 @@ pub const MAX_KEEPALIVE: u32 = 5;
 pub struct ClientArgs {
     #[arg(
         help = "[user@]host[:port] destination",
-        required_unless_present_any = ["list_sessions", "attach", "kill_named"]
+        required_unless_present_any = ["list_sessions", "attach", "kill_named", "ssh_version", "version", "control_command"]
     )]
     pub host: Option<String>,
+
+    #[arg(hide = true, allow_hyphen_values = true)]
+    pub command_operands: Vec<String>,
+
+    #[arg(long, action = clap::ArgAction::Version)]
+    pub version: Option<bool>,
+
+    #[arg(short = 'V', help = "Print an OpenSSH-compatible version and exit")]
+    pub ssh_version: bool,
+
+    #[arg(
+        short = 'G',
+        help = "Print resolved SSH configuration without connecting"
+    )]
+    pub print_config: bool,
+
+    #[arg(short = 'p', value_parser = clap::value_parser!(u16).range(1..))]
+    pub ssh_port: Option<u16>,
+
+    #[arg(short = 'l')]
+    pub login_name: Option<String>,
+
+    #[arg(short = 'c')]
+    pub cipher: Option<String>,
+
+    #[arg(short = 'e')]
+    pub escape_char: Option<String>,
+
+    #[arg(short = 'i')]
+    pub identity_files: Vec<String>,
+
+    #[arg(short = 'x')]
+    pub disable_x11: bool,
+
+    #[arg(short = 'f')]
+    pub background: bool,
+
+    #[arg(short = 't', overrides_with = "no_pty")]
+    pub force_pty: bool,
+
+    #[arg(short = 'N')]
+    pub no_remote_command: bool,
+
+    #[arg(short = 'v', action = clap::ArgAction::Count)]
+    pub verbose_count: u8,
+
+    #[arg(short = 'o', value_name = "OPTION")]
+    pub session_options: Vec<String>,
+
+    #[arg(short = 'M')]
+    pub master: bool,
+
+    #[arg(short = 'S')]
+    pub control_path: Option<String>,
+
+    #[arg(short = 'O')]
+    pub control_command: Option<String>,
+
+    #[arg(skip)]
+    pub control_master: Option<ControlMasterMode>,
+
+    #[arg(skip)]
+    pub control_persist: Option<ControlPersist>,
+
+    #[arg(long)]
+    pub ctl: bool,
+
+    #[arg(long)]
+    pub ctl_socket: Option<String>,
+
+    #[arg(long)]
+    pub no_persist: bool,
+
+    #[arg(skip)]
+    pub keepalive_explicit: bool,
 
     #[arg(short = 'u', long = "username")]
     pub username: Option<String>,
 
-    #[arg(short = 'p', long = "port", default_value_t = DEFAULT_PORT)]
+    #[arg(long = "port", default_value_t = DEFAULT_PORT)]
     pub port: u16,
 
-    #[arg(short = 'c', long = "command")]
+    #[arg(long = "command")]
     pub command: Option<String>,
 
-    #[arg(short = 'e', long = "noexit", alias = "no-exit")]
+    #[arg(long = "noexit", alias = "no-exit")]
     pub no_exit: bool,
 
     #[arg(long = "terminal-path")]
     pub terminal_path: Option<String>,
 
-    #[arg(short = 't', long = "tunnel", value_name = "SPEC")]
+    #[arg(short = 'L', long = "tunnel", value_name = "SPEC")]
     pub tunnel: Vec<String>,
 
     #[arg(
         short = 'r',
+        short_alias = 'R',
         long = "reversetunnel",
         alias = "reverse-tunnel",
         value_name = "SPEC"
@@ -64,12 +142,11 @@ pub struct ClientArgs {
         short = 'W',
         long = "stdio-forward",
         value_name = "HOST:PORT",
-        conflicts_with = "no_pty",
         help = "Forward stdio to host:port without a remote shell (ssh -W)"
     )]
     pub stdio_forward: Option<String>,
 
-    #[arg(long = "jumphost")]
+    #[arg(short = 'j', short_alias = 'J', long = "jumphost")]
     pub jumphost: Option<String>,
 
     #[arg(long = "jport", default_value_t = DEFAULT_PORT)]
@@ -78,7 +155,7 @@ pub struct ClientArgs {
     #[arg(long = "jserverfifo")]
     pub jserverfifo: Option<String>,
 
-    #[arg(short = 'x', long = "kill-other-sessions")]
+    #[arg(long = "kill-other-sessions")]
     pub kill_other_sessions: bool,
 
     /// Save this direct session under `~/.et/sessions/<name>`.
@@ -144,18 +221,13 @@ pub struct ClientArgs {
     #[arg(long = "remote-shell", value_enum)]
     pub remote_shell: Option<RemoteShellKind>,
 
-    #[arg(
-        short = 'v',
-        long = "verbose",
-        value_name = "LEVEL",
-        default_value_t = 0
-    )]
+    #[arg(long = "verbose", value_name = "LEVEL", default_value_t = 0)]
     pub verbose: u8,
 
     #[arg(short = 'k', long = "keepalive", default_value_t = MAX_KEEPALIVE, value_parser = validate_keepalive)]
     pub keepalive: u32,
 
-    #[arg(short = 'l', long = "logdir")]
+    #[arg(long = "logdir")]
     pub logdir: Option<String>,
 
     #[arg(
@@ -176,19 +248,20 @@ pub struct ClientArgs {
     #[arg(long = "silent")]
     pub silent: bool,
 
-    #[arg(short = 'N', long = "no-terminal")]
+    #[arg(long = "no-terminal")]
     pub no_terminal: bool,
 
-    /// Run `-c` on pipes instead of a pty: binary stdio, separate stderr, no
+    /// Run a command on pipes instead of a pty: binary stdio, separate stderr, no
     /// shell injection. Matches EternalTerminal `-T` / `--no-pty`.
     #[arg(
         short = 'T',
         long = "no-pty",
-        help = "Run -c command on pipes instead of a pty (binary stdio, separate stderr, no shell injection)"
+        overrides_with = "force_pty",
+        help = "Run command on pipes instead of a pty (binary stdio, separate stderr, no shell injection)"
     )]
     pub no_pty: bool,
 
-    #[arg(short = 'f', long = "forward-ssh-agent")]
+    #[arg(long = "forward-ssh-agent")]
     pub forward_ssh_agent: bool,
 
     #[arg(long = "ssh-socket")]
@@ -202,6 +275,7 @@ pub struct ClientArgs {
 
     /// Read only this absolute SSH configuration file (or `none`).
     #[arg(
+        short = 'F',
         long = "ssh-config",
         value_name = "PATH",
         conflicts_with = "no_ssh_config"
@@ -239,12 +313,244 @@ fn parse_disconnect_minutes(raw: &str) -> Result<i64, String> {
 }
 
 impl ClientArgs {
+    /// Stop option parsing at the destination, just like OpenSSH. In particular,
+    /// `host echo -v` must not change local verbosity.
+    pub fn try_parse_from<I, T>(values: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let values: Vec<std::ffi::OsString> = values.into_iter().map(Into::into).collect();
+        let mut command = Self::command();
+        command.build();
+        let mut normalized = values.first().cloned().into_iter().collect::<Vec<_>>();
+        let mut index = 1;
+        while index < values.len() {
+            let token = values[index].to_string_lossy();
+            if token == "--" {
+                normalized.extend_from_slice(&values[index..]);
+                break;
+            }
+            if !token.starts_with('-') || token == "-" {
+                normalized.push("--".into());
+                normalized.extend_from_slice(&values[index..]);
+                break;
+            }
+            if let Some(long) = token.strip_prefix("--") {
+                let name = long.split('=').next().unwrap_or(long);
+                if let Some(arg) = command.get_arguments().find(|arg| {
+                    arg.get_long() == Some(name)
+                        || arg
+                            .get_all_aliases()
+                            .is_some_and(|aliases| aliases.contains(&name))
+                }) {
+                    normalized.push(values[index].clone());
+                    if !long.contains('=')
+                        && arg.get_action().takes_values()
+                        && index + 1 < values.len()
+                    {
+                        index += 1;
+                        normalized.push(values[index].clone());
+                    }
+                }
+            } else {
+                let mut chars = token[1..].char_indices().peekable();
+                while let Some((offset, short)) = chars.next() {
+                    let arg = command.get_arguments().find(|arg| {
+                        arg.get_short() == Some(short)
+                            || arg
+                                .get_all_short_aliases()
+                                .is_some_and(|aliases| aliases.contains(&short))
+                    });
+                    // The canonical upstream pre-pass consumes unsupported SSH
+                    // value options too, so their operands never become a host.
+                    let takes_value = arg.is_some_and(|arg| arg.get_action().takes_values())
+                        || "BbEImPQw".contains(short);
+                    if arg.is_some() {
+                        normalized.push(format!("-{short}").into());
+                    }
+                    if takes_value {
+                        let value = if chars.peek().is_some() {
+                            Some(std::ffi::OsString::from(
+                                &token[1 + offset + short.len_utf8()..],
+                            ))
+                        } else {
+                            index += 1;
+                            values.get(index).cloned()
+                        };
+                        let value = value.ok_or_else(|| {
+                            clap::Error::raw(
+                                clap::error::ErrorKind::InvalidValue,
+                                format!("-{short} requires an argument"),
+                            )
+                        })?;
+                        if arg.is_some() {
+                            normalized.push(value);
+                        }
+                        break;
+                    }
+                }
+            }
+            index += 1;
+        }
+        let matches = command.try_get_matches_from(normalized)?;
+        let mut parsed = <Self as clap::FromArgMatches>::from_arg_matches(&matches)?;
+        if !parsed.command_operands.is_empty() {
+            parsed.command = Some(parsed.command_operands.join(" "));
+        }
+        if matches.value_source("verbose") != Some(clap::parser::ValueSource::CommandLine) {
+            parsed.verbose = parsed.verbose_count;
+        }
+        parsed.keepalive_explicit =
+            matches.value_source("keepalive") == Some(clap::parser::ValueSource::CommandLine);
+        if let Some(login) = &parsed.login_name {
+            parsed.username = Some(login.clone());
+        }
+        let mut controls = Vec::new();
+        if parsed.master {
+            controls.push((matches.index_of("master").unwrap(), "ControlMaster", "yes"));
+        }
+        if let Some(path) = parsed.control_path.as_deref() {
+            controls.push((
+                matches.index_of("control_path").unwrap(),
+                "ControlPath",
+                path,
+            ));
+        }
+        if let Some(indices) = matches.indices_of("session_options") {
+            for (index, option) in indices.zip(&parsed.session_options) {
+                let (key, value) = split_ssh_option(option);
+                controls.push((index, key, value));
+            }
+        }
+        controls.sort_by_key(|(index, _, _)| *index);
+        let mut path = parsed.control_path.clone();
+        for (_, key, value) in controls {
+            let invalid =
+                |message| clap::Error::raw(clap::error::ErrorKind::ValueValidation, message);
+            if key.eq_ignore_ascii_case("ControlMaster") {
+                parsed.control_master = Some(value.parse().map_err(invalid)?);
+            } else if key.eq_ignore_ascii_case("ControlPersist") {
+                parsed.control_persist = Some(value.parse().map_err(invalid)?);
+            } else if key.eq_ignore_ascii_case("ControlPath") {
+                path = Some(value.to_owned());
+            }
+        }
+        parsed.control_path = path;
+        if let Some(command) = &mut parsed.control_command {
+            command.make_ascii_lowercase();
+        }
+        parsed.no_pty &= !parsed.no_remote_command;
+        if parsed.no_pty && parsed.stdio_forward.is_some() {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "-W/--stdio-forward cannot be combined with -T/--no-pty",
+            ));
+        }
+        Ok(parsed)
+    }
+
     /// Seconds to put in `InitialPayload.disconnect_timeout_seconds`.
     ///
     /// `None` leaves the field unset. `Some(0)` is an explicit "no timeout".
     pub fn disconnect_timeout_seconds(&self) -> Option<i32> {
         self.disconnect_timeout
             .map(|minutes| i32::try_from(minutes * 60).expect("parser rejected overflow"))
+    }
+}
+
+impl CommandFactory for ClientArgs {
+    fn command() -> clap::Command {
+        <Self as clap::Args>::augment_args(clap::Command::new("et"))
+    }
+
+    fn command_for_update() -> clap::Command {
+        <Self as clap::Args>::augment_args_for_update(clap::Command::new("et"))
+    }
+}
+
+impl Parser for ClientArgs {
+    fn try_parse_from<I, T>(values: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        Self::try_parse_from(values)
+    }
+
+    fn parse_from<I, T>(values: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        Self::try_parse_from(values).unwrap_or_else(|error| error.exit())
+    }
+
+    fn try_parse() -> Result<Self, clap::Error> {
+        Self::try_parse_from(std::env::args_os())
+    }
+
+    fn parse() -> Self {
+        Self::parse_from(std::env::args_os())
+    }
+}
+
+/// Split an OpenSSH option, accepting both `Key=value` and `Key value`.
+pub fn split_ssh_option(option: &str) -> (&str, &str) {
+    let option = option.trim();
+    let end = option
+        .find(|c: char| c == '=' || c.is_whitespace())
+        .unwrap_or(option.len());
+    let (key, rest) = option.split_at(end);
+    (key, rest.trim_start().trim_start_matches('=').trim_start())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlMasterMode {
+    No,
+    Yes,
+    Auto,
+}
+
+impl std::str::FromStr for ControlMasterMode {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "no" | "false" => Ok(Self::No),
+            "yes" | "true" => Ok(Self::Yes),
+            "auto" => Ok(Self::Auto),
+            _ => Err(format!("invalid ControlMaster: {value}")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControlPersist {
+    pub enabled: bool,
+    /// Zero means indefinitely when enabled.
+    pub seconds: u64,
+}
+
+impl std::str::FromStr for ControlPersist {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "no" | "false" => Ok(Self {
+                enabled: false,
+                seconds: 0,
+            }),
+            "yes" | "true" => Ok(Self {
+                enabled: true,
+                seconds: 0,
+            }),
+            _ => value
+                .parse()
+                .map(|seconds| Self {
+                    enabled: true,
+                    seconds,
+                })
+                .map_err(|_| format!("invalid ControlPersist: {value}")),
+        }
     }
 }
 
@@ -330,6 +636,138 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ignored_ssh_options_never_turn_their_operands_into_hosts() {
+        let args = <ClientArgs as Parser>::try_parse_from([
+            "et",
+            "-4q",
+            "-B",
+            "interface",
+            "-Elogfile",
+            "-m",
+            "hmac",
+            "--unknown=ignored",
+            "host",
+            "-B",
+            "remote",
+        ])
+        .unwrap();
+        assert_eq!(args.host.as_deref(), Some("host"));
+        assert_eq!(args.command.as_deref(), Some("-B remote"));
+        assert!(ClientArgs::try_parse_from(["et", "-B"]).is_err());
+        assert_eq!(
+            ClientArgs::try_parse_from(["et", "--help"])
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::DisplayHelp
+        );
+        let forward =
+            ClientArgs::try_parse_from(["et", "-NT", "-W", "localhost:80", "host"]).unwrap();
+        assert!(!forward.no_pty);
+    }
+
+    #[test]
+    fn host_boundary_preserves_remote_operands_and_overrides_command_flag() {
+        let args = ClientArgs::try_parse_from([
+            "et",
+            "--command",
+            "ignored",
+            "-v",
+            "host",
+            "printf",
+            "a b",
+            "--port",
+            "7",
+            "-v",
+            "--",
+        ])
+        .unwrap();
+        assert_eq!(args.command.as_deref(), Some("printf a b --port 7 -v --"));
+        assert_eq!(args.port, DEFAULT_PORT);
+        assert_eq!(args.verbose, 1);
+        let escaped = ClientArgs::try_parse_from(["et", "--", "-host", "-V"]).unwrap();
+        assert_eq!(escaped.host.as_deref(), Some("-host"));
+        assert!(!escaped.ssh_version);
+        assert_eq!(escaped.command.as_deref(), Some("-V"));
+    }
+
+    #[test]
+    fn short_flags_have_openssh_meanings_and_last_pty_override_wins() {
+        let args = ClientArgs::try_parse_from([
+            "et",
+            "-fx",
+            "-luser",
+            "-c",
+            "aes256-ctr",
+            "-e",
+            "none",
+            "-i",
+            "/tmp/key",
+            "-Tt",
+            "-Jfirst",
+            "--jumphost",
+            "second",
+            "-N",
+            "host",
+        ])
+        .unwrap();
+        assert!(args.background && args.disable_x11 && args.force_pty && args.no_remote_command);
+        assert!(
+            !args.forward_ssh_agent && !args.kill_other_sessions && !args.no_exit && !args.no_pty
+        );
+        assert_eq!(args.username.as_deref(), Some("user"));
+        assert_eq!(args.cipher.as_deref(), Some("aes256-ctr"));
+        assert_eq!(args.identity_files, ["/tmp/key"]);
+        assert_eq!(args.jumphost.as_deref(), Some("second"));
+        assert!(
+            ClientArgs::try_parse_from(["et", "-tT", "host", "true"])
+                .unwrap()
+                .no_pty
+        );
+    }
+
+    #[test]
+    fn mux_controls_are_ordered_and_queries_do_not_require_a_host() {
+        let args = ClientArgs::try_parse_from([
+            "et",
+            "-M",
+            "-oControlMaster=auto",
+            "-S/tmp/first",
+            "-o",
+            "ControlPath = /tmp/second",
+            "-oControlPersist=37",
+            "-O",
+            "CHECK",
+        ])
+        .unwrap();
+        assert_eq!(args.control_master, Some(ControlMasterMode::Auto));
+        assert_eq!(args.control_path.as_deref(), Some("/tmp/second"));
+        assert_eq!(
+            args.control_persist,
+            Some(ControlPersist {
+                enabled: true,
+                seconds: 37
+            })
+        );
+        assert_eq!(args.control_command.as_deref(), Some("check"));
+        let later =
+            ClientArgs::try_parse_from(["et", "-oControlMaster=no", "-M", "-Ocheck"]).unwrap();
+        assert_eq!(later.control_master, Some(ControlMasterMode::Yes));
+        assert!(
+            ClientArgs::try_parse_from(["et", "-V"])
+                .unwrap()
+                .ssh_version
+        );
+        assert_eq!(
+            ClientArgs::try_parse_from(["et", "--version"])
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::DisplayVersion
+        );
+        assert!(ClientArgs::try_parse_from(["et", "-oControlPersist=-1", "host"]).is_err());
+        assert!(ClientArgs::try_parse_from(["et", "-G"]).is_err());
+    }
+
+    #[test]
     fn host_only_uses_default_port() {
         let a = ClientArgs::try_parse_from(["et", "host"]).unwrap();
         assert_eq!(a.host.as_deref(), Some("host"));
@@ -338,15 +776,16 @@ mod tests {
 
     #[test]
     fn port_override() {
-        let a = ClientArgs::try_parse_from(["et", "host", "-p", "9999"]).unwrap();
+        let a = ClientArgs::try_parse_from(["et", "--port", "9999", "-p2200", "host"]).unwrap();
         assert_eq!(a.port, 9999);
+        assert_eq!(a.ssh_port, Some(2200));
     }
 
     #[test]
     fn verbose_takes_an_integer_level_like_upstream() {
-        let a = ClientArgs::try_parse_from(["et", "host", "-v", "3"]).unwrap();
+        let a = ClientArgs::try_parse_from(["et", "-vvv", "host"]).unwrap();
         assert_eq!(a.verbose, 3);
-        let a = ClientArgs::try_parse_from(["et", "host", "--verbose=2"]).unwrap();
+        let a = ClientArgs::try_parse_from(["et", "--verbose=2", "-vvv", "host"]).unwrap();
         assert_eq!(a.verbose, 2);
         let a = ClientArgs::try_parse_from(["et", "host"]).unwrap();
         assert_eq!(a.verbose, 0);
@@ -367,17 +806,17 @@ mod tests {
     #[test]
     fn flow_control_parses_opt_in_modes() {
         let backpressure =
-            ClientArgs::try_parse_from(["et", "host", "--flow-control", "backpressure"]).unwrap();
+            ClientArgs::try_parse_from(["et", "--flow-control", "backpressure", "host"]).unwrap();
         assert_eq!(backpressure.flow_control, FlowControlMode::Backpressure);
 
         let discard =
-            ClientArgs::try_parse_from(["et", "host", "--flow-control", "discard"]).unwrap();
+            ClientArgs::try_parse_from(["et", "--flow-control", "discard", "host"]).unwrap();
         assert_eq!(discard.flow_control, FlowControlMode::Discard);
     }
 
     #[test]
     fn no_pty_flag_parses_with_command() {
-        let raw = ClientArgs::try_parse_from(["et", "-T", "-c", "printf ok", "host"]).unwrap();
+        let raw = ClientArgs::try_parse_from(["et", "-T", "host", "printf", "ok"]).unwrap();
         assert!(raw.no_pty);
         assert_eq!(raw.command.as_deref(), Some("printf ok"));
         let long =
@@ -389,12 +828,12 @@ mod tests {
     fn upstream_long_flag_spellings_parse() {
         let a = ClientArgs::try_parse_from([
             "et",
-            "host",
-            "-c",
+            "--command",
             "true",
             "--noexit",
             "--reversetunnel",
             "8080:80",
+            "host",
         ])
         .unwrap();
         assert!(a.no_exit);
@@ -406,9 +845,9 @@ mod tests {
         let a = ClientArgs::try_parse_from(["et", "host"]).unwrap();
         assert_eq!(a.effective_remote_shell(), RemoteShellKind::Posix);
         assert!(!a.remote_is_windows());
-        let a = ClientArgs::try_parse_from(["et", "host", "--winserver"]).unwrap();
+        let a = ClientArgs::try_parse_from(["et", "--winserver", "host"]).unwrap();
         assert_eq!(a.effective_remote_shell(), RemoteShellKind::Cmd);
-        let a = ClientArgs::try_parse_from(["et", "host", "--remote-shell", "powershell"]).unwrap();
+        let a = ClientArgs::try_parse_from(["et", "--remote-shell", "powershell", "host"]).unwrap();
         assert_eq!(a.effective_remote_shell(), RemoteShellKind::Powershell);
         assert!(a.remote_is_windows());
         assert_eq!(a.effective_terminal_path().as_deref(), Some("et.exe"));
@@ -416,14 +855,14 @@ mod tests {
 
     #[test]
     fn winserver_sets_the_default_terminal_path() {
-        let a = ClientArgs::try_parse_from(["et", "host", "--winserver"]).unwrap();
+        let a = ClientArgs::try_parse_from(["et", "--winserver", "host"]).unwrap();
         assert_eq!(a.effective_terminal_path().as_deref(), Some("et.exe"));
         let a = ClientArgs::try_parse_from([
             "et",
-            "host",
             "--winserver",
             "--terminal-path",
             "C:/tools/et.exe",
+            "host",
         ])
         .unwrap();
         assert_eq!(
@@ -434,17 +873,17 @@ mod tests {
 
     #[test]
     fn macserver_sets_the_default_terminal_path() {
-        let a = ClientArgs::try_parse_from(["et", "host", "--macserver"]).unwrap();
+        let a = ClientArgs::try_parse_from(["et", "--macserver", "host"]).unwrap();
         assert_eq!(
             a.effective_terminal_path().as_deref(),
             Some("/usr/local/bin/etterminal")
         );
         let a = ClientArgs::try_parse_from([
             "et",
-            "host",
             "--macserver",
             "--terminal-path",
             "/opt/etterminal",
+            "host",
         ])
         .unwrap();
         assert_eq!(
@@ -455,23 +894,23 @@ mod tests {
 
     #[test]
     fn keepalive_rejects_zero() {
-        assert!(ClientArgs::try_parse_from(["et", "host", "-k", "0"]).is_err());
+        assert!(ClientArgs::try_parse_from(["et", "-k", "0", "host"]).is_err());
     }
 
     #[test]
     fn keepalive_rejects_above_max() {
-        assert!(ClientArgs::try_parse_from(["et", "host", "-k", "6"]).is_err());
+        assert!(ClientArgs::try_parse_from(["et", "-k", "6", "host"]).is_err());
     }
 
     #[test]
     fn keepalive_accepts_bounds() {
-        assert!(ClientArgs::try_parse_from(["et", "host", "-k", "1"]).is_ok());
-        assert!(ClientArgs::try_parse_from(["et", "host", "-k", "5"]).is_ok());
+        assert!(ClientArgs::try_parse_from(["et", "-k", "1", "host"]).is_ok());
+        assert!(ClientArgs::try_parse_from(["et", "-k", "5", "host"]).is_ok());
     }
 
     #[test]
     fn no_terminal_flag() {
-        let a = ClientArgs::try_parse_from(["et", "host", "-N"]).unwrap();
+        let a = ClientArgs::try_parse_from(["et", "--no-terminal", "host"]).unwrap();
         assert!(a.no_terminal);
     }
 
@@ -479,30 +918,30 @@ mod tests {
     fn close_on_hangup_defaults_off_and_parses() {
         let off = ClientArgs::try_parse_from(["et", "host"]).unwrap();
         assert!(!off.close_on_hangup);
-        let on = ClientArgs::try_parse_from(["et", "host", "--close-on-hangup"]).unwrap();
+        let on = ClientArgs::try_parse_from(["et", "--close-on-hangup", "host"]).unwrap();
         assert!(on.close_on_hangup);
     }
 
     #[test]
     fn dynamic_and_stdio_forwards_parse_and_w_conflicts_with_no_pty() {
         let dynamic =
-            ClientArgs::try_parse_from(["et", "host", "-D", "1080", "-D", "[::1]:1081"]).unwrap();
+            ClientArgs::try_parse_from(["et", "-D", "1080", "-D", "[::1]:1081", "host"]).unwrap();
         assert_eq!(dynamic.dynamic, ["1080", "[::1]:1081"]);
         assert!(dynamic.stdio_forward.is_none());
-        let stdio = ClientArgs::try_parse_from(["et", "host", "-W", "127.0.0.1:9"]).unwrap();
+        let stdio = ClientArgs::try_parse_from(["et", "-W", "127.0.0.1:9", "host"]).unwrap();
         assert_eq!(stdio.stdio_forward.as_deref(), Some("127.0.0.1:9"));
-        assert!(ClientArgs::try_parse_from(["et", "host", "-W", "h:1", "-T", "-c", "id"]).is_err());
+        assert!(ClientArgs::try_parse_from(["et", "-W", "h:1", "-T", "host", "id"]).is_err());
     }
 
     #[test]
     fn multiple_tunnels() {
         let a = ClientArgs::try_parse_from([
             "et",
-            "host",
-            "-t",
+            "-L",
             "8080:remote:80",
-            "-t",
+            "--tunnel",
             "9090:remote:90",
+            "host",
         ])
         .unwrap();
         assert_eq!(a.tunnel.len(), 2);
@@ -510,9 +949,9 @@ mod tests {
 
     #[test]
     fn telemetry_flag_accepted_as_noop() {
-        let a = ClientArgs::try_parse_from(["et", "host", "--telemetry"]).unwrap();
+        let a = ClientArgs::try_parse_from(["et", "--telemetry=true", "host"]).unwrap();
         assert!(a.telemetry);
-        let a = ClientArgs::try_parse_from(["et", "host", "--telemetry", "false"]).unwrap();
+        let a = ClientArgs::try_parse_from(["et", "--telemetry", "false", "host"]).unwrap();
         assert!(!a.telemetry);
     }
 
@@ -524,32 +963,32 @@ mod tests {
         assert_eq!(named.kill_named.as_deref(), Some("work"));
         assert!(!named.kill_other_sessions);
         let timeout =
-            ClientArgs::try_parse_from(["et", "host", "--disconnect-timeout", "2"]).unwrap();
+            ClientArgs::try_parse_from(["et", "--disconnect-timeout", "2", "host"]).unwrap();
         assert_eq!(timeout.disconnect_timeout_seconds(), Some(120));
-        assert!(ClientArgs::try_parse_from(["et", "host", "--disconnect-timeout", "-1"]).is_err());
+        assert!(ClientArgs::try_parse_from(["et", "--disconnect-timeout", "-1", "host"]).is_err());
     }
 
     #[test]
     fn ssh_config_and_no_ssh_config_parse() {
         let selected =
-            ClientArgs::try_parse_from(["et", "host", "--ssh-config", "/etc/et/ssh_config"])
+            ClientArgs::try_parse_from(["et", "--ssh-config", "/etc/et/ssh_config", "host"])
                 .unwrap();
         assert_eq!(selected.ssh_config.as_deref(), Some("/etc/et/ssh_config"));
         assert!(!selected.no_ssh_config);
 
-        let none = ClientArgs::try_parse_from(["et", "host", "--ssh-config", "none"]).unwrap();
+        let none = ClientArgs::try_parse_from(["et", "-F", "none", "host"]).unwrap();
         assert_eq!(none.ssh_config.as_deref(), Some("none"));
         assert!(!none.no_ssh_config);
 
         let windows =
-            ClientArgs::try_parse_from(["et", "host", "--ssh-config", r"C:\Users\me\.ssh\config"])
+            ClientArgs::try_parse_from(["et", "--ssh-config", r"C:\Users\me\.ssh\config", "host"])
                 .unwrap();
         assert_eq!(
             windows.ssh_config.as_deref(),
             Some(r"C:\Users\me\.ssh\config")
         );
 
-        let disabled = ClientArgs::try_parse_from(["et", "host", "--no-ssh-config"]).unwrap();
+        let disabled = ClientArgs::try_parse_from(["et", "--no-ssh-config", "host"]).unwrap();
         assert!(disabled.ssh_config.is_none());
         assert!(disabled.no_ssh_config);
     }
@@ -558,18 +997,18 @@ mod tests {
     fn ssh_config_conflicts_with_no_ssh_config() {
         assert!(ClientArgs::try_parse_from([
             "et",
-            "host",
             "--ssh-config",
             "/etc/et/ssh_config",
             "--no-ssh-config",
+            "host",
         ])
         .is_err());
         assert!(ClientArgs::try_parse_from([
             "et",
-            "host",
             "--no-ssh-config",
             "--ssh-config",
             "none",
+            "host",
         ])
         .is_err());
     }

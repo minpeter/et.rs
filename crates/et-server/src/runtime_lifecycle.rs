@@ -1,10 +1,12 @@
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use crate::registry::RegistrationIdentity;
+use crate::registry::{RegistrationError, RegistrationIdentity};
 use crate::runtime_error::RuntimeError;
 use crate::runtime_state::RuntimeCore;
 use crate::session::SessionConnection;
+use crate::session_slot::Slot;
 
 pub(crate) enum LifecycleEvent {
     TerminalDisconnected(RegistrationIdentity),
@@ -67,7 +69,24 @@ pub(crate) fn run(
         ));
     }
     let mut first_error = None;
-    while let Ok(event) = events.recv() {
+    let mut next_sweep = Instant::now();
+    loop {
+        let now = Instant::now();
+        if now >= next_sweep {
+            if let Err(error) = expire_unclaimed_resumes(&core, now) {
+                crate::diag::info(format!(
+                    "could not expire unclaimed terminal resumes: {error}"
+                ));
+                first_error.get_or_insert(error);
+            }
+            next_sweep = now + Duration::from_millis(100);
+        }
+        let event = match events.recv_timeout(next_sweep.saturating_duration_since(Instant::now()))
+        {
+            Ok(event) => event,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         match event {
             LifecycleEvent::TerminalDisconnected(identity) => {
                 crate::diag::info(format!(
@@ -140,6 +159,79 @@ pub(crate) fn run(
         }
     }
     first_error.map_or(Ok(()), Err)
+}
+
+/// A live PTY can re-register after restart without its client ever returning.
+/// Allow the promised recovery grace, then close it using the same override
+/// precedence as the active bridge (in particular, Some(0) disables expiry).
+pub(crate) fn expire_unclaimed_resumes(
+    core: &RuntimeCore,
+    now: Instant,
+) -> Result<(), RuntimeError> {
+    for (registration, registered_at) in core.registry.resumed()? {
+        let seconds = registration
+            .disconnect_timeout_seconds
+            .unwrap_or(core.disconnect_timeout_seconds);
+        if seconds <= 0
+            || now.saturating_duration_since(registered_at)
+                < Duration::from_secs(seconds as u64).max(et_core::RECOVERY_GRACE)
+        {
+            continue;
+        }
+        let identity = registration.identity();
+        let mut terminal = {
+            // Match claim()'s lock order: session table, then registry. Checking
+            // and removing under this lock prevents a reconnect from claiming
+            // a generation between our expiry decision and deregistration.
+            let mut state = core.sessions.lock()?;
+            if state.shutdown {
+                return Ok(());
+            }
+            let current_slot = state
+                .slots
+                .get(&registration.id)
+                .filter(|slot| identity.matches(slot.registration()));
+            if current_slot.is_some_and(|slot| !matches!(slot, Slot::Registered(_))) {
+                continue;
+            }
+            let remove_slot = current_slot.is_some();
+            let stream = match core.registry.clone_stream(&registration) {
+                Ok(stream) => stream,
+                Err(RegistrationError::Unavailable) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if !core.registry.remove_if_current(&identity)? {
+                continue;
+            }
+            if remove_slot {
+                state.slots.remove(&registration.id);
+                core.sessions.inner.changed.notify_all();
+            }
+            stream
+        };
+        core.raw_sockets.shutdown_inactive_registration(&identity)?;
+        // This generation has no session writer. Keep the close bounded without
+        // blocking the table lock or the rest of the lifecycle worker.
+        let close = et_core::packet::Packet::new(
+            et_core::proto::TerminalPacketType::TerminalClose as u8,
+            Vec::new(),
+        );
+        let sent = terminal.set_nonblocking(true).and_then(|()| {
+            et_net::local_packet::write_local_packet_cancelled(
+                &mut terminal,
+                &close,
+                &core.shutdown,
+                Instant::now() + Duration::from_millis(100),
+            )
+        });
+        if let Err(error) = sent {
+            crate::diag::info(format!(
+                "id={}: could not close expired resumed terminal: {error}",
+                registration.id
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -64,11 +64,12 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
         .map_err(|error| clap_io("could not install server signal handlers", error))?;
     let router_path = select_router_path(config.server_fifo.as_deref())
         .map_err(|error| clap_io("could not select terminal router path", error))?;
-    let mut runtime = Runtime::start_with_listen_backlog(
+    let mut runtime = Runtime::start_with_settings(
         config.bind_ip,
         config.port,
         router_path,
         config.listen_backlog,
+        config.disconnect_timeout_seconds,
     )
     .map_err(|error| clap_io("could not start ET server", error))?;
     if parsed.daemon_child {

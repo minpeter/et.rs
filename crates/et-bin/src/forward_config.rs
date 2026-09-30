@@ -81,6 +81,14 @@ impl ForwardConfig {
         &mut self,
         resolved: &ResolvedSshConfig,
     ) -> Result<(), ForwardConfigError> {
+        if resolved.clear_all_forwardings {
+            self.local_sources.retain(|source| source.stdio);
+            self.initial_payload.reversetunnels.retain(|request| {
+                request.source.is_none()
+                    && request.environmentvariable.as_deref() == Some("SSH_AUTH_SOCK")
+            });
+            return validate_environment_names(&self.initial_payload.reversetunnels);
+        }
         let mut local_requests = Vec::new();
         self.local_sources.retain(|source| {
             if local_requests.contains(&source.request) {
@@ -99,10 +107,33 @@ impl ForwardConfig {
                 ));
             }
         }
+        for endpoint in &resolved.dynamic_forwards {
+            let mut source = ForwardSource::dynamic(endpoint.clone());
+            source.origin = et_net::forward::ForwardOrigin::SshConfig {
+                strict: resolved.exit_on_forward_failure,
+            };
+            if !local_requests.contains(&source.request) {
+                local_requests.push(source.request.clone());
+                self.local_sources.push(source);
+            }
+        }
 
+        let mut explicit = std::mem::take(&mut self.initial_payload.reversetunnels);
+        // build() appends the generated agent request last. Keep that invariant
+        // after importing config rows so the reconnect proxy can retarget it.
+        let agent = explicit
+            .last()
+            .is_some_and(|request| {
+                request.source.is_none()
+                    && request.environmentvariable.as_deref() == Some("SSH_AUTH_SOCK")
+            })
+            .then(|| explicit.pop().unwrap());
         let mut remote_requests = Vec::new();
         let mut deduplicated = Vec::new();
-        for request in std::mem::take(&mut self.initial_payload.reversetunnels) {
+        for request in explicit
+            .into_iter()
+            .chain(resolved.remote_forwards.iter().cloned())
+        {
             let is_agent_forward = request.source.is_none()
                 && request.environmentvariable.as_deref() == Some("SSH_AUTH_SOCK");
             if is_agent_forward || !remote_requests.contains(&request) {
@@ -110,6 +141,7 @@ impl ForwardConfig {
                 deduplicated.push(request);
             }
         }
+        deduplicated.extend(agent);
         self.initial_payload.reversetunnels = deduplicated;
         validate_environment_names(&self.initial_payload.reversetunnels)
     }
@@ -159,12 +191,11 @@ pub fn build(
             jumphost: Some(false),
             reversetunnels: reverse_tunnels,
             environmentvariables: std::collections::HashMap::new(),
-            no_pty: args.no_pty.then_some(true),
-            command: args
-                .no_pty
+            no_pty: (args.no_pty && !args.no_remote_command).then_some(true),
+            command: (args.no_pty && !args.no_remote_command)
                 .then(|| args.command.clone().unwrap_or_default()),
             supports_exit_status: Some(true),
-            no_shell: args.stdio_forward.is_some().then_some(true),
+            no_shell: (args.stdio_forward.is_some() || args.no_remote_command).then_some(true),
             flowcontrol: args.flow_control.protocol_value(),
             disconnect_timeout_seconds: args.disconnect_timeout_seconds(),
         },

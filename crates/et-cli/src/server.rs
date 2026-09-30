@@ -26,6 +26,15 @@ pub struct ServerArgs {
     #[arg(long = "bindip", value_parser = parse_bind_ip)]
     pub bindip: Option<IpAddr>,
 
+    /// CLI minutes, converted to seconds by the value parser.
+    #[arg(
+        long = "disconnect-timeout",
+        value_name = "MINUTES",
+        value_parser = parse_disconnect_timeout,
+        help = "Minutes a disconnected terminal may remain alive; 0 disables the timeout"
+    )]
+    pub disconnect_timeout_seconds: Option<i32>,
+
     #[arg(long = "serverfifo")]
     pub serverfifo: Option<PathBuf>,
 
@@ -80,6 +89,8 @@ pub struct ServerConfig {
     pub telemetry: bool,
     /// Depth of the kernel accept queue. Always positive after resolution.
     pub listen_backlog: i32,
+    /// Default for sessions without an explicit override. Zero disables expiry.
+    pub disconnect_timeout_seconds: i32,
 }
 
 /// Upstream default max log size for `etserver` (20 MiB).
@@ -90,6 +101,7 @@ pub enum ConfigError {
     InvalidPort(String),
     InvalidBindIp(String),
     InvalidBacklog(String),
+    InvalidDisconnectTimeout(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -98,6 +110,9 @@ impl std::fmt::Display for ConfigError {
             Self::InvalidPort(value) => write!(f, "invalid server port: {value}"),
             Self::InvalidBindIp(value) => write!(f, "invalid server bind IP: {value}"),
             Self::InvalidBacklog(value) => write!(f, "invalid server listen backlog: {value}"),
+            Self::InvalidDisconnectTimeout(value) => {
+                write!(f, "invalid server disconnect timeout in minutes: {value}")
+            }
         }
     }
 }
@@ -118,6 +133,7 @@ pub fn resolve_config(
         log_size: DEFAULT_LOG_SIZE,
         telemetry: false,
         listen_backlog: DEFAULT_LISTEN_BACKLOG,
+        disconnect_timeout_seconds: 0,
     };
     let ini_log_directory_set = if let Some(text) = ini_text {
         apply_ini(&mut config, args, text)?
@@ -129,6 +145,9 @@ pub fn resolve_config(
     }
     if let Some(bind_ip) = args.bindip {
         config.bind_ip = bind_ip;
+    }
+    if let Some(seconds) = args.disconnect_timeout_seconds {
+        config.disconnect_timeout_seconds = seconds;
     }
     if let Some(path) = &args.serverfifo {
         config.server_fifo = Some(path.clone());
@@ -210,6 +229,10 @@ fn apply_ini(
             ("networking", "bind_ip") if args.bindip.is_none() => {
                 config.bind_ip = parse_bind_ip(value).map_err(ConfigError::InvalidBindIp)?;
             }
+            ("networking", "disconnect_timeout") if args.disconnect_timeout_seconds.is_none() => {
+                config.disconnect_timeout_seconds = parse_disconnect_timeout(value)
+                    .map_err(ConfigError::InvalidDisconnectTimeout)?;
+            }
             ("networking", "backlog") => {
                 let parsed = value
                     .parse::<i32>()
@@ -258,6 +281,15 @@ fn parse_port(value: &str) -> Result<u16, String> {
 
 fn parse_bind_ip(value: &str) -> Result<IpAddr, String> {
     value.parse::<IpAddr>().map_err(|_| value.to_owned())
+}
+
+fn parse_disconnect_timeout(value: &str) -> Result<i32, String> {
+    value
+        .parse::<i32>()
+        .ok()
+        .filter(|minutes| *minutes >= 0)
+        .and_then(|minutes| minutes.checked_mul(60))
+        .ok_or_else(|| value.to_owned())
 }
 
 #[cfg(test)]

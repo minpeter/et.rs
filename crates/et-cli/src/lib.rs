@@ -7,8 +7,7 @@
 //! - [`parse_positional_host`]: the `et` client positional grammar, which
 //!   counts colons to disambiguate bare (unbracketed) IPv6 from a trailing port.
 
-/// Short version string (`-V`), byte-compatible with upstream's
-/// `et version X.Y.Z` output that scripts may parse.
+/// ET version string. The client's `-V` is a separate OpenSSH compatibility query.
 pub const VERSION: &str = concat!("version ", env!("CARGO_PKG_VERSION"));
 
 /// Long version string (`--version`), identifying the et.rs port.

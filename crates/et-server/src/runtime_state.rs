@@ -19,6 +19,7 @@ pub(crate) struct RuntimeCore {
     pub(crate) forward_resolver: Arc<dyn et_net::forward::ForwardResolver>,
     /// Process start, for the post-restart `RETRY_LATER` grace window.
     pub(crate) started: Instant,
+    pub(crate) disconnect_timeout_seconds: i32,
 }
 
 pub(crate) const MAX_PRE_AUTH_CONNECTIONS: usize = 128;

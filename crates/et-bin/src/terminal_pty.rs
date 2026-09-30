@@ -24,6 +24,10 @@ use sysinfo::{Pid as SystemPid, ProcessesToUpdate, Signal as SystemSignal, Syste
 const MAX_OUTPUT_CHUNK: usize = 16 * 1024;
 const FINAL_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[path = "terminal_tmux_filter.rs"]
+mod terminal_tmux_filter;
+use terminal_tmux_filter::TmuxCcFilter;
+
 use crate::terminal_protocol::{
     handle_packet, read_initialization, read_ready_packet, write_terminal_exit_status,
     LocalPacketEffect, TerminalPacketError,
@@ -121,6 +125,15 @@ where
     command.env("TERM", term);
     for (name, value) in initialization.environment {
         command.env(name, value);
+    }
+    // The bootstrap SSH tty (or client-provided SSH_TTY) is not this session's
+    // tty. portable-pty caches the allocated slave name behind a safe Unix API.
+    #[cfg(unix)]
+    {
+        command.env_remove("SSH_TTY");
+        if let Some(name) = pair.master.tty_name() {
+            command.env("SSH_TTY", name);
+        }
     }
     // Complete every fallible descriptor allocation before creating the shell.
     // Once the process exists, all returns below pass through one cleanup path.
@@ -359,14 +372,16 @@ fn forward_output(
     }
     let mut buffer = [0u8; MAX_OUTPUT_CHUNK];
     let mut startup = prefix.map(|_| Vec::with_capacity(3));
+    let mut filter = TmuxCcFilter::default();
     loop {
         let count = reader
             .read(&mut buffer)
             .map_err(|error| format!("could not read PTY output: {error}"))?;
         if count == 0 {
             if let Some(startup) = startup {
-                write_output(router, cancelled, &startup)?;
+                write_output(router, cancelled, &filter.apply(&startup))?;
             }
+            write_output(router, cancelled, &filter.finish())?;
             return Ok(());
         }
         if let Some(mut pending) = startup.take() {
@@ -391,12 +406,12 @@ fn forward_output(
                     continue;
                 }
             } else {
-                write_output(router, cancelled, &pending)?;
+                write_output(router, cancelled, &filter.apply(&pending))?;
             }
-            write_output(router, cancelled, &buffer[consumed..count])?;
+            write_output(router, cancelled, &filter.apply(&buffer[consumed..count]))?;
             continue;
         }
-        write_output(router, cancelled, &buffer[..count])?;
+        write_output(router, cancelled, &filter.apply(&buffer[..count]))?;
     }
 }
 
@@ -405,23 +420,24 @@ fn write_output(
     cancelled: &AtomicBool,
     output: &[u8],
 ) -> Result<(), String> {
-    if output.is_empty() {
-        return Ok(());
-    }
-    let message = TerminalBuffer {
-        buffer: Some(output.to_vec()),
-
-        is_stderr: None,
-    };
-    let packet = Packet::new(
-        TerminalPacketType::TerminalBuffer as u8,
-        message.encode_to_vec(),
-    );
     let mut router = router
         .lock()
         .map_err(|_| "terminal router writer is unavailable".to_owned())?;
-    write_local_packet_until_cancelled(&mut *router, &packet, cancelled)
-        .map_err(|error| format!("could not forward PTY output: {error}"))
+    // A filtered protocol line can span several reads. Keep local packets
+    // bounded even when releasing a previously incomplete line.
+    for chunk in output.chunks(MAX_OUTPUT_CHUNK) {
+        let message = TerminalBuffer {
+            buffer: Some(chunk.to_vec()),
+            is_stderr: None,
+        };
+        let packet = Packet::new(
+            TerminalPacketType::TerminalBuffer as u8,
+            message.encode_to_vec(),
+        );
+        write_local_packet_until_cancelled(&mut *router, &packet, cancelled)
+            .map_err(|error| format!("could not forward PTY output: {error}"))?;
+    }
+    Ok(())
 }
 
 struct PumpCompletion {
@@ -901,6 +917,97 @@ mod tests {
         let packets = packets_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let output = packets.concat();
         (packets, output)
+    }
+
+    #[cfg(unix)]
+    fn run_probe(script: &str, pipe: bool) -> Vec<u8> {
+        let (router, mut peer) = et_net::local::wake_pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let init = TermInit {
+            environmentnames: vec!["SSH_TTY".to_owned()],
+            environmentvalues: vec!["/client/not-this-tty".to_owned()],
+            no_pty: pipe.then_some(true),
+            command: pipe.then(|| script.to_owned()),
+            ..TermInit::default()
+        };
+        write_local_packet(
+            &mut peer,
+            &Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec()),
+        )
+        .unwrap();
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", script]);
+        command.env("SSH_TTY", "/bootstrap/not-this-tty");
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result =
+                run_with_command(router, "xterm", command, Duration::ZERO, None, |_| Ok(()));
+            done_tx.send(result).unwrap();
+        });
+        let mut output = Vec::new();
+        loop {
+            let packet = read_local_packet(&mut peer).unwrap();
+            if packet.header() == TerminalPacketType::TerminalExitStatus as u8 {
+                let status = et_core::proto::TerminalExitStatus::decode(packet.payload()).unwrap();
+                assert_eq!(
+                    status.exitcode,
+                    Some(0),
+                    "{}",
+                    String::from_utf8_lossy(&output)
+                );
+                break;
+            }
+            assert_eq!(packet.header(), TerminalPacketType::TerminalBuffer as u8);
+            output.extend(
+                TerminalBuffer::decode(packet.payload())
+                    .unwrap()
+                    .buffer
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        output
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_tty_is_the_allocated_slave_and_does_not_contaminate_pipe_environment() {
+        let inherited = std::env::var_os("SSH_TTY");
+        let output = run_probe("test -t 0 && test -n \"$SSH_TTY\" && test \"$SSH_TTY\" = \"$(tty)\" || exit 73; printf PTY-IDENTITY-OK", false);
+        assert!(output
+            .windows(b"PTY-IDENTITY-OK".len())
+            .any(|part| part == b"PTY-IDENTITY-OK"));
+        assert_eq!(std::env::var_os("SSH_TTY"), inherited);
+        let output = run_probe(
+            r#"test ! -t 0 && test "$SSH_TTY" = /client/not-this-tty || exit 74; printf '\033P1000p%%output %%0 hi\nwall\n\033\\\000\377'"#,
+            true,
+        );
+        assert_eq!(output, b"\x1bP1000p%output %0 hi\nwall\n\x1b\\\0\xff");
+        assert_eq!(std::env::var_os("SSH_TTY"), inherited);
+    }
+
+    #[test]
+    fn forwarding_filters_control_stream_after_motd_and_bounds_long_lines() {
+        let mut input = b"\r\n\x1bP1000p%output %0 ".to_vec();
+        input.extend(vec![b'x'; MAX_OUTPUT_CHUNK * 2]);
+        input.extend_from_slice(b"\nBroadcast wall\r\n%exit\n\x1b\\prompt");
+        let mut expected = b"motd\r\n\x1bP1000p%output %0 ".to_vec();
+        expected.extend(vec![b'x'; MAX_OUTPUT_CHUNK * 2]);
+        expected.extend_from_slice(b"\n%exit\n\x1b\\prompt");
+        let (packets, output) = collect_forwarded(
+            &input.chunks(MAX_OUTPUT_CHUNK).collect::<Vec<_>>(),
+            Some(b"motd\r\n"),
+        );
+        assert_eq!(output, expected);
+        assert!(packets
+            .iter()
+            .all(|packet| packet.len() <= MAX_OUTPUT_CHUNK));
     }
 
     #[cfg(unix)]

@@ -85,3 +85,52 @@ fn cli_rejects_zero_port_and_non_literal_bind() {
     assert!(ServerArgs::try_parse_from(["etserver", "--port", "0"]).is_err());
     assert!(ServerArgs::try_parse_from(["etserver", "--bindip", "localhost"]).is_err());
 }
+
+#[test]
+fn disconnect_timeout_minutes_defaults_ini_cli_and_explicit_zero() {
+    let args = ServerArgs::try_parse_from(["etserver"]).unwrap();
+    assert_eq!(
+        resolve_config(&args, None)
+            .unwrap()
+            .disconnect_timeout_seconds,
+        0
+    );
+    let ini = "[Networking]\ndisconnect_timeout=7\n";
+    assert_eq!(
+        resolve_config(&args, Some(ini))
+            .unwrap()
+            .disconnect_timeout_seconds,
+        420
+    );
+    for (minutes, seconds) in [("2", 120), ("0", 0), ("35791394", 2_147_483_640)] {
+        let args =
+            ServerArgs::try_parse_from(["etserver", "--disconnect-timeout", minutes]).unwrap();
+        for ini in [ini, "[Networking]\ndisconnect_timeout=invalid\n"] {
+            assert_eq!(
+                resolve_config(&args, Some(ini))
+                    .unwrap()
+                    .disconnect_timeout_seconds,
+                seconds
+            );
+        }
+    }
+}
+
+#[test]
+fn invalid_disconnect_timeout_rejects_negative_overflow_and_non_integer() {
+    let args = ServerArgs::try_parse_from(["etserver"]).unwrap();
+    for invalid in ["-1", "35791395", "2147483648", "1.5", "nope"] {
+        assert!(ServerArgs::try_parse_from([
+            "etserver",
+            &format!("--disconnect-timeout={invalid}")
+        ])
+        .is_err());
+        assert!(matches!(
+            resolve_config(
+                &args,
+                Some(&format!("[Networking]\ndisconnect_timeout={invalid}\n"))
+            ),
+            Err(ConfigError::InvalidDisconnectTimeout(_))
+        ));
+    }
+}

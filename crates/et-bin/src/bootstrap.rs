@@ -244,14 +244,17 @@ fn append_operational_options(args: &mut Vec<String>, options: &[String]) {
 
 pub(crate) fn is_forced_operational_option(option: &str) -> bool {
     let key = ssh_option_key(option);
-    FILTERED_SSH_OPTION_KEYS
-        .iter()
-        .any(|filtered| key.eq_ignore_ascii_case(filtered))
+    is_control_option(option)
+        || FILTERED_SSH_OPTION_KEYS
+            .iter()
+            .any(|filtered| key.eq_ignore_ascii_case(filtered))
 }
 
 pub(crate) fn is_control_option(option: &str) -> bool {
     let key = ssh_option_key(option);
-    key.eq_ignore_ascii_case("ControlMaster") || key.eq_ignore_ascii_case("ControlPath")
+    key.eq_ignore_ascii_case("ControlMaster")
+        || key.eq_ignore_ascii_case("ControlPath")
+        || key.eq_ignore_ascii_case("ControlPersist")
 }
 
 fn ssh_option_key(option: &str) -> &str {

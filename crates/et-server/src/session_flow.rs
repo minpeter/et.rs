@@ -89,6 +89,14 @@ impl FlowControl {
         if state.stop != StopMode::Running {
             return Err(SessionError::Unavailable);
         }
+        // The client may exit as soon as it sees status. Do not let the
+        // fair control lane overtake preceding terminal output. The bridge
+        // retains this packet and retries after the writer's completion wake.
+        if packet.header() == et_core::proto::TerminalPacketType::TerminalExitStatus as u8
+            && (state.in_flight || !state.queue.is_empty())
+        {
+            return Err(SessionError::Connection(ConnError::Backpressure));
+        }
         match state.queue.push(packet) {
             Ok(()) => {
                 #[cfg(test)]

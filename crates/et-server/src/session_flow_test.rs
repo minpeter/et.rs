@@ -16,6 +16,54 @@ use super::{
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
 
+#[test]
+fn exit_status_waits_for_queued_and_in_flight_output() {
+    use et_core::packet::Packet;
+    use et_core::proto::{TerminalBuffer, TerminalExitStatus, TerminalPacketType};
+
+    for flow in [
+        FlowControl::new_default(),
+        FlowControl::new(et_core::flow_control::FlowControlMode::Backpressure),
+        FlowControl::new(et_core::flow_control::FlowControlMode::Discard),
+    ] {
+        let output = |bytes: &[u8]| {
+            Packet::new(
+                TerminalPacketType::TerminalBuffer as u8,
+                TerminalBuffer {
+                    buffer: Some(bytes.to_vec()),
+                    is_stderr: None,
+                }
+                .encode_to_vec(),
+            )
+        };
+        let first = output(b"first\n");
+        let last = output(b"last\n");
+        let status = Packet::new(
+            TerminalPacketType::TerminalExitStatus as u8,
+            TerminalExitStatus { exitcode: Some(0) }.encode_to_vec(),
+        );
+        flow.enqueue(first.clone()).unwrap();
+        flow.enqueue(last.clone()).unwrap();
+        for expected in [first, last] {
+            assert!(matches!(
+                flow.enqueue(status.clone()),
+                Err(SessionError::Connection(ConnError::Backpressure))
+            ));
+            let packet = flow.next_packet().unwrap();
+            assert_eq!(packet, expected);
+            // Even with an empty queue, the in-flight final frame still
+            // precedes status; an early status would truncate client output.
+            assert!(matches!(
+                flow.enqueue(status.clone()),
+                Err(SessionError::Connection(ConnError::Backpressure))
+            ));
+            assert!(flow.complete(packet, &FlowWriteResult::Delivered, true));
+        }
+        flow.enqueue(status.clone()).unwrap();
+        assert_eq!(flow.next_packet().unwrap(), status);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn final_in_flight_completion_wakes_bridge_after_control_capacity_reopens() {

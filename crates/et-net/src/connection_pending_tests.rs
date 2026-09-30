@@ -16,6 +16,7 @@ fn pair() -> (Connection, Connection) {
     let (client, server) = streams();
     let sender = Connection::new_client(client, &[19; 32]);
     sender.shrink_transport_window_for_tests(4096).unwrap();
+    sender.set_io_timeout(Some(Duration::from_secs(3))).unwrap();
     let peer = Connection::new_server(server, &[19; 32]);
     peer.set_io_timeout(Some(Duration::from_secs(3))).unwrap();
     (sender, peer)
@@ -45,6 +46,59 @@ fn pending_send_enables_socket_sigpipe_suppression_on_apple() {
     rustix::net::sockopt::set_socket_nosigpipe(&stream, false).unwrap();
     sender.start_write_packet_owned(7, b"first").unwrap();
     assert!(rustix::net::sockopt::socket_nosigpipe(&stream).unwrap());
+    assert!(rustix::fs::fcntl_getfl(&stream)
+        .unwrap()
+        .contains(rustix::fs::OFlags::NONBLOCK));
+}
+
+#[test]
+fn synchronous_read_after_live_write_waits_for_delayed_response() {
+    let (mut sender, mut peer) = pair();
+    sender.start_write_packet_owned(7, b"request").unwrap();
+    drain(&mut sender);
+    let receiver = thread::spawn(move || {
+        assert_eq!(peer.read_packet().unwrap().payload(), b"request");
+        thread::sleep(Duration::from_millis(50));
+        peer.write_packet(8, b"response").unwrap();
+    });
+    assert_eq!(sender.read_packet().unwrap(), Packet::new(8, b"response"));
+    receiver.join().unwrap();
+    assert!(sender.connected());
+}
+
+#[test]
+fn synchronous_read_after_live_write_honors_deadline() {
+    let (mut sender, _peer) = pair();
+    sender.start_write_packet_owned(7, b"request").unwrap();
+    drain(&mut sender);
+    let started = Instant::now();
+    let error = sender
+        .read_packet_deadline(started + Duration::from_millis(50))
+        .unwrap_err();
+    assert!(matches!(error, ConnError::Io(ref error)
+        if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)));
+    assert!(started.elapsed() >= Duration::from_millis(40));
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn synchronous_write_after_live_write_waits_until_deadline() {
+    let (mut sender, _peer) = pair();
+    sender.start_write_packet_owned(7, b"request").unwrap();
+    drain(&mut sender);
+    let started = Instant::now();
+    let error = sender
+        .write_packet_live_until(
+            8,
+            &vec![42; 1024 * 1024],
+            started + Duration::from_millis(100),
+        )
+        .unwrap_err();
+    assert!(matches!(error, ConnError::Io(ref error)
+        if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)));
+    assert!(started.elapsed() >= Duration::from_millis(80));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(!sender.connected());
 }
 
 #[test]

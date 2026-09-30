@@ -1,4 +1,4 @@
-use std::io::{self, Read};
+use std::io;
 use std::net::{Shutdown, TcpStream};
 use std::time::{Duration, Instant};
 
@@ -286,7 +286,7 @@ impl Connection {
             }
             constrain_recovery_io(&self.stream, deadline)?;
             let mut buffer = [0u8; 8192];
-            match self.stream.read(&mut buffer) {
+            match crate::connection_nonblocking::read_blocking(&self.stream, &mut buffer) {
                 Ok(0) => {
                     self.disconnect();
                     return Err(ConnError::Io(io::ErrorKind::UnexpectedEof.into()));

@@ -37,12 +37,14 @@ impl PendingWrite {
             ));
         }
         let end = self.frame.len().min(self.offset + WRITE_QUANTUM);
-        // Darwin uses a socket option rather than MSG_NOSIGNAL. Do not rely
-        // on the embedding process ignoring SIGPIPE globally.
+        // Darwin's MSG_DONTWAIT only avoids the send-buffer lock; it does
+        // not avoid waiting for buffer space. Keep O_NONBLOCK on all clones
+        // permanently; synchronous Connection I/O waits for readiness.
         #[cfg(target_vendor = "apple")]
         let flags = {
             if self.offset == 0 {
                 rustix::net::sockopt::set_socket_nosigpipe(&self.stream, true)?;
+                self.stream.set_nonblocking(true)?;
             }
             rustix::net::SendFlags::DONTWAIT
         };

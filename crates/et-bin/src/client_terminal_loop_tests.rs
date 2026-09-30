@@ -193,6 +193,9 @@ fn tcp_streams() -> (TcpStream, TcpStream) {
     socket2::SockRef::from(&client)
         .set_send_buffer_size(4096)
         .unwrap();
+    client
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
     let server = listener.accept().unwrap().0;
     server
         .set_read_timeout(Some(Duration::from_secs(3)))
@@ -203,11 +206,19 @@ fn tcp_streams() -> (TcpStream, TcpStream) {
 // Fill the live socket before creating a Connection so even a tiny close
 // record cannot complete in its first send. The receiver strips this prefix.
 fn fill_transport(stream: &TcpStream) -> usize {
+    // MSG_DONTWAIT alone does not prevent a Darwin send-buffer-space wait.
+    // This is fixture setup, before any Connection/other clone can use it.
+    stream.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
     let mut count = 0;
     loop {
+        assert!(Instant::now() < deadline, "transport never saturated");
         match rustix::net::send(stream, &[0; 4096], rustix::net::SendFlags::DONTWAIT) {
             Ok(n) => count += n,
-            Err(rustix::io::Errno::AGAIN) => return count,
+            Err(rustix::io::Errno::AGAIN) => {
+                stream.set_nonblocking(false).unwrap();
+                return count;
+            }
             Err(error) => panic!("filling transport: {error}"),
         }
     }
@@ -246,6 +257,7 @@ where
 fn stdio_exit_finishes_close_under_transport_backpressure() {
     let (client, mut server) = tcp_streams();
     let prefix = fill_transport(&client);
+    let control = client.try_clone().unwrap();
     let (done_tx, done_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
         let mut connection = Connection::new_client(client, &[19; 32]);
@@ -258,6 +270,9 @@ fn stdio_exit_finishes_close_under_transport_backpressure() {
     server.read_exact(&mut vec![0; prefix]).unwrap();
     let mut peer = Connection::new_server(server, &[19; 32]);
     let close = peer.read_packet();
+    if close.is_err() {
+        let _ = control.shutdown(std::net::Shutdown::Both);
+    }
     worker.join().unwrap();
     assert!(early.is_err(), "pump returned before close could be sent");
     assert!(!done_rx.recv_timeout(Duration::from_secs(3)).unwrap());
@@ -395,6 +410,7 @@ fn stdin_in_hup_drains_all_chunks_and_pending_frames_before_exit() {
         .contains(PollFlags::IN | PollFlags::HUP));
     let (client, mut server) = tcp_streams();
     let prefix = fill_transport(&client);
+    let control = client.try_clone().unwrap();
     let (read_tx, read_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
@@ -415,7 +431,10 @@ fn stdin_in_hup_drains_all_chunks_and_pending_frames_before_exit() {
     server.read_exact(&mut vec![0; prefix]).unwrap();
     let mut peer = Connection::new_server(server, &[19; 32]);
     let mut received = Vec::new();
-    while let Ok(packet) = peer.read_packet() {
+    while received.len() < expected.len() {
+        let Ok(packet) = peer.read_packet() else {
+            break;
+        };
         assert_eq!(packet.header(), TerminalPacketType::TerminalBuffer as u8);
         received.extend(
             TerminalBuffer::decode(packet.payload())
@@ -424,9 +443,11 @@ fn stdin_in_hup_drains_all_chunks_and_pending_frames_before_exit() {
                 .unwrap(),
         );
     }
+    let completed = done_rx.recv_timeout(Duration::from_secs(3));
+    let _ = control.shutdown(std::net::Shutdown::Both);
     worker.join().unwrap();
     assert!(early.is_err(), "pump abandoned a pending stdin frame");
-    assert!(!done_rx.recv_timeout(Duration::from_secs(3)).unwrap());
+    assert!(!completed.unwrap());
     assert_eq!(received, expected);
     assert_eq!(peer.reader_sequence(), 4);
 }

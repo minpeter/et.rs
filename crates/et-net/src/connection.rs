@@ -1,7 +1,8 @@
-use std::io::{self, Read, Write};
+use std::io;
 use std::net::{Shutdown, TcpStream};
 use std::time::{Duration, Instant};
 
+use crate::connection_nonblocking::{read_blocking, write_blocking};
 use et_core::backed_reader::{BackedReader, ReadError, ReadItem};
 use et_core::backed_writer::{BackedWriter, RecoverError, WriterOutcome};
 use et_core::crypto::{
@@ -256,7 +257,7 @@ impl Connection {
                 }
             }
             let mut buffer = [0u8; 8192];
-            match self.stream.read(&mut buffer) {
+            match read_blocking(&self.stream, &mut buffer) {
                 Ok(0) => {
                     self.disconnect();
                     return Err(ConnError::Io(io::ErrorKind::UnexpectedEof.into()));
@@ -300,7 +301,7 @@ impl Connection {
                 .set_read_timeout(Some(remaining))
                 .map_err(ConnError::Io)?;
             let mut buffer = [0u8; 8192];
-            match self.stream.read(&mut buffer) {
+            match read_blocking(&self.stream, &mut buffer) {
                 Ok(0) => {
                     let _ = self.stream.set_read_timeout(None);
                     self.disconnect();
@@ -353,6 +354,9 @@ impl Connection {
         }
     }
 
+    /// Clone the transport for readiness polling or shutdown. On Apple,
+    /// live sends leave the shared socket nonblocking; use Connection's
+    /// packet APIs rather than assuming blocking I/O on this raw clone.
     pub fn try_clone_stream(&self) -> Result<TcpStream, ConnError> {
         self.stream.try_clone().map_err(ConnError::Io)
     }
@@ -519,7 +523,7 @@ fn write_all_until(stream: &mut TcpStream, mut buffer: &[u8], deadline: Instant)
                 io::Error::new(io::ErrorKind::TimedOut, "live write deadline elapsed")
             })?;
         stream.set_write_timeout(Some(remaining))?;
-        match stream.write(buffer) {
+        match write_blocking(stream, buffer) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(count) => buffer = &buffer[count..],
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}

@@ -105,7 +105,9 @@ fn pump_services_inbound_while_forwarding_peer_refuses_to_read() {
     peer.write_packet(255, b"dispatch-before-output-drain")
         .unwrap();
     let observed = done_rx.recv_timeout(Duration::from_secs(1));
-    control.shutdown(Shutdown::Both).unwrap();
+    // Dropping the completed pump's pending frame may already have shut
+    // down this socket (Darwin reports ENOTCONN on a second shutdown).
+    let _ = control.shutdown(Shutdown::Both);
     worker.join().unwrap();
 
     // Then: dispatch ended the pump, not a write timeout/reconnect. No API
@@ -216,6 +218,24 @@ fn fill_transport(stream: &TcpStream) -> usize {
         match rustix::net::send(stream, &[0; 4096], rustix::net::SendFlags::DONTWAIT) {
             Ok(n) => count += n,
             Err(rustix::io::Errno::AGAIN) => {
+                // A first EAGAIN can precede ACKs for bytes still moving to
+                // the peer's receive queue. Fill that newly freed capacity
+                // too; only an unread, settled window proves backpressure.
+                let mut descriptors = [PollFd::new(stream, PollFlags::OUT)];
+                let timeout = Timespec::try_from(Duration::from_millis(250)).unwrap();
+                if poll(&mut descriptors, Some(&timeout)).unwrap() != 0 {
+                    continue;
+                }
+                // Poll's low-water mark can hide room for a tiny close.
+                // Prove that even one more byte cannot be accepted.
+                match rustix::net::send(stream, &[0], rustix::net::SendFlags::DONTWAIT) {
+                    Ok(n) => {
+                        count += n;
+                        continue;
+                    }
+                    Err(rustix::io::Errno::AGAIN) => {}
+                    Err(error) => panic!("probing saturated transport: {error}"),
+                }
                 stream.set_nonblocking(false).unwrap();
                 return count;
             }

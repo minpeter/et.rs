@@ -78,6 +78,10 @@ pub(crate) fn take_hangup_close(connection: &mut Connection, hangup: &HangupClos
     if !hangup.requested() {
         return false;
     }
+    // A retained partial frame would otherwise refuse the close as
+    // backpressure; finish it so the close follows it in order.
+    #[cfg(unix)]
+    let _ = connection.finish_pending_write();
     if connection.connected() {
         let _ = connection.write_packet(TerminalPacketType::TerminalClose as u8, &[]);
     }

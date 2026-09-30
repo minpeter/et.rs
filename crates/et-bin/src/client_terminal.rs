@@ -473,7 +473,7 @@ where
     )
 }
 
-fn write_owned_recovering_with<F, W>(
+pub(crate) fn write_owned_recovering_with<F, W>(
     connection: &mut Connection,
     header: u8,
     payload: &[u8],
@@ -495,7 +495,7 @@ where
     )
 }
 
-fn write_owned_with_policy<W, R>(
+pub(crate) fn write_owned_with_policy<W, R>(
     connection: &mut Connection,
     header: u8,
     payload: &[u8],

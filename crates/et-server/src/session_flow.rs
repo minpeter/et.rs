@@ -89,6 +89,14 @@ impl FlowControl {
         if state.stop != StopMode::Running {
             return Err(SessionError::Unavailable);
         }
+        // The client may exit as soon as it sees status. Do not let the
+        // fair control lane overtake preceding terminal output. The bridge
+        // retains this packet and retries after the writer's completion wake.
+        if packet.header() == et_core::proto::TerminalPacketType::TerminalExitStatus as u8
+            && (state.in_flight || !state.queue.is_empty())
+        {
+            return Err(SessionError::Connection(ConnError::Backpressure));
+        }
         match state.queue.push(packet) {
             Ok(()) => {
                 #[cfg(test)]
@@ -317,12 +325,13 @@ pub(super) fn run_writer(session: Weak<ActiveSession>, flow: Arc<FlowControl>) {
         let Some(session) = session.upgrade() else {
             return;
         };
-        // Popping this packet may have reopened bounded queue capacity.
-        // Wake the bridge so it polls terminal output again instead of
-        // sleeping indefinitely with terminal readability disabled.
-        let _ = session.signal();
         let (result, connected) = writer::write_packet(&session, &flow, &packet);
-        if !flow.complete(packet, &result, connected) {
+        let running = flow.complete(packet, &result, connected);
+        // In-flight packets still own queue capacity until complete. Wake
+        // after releasing it, including when this was the final queued frame:
+        // a signal before the write can strand the bridge's retained packet.
+        let _ = session.signal();
+        if !running {
             return;
         }
     }

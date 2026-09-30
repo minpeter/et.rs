@@ -658,7 +658,7 @@ fn send_or_hold(
     connected: &mut bool,
     connection_generation: &mut u64,
 ) -> Result<Option<Packet>, SessionError> {
-    match session.send_packet_owned(packet.header(), packet.payload()) {
+    match session.send_bridge_packet_owned(packet.header(), packet.payload()) {
         Ok(()) => Ok(None),
         Err(SessionWriteError::BeforeReplay(SessionError::Connection(ConnError::Backpressure))) => {
             Ok(Some(packet))
@@ -1071,6 +1071,80 @@ mod tests {
     use prost::Message;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_services_inbound_while_forwarding_peer_refuses_to_read() {
+        use et_net::connection::Connection;
+        use et_net::local_packet::{read_local_packet, write_local_packet};
+        use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
+        use std::sync::mpsc;
+        use std::thread;
+
+        // Given: the actual jumphost bridge relays a large forwarding frame
+        // into a tiny TCP window. The remote peer never drains that output.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        rustix::net::sockopt::set_socket_recv_buffer_size(&listener, 4096).unwrap();
+        let server = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (client, _) = listener.accept().unwrap();
+        let control = server.try_clone().unwrap();
+        let connection = Connection::new_server(server, &[19; 32]);
+        connection.shrink_transport_window_for_tests(4096).unwrap();
+        let mut peer = Connection::new_client(client, &[19; 32]);
+        let (terminal, mut terminal_peer) = et_net::local::wake_pair().unwrap();
+        let session = Arc::new(ActiveSession::new(connection, &terminal, None).unwrap());
+        rustix::net::sockopt::set_socket_send_buffer_size(
+            session.try_clone_stream().unwrap().0,
+            4096,
+        )
+        .unwrap();
+        session.start_flow_writer();
+        let bridge_session = Arc::clone(&session);
+        let bridge = thread::spawn(move || {
+            run_mode(
+                bridge_session,
+                terminal,
+                Forwarder::start(Vec::new()).unwrap(),
+                BridgeMode::Jumphost,
+            )
+        });
+        let (sent_tx, sent_rx) = mpsc::sync_channel(1);
+        let (received_tx, received_rx) = mpsc::sync_channel(1);
+        let local = thread::spawn(move || {
+            write_local_packet(
+                &mut terminal_peer,
+                &Packet::new(
+                    TerminalPacketType::PortForwardData as u8,
+                    vec![3; 60 * 1024],
+                ),
+            )
+            .unwrap();
+            sent_tx.send(()).unwrap();
+            received_tx
+                .send(read_local_packet(&mut terminal_peer))
+                .unwrap();
+        });
+
+        // When: local output has entered the bridge, send input requiring a
+        // local delivery before releasing any remote output drainage.
+        sent_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        peer.write_packet(
+            TerminalPacketType::TerminalInfo as u8,
+            b"input-before-drain",
+        )
+        .unwrap();
+        let received = received_rx.recv_timeout(Duration::from_secs(1));
+        control.shutdown(Shutdown::Both).unwrap();
+        session.shutdown().unwrap();
+        local.join().unwrap();
+        let _bridge_result = bridge.join().unwrap();
+
+        // Then: the bridge delivered input without transport recovery.
+        assert!(
+            matches!(received, Ok(Ok(ref packet)) if packet.payload() == b"input-before-drain"),
+            "bridge starved input behind forwarding output: {received:?}"
+        );
+    }
 
     enum WriteStep {
         Accept(usize),

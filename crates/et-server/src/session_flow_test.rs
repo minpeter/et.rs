@@ -16,6 +16,112 @@ use super::{
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
 
+#[test]
+fn exit_status_waits_for_queued_and_in_flight_output() {
+    use et_core::packet::Packet;
+    use et_core::proto::{TerminalBuffer, TerminalExitStatus, TerminalPacketType};
+
+    for flow in [
+        FlowControl::new_default(),
+        FlowControl::new(et_core::flow_control::FlowControlMode::Backpressure),
+        FlowControl::new(et_core::flow_control::FlowControlMode::Discard),
+    ] {
+        let output = |bytes: &[u8]| {
+            Packet::new(
+                TerminalPacketType::TerminalBuffer as u8,
+                TerminalBuffer {
+                    buffer: Some(bytes.to_vec()),
+                    is_stderr: None,
+                }
+                .encode_to_vec(),
+            )
+        };
+        let first = output(b"first\n");
+        let last = output(b"last\n");
+        let status = Packet::new(
+            TerminalPacketType::TerminalExitStatus as u8,
+            TerminalExitStatus { exitcode: Some(0) }.encode_to_vec(),
+        );
+        flow.enqueue(first.clone()).unwrap();
+        flow.enqueue(last.clone()).unwrap();
+        for expected in [first, last] {
+            assert!(matches!(
+                flow.enqueue(status.clone()),
+                Err(SessionError::Connection(ConnError::Backpressure))
+            ));
+            let packet = flow.next_packet().unwrap();
+            assert_eq!(packet, expected);
+            // Even with an empty queue, the in-flight final frame still
+            // precedes status; an early status would truncate client output.
+            assert!(matches!(
+                flow.enqueue(status.clone()),
+                Err(SessionError::Connection(ConnError::Backpressure))
+            ));
+            assert!(flow.complete(packet, &FlowWriteResult::Delivered, true));
+        }
+        flow.enqueue(status.clone()).unwrap();
+        assert_eq!(flow.next_packet().unwrap(), status);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn final_in_flight_completion_wakes_bridge_after_control_capacity_reopens() {
+    use rustix::event::{poll, PollFd, PollFlags};
+    use rustix::time::Timespec;
+    use std::io::Read;
+
+    // Given: a bounded control lane with one in-flight packet that still
+    // owns its capacity. The bridge's next forwarding packet cannot enter.
+    let (server, mut client) = connection_pair();
+    let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
+    let session = Arc::new(
+        ActiveSession::new(
+            server,
+            &terminal,
+            Some(FlowControlMode::Backpressure as i32),
+        )
+        .unwrap(),
+    );
+    let mut wake = session.take_wake_reader().unwrap();
+    wake.set_nonblocking(true).unwrap();
+    let (reached_tx, reached_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    *session.prepared_write_hook.lock().unwrap() = Some((reached_tx, release_rx));
+    session.start_flow_writer();
+    session.send_packet_owned(7, &vec![3; 60 * 1024]).unwrap();
+    reached_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+    assert!(matches!(
+        session.send_packet_owned(7, &vec![4; 16 * 1024]),
+        Err(SessionWriteError::BeforeReplay(SessionError::Connection(
+            ConnError::Backpressure
+        )))
+    ));
+    let mut bytes = [0; 64];
+    loop {
+        match wake.read(&mut bytes) {
+            Ok(count) => assert!(count > 0),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("draining earlier bridge wake: {error}"),
+        }
+    }
+    let mut descriptors = [PollFd::new(&wake, PollFlags::IN)];
+    let timeout = Timespec::try_from(Duration::from_secs(1)).unwrap();
+
+    // When: the final writer completes; there is no next queue pop to wake
+    // the bridge, and no new inbound network traffic.
+    release_tx.send(()).unwrap();
+    assert_eq!(client.read_packet().unwrap().payload(), vec![3; 60 * 1024]);
+    let ready = poll(&mut descriptors, Some(&timeout)).unwrap();
+    session.shutdown().unwrap();
+
+    // Then: the bridge observes the precise capacity-reopened event.
+    assert_eq!(
+        ready, 1,
+        "final control completion stranded the bridge's retained packet"
+    );
+}
+
 fn connection_pair() -> (Connection, Connection) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let address = listener.local_addr().unwrap();

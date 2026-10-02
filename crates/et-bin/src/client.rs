@@ -180,10 +180,21 @@ fn run_client(
     #[cfg(unix)]
     if args.ctl && !args.no_persist {
         if let Some(name) = args.session_name.as_deref() {
-            if let Some(saved) =
-                crate::session_store::load_for(name, &resolved.hostname, destination.port)?
-            {
-                return crate::session_store::attach_saved(saved, args, resolver, deadline);
+            if let Some(saved) = crate::session_store::load_for(
+                name,
+                &resolved.hostname,
+                destination.port,
+                requested_user.as_deref().or(resolved.user.as_deref()),
+            )? {
+                let id = saved.id.clone();
+                match crate::session_store::attach_saved(saved, args, resolver, deadline) {
+                    Err(error @ ClientError::ServerInvalidKey(_)) => {
+                        if !crate::session_store::remove_if_matches(name, &id)? {
+                            return Err(error);
+                        }
+                    }
+                    result => return result,
+                }
             }
         }
     }
@@ -479,11 +490,14 @@ fn run_client(
                 name,
                 &endpoint.host,
                 endpoint.port,
+                probe_request.user.as_deref(),
                 &credentials.id,
                 &credentials.passkey,
             )?;
         }
     }
+    #[cfg(unix)]
+    crate::local_daemon::detach().map_err(|e| ClientError::Terminal(e.to_string()))?;
     et_cli::logging::verbose(1, format!("Client created with id: {}", credentials.id));
     if args.no_terminal
         && !has_forwarding
@@ -846,7 +860,7 @@ fn session_ssh_options(args: &ClientArgs) -> Vec<String> {
         ) {
             continue;
         }
-        if seen.insert(key) {
+        if matches!(key.as_str(), "identityfile" | "certificatefile") || seen.insert(key) {
             selected.push(option.clone());
         }
     }
@@ -1041,6 +1055,29 @@ mod tests {
                 "RemoteCommand=echo config",
                 "Port=24",
                 "IdentityFile=/tmp/key"
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_identity_and_certificate_options_reach_bootstrap_in_order() {
+        let args = ClientArgs::try_parse_from([
+            "et",
+            "-oIdentityFile=/key1",
+            "-oIdentityFile=/key2",
+            "-oCertificateFile=/cert1",
+            "-oCertificateFile=/cert2",
+            "host",
+        ])
+        .unwrap();
+        let effective = effective_ssh_args(&args, &Default::default()).unwrap();
+        assert_eq!(
+            effective.ssh_option,
+            [
+                "IdentityFile=/key1",
+                "IdentityFile=/key2",
+                "CertificateFile=/cert1",
+                "CertificateFile=/cert2"
             ]
         );
     }

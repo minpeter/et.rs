@@ -24,10 +24,14 @@ impl AgentForward {
         #[cfg(unix)]
         {
             let proxy = if args.forward_ssh_agent {
-                let proxy =
-                    unix::Proxy::open(id, args.ssh_socket.clone().map(OsString::from), true)
-                        .map_err(agent_error)?
-                        .expect("created agent proxy directory");
+                let proxy = unix::Proxy::open(
+                    id,
+                    args.ssh_socket.clone().map(OsString::from),
+                    unix::Policy::Initial,
+                    true,
+                )
+                .map_err(agent_error)?
+                .expect("created agent proxy directory");
                 let environment = std::env::var_os("SSH_AUTH_SOCK");
                 proxy.refresh(environment.as_deref()).map_err(agent_error)?;
                 // build() appends the generated agent request after user tunnels.
@@ -70,7 +74,8 @@ impl AgentForward {
         #[cfg(unix)]
         {
             let environment = std::env::var_os("SSH_AUTH_SOCK");
-            let proxy = unix::Proxy::open(id, None, environment.is_some()).map_err(agent_error)?;
+            let proxy = unix::Proxy::open(id, None, unix::Policy::Attach, environment.is_some())
+                .map_err(agent_error)?;
             let mut forward = Self { proxy };
             forward.established();
             if let Some(proxy) = &forward.proxy {
@@ -131,9 +136,16 @@ mod unix {
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     const UNIX_PATH_MAX: usize = 104;
 
+    #[derive(Clone, Copy)]
+    pub(super) enum Policy {
+        Initial,
+        Attach,
+    }
+
     pub(super) struct Proxy {
         path: PathBuf,
         pinned: Option<OsString>,
+        policy: Policy,
         pub(super) established: bool,
     }
 
@@ -141,6 +153,7 @@ mod unix {
         pub(super) fn open(
             id: &str,
             pinned: Option<OsString>,
+            policy: Policy,
             create: bool,
         ) -> io::Result<Option<Self>> {
             if id.len() != 16 || !id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
@@ -155,6 +168,7 @@ mod unix {
             Ok(Self::open_directory(&directory, create)?.map(|_| Self {
                 path,
                 pinned,
+                policy,
                 established: false,
             }))
         }
@@ -244,7 +258,7 @@ mod unix {
                 }
                 // Saved-session attach follows the current environment. A bad
                 // environment value disables forwarding, but not the session.
-                if self.pinned.is_none() {
+                if matches!(self.policy, Policy::Attach) {
                     return Ok(());
                 }
                 return Err(io::Error::new(

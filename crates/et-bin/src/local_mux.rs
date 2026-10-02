@@ -179,6 +179,7 @@ fn run(args: &ClientArgs, mut socket: std::os::unix::net::UnixStream) -> io::Res
     if args.no_pty {
         return Err(ipc::invalid("raw -T mux passengers are unsupported"));
     }
+    crate::local_daemon::detach()?;
     let tty = io::stdin().is_terminal();
     let mut request = ipc::words(&[NEW_SESSION, 0]);
     ipc::string(&mut request, b"");

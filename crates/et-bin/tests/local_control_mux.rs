@@ -752,15 +752,215 @@ fn stale_auto_master_background_passenger_and_nonce_marker() {
 fn saved_attach_can_report_background_readiness() {
     let stack = Stack::start();
     let release = stack.root.join("release-attach");
+    let finished = stack.root.join("finished-attach");
+    let started = stack.root.join("started-attach");
     let socket = stack.start_control(&format!(
-        "while [ ! -f '{}' ]; do sleep 0.05; done; exit",
-        release.display()
+        "touch '{}'; while [ ! -f '{}' ]; do sleep 0.05; done; touch '{}'; exit",
+        started.display(),
+        release.display(),
+        finished.display()
     ));
+    wait(|| started.exists());
     assert_eq!(ctl(&socket, 5, b"").0, 64);
     wait(|| !socket.exists());
     let attached = output(stack.client().args(["-f", "--attach", "work"]));
     assert!(attached.status.success(), "{attached:?}");
+    assert!(!finished.exists());
+    let daemon = background_attach_pid(&stack);
     fs::write(release, b"exit").unwrap();
+    wait(|| finished.exists());
+    wait(|| {
+        let system = sysinfo::System::new_with_specifics(
+            sysinfo::RefreshKind::nothing()
+                .with_processes(sysinfo::ProcessRefreshKind::everything().without_tasks()),
+        );
+        system
+            .process(daemon)
+            .is_none_or(|p| p.status() == sysinfo::ProcessStatus::Zombie)
+    });
+}
+
+fn background_attach_pid(stack: &Stack) -> sysinfo::Pid {
+    let system = sysinfo::System::new_with_specifics(
+        sysinfo::RefreshKind::nothing()
+            .with_processes(sysinfo::ProcessRefreshKind::everything().without_tasks()),
+    );
+    let matching = system
+        .processes()
+        .iter()
+        .filter(|(_, process)| {
+            process.cmd().iter().any(|arg| arg == "--attach")
+                && process
+                    .cmd()
+                    .iter()
+                    .any(|arg| arg == stack.terminal.as_os_str())
+        })
+        .map(|(pid, _)| *pid)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected the saved-session attach daemon"
+    );
+    matching[0]
+}
+
+#[test]
+fn saved_control_identity_rejects_other_users_and_replaces_defunct_session() {
+    let stack = Stack::start();
+    let socket = stack.start_control("printf 'original\\n'");
+    assert_eq!(ctl(&socket, 5, b"").0, 64);
+    wait(|| !socket.exists());
+    let saved_path = stack.root.join(".et/sessions/work");
+    let saved = fs::read_to_string(&saved_path).unwrap();
+    assert!(saved.contains("user=tester\n"));
+    let count = fs::read_to_string(stack.root.join("ssh-count")).unwrap();
+    let mismatch =
+        output(
+            stack
+                .client()
+                .args(["--ctl", "--name", "work", "-ldeploy", "127.0.0.1"]),
+        );
+    assert!(!mismatch.status.success(), "{mismatch:?}");
+    assert_eq!(fs::read_to_string(&saved_path).unwrap(), saved);
+    assert_eq!(
+        fs::read_to_string(stack.root.join("ssh-count")).unwrap(),
+        count
+    );
+
+    // Transport failure is not proof the saved shell is gone. Preserve the
+    // record and do not SSH-bootstrap a replacement on an unreachable port.
+    let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
+    let unused_port = reserved.local_addr().unwrap().port();
+    drop(reserved);
+    let unavailable = saved.replace(
+        &format!("port={}\n", stack.port),
+        &format!("port={unused_port}\n"),
+    );
+    fs::write(&saved_path, &unavailable).unwrap();
+    let failed = output(
+        stack
+            .client()
+            .args(["--ctl", "--name", "work", "--port"])
+            .arg(unused_port.to_string())
+            .args(["-oConnectTimeout=1", "127.0.0.1"]),
+    );
+    assert!(!failed.status.success());
+    assert_eq!(fs::read_to_string(&saved_path).unwrap(), unavailable);
+    assert_eq!(
+        fs::read_to_string(stack.root.join("ssh-count")).unwrap(),
+        count
+    );
+    fs::write(&saved_path, &saved).unwrap();
+
+    // End the detached remote shell, then restore its now-obsolete record as
+    // would happen when the server expires it without a local owner present.
+    assert!(output(stack.client().args(["--kill", "work"]))
+        .status
+        .success());
+    fs::write(&saved_path, &saved).unwrap();
+    fs::set_permissions(&saved_path, fs::Permissions::from_mode(0o600)).unwrap();
+    stack.start_control("printf 'replacement\\n'");
+    let replacement = fs::read_to_string(&saved_path).unwrap();
+    assert_ne!(
+        replacement.lines().find(|l| l.starts_with("id=")),
+        saved.lines().find(|l| l.starts_with("id="))
+    );
+    assert_eq!(
+        fs::read_to_string(stack.root.join("ssh-count"))
+            .unwrap()
+            .lines()
+            .count(),
+        count.lines().count() + 1
+    );
+}
+
+#[test]
+fn background_bootstrap_can_prompt_on_controlling_terminal_before_detach() {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    let stack = Stack::start();
+    let ssh_path = stack.root.join("ssh");
+    let original = fs::read_to_string(&ssh_path).unwrap();
+    let prompt = "if [ ! -f \"$HOME/authenticated\" ]; then\nexec 3<>/dev/tty || exit 90\nprintf 'AUTH-PROMPT\\n' >&3\nIFS= read -r answer <&3\n[ \"$answer\" = approve ] || exit 91\ntouch \"$HOME/authenticated\"\nexec 3>&-\nfi\n";
+    fs::write(
+        &ssh_path,
+        original.replace("printf 'bootstrap", &format!("{prompt}printf 'bootstrap")),
+    )
+    .unwrap();
+    let socket = stack.root.join("mux");
+    let mut command = stack.client();
+    command
+        .args(["-M", "-f", "-S"])
+        .arg(&socket)
+        .arg("127.0.0.1");
+    let mut builder = CommandBuilder::new(command.get_program());
+    for arg in command.get_args() {
+        builder.arg(arg);
+    }
+    for (key, value) in command.get_envs() {
+        if let Some(value) = value {
+            builder.env(key, value);
+        }
+    }
+    let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+    let mut child = pair.slave.spawn_command(builder).unwrap();
+    drop(pair.slave);
+    let mut reader = BufReader::new(pair.master.try_clone_reader().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut line = String::new();
+        while reader.read_line(&mut line).is_ok_and(|count| count > 0) {
+            if line.contains("AUTH-PROMPT") {
+                let _ = tx.send(());
+            }
+            line.clear();
+        }
+    });
+    let prompted = rx.recv_timeout(LIMIT);
+    if prompted.is_err() {
+        if let Some(pid) = child.process_id() {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+    prompted.expect("background bootstrap lost its controlling terminal");
+    assert!(child.try_wait().unwrap().is_none());
+    pair.master
+        .take_writer()
+        .unwrap()
+        .write_all(b"approve\n")
+        .unwrap();
+    let deadline = Instant::now() + LIMIT;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            if let Some(pid) = child.process_id() {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            let _ = child.wait();
+            panic!("background client did not signal readiness");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success());
+    reader.join().unwrap();
+    assert!(stack.root.join("authenticated").exists());
+    assert!(output(&mut stack.mux(&socket, "check")).status.success());
+    let result = output(
+        stack
+            .client()
+            .arg("-S")
+            .arg(&socket)
+            .args(["127.0.0.1", "exit 29"]),
+    );
+    assert_eq!(result.status.code(), Some(29));
 }
 
 #[test]

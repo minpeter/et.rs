@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
 use std::io::{Read, Write};
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::net::{IpAddr, Ipv6Addr};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
+#[cfg(unix)]
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,9 +16,9 @@ use et_core::proto::{
     PortForwardData, PortForwardDestinationRequest, PortForwardSourceRequest, SocketEndpoint,
     TerminalPacketType,
 };
-#[cfg(unix)]
-use et_net::forward::ForwardError;
 use et_net::forward::Forwarder;
+#[cfg(unix)]
+use et_net::forward::{ForwardError, ForwardResolver};
 #[cfg(unix)]
 use et_net::forward::{ForwardOrigin, ForwardSource};
 use prost::Message;
@@ -787,6 +789,59 @@ fn local_and_reverse_listener_limits_fail_before_binding() {
         "unexpected error: {error}"
     );
     assert!(paths.iter().all(|path| !path.exists()));
+}
+
+#[cfg(unix)]
+#[test]
+fn reverse_dns_fanout_reports_reverse_limit_before_binding() {
+    struct FanoutResolver;
+    impl ForwardResolver for FanoutResolver {
+        fn resolve(&self, _host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+            Ok((1..=33)
+                .map(|octet| SocketAddr::from((Ipv4Addr::new(127, 0, 0, octet), port)))
+                .collect())
+        }
+    }
+
+    let path = std::env::temp_dir().join(format!("et-reverse-fanout-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let unix_request = PortForwardSourceRequest {
+        source: Some(SocketEndpoint {
+            name: Some(path.to_string_lossy().into_owned()),
+            port: None,
+        }),
+        destination: Some(SocketEndpoint {
+            name: Some("/tmp/destination.sock".to_owned()),
+            port: None,
+        }),
+        environmentvariable: None,
+    };
+    let owner = (
+        rustix::process::geteuid().as_raw(),
+        rustix::process::getegid().as_raw(),
+    );
+
+    let error = match Forwarder::start_with_user_deadline(
+        vec![unix_request, request_on("fanout.test", 12345, 1)],
+        Some(owner),
+        Instant::now() + TIMEOUT,
+        Arc::new(FanoutResolver),
+    ) {
+        Ok((forwarder, _)) => {
+            forwarder.shutdown().unwrap();
+            panic!("reverse DNS fanout did not exceed the listener cap")
+        }
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        ForwardError::Protocol("reverse listener limit exceeded")
+    ));
+    assert!(
+        !path.exists(),
+        "cap must be checked before any source binds"
+    );
 }
 
 fn reserve_port() -> u16 {

@@ -1001,11 +1001,16 @@ fn bind_sources(
                 listener_count,
             )
         };
+        let limit_error = if owner.is_some() {
+            "reverse listener limit exceeded"
+        } else {
+            "local listener limit exceeded"
+        };
         listener_count = listener_count
             .checked_add(additional_listeners)
-            .ok_or(ForwardError::Protocol("reverse listener limit exceeded"))?;
+            .ok_or(ForwardError::Protocol(limit_error))?;
         if listener_count > listener_limit {
-            return Err(ForwardError::Protocol("local listener limit exceeded"));
+            return Err(ForwardError::Protocol(limit_error));
         }
         plans.push(plan);
     }

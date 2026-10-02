@@ -221,6 +221,9 @@ Mux v4 supports command/interactive passengers, `check`, `stop`, `exit`, and
 local TCP/Unix forwarding `forward`/`cancel`. Cancel closes the listener, not
 accepted streams. The shared shell accepts one passenger at a time; remote,
 dynamic, stdio, X11, subsystem, and per-passenger agent requests are rejected.
+Background startup keeps the controlling terminal through SSH authentication
+so password, passphrase and host-key prompts work, then detaches stdio before
+the session pump starts.
 `-N` starts a forwarding-only session without a remote shell; `--no-terminal`
 retains its older meaning of disabling the client terminal while starting a shell.
 
@@ -228,7 +231,11 @@ retains its older meaning of disabling the client terminal while starting a shel
 its private local socket path. The byte protocol exposes input, resize, output
 cursors, status, a transcript with secret-input redaction, and local shutdown.
 Repeating `--ctl --name work` adopts that saved session without replaying its
-startup command. `--no-persist` disables saving and automatic adoption. Control
+startup command, provided the resolved host, ET port and remote user match.
+Older records without a remote user require explicit `--attach work` rather
+than automatic adoption. A definite invalid-key response replaces only the
+matching stale record with a fresh session; transport errors preserve it.
+`--no-persist` disables saving and automatic adoption. Control
 shutdown and mux `exit` leave a saved remote shell attachable; `--kill work`
 explicitly ends the remote session. A definite remote end removes matching saved
 control-session credentials, allowing the same name to start a fresh session.

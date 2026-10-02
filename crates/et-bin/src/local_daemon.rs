@@ -51,7 +51,6 @@ pub fn prepare(parsed: &mut ClientArgs, raw: &[OsString]) -> io::Result<Option<i
     }
     if std::env::var_os(CHILD).is_some() {
         crate::detach::close_inherited_descriptors()?;
-        rustix::process::setsid()?;
         return Ok(None);
     }
     let directory = std::env::temp_dir().join(format!("et-ready-{}", nonce()));
@@ -71,9 +70,9 @@ pub fn prepare(parsed: &mut ClientArgs, raw: &[OsString]) -> io::Result<Option<i
         command
             .args(raw)
             .env(CHILD, &path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
         let mut child = crate::detach::spawn(&mut command)
             .map_err(|e| io::Error::new(e.kind(), format!("spawning background client: {e}")))?;
         let deadline = Instant::now() + Duration::from_secs(45);
@@ -131,6 +130,23 @@ pub fn prepare(parsed: &mut ClientArgs, raw: &[OsString]) -> io::Result<Option<i
         );
     }
     Ok(Some(0))
+}
+
+/// Keep the re-exec child in the foreground process group through SSH
+/// authentication. Detach only after authentication, before copying stdio into
+/// the terminal pump or passing its descriptors to a mux master.
+pub fn detach() -> io::Result<()> {
+    if std::env::var_os(CHILD).is_some() {
+        let null = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")?;
+        rustix::process::setsid()?;
+        rustix::stdio::dup2_stdin(&null)?;
+        rustix::stdio::dup2_stdout(&null)?;
+        rustix::stdio::dup2_stderr(&null)?;
+    }
+    Ok(())
 }
 
 /// The accepted socket stays nonblocking: Darwin rejects SO_RCVTIMEO after

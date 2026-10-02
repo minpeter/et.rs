@@ -7,7 +7,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::unix::{validate_proxy_path, Proxy};
+use super::unix::{validate_proxy_path, Policy, Proxy};
 
 struct Session {
     id: String,
@@ -22,7 +22,12 @@ impl Session {
     }
 
     fn proxy(&self, pinned: Option<String>) -> Proxy {
-        let mut proxy = Proxy::open(&self.id, pinned.map(OsString::from), true)
+        let policy = if pinned.is_some() {
+            Policy::Initial
+        } else {
+            Policy::Attach
+        };
+        let mut proxy = Proxy::open(&self.id, pinned.map(OsString::from), policy, true)
             .unwrap()
             .unwrap();
         proxy.mark_established();
@@ -188,6 +193,33 @@ fn environment_targets_fail_closed_without_rejecting_attach() {
 }
 
 #[test]
+fn initial_environment_target_is_validated_but_attach_remains_nonfatal() {
+    let session = Session::new();
+    let initial = Proxy::open(&session.id, None, Policy::Initial, true)
+        .unwrap()
+        .unwrap();
+    for invalid in [
+        OsString::from("relative.sock"),
+        session.directory.join("./agent.sock").into_os_string(),
+    ] {
+        assert!(initial.refresh(Some(&invalid)).is_err());
+        assert!(fs::symlink_metadata(initial.path()).is_err());
+    }
+    drop(initial);
+
+    let attached = session.proxy(None);
+    for invalid in [
+        OsString::from("relative.sock"),
+        session.directory.join("./agent.sock").into_os_string(),
+    ] {
+        attached.refresh(Some(&invalid)).unwrap();
+        // The same fail-closed policy applies when reconnect refreshes again.
+        attached.refresh(Some(&invalid)).unwrap();
+        assert!(fs::symlink_metadata(attached.path()).is_err());
+    }
+}
+
+#[test]
 fn non_utf8_environment_target_is_preserved() {
     let session = Session::new();
     let proxy = session.proxy(None);
@@ -201,7 +233,9 @@ fn non_utf8_environment_target_is_preserved() {
 #[test]
 fn unestablished_proxy_is_removed_but_established_proxy_is_retained() {
     let unestablished = Session::new();
-    let proxy = Proxy::open(&unestablished.id, None, true).unwrap().unwrap();
+    let proxy = Proxy::open(&unestablished.id, None, Policy::Initial, true)
+        .unwrap()
+        .unwrap();
     proxy
         .refresh(Some(std::ffi::OsStr::new("/tmp/agent.sock")))
         .unwrap();
@@ -231,7 +265,7 @@ fn unsafe_directory_and_non_symlink_proxy_are_not_modified() {
     fs::create_dir(&target.directory).unwrap();
     fs::set_permissions(&target.directory, fs::Permissions::from_mode(0o755)).unwrap();
     symlink(&target.directory, &session.directory).unwrap();
-    assert!(Proxy::open(&session.id, None, true).is_err());
+    assert!(Proxy::open(&session.id, None, Policy::Attach, true).is_err());
     assert_eq!(
         fs::metadata(&target.directory)
             .unwrap()
@@ -243,7 +277,7 @@ fn unsafe_directory_and_non_symlink_proxy_are_not_modified() {
     fs::remove_file(&session.directory).unwrap();
     fs::create_dir(&session.directory).unwrap();
     fs::set_permissions(&session.directory, fs::Permissions::from_mode(0o770)).unwrap();
-    assert!(Proxy::open(&session.id, None, true).is_err());
+    assert!(Proxy::open(&session.id, None, Policy::Attach, true).is_err());
     fs::set_permissions(&session.directory, fs::Permissions::from_mode(0o700)).unwrap();
     let proxy = session.proxy(None);
     fs::write(proxy.path(), "do not replace").unwrap();
@@ -251,7 +285,7 @@ fn unsafe_directory_and_non_symlink_proxy_are_not_modified() {
     assert!(proxy.refresh(None).is_err());
     assert_eq!(fs::read_to_string(proxy.path()).unwrap(), "do not replace");
     for invalid in ["../abcdefghijklmn", "", "short", "abcdefghijklmnop/child"] {
-        assert!(Proxy::open(invalid, None, true).is_err());
+        assert!(Proxy::open(invalid, None, Policy::Attach, true).is_err());
     }
 }
 
@@ -265,7 +299,9 @@ fn missing_proxy_directory_is_recreated_for_attach() {
     let path = first.path().to_owned();
     drop(first);
     fs::remove_dir_all(&session.directory).unwrap();
-    assert!(Proxy::open(&session.id, None, false).unwrap().is_none());
+    assert!(Proxy::open(&session.id, None, Policy::Attach, false)
+        .unwrap()
+        .is_none());
     let attached = session.proxy(None);
     attached
         .refresh(Some(OsStr::new("/tmp/new-agent.sock")))

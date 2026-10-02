@@ -777,6 +777,7 @@ struct CancellableStdout {
 impl Write for CancellableStdout {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         use rustix::event::{poll, PollFd, PollFlags};
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
         let mut descriptors = [
             PollFd::new(&self.file, PollFlags::OUT),
             PollFd::new(&self.cancel, PollFlags::IN | PollFlags::HUP),
@@ -793,10 +794,26 @@ impl Write for CancellableStdout {
                         "console output cancelled",
                     ));
                 }
+                Ok(_) if descriptors[0].revents().contains(PollFlags::NVAL) => {
+                    // Darwin reports POLLNVAL for /dev/null even though writes
+                    // succeed immediately. Only bypass readiness for this
+                    // nonblocking discard device, never an arbitrary character
+                    // device that could stall the output worker indefinitely.
+                    let metadata = self.file.metadata()?;
+                    if metadata.file_type().is_char_device()
+                        && metadata.rdev() == std::fs::metadata("/dev/null")?.rdev()
+                    {
+                        return self.file.write(&bytes[..bytes.len().min(4096)]);
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "console output is unavailable",
+                    ));
+                }
                 Ok(_)
                     if descriptors[0]
                         .revents()
-                        .intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) =>
+                        .intersects(PollFlags::ERR | PollFlags::HUP) =>
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,

@@ -370,9 +370,10 @@ exit "$ET_FAKE_EXIT"
             .into_iter()
             .filter(|argv| argv.first().is_some_and(|arg| arg != "-MNf" && arg != "-O"))
             .filter(|argv| {
-                !argv
-                    .iter()
-                    .any(|arg| arg == "-oSetEnv=ET_RS_CONFIG_SENTINEL=1")
+                !argv.iter().any(|arg| {
+                    arg == "-oSetEnv=ET_RS_CONFIG_SENTINEL=1"
+                        || arg == "-oRemoteCommand=ET_RS_CONFIG_SENTINEL"
+                })
             })
             .map(|argv| {
                 argv.into_iter()
@@ -1272,14 +1273,9 @@ fn effective_ssh_config_drives_native_jump_agent_and_environment() {
             agent.destination.as_ref().unwrap().name.as_deref(),
             proxy.to_str()
         );
-        assert_eq!(
-            fs::read_link(proxy).unwrap(),
-            PathBuf::from(if cli_override {
-                "/tmp/cli-agent"
-            } else {
-                "/tmp/config agent"
-            })
-        );
+        // The fixture rejects initialization after capturing the payload.
+        // An unestablished agent proxy must not survive that failure.
+        assert!(!proxy.parent().unwrap().exists());
         let work = fake.work_invocations();
         assert_eq!(
             fake.invocations()

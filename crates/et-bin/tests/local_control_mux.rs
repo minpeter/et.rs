@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{symlink, PermissionsExt};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -337,7 +337,7 @@ fn mux_reuses_transport_commands_propagate_exit_and_forward_cancel_keeps_streams
             .args([
                 "-oBatchMode=yes",
                 "-oConnectTimeout=1",
-                "-T",
+                "-tt",
                 "127.0.0.1",
                 "printf 'OPEN%s\\n' SSH-MUX; exit 37",
             ]),
@@ -413,7 +413,7 @@ fn mux_controlpersist_expires_and_live_socket_cannot_be_replaced() {
     let socket = stack.root.join("mux");
     let started = output(stack.client().args(["-M", "-f", "-S"]).arg(&socket).args([
         "-o",
-        "ControlPersist=2",
+        "ControlPersist=10",
         "127.0.0.1",
     ]));
     assert!(started.status.success(), "{started:?}");
@@ -694,4 +694,117 @@ fn primary_noexit_keeps_shell_state_and_reports_real_remote_exit() {
         .unwrap()
         .contains("STATE=kept"));
     assert!(!socket.exists());
+}
+
+#[test]
+fn stale_auto_master_background_passenger_and_nonce_marker() {
+    let stack = Stack::start();
+    let socket = stack.root.join("mux");
+    drop(UnixListener::bind(&socket).unwrap());
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    let started = output(
+        stack
+            .client()
+            .args(["-f", "-oControlMaster=auto", "-S"])
+            .arg(&socket)
+            .arg("127.0.0.1"),
+    );
+    assert!(started.status.success(), "{started:?}");
+    let rejected = output(
+        stack
+            .client()
+            .args(["-T", "-S"])
+            .arg(&socket)
+            .args(["127.0.0.1", "true"]),
+    );
+    assert!(!rejected.status.success());
+    let command = output(
+        stack
+            .client()
+            .arg("-S")
+            .arg(&socket)
+            .args(["127.0.0.1", "printf '__ET_PASSENGER_EXIT__:0\\n'; exit 23"]),
+    );
+    assert_eq!(command.status.code(), Some(23), "{command:?}");
+    assert!(String::from_utf8_lossy(&command.stdout).contains("__ET_PASSENGER_EXIT__:0"));
+    let release = stack.root.join("release");
+    let finished = stack.root.join("finished");
+    let script = format!(
+        "while [ ! -f '{}' ]; do sleep 0.05; done; touch '{}'",
+        release.display(),
+        finished.display()
+    );
+    let background = output(
+        stack
+            .client()
+            .args(["-f", "-S"])
+            .arg(&socket)
+            .arg("127.0.0.1")
+            .arg(&script),
+    );
+    assert!(background.status.success(), "{background:?}");
+    assert!(!finished.exists());
+    fs::write(release, b"go").unwrap();
+    wait(|| finished.exists());
+}
+
+#[test]
+fn saved_attach_can_report_background_readiness() {
+    let stack = Stack::start();
+    let release = stack.root.join("release-attach");
+    let socket = stack.start_control(&format!(
+        "while [ ! -f '{}' ]; do sleep 0.05; done; exit",
+        release.display()
+    ));
+    assert_eq!(ctl(&socket, 5, b"").0, 64);
+    wait(|| !socket.exists());
+    let attached = output(stack.client().args(["-f", "--attach", "work"]));
+    assert!(attached.status.success(), "{attached:?}");
+    fs::write(release, b"exit").unwrap();
+}
+
+#[test]
+fn slow_passenger_output_applies_backpressure_without_failing_command() {
+    let stack = Stack::start();
+    let socket = stack.root.join("mux");
+    assert!(output(
+        stack
+            .client()
+            .args(["-M", "-f", "-S"])
+            .arg(&socket)
+            .arg("127.0.0.1")
+    )
+    .status
+    .success());
+    let mut passenger = stack
+        .client()
+        .arg("-S")
+        .arg(&socket)
+        .args([
+            "127.0.0.1",
+            "dd if=/dev/zero bs=1000000 count=6 2>/dev/null; exit 19",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Let the pipe and the master's bounded queue fill before reading output.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(passenger.try_wait().unwrap().is_none());
+    assert!(output(&mut stack.mux(&socket, "check")).status.success());
+    let mut stdout = passenger.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let status = passenger.wait_timeout(LIMIT).unwrap();
+    if status.is_none() {
+        let _ = passenger.kill();
+        let _ = passenger.wait();
+    }
+    let bytes = reader.join().unwrap();
+    assert_eq!(status.unwrap().code(), Some(19));
+    assert_eq!(bytes.iter().filter(|&&byte| byte == 0).count(), 6_000_000);
 }

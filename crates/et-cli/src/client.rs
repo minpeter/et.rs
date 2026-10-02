@@ -88,6 +88,9 @@ pub struct ClientArgs {
     #[arg(skip)]
     pub control_persist: Option<ControlPersist>,
 
+    #[arg(skip)]
+    pub control_path_explicit_none: bool,
+
     #[arg(long)]
     pub ctl: bool,
 
@@ -325,8 +328,14 @@ impl ClientArgs {
         command.build();
         let mut normalized = values.first().cloned().into_iter().collect::<Vec<_>>();
         let mut index = 1;
+        let mut login_seen = false;
         while index < values.len() {
-            let token = values[index].to_string_lossy();
+            let token = values[index].to_str().ok_or_else(|| {
+                clap::Error::raw(
+                    clap::error::ErrorKind::InvalidUtf8,
+                    "option names and attached option values must be valid UTF-8",
+                )
+            })?;
             if token == "--" {
                 normalized.extend_from_slice(&values[index..]);
                 break;
@@ -348,10 +357,14 @@ impl ClientArgs {
                     if !long.contains('=')
                         && arg.get_action().takes_values()
                         && index + 1 < values.len()
+                        && (name != "telemetry"
+                            || matches!(values[index + 1].to_str(), Some("true" | "false")))
                     {
                         index += 1;
                         normalized.push(values[index].clone());
                     }
+                } else {
+                    normalized.push(values[index].clone());
                 }
             } else {
                 let mut chars = token[1..].char_indices().peekable();
@@ -366,7 +379,11 @@ impl ClientArgs {
                     // value options too, so their operands never become a host.
                     let takes_value = arg.is_some_and(|arg| arg.get_action().takes_values())
                         || "BbEImPQw".contains(short);
-                    if arg.is_some() {
+                    // OpenSSH keeps the first login selector; clap's other
+                    // scalar options intentionally retain last-value behavior.
+                    let keep = arg.is_some() && !(short == 'l' && login_seen);
+                    login_seen |= short == 'l';
+                    if keep {
                         normalized.push(format!("-{short}").into());
                     }
                     if takes_value {
@@ -384,7 +401,7 @@ impl ClientArgs {
                                 format!("-{short} requires an argument"),
                             )
                         })?;
-                        if arg.is_some() {
+                        if keep {
                             normalized.push(value);
                         }
                         break;
@@ -406,17 +423,24 @@ impl ClientArgs {
         if let Some(login) = &parsed.login_name {
             parsed.username = Some(login.clone());
         }
+        let login_index = matches
+            .indices_of("login_name")
+            .and_then(|mut values| values.next());
+        let option_user = matches.indices_of("session_options").and_then(|indices| {
+            indices
+                .zip(&parsed.session_options)
+                .find_map(|(index, option)| {
+                    let (key, value) = split_ssh_option(option);
+                    key.eq_ignore_ascii_case("User")
+                        .then(|| (index, value.to_owned()))
+                })
+        });
+        if let Some((option_index, user)) = option_user {
+            if login_index.is_none_or(|index| option_index < index) {
+                parsed.username = Some(user);
+            }
+        }
         let mut controls = Vec::new();
-        if parsed.master {
-            controls.push((matches.index_of("master").unwrap(), "ControlMaster", "yes"));
-        }
-        if let Some(path) = parsed.control_path.as_deref() {
-            controls.push((
-                matches.index_of("control_path").unwrap(),
-                "ControlPath",
-                path,
-            ));
-        }
         if let Some(indices) = matches.indices_of("session_options") {
             for (index, option) in indices.zip(&parsed.session_options) {
                 let (key, value) = split_ssh_option(option);
@@ -424,17 +448,33 @@ impl ClientArgs {
             }
         }
         controls.sort_by_key(|(index, _, _)| *index);
-        let mut path = parsed.control_path.clone();
+        let mut path = None;
         for (_, key, value) in controls {
             let invalid =
                 |message| clap::Error::raw(clap::error::ErrorKind::ValueValidation, message);
-            if key.eq_ignore_ascii_case("ControlMaster") {
+            if key.eq_ignore_ascii_case("ControlMaster") && parsed.control_master.is_none() {
                 parsed.control_master = Some(value.parse().map_err(invalid)?);
-            } else if key.eq_ignore_ascii_case("ControlPersist") {
+            } else if key.eq_ignore_ascii_case("ControlPersist") && parsed.control_persist.is_none()
+            {
                 parsed.control_persist = Some(value.parse().map_err(invalid)?);
-            } else if key.eq_ignore_ascii_case("ControlPath") {
+            } else if key.eq_ignore_ascii_case("ControlPath") && path.is_none() {
                 path = Some(value.to_owned());
             }
+        }
+        // OpenSSH's dedicated mux flags override their -o counterparts,
+        // regardless of command-line ordering.
+        if parsed.master {
+            parsed.control_master = Some(ControlMasterMode::Yes);
+        }
+        if let Some(dedicated) = parsed.control_path.as_deref() {
+            path = Some(dedicated.to_owned());
+        }
+        if path
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("none"))
+        {
+            parsed.control_path_explicit_none = true;
+            path = None;
         }
         parsed.control_path = path;
         if let Some(command) = &mut parsed.control_command {
@@ -543,8 +583,7 @@ impl std::str::FromStr for ControlPersist {
                 enabled: true,
                 seconds: 0,
             }),
-            _ => value
-                .parse()
+            _ => parse_time_seconds(value)
                 .map(|seconds| Self {
                     enabled: true,
                     seconds,
@@ -552,6 +591,52 @@ impl std::str::FromStr for ControlPersist {
                 .map_err(|_| format!("invalid ControlPersist: {value}")),
         }
     }
+}
+
+fn parse_time_seconds(value: &str) -> Result<u64, String> {
+    if value.is_empty() {
+        return Err("invalid empty ControlPersist".to_owned());
+    }
+    let mut total = 0_u64;
+    let mut digits = String::new();
+    for character in value.chars() {
+        if character.is_ascii_digit() {
+            digits.push(character);
+            continue;
+        }
+        if digits.is_empty() {
+            return Err(format!("invalid ControlPersist: {value}"));
+        }
+        let amount: u64 = digits
+            .parse()
+            .map_err(|_| format!("invalid ControlPersist: {value}"))?;
+        digits.clear();
+        let multiplier = match character.to_ascii_lowercase() {
+            'w' => 7 * 24 * 60 * 60,
+            'd' => 24 * 60 * 60,
+            'h' => 60 * 60,
+            'm' => 60,
+            's' => 1,
+            _ => return Err(format!("invalid ControlPersist: {value}")),
+        };
+        total = total
+            .checked_add(
+                amount
+                    .checked_mul(multiplier)
+                    .ok_or_else(|| format!("invalid ControlPersist: {value}"))?,
+            )
+            .ok_or_else(|| format!("invalid ControlPersist: {value}"))?;
+    }
+    if !digits.is_empty() {
+        total = total
+            .checked_add(
+                digits
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid ControlPersist: {value}"))?,
+            )
+            .ok_or_else(|| format!("invalid ControlPersist: {value}"))?;
+    }
+    Ok(total)
 }
 
 /// Remote login-shell grammar.
@@ -645,7 +730,6 @@ mod tests {
             "-Elogfile",
             "-m",
             "hmac",
-            "--unknown=ignored",
             "host",
             "-B",
             "remote",
@@ -654,6 +738,7 @@ mod tests {
         assert_eq!(args.host.as_deref(), Some("host"));
         assert_eq!(args.command.as_deref(), Some("-B remote"));
         assert!(ClientArgs::try_parse_from(["et", "-B"]).is_err());
+        assert!(ClientArgs::try_parse_from(["et", "--unknown=ignored", "host"]).is_err());
         assert_eq!(
             ClientArgs::try_parse_from(["et", "--help"])
                 .unwrap_err()
@@ -723,6 +808,34 @@ mod tests {
                 .unwrap()
                 .no_pty
         );
+        assert_eq!(
+            ClientArgs::try_parse_from(["et", "-l", "alice", "-oUser=carol", "bob@host"])
+                .unwrap()
+                .username
+                .as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            ClientArgs::try_parse_from(["et", "-oUser=carol", "-l", "alice", "bob@host"])
+                .unwrap()
+                .username
+                .as_deref(),
+            Some("carol")
+        );
+    }
+
+    #[test]
+    fn first_login_selector_survives_repeated_l_flags() {
+        for options in [
+            ["-lalice", "-oUser=carol", "-ldave"],
+            ["-oUser=alice", "-lcarol", "-ldave"],
+            ["-lalice", "-lcarol", "-oUser=dave"],
+        ] {
+            let args =
+                ClientArgs::try_parse_from(["et"].into_iter().chain(options).chain(["bob@host"]))
+                    .unwrap();
+            assert_eq!(args.username.as_deref(), Some("alice"));
+        }
     }
 
     #[test]
@@ -739,8 +852,8 @@ mod tests {
             "CHECK",
         ])
         .unwrap();
-        assert_eq!(args.control_master, Some(ControlMasterMode::Auto));
-        assert_eq!(args.control_path.as_deref(), Some("/tmp/second"));
+        assert_eq!(args.control_master, Some(ControlMasterMode::Yes));
+        assert_eq!(args.control_path.as_deref(), Some("/tmp/first"));
         assert_eq!(
             args.control_persist,
             Some(ControlPersist {
@@ -764,7 +877,42 @@ mod tests {
             clap::error::ErrorKind::DisplayVersion
         );
         assert!(ClientArgs::try_parse_from(["et", "-oControlPersist=-1", "host"]).is_err());
+        assert_eq!(
+            ClientArgs::try_parse_from(["et", "-oControlPersist=1h30m", "host"])
+                .unwrap()
+                .control_persist
+                .unwrap()
+                .seconds,
+            5400
+        );
+        assert!(ClientArgs::try_parse_from(["et", "-Snone", "host"])
+            .unwrap()
+            .control_path
+            .is_none());
         assert!(ClientArgs::try_parse_from(["et", "-G"]).is_err());
+    }
+
+    #[test]
+    fn repeated_mux_options_keep_first_option_and_last_dedicated_path() {
+        let args = ClientArgs::try_parse_from([
+            "et",
+            "-oControlPath=/first",
+            "-oControlPath=/second",
+            "-oControlMaster=auto",
+            "-oControlMaster=no",
+            "-oControlPersist=2m",
+            "-oControlPersist=3m",
+            "host",
+        ])
+        .unwrap();
+        assert_eq!(args.control_path.as_deref(), Some("/first"));
+        assert_eq!(args.control_master, Some(ControlMasterMode::Auto));
+        assert_eq!(args.control_persist.unwrap().seconds, 120);
+        let args =
+            ClientArgs::try_parse_from(["et", "-S/one", "-oControlPath=/option", "-S/two", "host"])
+                .unwrap();
+        assert_eq!(args.control_path.as_deref(), Some("/two"));
+        assert!(ClientArgs::try_parse_from(["et", "-oControlPersist=", "host"]).is_err());
     }
 
     #[test]
@@ -953,6 +1101,9 @@ mod tests {
         assert!(a.telemetry);
         let a = ClientArgs::try_parse_from(["et", "--telemetry", "false", "host"]).unwrap();
         assert!(!a.telemetry);
+        let a = ClientArgs::try_parse_from(["et", "--telemetry", "host"]).unwrap();
+        assert_eq!(a.host.as_deref(), Some("host"));
+        assert!(ClientArgs::try_parse_from(["et", "--unknown", "value", "host"]).is_err());
     }
 
     #[test]

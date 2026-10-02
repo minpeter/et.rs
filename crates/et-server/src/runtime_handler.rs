@@ -754,7 +754,11 @@ fn run_jumphost(
     };
     let active = Arc::new(active);
     active.set_forward_exit_status(payload.supports_exit_status.unwrap_or(false));
-    active.set_disconnect_timeout(payload.disconnect_timeout_seconds);
+    active.set_disconnect_timeout(Some(
+        payload
+            .disconnect_timeout_seconds
+            .unwrap_or(core.disconnect_timeout_seconds),
+    ));
     active.start_flow_writer();
     if start.activate(active.clone()).is_err() {
         crate::diag::info(format!("id={id}: jumphost could not activate session"));

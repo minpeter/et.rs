@@ -43,7 +43,7 @@ impl History {
         self.head += if self.records { 1 } else { bytes.len() as i64 };
         self.retained += bytes.len();
         self.chunks.push_back((direction, bytes.to_vec()));
-        while self.retained > self.capacity && self.chunks.len() > 1 {
+        while self.retained > self.capacity {
             let (_, bytes) = self.chunks.pop_front().unwrap();
             self.retained -= bytes.len();
             self.base += if self.records { 1 } else { bytes.len() as i64 };
@@ -139,7 +139,9 @@ impl Control {
 }
 
 pub fn control_dir() -> io::Result<PathBuf> {
-    let home = std::env::var_os("HOME").ok_or_else(|| invalid("HOME is not set"))?;
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .ok_or_else(|| invalid("HOME is not set"))?;
     let root = PathBuf::from(home).join(".et");
     crate::local_ipc::private_dir(&root)?;
     let directory = root.join("control");

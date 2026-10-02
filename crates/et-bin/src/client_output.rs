@@ -112,6 +112,7 @@ impl ConsoleOutput {
                 Box::new(CancellableStdout {
                     file,
                     cancel: cancel_reader,
+                    discard_device: None,
                 }),
                 cancel,
                 Box::new(|| Ok(())),
@@ -771,6 +772,7 @@ fn drain_stream(stream: &mut LocalStream) -> io::Result<()> {
 struct CancellableStdout {
     file: File,
     cancel: LocalStream,
+    discard_device: Option<bool>,
 }
 
 #[cfg(unix)]
@@ -799,10 +801,14 @@ impl Write for CancellableStdout {
                     // succeed immediately. Only bypass readiness for this
                     // nonblocking discard device, never an arbitrary character
                     // device that could stall the output worker indefinitely.
-                    let metadata = self.file.metadata()?;
-                    if metadata.file_type().is_char_device()
-                        && metadata.rdev() == std::fs::metadata("/dev/null")?.rdev()
-                    {
+                    let discard_device = *self.discard_device.get_or_insert_with(|| {
+                        self.file.metadata().is_ok_and(|metadata| {
+                            metadata.file_type().is_char_device()
+                                && std::fs::metadata("/dev/null")
+                                    .is_ok_and(|null| metadata.rdev() == null.rdev())
+                        })
+                    });
+                    if discard_device {
                         return self.file.write(&bytes[..bytes.len().min(4096)]);
                     }
                     return Err(io::Error::new(

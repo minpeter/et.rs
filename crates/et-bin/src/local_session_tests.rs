@@ -86,10 +86,19 @@ fn local_control_secret_redaction_and_resize_cannot_kill_session() {
 
 #[test]
 fn local_exit_marker_survives_every_packet_boundary_and_ignores_echo() {
-    let prefix = b"echo __ET_PASSENGER_EXIT__:%d\\n\r\nPAYLOAD\r\n";
-    let bytes = [prefix.as_slice(), b"__ET_PASSENGER_EXIT__:37\r\nprompt"].concat();
+    let template = ExitMarker::new();
+    let command = template.command("true");
+    let marker = command
+        .split("\\n")
+        .nth(1)
+        .unwrap()
+        .split("%d")
+        .next()
+        .unwrap();
+    let prefix = format!("{command}\r\n__ET_PASSENGER_EXIT__:0\r\nPAYLOAD\r\n");
+    let bytes = format!("{prefix}{marker}37\r\nprompt").into_bytes();
     for split in 0..=bytes.len() {
-        let mut marker = ExitMarker::new();
+        let mut marker = template.clone();
         let (mut out, code) = marker.consume(&bytes[..split]);
         if code.is_none() {
             let (tail, code) = marker.consume(&bytes[split..]);
@@ -98,7 +107,7 @@ fn local_exit_marker_survives_every_packet_boundary_and_ignores_echo() {
         } else {
             assert_eq!(code, Some(37));
         }
-        assert_eq!(out, prefix, "split={split}");
+        assert_eq!(out, prefix.as_bytes(), "split={split}");
     }
     let mut marker = ExitMarker::new();
     assert_eq!(
@@ -171,7 +180,7 @@ fn local_listener_authenticates_buffered_readiness_after_sender_closes() {
     peer.write_all(&[0]).unwrap();
     drop(peer);
     let mut accepted = listener.accept().unwrap().unwrap();
-    let status = crate::local_daemon::read_status(&mut accepted).unwrap();
+    let status = crate::local_daemon::read_status(&mut accepted, ipc::TIMEOUT).unwrap();
     assert_eq!(status, [0]);
 }
 
@@ -184,10 +193,10 @@ fn local_readiness_partial_response_times_out_without_peer_close() {
     peer.write_all(&[1, b'x']).unwrap();
     let mut accepted = listener.accept().unwrap().unwrap();
     let started = std::time::Instant::now();
-    let error = crate::local_daemon::read_status(&mut accepted).unwrap_err();
+    let timeout = Duration::from_millis(30);
+    let error = crate::local_daemon::read_status(&mut accepted, timeout).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-    assert!(started.elapsed() >= ipc::TIMEOUT);
-    assert!(started.elapsed() < ipc::TIMEOUT + Duration::from_secs(2));
+    assert!(started.elapsed() >= timeout);
     drop(peer);
 }
 
@@ -229,8 +238,16 @@ fn local_passenger_alias_flags_restore_and_orphan_cannot_poison_next_command() {
         .unwrap()
         .contains(rustix::fs::OFlags::NONBLOCK));
     passenger.orphaned = true;
+    let command = passenger.marker.as_ref().unwrap().command("true");
+    let marker = command
+        .split("\\n")
+        .nth(1)
+        .unwrap()
+        .split("%d")
+        .next()
+        .unwrap();
     passenger
-        .receive(b"late output\n__ET_PASSENGER_EXIT__:23\n")
+        .receive(format!("late output\n{marker}23\n").as_bytes())
         .unwrap();
     assert!(passenger.queued.is_empty());
     assert_eq!(passenger.status, Some(23));
@@ -252,4 +269,64 @@ fn local_queries_never_spawn_background_daemon_or_generate_control_name() {
     assert!(crate::local_daemon::prepare(&mut args, &[])
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn local_history_rejects_oversized_records_and_advances_cursors() {
+    for records in [false, true] {
+        let mut history = local_control::History::new(3, records);
+        history.append(b'<', b"oversized");
+        let cursor = if records { 1_i64 } else { 9 };
+        assert_eq!(
+            history.read(0),
+            [cursor.to_be_bytes().as_slice(), &[1]].concat()
+        );
+        history.append(b'>', b"ok");
+        assert!(history.read(-1).ends_with(b"ok"));
+    }
+}
+
+#[test]
+fn local_concurrent_stale_replacement_keeps_exactly_one_live_listener() {
+    let directory = Directory::new();
+    let path = directory.0.join("mux");
+    drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let workers: Vec<_> = (0..2)
+        .map(|_| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                Listener::bind(&path)
+            })
+        })
+        .collect();
+    barrier.wait();
+    let results: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert!(results
+        .iter()
+        .filter_map(|r| r.as_ref().err())
+        .all(|e| e.kind() == io::ErrorKind::AddrInUse));
+    assert!(ipc::connect(&path).is_ok());
+    drop(results);
+    assert!(!path.exists());
+}
+
+#[test]
+fn local_initial_command_cannot_overfill_pending_queue() {
+    let mut args = ClientArgs::try_parse_from(["et", "--ctl", "host"]).unwrap();
+    args.command = Some("x".repeat(MAX_PENDING * 16 * 1024));
+    assert!(Runtime::new(
+        &args,
+        Prepared {
+            mux: None,
+            ctl: None
+        }
+    )
+    .is_err());
 }

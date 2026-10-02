@@ -101,16 +101,13 @@ fn run_client(
     resolver: &dyn EndpointResolver,
     deadline: Deadline,
 ) -> Result<i32, ClientError> {
-    if args.ssh_version {
-        println!(
-            "OpenSSH_9.9p1 EternalTerminal_{}",
-            env!("CARGO_PKG_VERSION")
-        );
-        return Ok(0);
-    }
     #[cfg(unix)]
-    if !args.print_config && crate::local_mux::passenger(args) {
-        return crate::local_mux::run(args).map_err(|e| ClientError::Terminal(e.to_string()));
+    if !args.print_config && args.control_path.is_some() && crate::local_mux::passenger(args) {
+        if let Some(code) =
+            crate::local_mux::try_run(args).map_err(|e| ClientError::Terminal(e.to_string()))?
+        {
+            return Ok(code);
+        }
     }
     #[cfg(windows)]
     if !args.print_config
@@ -143,14 +140,7 @@ fn run_client(
         .as_deref()
         .ok_or(ClientError::Unsupported("a destination host is required"))?;
     let destination = parse_positional_host(host, args.port)?;
-    let requested_user = args
-        .session_options
-        .iter()
-        .rev()
-        .map(|option| et_cli::client::split_ssh_option(option))
-        .find(|(key, _)| key.eq_ignore_ascii_case("User"))
-        .map(|(_, value)| value.to_owned())
-        .or_else(|| command_user(destination.user, args.username.clone()));
+    let requested_user = command_user(destination.user, args.username.clone());
     validate_ssh_destination(&destination.host, requested_user.as_deref())?;
     let ssh_config = selected_ssh_config(args)?;
     let mut query_options = session_ssh_options(args);
@@ -181,19 +171,36 @@ fn run_client(
     let args = &effective;
     #[cfg(unix)]
     if crate::local_mux::passenger(args) {
-        return crate::local_mux::run(args).map_err(|e| ClientError::Terminal(e.to_string()));
+        if let Some(code) =
+            crate::local_mux::try_run(args).map_err(|e| ClientError::Terminal(e.to_string()))?
+        {
+            return Ok(code);
+        }
     }
     #[cfg(unix)]
     if args.ctl && !args.no_persist {
         if let Some(name) = args.session_name.as_deref() {
-            if crate::session_store::exists_for(name, &resolved.hostname, destination.port)? {
-                return crate::session_store::attach(name, args, resolver, deadline);
+            if let Some(saved) =
+                crate::session_store::load_for(name, &resolved.hostname, destination.port)?
+            {
+                return crate::session_store::attach_saved(saved, args, resolver, deadline);
             }
         }
     }
     validate_bootstrap_mode(args)?;
     #[cfg(unix)]
-    let local_session = crate::local_session::prepare(args)?;
+    let local_session = match crate::local_session::prepare(args) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            // Another auto client may have won the bind after our first probe.
+            if args.control_master == Some(et_cli::client::ControlMasterMode::Auto) {
+                if let Ok(Some(code)) = crate::local_mux::try_run(args) {
+                    return Ok(code);
+                }
+            }
+            return Err(error);
+        }
+    };
     let mut forward_config =
         crate::forward_config::build(args, std::env::var("SSH_AUTH_SOCK").ok().as_deref())?;
     forward_config.apply_ssh_config(&resolved)?;
@@ -455,7 +462,7 @@ fn run_client(
                 .insert("COLORTERM".to_owned(), value.to_owned());
         }
     }
-    let agent_forward =
+    let mut agent_forward =
         crate::agent_forward::AgentForward::prepare(args, &credentials.id, &mut initial_payload)?;
     et_cli::logging::info(format!("Connecting to {endpoint}"));
     let connection = connect_initial(
@@ -465,6 +472,7 @@ fn run_client(
         resolver,
         deadline,
     )?;
+    agent_forward.established();
     if let Some(name) = args.session_name.as_deref() {
         if args.jumphost.is_none() && !args.no_pty && !args.no_persist {
             crate::session_store::save_direct(
@@ -713,11 +721,7 @@ fn selected_ssh_config(args: &ClientArgs) -> Result<Option<String>, ClientError>
 }
 
 fn command_user(positional: Option<String>, option: Option<String>) -> Option<String> {
-    match positional {
-        Some(user) if user.is_empty() => None,
-        Some(user) => Some(user),
-        None => option,
-    }
+    option.or_else(|| positional.filter(|user| !user.is_empty()))
 }
 
 #[cfg(test)]
@@ -793,7 +797,9 @@ fn effective_ssh_args(
     }
     args.no_terminal |= args.no_remote_command;
     args.control_master = args.control_master.or(config.control_master);
-    args.control_path = args.control_path.or_else(|| config.control_path.clone());
+    if !args.control_path_explicit_none {
+        args.control_path = args.control_path.or_else(|| config.control_path.clone());
+    }
     args.control_persist = args.control_persist.or(config.control_persist);
     if config.clear_all_forwardings {
         args.tunnel.clear();
@@ -831,21 +837,12 @@ fn session_ssh_options(args: &ClientArgs) -> Vec<String> {
         let key = et_cli::client::split_ssh_option(option)
             .0
             .to_ascii_lowercase();
-        // Other recognized session options are applied by ET after file resolution.
-        if !matches!(
+        // ET applies additive forwarding/environment options after resolution;
+        // all other options must reach ssh -G so OpenSSH validates and resolves
+        // their scalar precedence.
+        if matches!(
             key.as_str(),
-            "hostname"
-                | "user"
-                | "port"
-                | "connecttimeout"
-                | "serveraliveinterval"
-                | "clearallforwardings"
-                | "exitonforwardfailure"
-                | "batchmode"
-                | "remotecommand"
-                | "controlmaster"
-                | "controlpath"
-                | "controlpersist"
+            "localforward" | "remoteforward" | "dynamicforward" | "sendenv" | "setenv" | "user"
         ) {
             continue;
         }
@@ -1168,7 +1165,7 @@ mod tests {
                 Some("option".to_string()),
                 Some("config".to_string()),
             ),
-            Some("positional".to_string())
+            Some("option".to_string())
         );
         assert_eq!(
             effective_user(None, Some("option".to_string()), Some("config".to_string()),),
@@ -1180,7 +1177,7 @@ mod tests {
                 Some("option".to_string()),
                 Some("config".to_string()),
             ),
-            Some("config".to_string())
+            Some("option".to_string())
         );
     }
 

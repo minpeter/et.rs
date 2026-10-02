@@ -20,11 +20,17 @@ use crate::resolver::EndpointResolver;
 const VERSION: &str = "1";
 
 #[cfg(unix)]
-pub fn exists_for(name: &str, host: &str, port: u16) -> Result<bool, ClientError> {
+pub fn load_for(name: &str, host: &str, port: u16) -> Result<Option<SavedSession>, ClientError> {
     if !valid_name(name) {
         return Err(ClientError::Terminal("invalid session name".to_owned()));
     }
-    let path = sessions_dir().map_err(ClientError::Terminal)?.join(name);
+    let directory = sessions_dir().map_err(ClientError::Terminal)?;
+    if !directory.exists() {
+        return Ok(None);
+    }
+    let _lock = crate::local_ipc::lock_directory(&directory)
+        .map_err(|e| ClientError::Terminal(e.to_string()))?;
+    let path = directory.join(name);
     match fs::symlink_metadata(path) {
         Ok(_) => {
             let saved = load(name).map_err(ClientError::Terminal)?;
@@ -33,9 +39,9 @@ pub fn exists_for(name: &str, host: &str, port: u16) -> Result<bool, ClientError
                     "session {name} belongs to a different destination; use --attach or a different --name"
                 )));
             }
-            Ok(true)
+            Ok(Some(saved))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(ClientError::Terminal(error.to_string())),
     }
 }
@@ -45,7 +51,13 @@ pub fn remove_if_matches(name: &str, id: &str) -> Result<(), ClientError> {
     if !valid_name(name) {
         return Err(ClientError::Terminal("invalid session name".to_owned()));
     }
-    let path = sessions_dir().map_err(ClientError::Terminal)?.join(name);
+    let directory = sessions_dir().map_err(ClientError::Terminal)?;
+    if !directory.exists() {
+        return Ok(());
+    }
+    let _lock = crate::local_ipc::lock_directory(&directory)
+        .map_err(|e| ClientError::Terminal(e.to_string()))?;
+    let path = directory.join(name);
     match fs::symlink_metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(ClientError::Terminal(error.to_string())),
@@ -122,6 +134,15 @@ pub fn attach(
     deadline: Deadline,
 ) -> Result<i32, ClientError> {
     let saved = load(name).map_err(ClientError::Terminal)?;
+    attach_saved(saved, args, resolver, deadline)
+}
+
+pub fn attach_saved(
+    saved: SavedSession,
+    args: &ClientArgs,
+    resolver: &dyn EndpointResolver,
+    deadline: Deadline,
+) -> Result<i32, ClientError> {
     #[cfg(unix)]
     let local_session = crate::local_session::prepare(args)?;
     let reconnect_timeout = {
@@ -175,6 +196,7 @@ pub fn attach(
     if let Some(prepared) = local_session {
         let mut adopted = args.clone();
         adopted.command = None;
+        adopted.host = Some(saved.host.clone());
         return crate::local_session::run(
             connection,
             &adopted,
@@ -184,6 +206,8 @@ pub fn attach(
             reconnect_session,
         );
     }
+    #[cfg(unix)]
+    crate::local_daemon::ready().map_err(|e| ClientError::Terminal(e.to_string()))?;
     crate::client_terminal::run(
         connection,
         crate::client_terminal::TerminalOptions {
@@ -298,6 +322,9 @@ fn save(session: &SavedSession) -> Result<(), String> {
             .ok_or_else(|| "session directory is invalid".to_owned())?,
     )?;
     ensure_private_dir(&directory)?;
+    #[cfg(unix)]
+    let _lock = crate::local_ipc::lock_directory(&directory)
+        .map_err(|_| "could not lock the session directory".to_owned())?;
     if !printable_field(&session.host)
         || !printable_field(&session.id)
         || !printable_field(&session.passkey)

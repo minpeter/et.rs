@@ -40,6 +40,7 @@ wait-timeout = "0.2.1"
 nix = { version = "0.31.3", default-features = false, features = ["signal", "socket", "user"] }
 rustix = { version = "1.1.4", features = ["event", "fs", "net", "process", "termios", "time"] }
 signal-hook = "0.3.18"
+socket2 = "0.6.1"
 
 [target.'cfg(windows)'.dependencies]
 # Already used by crossterm; safe GetConsoleMode/SetConsoleMode wrappers.

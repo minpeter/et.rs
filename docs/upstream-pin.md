@@ -40,7 +40,7 @@ The reviewed baseline-to-tip range contains 77 classified commits. Unclassified 
 | [`12889c5`](https://github.com/MisterTea/EternalTerminal/commit/12889c5bfbf1ece81d45b4834f9b05254e723e1e) | 2026-07-21 | ci | skip | #776 GCC-16 CI |
 | [`90711ad`](https://github.com/MisterTea/EternalTerminal/commit/90711ad421264db30dc5d05df4a37452b41a7667) | 2026-07-21 | ci | skip | #777 windows deploy |
 | [`69b3353`](https://github.com/MisterTea/EternalTerminal/commit/69b33537ab12f324cf619aca04dc483728dc30c3) | 2026-07-30 | security | **ported** | #784 handshake 4KiB, recover, unix-socket LPE. Landed in et.rs via #31 / 906a7ca. |
-| [`b74a12e`](https://github.com/MisterTea/EternalTerminal/commit/b74a12efc567dbc1360ac0846f889c945a2eba60) | 2026-08-07 | product | **ported** | #788 non-TTY EOF survival and SSH diagnostics; Linux tests, Windows cross-check |
+| [`b74a12e`](https://github.com/MisterTea/EternalTerminal/commit/b74a12efc567dbc1360ac0846f889c945a2eba60) | 2026-08-07 | product | **ported** | #788 non-TTY input EOF survival; diagnostics and Windows raw input tracked under #874 |
 | [`fcce839`](https://github.com/MisterTea/EternalTerminal/commit/fcce83924326ab5743878f2d58a534bd8a6bc22c) | 2026-09-01 | other | skip | #801 HTM/Windows/coverage; not et.rs server accept/reconnect |
 | [`50b961d`](https://github.com/MisterTea/EternalTerminal/commit/50b961d9e9eb6daf57d8a5ce9cae8f9209bffe44) | 2026-09-01 | security | **ported** | #798 accept starvation / stuck reconnect. Landed in et.rs via #77. PROTOCOL_VERSION stays 6. |
 | [`3e8db00`](https://github.com/MisterTea/EternalTerminal/commit/3e8db00cdccba4906ca1b995d3fd7c0650a9fac9) | 2026-09-01 | product | skip | #803 TIOCGWINSZ; Unix terminal-size observation only |
@@ -87,7 +87,7 @@ The reviewed baseline-to-tip range contains 77 classified commits. Unclassified 
 | [`9a2d230`](https://github.com/MisterTea/EternalTerminal/commit/9a2d23092584606f8d0c55b111ed7416ca71d5ea) | 2026-09-25 | product | **ported** | #853 Unix mux v4 and local TCP/Unix mutation; unsupported requests rejected (see below) |
 | [`c5ddae7`](https://github.com/MisterTea/EternalTerminal/commit/c5ddae79be824944df0e423cb49c032c60cf3394) | 2026-09-25 | ci | skip | #865 HTM e2e harness. CI/product only. |
 | [`64fa900`](https://github.com/MisterTea/EternalTerminal/commit/64fa9006142cc63e936445fb908d07338ae9009e) | 2026-09-25 | product | **ported** | #863 split `id/passkey_TERM` at the first underscore. |
-| [`99ac197`](https://github.com/MisterTea/EternalTerminal/commit/99ac1972c21f68c141d66f967ded231fc2903c7b) | 2026-09-25 | product | skip | #843/#769 SSH banner stderr UX. Product only. |
+| [`99ac197`](https://github.com/MisterTea/EternalTerminal/commit/99ac1972c21f68c141d66f967ded231fc2903c7b) | 2026-09-25 | product | skip | #843/#769 equivalent foreground behavior: SSH inherits stderr; file logging does not redirect it |
 | [`fe0795c`](https://github.com/MisterTea/EternalTerminal/commit/fe0795c1dc6c42d13b50445681bf6a5b341ca64e) | 2026-09-25 | protocol | **ported** | #858 `disconnect_timeout_seconds` field 8. et.rs `flowcontrol` moved to field 9. |
 | [`a4bed0c`](https://github.com/MisterTea/EternalTerminal/commit/a4bed0cfabe64cc307bc0afb63c6512e4e85d4e8) | 2026-09-25 | protocol | **ported** | #864 client reads peer catchup before writing its own. |
 | [`f3137ce`](https://github.com/MisterTea/EternalTerminal/commit/f3137cee7b805284d7c76a7a5538884946576fd1) | 2026-09-26 | product | **ported** | #867 OpenSSH short-flag remap; README migration required |
@@ -105,7 +105,7 @@ The reviewed baseline-to-tip range contains 77 classified commits. Unclassified 
 | [`ea2542f`](https://github.com/MisterTea/EternalTerminal/commit/ea2542fade29191703356e0abf00b78e72bb58e2) | 2026-09-30 | ci | skip | #875 C++ mains testable (MainEntry split) + setup-failure CI coverage. C++ harness only; not et.rs wire. PROTOCOL_VERSION stays 6. |
 | [`a5e29af`](https://github.com/MisterTea/EternalTerminal/commit/a5e29afdf97b163cdc74331a58fbdb0514a466c5) | 2026-09-30 | product | skip | #873 client setup failures throw instead of exit(1); Connection drops writes when no handshake writer (hang fix). Product/reliability; et.rs already uses Result paths. No wire/auth change. PROTOCOL_VERSION stays 6. |
 | [`dc1dc63`](https://github.com/MisterTea/EternalTerminal/commit/dc1dc63dc6b6175168d4dbc52227608ed3cbc6d0) | 2026-09-30 | ci | skip | #877 OpenWrt package installs et1. Packaging/CI only. PROTOCOL_VERSION stays 6. |
-| [`bcc28abc`](https://github.com/MisterTea/EternalTerminal/commit/bcc28abc39d5445bd6f80efe518c8e5fdae125c4) | 2026-10-01 | product | skip | #878/#769 SSH auth banners on terminal after stderr→log redirect (preserve original stderr). Same product/UX family as #843/#769 skip; not wire/auth. PROTOCOL_VERSION stays 6. |
+| [`bcc28abc`](https://github.com/MisterTea/EternalTerminal/commit/bcc28abc39d5445bd6f80efe518c8e5fdae125c4) | 2026-10-01 | product | skip | #878/#769 logging never redirects process stderr; foreground SSH already inherits it; background -f intentionally detaches stdio |
 | [`5129342`](https://github.com/MisterTea/EternalTerminal/commit/5129342ef5ce3185125d907b95ad6d15a36b1cb6) | 2026-10-02 | docs | skip | #876 README-only editor setup for upstream et1; et.rs does not package that wrapper or claim editor sleep-cycle verification. Pin tip. |
 
 
@@ -158,10 +158,10 @@ Upstream left reconnect passkey-before-recover for a future
 `PROTOCOL_VERSION` bump; that residual is still unported. Do **not** treat
 this pin as a green light to bump `PROTOCOL_VERSION` or land a v7 port.
 
-[`b74a12e`](https://github.com/MisterTea/EternalTerminal/commit/b74a12efc567dbc1360ac0846f889c945a2eba60) (`#788`) is `status: ported` with `#874`:
-non-TTY EOF no longer ends the session, and SSH diagnostics survive as recognizable
-phrases, including redirected raw bytes on Windows. Linux heredoc and input tests
-pass; the Windows path is cross-compiled, not natively exercised in this port.
+[`b74a12e`](https://github.com/MisterTea/EternalTerminal/commit/b74a12efc567dbc1360ac0846f889c945a2eba60) (`#788`) is `status: ported`:
+non-TTY input EOF no longer ends the session. SSH diagnostic phrasing and the
+Windows redirected-byte input path are tracked under `#874`. Linux heredoc and
+input tests pass; redirected Windows input lacks native runtime coverage.
 [`fcce839`](https://github.com/MisterTea/EternalTerminal/commit/fcce83924326ab5743878f2d58a534bd8a6bc22c) (`#801`),
 [`3e8db00`](https://github.com/MisterTea/EternalTerminal/commit/3e8db00cdccba4906ca1b995d3fd7c0650a9fac9) (`#803`), and
 [`342c0df`](https://github.com/MisterTea/EternalTerminal/commit/342c0dfb32882c94df6aa18092fc897015222c0b) (`#802`) stay `status: skip`
@@ -336,7 +336,9 @@ are explicitly unsupported. ControlPath tokens are literal, not expanded.
 underscore, so a TERM such as `xterm_256color` does not abort session start.
 
 [`99ac197`](https://github.com/MisterTea/EternalTerminal/commit/99ac1972c21f68c141d66f967ded231fc2903c7b)
-(`#843` / `#769`) stays `status: skip`. SSH banner stderr UX. Product only.
+(`#843` / `#769`) stays `status: skip`: foreground `SystemSsh` already inherits
+stderr, and file logging never redirects that descriptor. Background `-f`
+intentionally detaches stdio rather than displaying interactive auth banners.
 
 [`fe0795c`](https://github.com/MisterTea/EternalTerminal/commit/fe0795c1dc6c42d13b50445681bf6a5b341ca64e)
 (`#858`) is `status: ported` for the wire field and the etserver/etterminal
@@ -445,10 +447,10 @@ Product/reliability; et.rs already uses `Result` paths. No wire/auth change.
 `et1`. Packaging/CI only. `PROTOCOL_VERSION` stays 6.
 
 [`bcc28abc`](https://github.com/MisterTea/EternalTerminal/commit/bcc28abc39d5445bd6f80efe518c8e5fdae125c4)
-(`#878` / `#769`) stays `status: skip`. SSH auth banners
-show on the terminal after the stderr→log redirect (preserve original stderr).
-Same product/UX family as `#843`/`#769`. Not wire/auth. Pin ≠ a claim that
-every product backlog item is finished. `PROTOCOL_VERSION` stays 6.
+(`#878` / `#769`) stays `status: skip`: et.rs logging never redirects process
+stderr, so preserving a pre-redirect descriptor is unnecessary. Foreground SSH
+inherits stderr; background `-f` intentionally detaches it. `PROTOCOL_VERSION`
+stays 6.
 
 [`5129342`](https://github.com/MisterTea/EternalTerminal/commit/5129342ef5ce3185125d907b95ad6d15a36b1cb6)
 (`#876`) is the pin tip and `status: skip`. This README-only change documents

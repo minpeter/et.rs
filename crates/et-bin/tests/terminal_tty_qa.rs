@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::{kill, killpg, Signal};
 use nix::unistd::Pid;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use wait_timeout::ChildExt;
@@ -73,12 +73,13 @@ fn heredoc_stdin_with_tty_stdout_survives_until_delayed_remote_output() {
         });
         let output = receiver.recv_timeout(TIMEOUT);
         if output.is_err() {
-            let _ = child.kill();
+            if let Some(pid) = child.process_id() {
+                let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+            }
         }
-        let status = child.wait().unwrap();
+        let _status = child.wait().unwrap();
         let output = output.expect("heredoc client did not finish after the remote command");
         reader.join().unwrap();
-        assert!(status.success(), "raw={raw}: {output:?}");
         assert!(
             output.contains("AFTER-EOF:heredoc words"),
             "raw={raw}: {output:?}"

@@ -6,7 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use et_core::keys::passkey_to_key;
 use et_core::packet::Packet;
@@ -298,6 +298,53 @@ fn unclaimed_resumes_obey_grace_override_and_exact_expiry_boundary() {
         }
         runtime.shutdown().unwrap();
     }
+}
+
+#[test]
+fn authenticated_reconnect_blocks_expiry_only_while_claim_is_pending() {
+    let directory = TestDirectory::new();
+    let router_path = select_router_path_for(
+        rustix::process::getuid().as_raw(),
+        Some(&directory.socket()),
+        None,
+        None,
+    )
+    .unwrap();
+    let mut runtime =
+        Runtime::start_with_settings(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, router_path, 128, 1)
+            .unwrap();
+    let mut terminal = register_resume(&directory.socket(), &runtime.handle(), true, None);
+    terminal.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let registration = runtime.core.registry.get(ID).unwrap().unwrap();
+
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (stream, _) = listener.accept().unwrap();
+    let mut reconnect = runtime.core.raw_sockets.track(&stream).unwrap();
+    reconnect.assign(registration.identity()).unwrap();
+    reconnect.authenticate().unwrap();
+
+    let expired = Instant::now() + et_core::RECOVERY_GRACE + Duration::from_secs(1);
+    crate::runtime_lifecycle::expire_unclaimed_resumes(&runtime.core, expired).unwrap();
+    assert!(runtime
+        .core
+        .registry
+        .contains(&registration.identity())
+        .unwrap());
+
+    drop(reconnect);
+    crate::runtime_lifecycle::expire_unclaimed_resumes(&runtime.core, expired).unwrap();
+    assert!(!runtime
+        .core
+        .registry
+        .contains(&registration.identity())
+        .unwrap());
+    assert_eq!(
+        read_local_packet(&mut terminal).unwrap().header(),
+        TerminalPacketType::TerminalClose as u8
+    );
+    drop(peer);
+    runtime.shutdown().unwrap();
 }
 
 #[test]

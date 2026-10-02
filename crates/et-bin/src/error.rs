@@ -124,7 +124,8 @@ impl std::fmt::Display for ClientError {
                 write!(f, "Could not resolve hostname {endpoint}: Operation timed out")
             }
             Self::DnsResolution { endpoint, source } => {
-                write!(f, "Could not resolve hostname {endpoint}: {source}")
+                write!(f, "Could not resolve hostname {endpoint}: ")?;
+                write_connect_reason(f, source)
             }
             Self::DnsWorker(error) => write!(f, "could not start DNS resolver: {error}"),
             Self::DnsWorkerPanicked => write!(f, "DNS resolver worker terminated unexpectedly"),
@@ -339,6 +340,14 @@ mod tests {
         ] {
             assert!(error.to_string().contains("Operation timed out"));
         }
+        let resolution = ClientError::DnsResolution {
+            endpoint: "dns.invalid:2022".to_owned(),
+            source: io::Error::new(io::ErrorKind::TimedOut, "localized resolver timeout"),
+        };
+        assert_eq!(
+            resolution.to_string(),
+            "Could not resolve hostname dns.invalid:2022: Operation timed out: localized resolver timeout"
+        );
     }
 
     #[cfg(windows)]

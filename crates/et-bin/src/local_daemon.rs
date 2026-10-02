@@ -46,7 +46,7 @@ pub fn prepare(parsed: &mut ClientArgs, raw: &[OsString]) -> io::Result<Option<i
             format!("{host}-{}", nonce())
         }));
     }
-    if !(parsed.ctl || parsed.background) || crate::local_mux::passenger(parsed) {
+    if !(parsed.ctl || parsed.background) || parsed.control_command.is_some() {
         return Ok(None);
     }
     if std::env::var_os(CHILD).is_some() {
@@ -84,7 +84,7 @@ pub fn prepare(parsed: &mut ClientArgs, raw: &[OsString]) -> io::Result<Option<i
                     format!("accepting daemon readiness connection: {e}"),
                 )
             })? {
-                let received = read_status(&mut socket).map_err(|e| {
+                let received = read_status(&mut socket, local_ipc::TIMEOUT).map_err(|e| {
                     io::Error::new(e.kind(), format!("reading daemon readiness response: {e}"))
                 });
                 break received.and_then(|status| match status.split_first() {
@@ -116,6 +116,7 @@ pub fn prepare(parsed: &mut ClientArgs, raw: &[OsString]) -> io::Result<Option<i
         startup
     })();
     drop(listener);
+    let _ = std::fs::remove_file(directory.join(".et-lock"));
     let _ = std::fs::remove_dir(directory);
     result?;
     if parsed.ctl {
@@ -134,8 +135,11 @@ pub fn prepare(parsed: &mut ClientArgs, raw: &[OsString]) -> io::Result<Option<i
 
 /// The accepted socket stays nonblocking: Darwin rejects SO_RCVTIMEO after
 /// the sender has closed, even when its complete response is still buffered.
-pub(super) fn read_status(socket: &mut std::os::unix::net::UnixStream) -> io::Result<Vec<u8>> {
-    let deadline = Instant::now() + local_ipc::TIMEOUT;
+pub(super) fn read_status(
+    socket: &mut std::os::unix::net::UnixStream,
+    timeout: Duration,
+) -> io::Result<Vec<u8>> {
+    let deadline = Instant::now() + timeout;
     let mut status = Vec::new();
     let mut buffer = [0; 8192];
     while status.len() < buffer.len() {

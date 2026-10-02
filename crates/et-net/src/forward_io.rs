@@ -109,6 +109,7 @@ pub(crate) fn spawn_listener(
     commands: CommandSender,
     cancel: channel::Receiver<()>,
     stop: ListenerStop,
+    worker_stopped: Arc<AtomicBool>,
     next_client_fd: Arc<AtomicI32>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -131,7 +132,13 @@ pub(crate) fn spawn_listener(
                 ];
                 // poll() is never restarted by SA_RESTART; retry on EINTR so
                 // a stray signal cannot silently stop the forward acceptor.
-                match poll(&mut descriptors, None) {
+                match poll(
+                    &mut descriptors,
+                    Some(&rustix::event::Timespec {
+                        tv_sec: 0,
+                        tv_nsec: 100_000_000,
+                    }),
+                ) {
                     Ok(_) => {}
                     Err(error) if error == rustix::io::Errno::INTR => continue,
                     Err(_) => return,
@@ -142,13 +149,16 @@ pub(crate) fn spawn_listener(
                 {
                     return;
                 }
+                if worker_stopped.load(Ordering::Acquire) {
+                    return;
+                }
                 if !descriptors[0].revents().contains(PollFlags::IN) {
                     continue;
                 }
             }
             #[cfg(windows)]
             {
-                if stop.load(Ordering::Acquire) {
+                if stop.load(Ordering::Acquire) || worker_stopped.load(Ordering::Acquire) {
                     return;
                 }
             }
@@ -194,7 +204,8 @@ pub(crate) fn spawn_listener(
 }
 
 // Listener cancellation must not wait for the transport pump to drain a full
-// worker queue. Already admitted streams remain owned by the worker.
+// worker queue. A stream is admitted only once its Accepted command is queued;
+// those already-admitted streams remain owned by the worker.
 fn send_accepted_until_stopped(
     commands: &CommandSender,
     cancel: &channel::Receiver<()>,

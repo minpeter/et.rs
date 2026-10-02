@@ -88,17 +88,33 @@ fn forward_body(kind: u32, id: u32, request: &PortForwardSourceRequest) -> io::R
     Ok(body)
 }
 
-pub fn run(args: &ClientArgs) -> io::Result<i32> {
+pub fn try_run(args: &ClientArgs) -> io::Result<Option<i32>> {
+    let path = args
+        .control_path
+        .as_deref()
+        .ok_or_else(|| ipc::invalid("-O requires ControlPath/-S"))?;
+    let socket = match ipc::connect(Path::new(path)) {
+        Ok(socket) => socket,
+        Err(error)
+            if args.control_command.is_none()
+                && matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                ) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error),
+    };
+    run(args, socket).map(Some)
+}
+
+fn run(args: &ClientArgs, mut socket: std::os::unix::net::UnixStream) -> io::Result<i32> {
     if !args.reverse_tunnel.is_empty() || !args.dynamic.is_empty() || args.stdio_forward.is_some() {
         return Err(ipc::invalid(
             "mux remote/dynamic/stdio forwarding is unsupported",
         ));
     }
-    let path = args
-        .control_path
-        .as_deref()
-        .ok_or_else(|| ipc::invalid("-O requires ControlPath/-S"))?;
-    let mut socket = ipc::connect(Path::new(path))?;
     socket.write_all(&ipc::mux_frame(&ipc::words(&[HELLO, 4])))?;
     let hello = ipc::read_mux(&mut socket)?;
     let mut hello = Decoder(&hello);
@@ -160,10 +176,15 @@ pub fn run(args: &ClientArgs) -> io::Result<i32> {
         crate::local_daemon::ready()?;
         return Ok(0);
     }
-    let tty = io::stdin().is_terminal() && !args.no_pty;
+    if args.no_pty {
+        return Err(ipc::invalid("raw -T mux passengers are unsupported"));
+    }
+    let tty = io::stdin().is_terminal();
     let mut request = ipc::words(&[NEW_SESSION, 0]);
     ipc::string(&mut request, b"");
-    request.extend(ipc::words(&[u32::from(tty), 0, 0, 0, u32::MAX]));
+    // The shared remote shell is always PTY-backed, including redirected
+    // local input. Only local raw-mode handling depends on is_terminal().
+    request.extend(ipc::words(&[1, 0, 0, 0, u32::MAX]));
     ipc::string(
         &mut request,
         std::env::var("TERM")
@@ -212,31 +233,39 @@ pub fn run(args: &ClientArgs) -> io::Result<i32> {
 
 /// Strip the status sentinel across arbitrary packet boundaries. Commands run
 /// in a subshell so `exit` never tears down the master's shared remote shell.
+#[cfg_attr(test, derive(Clone))]
 pub struct ExitMarker {
     carry: Vec<u8>,
+    marker: String,
 }
 impl ExitMarker {
     pub fn new() -> Self {
-        Self { carry: Vec::new() }
+        Self {
+            carry: Vec::new(),
+            marker: format!(
+                "__ET_PASSENGER_EXIT_{}__:",
+                et_core::keys::gen_id_passkey().1
+            ),
+        }
     }
-    pub fn command(command: &str) -> String {
-        format!("({command}); printf '\\n__ET_PASSENGER_EXIT__:%d\\n' $?\n")
+    pub fn command(&self, command: &str) -> String {
+        format!("({command}); printf '\\n{}%d\\n' $?\n", self.marker)
     }
     pub fn consume(&mut self, bytes: &[u8]) -> (Vec<u8>, Option<u32>) {
-        const MARKER: &[u8] = b"__ET_PASSENGER_EXIT__:";
+        let marker = self.marker.as_bytes();
         self.carry.extend_from_slice(bytes);
         // The echoed printf command contains the marker followed by %d, so
         // accept only a complete numeric status followed by a line ending.
         let mut scan = 0;
-        while scan + MARKER.len() <= self.carry.len() {
+        while scan + marker.len() <= self.carry.len() {
             let Some(offset) = self.carry[scan..]
-                .windows(MARKER.len())
-                .position(|s| s == MARKER)
+                .windows(marker.len())
+                .position(|s| s == marker)
             else {
                 break;
             };
             let start = scan + offset;
-            let digits = start + MARKER.len();
+            let digits = start + marker.len();
             if let Some(end) = self.carry[digits..].iter().position(|b| *b == b'\n') {
                 let number = &self.carry[digits..digits + end];
                 let number = number.strip_suffix(b"\r").unwrap_or(number);
@@ -261,9 +290,9 @@ impl ExitMarker {
                 scan = digits;
             }
         }
-        let retain = (1..MARKER.len())
+        let retain = (1..marker.len())
             .rev()
-            .find(|&n| self.carry.ends_with(&MARKER[..n]))
+            .find(|&n| self.carry.ends_with(&marker[..n]))
             .unwrap_or(0);
         let output = self.carry.drain(..self.carry.len() - retain).collect();
         (output, None)

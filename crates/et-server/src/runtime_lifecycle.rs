@@ -70,16 +70,23 @@ pub(crate) fn run(
     }
     let mut first_error = None;
     let mut next_sweep = Instant::now();
+    let mut sweep_failed = false;
     loop {
         let now = Instant::now();
         if now >= next_sweep {
-            if let Err(error) = expire_unclaimed_resumes(&core, now) {
-                crate::diag::info(format!(
-                    "could not expire unclaimed terminal resumes: {error}"
-                ));
-                first_error.get_or_insert(error);
+            match expire_unclaimed_resumes(&core, now) {
+                Ok(()) => sweep_failed = false,
+                Err(error) if !sweep_failed => {
+                    crate::diag::info(format!(
+                        "could not expire unclaimed terminal resumes: {error}"
+                    ));
+                    sweep_failed = true;
+                }
+                Err(_) => {}
             }
-            next_sweep = now + Duration::from_millis(100);
+            // Recovery grace is measured in minutes. A one-second pass keeps
+            // expiry prompt without churning the registry lock at 10 Hz.
+            next_sweep = now + Duration::from_secs(1);
         }
         let event = match events.recv_timeout(next_sweep.saturating_duration_since(Instant::now()))
         {
@@ -194,6 +201,13 @@ pub(crate) fn expire_unclaimed_resumes(
             if current_slot.is_some_and(|slot| !matches!(slot, Slot::Registered(_))) {
                 continue;
             }
+            // Authentication is marked before claim(). Check it while the
+            // table lock is held: authenticate() and claim() then linearize
+            // on opposite sides of this decision, while passkey-less peers do
+            // not keep a resumed terminal alive.
+            if core.raw_sockets.has_authenticated_registration(&identity)? {
+                continue;
+            }
             let remove_slot = current_slot.is_some();
             let stream = match core.registry.clone_stream(&registration) {
                 Ok(stream) => stream,
@@ -225,6 +239,7 @@ pub(crate) fn expire_unclaimed_resumes(
             )
         });
         if let Err(error) = sent {
+            let _ = terminal.shutdown(std::net::Shutdown::Both);
             crate::diag::info(format!(
                 "id={}: could not close expired resumed terminal: {error}",
                 registration.id

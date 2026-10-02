@@ -789,7 +789,11 @@ fn cancellable_stdout_accepts_null_output_but_still_honors_cancellation() {
         .open("/dev/null")
         .unwrap();
     let (cancel, mut cancel_signal) = et_net::local::wake_pair().unwrap();
-    let mut writer = CancellableStdout { file, cancel };
+    let mut writer = CancellableStdout {
+        file,
+        cancel,
+        discard_device: None,
+    };
     let (done_tx, done_rx) = mpsc::sync_channel(0);
     std::thread::spawn(move || {
         let written = writer.write_all(&vec![0xa7; 8193]);
@@ -814,7 +818,11 @@ fn cancellable_stdout_fails_when_output_is_closed() {
     drop(output);
     drop(peer);
     let (cancel, _cancel_signal) = et_net::local::wake_pair().unwrap();
-    let mut writer = CancellableStdout { file, cancel };
+    let mut writer = CancellableStdout {
+        file,
+        cancel,
+        discard_device: None,
+    };
 
     let (done_tx, done_rx) = mpsc::sync_channel(0);
     std::thread::spawn(move || done_tx.send(writer.write(b"closed")).unwrap());

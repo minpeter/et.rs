@@ -4,6 +4,8 @@
 
 use et_cli::client::ClientArgs;
 use et_core::proto::InitialPayload;
+#[cfg(unix)]
+use std::ffi::OsString;
 
 use crate::error::ClientError;
 use crate::initial_connect::ReconnectOutcome;
@@ -22,12 +24,12 @@ impl AgentForward {
         #[cfg(unix)]
         {
             let proxy = if args.forward_ssh_agent {
-                let proxy = unix::Proxy::open(id, args.ssh_socket.clone(), true)
-                    .map_err(agent_error)?
-                    .expect("created agent proxy directory");
-                proxy
-                    .refresh(std::env::var("SSH_AUTH_SOCK").ok().as_deref())
-                    .map_err(agent_error)?;
+                let proxy =
+                    unix::Proxy::open(id, args.ssh_socket.clone().map(OsString::from), true)
+                        .map_err(agent_error)?
+                        .expect("created agent proxy directory");
+                let environment = std::env::var_os("SSH_AUTH_SOCK");
+                proxy.refresh(environment.as_deref()).map_err(agent_error)?;
                 // build() appends the generated agent request after user tunnels.
                 let request = payload.reversetunnels.last_mut().expect("agent request");
                 request
@@ -67,12 +69,14 @@ impl AgentForward {
     pub fn attach(id: &str) -> Result<Self, ClientError> {
         #[cfg(unix)]
         {
-            let environment = std::env::var("SSH_AUTH_SOCK").ok();
+            let environment = std::env::var_os("SSH_AUTH_SOCK");
             let proxy = unix::Proxy::open(id, None, environment.is_some()).map_err(agent_error)?;
-            if let Some(proxy) = &proxy {
+            let mut forward = Self { proxy };
+            forward.established();
+            if let Some(proxy) = &forward.proxy {
                 proxy.refresh(environment.as_deref()).map_err(agent_error)?;
             }
-            Ok(Self { proxy })
+            Ok(forward)
         }
         #[cfg(windows)]
         {
@@ -81,12 +85,21 @@ impl AgentForward {
         }
     }
 
+    /// Retain the proxy after this process exits. Until this is called, drop
+    /// removes a proxy created for an initial connection that never succeeded.
+    pub fn established(&mut self) {
+        #[cfg(unix)]
+        if let Some(proxy) = &mut self.proxy {
+            proxy.established = true;
+        }
+    }
+
     pub fn reconnected(&self, outcome: ReconnectOutcome) -> Result<ReconnectOutcome, ClientError> {
         #[cfg(unix)]
         if outcome == ReconnectOutcome::Recovered {
             if let Some(proxy) = &self.proxy {
                 proxy
-                    .refresh(std::env::var("SSH_AUTH_SOCK").ok().as_deref())
+                    .refresh(std::env::var_os("SSH_AUTH_SOCK").as_deref())
                     .map_err(agent_error)?;
             }
         }
@@ -101,8 +114,11 @@ fn agent_error(error: std::io::Error) -> ClientError {
 
 #[cfg(unix)]
 mod unix {
+    use std::ffi::{OsStr, OsString};
     use std::io;
     use std::os::fd::OwnedFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
     use std::path::{Path, PathBuf};
 
     use rustix::fs::{
@@ -110,16 +126,21 @@ mod unix {
     };
 
     const LINK: &str = "agent.sock";
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const UNIX_PATH_MAX: usize = 108;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const UNIX_PATH_MAX: usize = 104;
 
     pub(super) struct Proxy {
         path: PathBuf,
-        pinned: Option<String>,
+        pinned: Option<OsString>,
+        pub(super) established: bool,
     }
 
     impl Proxy {
         pub(super) fn open(
             id: &str,
-            pinned: Option<String>,
+            pinned: Option<OsString>,
             create: bool,
         ) -> io::Result<Option<Self>> {
             if id.len() != 16 || !id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
@@ -129,9 +150,12 @@ mod unix {
                 ));
             }
             let directory = std::env::temp_dir().join(format!("et-agent-{id}"));
+            let path = directory.join(LINK);
+            validate_proxy_path(&path)?;
             Ok(Self::open_directory(&directory, create)?.map(|_| Self {
-                path: directory.join(LINK),
+                path,
                 pinned,
+                established: false,
             }))
         }
 
@@ -169,6 +193,11 @@ mod unix {
             &self.path
         }
 
+        #[cfg(test)]
+        pub(super) fn mark_established(&mut self) {
+            self.established = true;
+        }
+
         fn check_link(directory: &OwnedFd) -> io::Result<bool> {
             match statat(directory, LINK, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(stat)
@@ -186,7 +215,7 @@ mod unix {
             }
         }
 
-        pub(super) fn refresh(&self, environment: Option<&str>) -> io::Result<()> {
+        pub(super) fn refresh(&self, environment: Option<&OsStr>) -> io::Result<()> {
             // A reconnect may follow temporary-directory cleanup. Reopen and
             // verify the directory each time, recreating it when necessary.
             let directory = Self::open_directory(self.path.parent().expect("proxy parent"), true)?
@@ -205,12 +234,18 @@ mod unix {
                 }
                 return Ok(());
             };
-            if !Path::new(target).is_absolute()
-                || target.contains('\0')
-                || Path::new(target) == self.path
-            {
+            let target = Path::new(target);
+            let invalid = !target.is_absolute()
+                || target.as_os_str().as_bytes().contains(&0)
+                || normalize(target) == normalize(&self.path);
+            if invalid {
                 if exists {
                     unlinkat(&directory, LINK, AtFlags::empty())?;
+                }
+                // Saved-session attach follows the current environment. A bad
+                // environment value disables forwarding, but not the session.
+                if self.pinned.is_none() {
+                    return Ok(());
                 }
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -225,6 +260,44 @@ mod unix {
             }
             result.map_err(Into::into)
         }
+    }
+
+    impl Drop for Proxy {
+        fn drop(&mut self) {
+            if !self.established {
+                let parent = self.path.parent().expect("proxy parent");
+                if let Ok(Some(directory)) = Self::open_directory(parent, false) {
+                    if matches!(Self::check_link(&directory), Ok(true)) {
+                        let _ = unlinkat(&directory, LINK, AtFlags::empty());
+                    }
+                    let _ = std::fs::remove_dir(parent);
+                }
+            }
+        }
+    }
+
+    fn normalize(path: &Path) -> PathBuf {
+        let mut normalized = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    normalized.pop();
+                }
+                other => normalized.push(other.as_os_str()),
+            }
+        }
+        normalized
+    }
+
+    pub(super) fn validate_proxy_path(path: &Path) -> io::Result<()> {
+        if path.as_os_str().as_bytes().len() >= UNIX_PATH_MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "agent proxy path is too long for a Unix socket",
+            ));
+        }
+        Ok(())
     }
 }
 

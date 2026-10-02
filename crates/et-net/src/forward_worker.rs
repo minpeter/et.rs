@@ -315,8 +315,11 @@ pub(crate) fn run(
             next_client_fd,
         )
     });
+    // Stop externally owned listeners even if publishing the failure is
+    // blocked by a full outbound queue.
+    let was_shutdown = shutdown.swap(true, Ordering::AcqRel);
     if let Err(error) = result {
-        if !shutdown.load(Ordering::Acquire) {
+        if !was_shutdown {
             channel::select! {
                 send(outbound, Err(error)) -> _ => {}
                 recv(cancel) -> _ => {}
@@ -433,18 +436,25 @@ impl Worker {
             let stop = listener_stop.try_clone().map_err(ForwardError::Io)?;
             #[cfg(windows)]
             let stop = listener_stop.clone();
-            let spawn = if source.socks {
-                spawn_socks_listener
+            let thread = if source.socks {
+                spawn_socks_listener(
+                    source,
+                    self.commands.clone(),
+                    self.cancel.clone(),
+                    stop,
+                    next_client_fd.clone(),
+                )
             } else {
-                spawn_listener
+                spawn_listener(
+                    source,
+                    self.commands.clone(),
+                    self.cancel.clone(),
+                    stop,
+                    Arc::new(AtomicBool::new(false)),
+                    next_client_fd.clone(),
+                )
             };
-            self.threads.push(spawn(
-                source,
-                self.commands.clone(),
-                self.cancel.clone(),
-                stop,
-                next_client_fd.clone(),
-            ));
+            self.threads.push(thread);
         }
         let result = loop {
             let Some(command) = commands.recv() else {

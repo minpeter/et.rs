@@ -82,7 +82,10 @@ impl TmuxCcFilter {
             match self.line {
                 Line::Prefix => {
                     self.pending.push(byte);
-                    if self.pending == ST {
+                    // A response is opaque until its matching %end/%error,
+                    // even when its first bytes happen to be the outer DCS
+                    // terminator.
+                    if !self.response && self.pending == ST {
                         output.extend_from_slice(ST);
                         self.leave_control();
                         continue;
@@ -264,6 +267,14 @@ mod tests {
         assert_every_split(
             b"\x1bP1000pwall\n%output %0 hello\n\x1b\\",
             b"\x1bP1000p%output %0 hello\n\x1b\\",
+        );
+    }
+
+    #[test]
+    fn response_body_starting_with_st_is_opaque_across_every_split() {
+        assert_every_split(
+            b"\x1bP1000p%begin 1 2 3\n\x1b\\opaque\n%end 1 2 3\nwall\n%exit\n",
+            b"\x1bP1000p%begin 1 2 3\n\x1b\\opaque\n%end 1 2 3\n%exit\n",
         );
     }
 

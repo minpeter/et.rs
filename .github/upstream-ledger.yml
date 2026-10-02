@@ -75,7 +75,7 @@ commits:
     date: "2026-08-07"
     kind: product
     status: ported
-    note: "#788 non-TTY EOF survival and SSH diagnostic handling, including Windows redirected raw bytes. Linux heredoc/EOF tests and workspace suite pass; Windows cross-check only."
+    note: "#788 non-TTY input EOF disables input without closing the session. Heredoc/EOF tests pass; diagnostic phrasing and Windows redirected bytes are tracked under #874."
     et_pr: 788
   - sha: fcce83924326ab5743878f2d58a534bd8a6bc22c
     date: "2026-09-01"
@@ -352,7 +352,7 @@ commits:
     date: "2026-09-25"
     kind: product
     status: skip
-    note: "#843/#769 SSH banner stderr UX. Product only. PROTOCOL_VERSION stays 6."
+    note: "#843/#769 equivalent foreground behavior: SystemSsh inherits stderr for bootstrap and logging writes its own file without redirecting process stderr. Background -f intentionally detaches stdio. PROTOCOL_VERSION stays 6."
     et_pr: 843
   - sha: fe0795c1dc6c42d13b50445681bf6a5b341ca64e
     date: "2026-09-25"
@@ -460,7 +460,7 @@ commits:
     date: "2026-10-01"
     kind: product
     status: skip
-    note: "#878/#769 SSH auth banners on terminal after stderr→log redirect (preserve original stderr). Same product/UX family as #843/#769 skip; not wire/auth. PROTOCOL_VERSION stays 6."
+    note: "#878/#769 original-stderr preservation is unnecessary: et.rs file logging never redirects process stderr and SystemSsh inherits it. Background -f intentionally detaches stdio. PROTOCOL_VERSION stays 6."
     et_pr: 878
   - sha: 5129342ef5ce3185125d907b95ad6d15a36b1cb6
     date: "2026-10-02"

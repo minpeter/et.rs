@@ -50,7 +50,8 @@ pub fn parse_tunnels(arguments: &[String]) -> Result<Vec<PortForwardSourceReques
     Ok(requests)
 }
 
-/// One `--tunnel`/`-r` value, mirroring upstream `parseRangesToRequests` after #789:
+/// One `--tunnel`/`-L` or `--reversetunnel`/`-r` value, mirroring upstream
+/// `parseRangesToRequests` after #789:
 /// comma-separated elements are parsed independently — et-style when they have
 /// at most two colon parts, otherwise ssh-style (`bind:port:host:hostport`).
 fn parse_argument(
@@ -178,6 +179,9 @@ fn parse_ssh_style(
         parts.insert(0, "localhost".to_owned());
     }
     if parts.len() != 4 {
+        return Err(TunnelError::InvalidSyntax(input.to_owned()));
+    }
+    if parts[2].is_empty() {
         return Err(TunnelError::InvalidSyntax(input.to_owned()));
     }
     push_request(

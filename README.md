@@ -234,6 +234,10 @@ explicitly ends the remote session. A definite remote end removes matching saved
 control-session credentials, allowing the same name to start a fresh session.
 Raw `-T` masters/control sessions (except forwarding-only `-NT`), stdio `-W`
 control sessions, and Windows local mux/control/background modes are unsupported.
+Raw `-T` passengers are rejected too; independent OpenSSH mux clients must request
+a PTY (`-tt`). `ControlPersist` retains a live shared shell, not one that has
+already exited remotely. Local socket paths require private owner-only directories;
+user-controlled symlink ancestors are rejected.
 
 ### Connecting to a Windows host
 
@@ -272,6 +276,9 @@ terminal types are forwarded unchanged.
 - Reconnecting client and server sessions with backed reader/writer replay.
 - Non-TTY sessions survive local input EOF (including redirected Windows handles)
   while reporting recognizable SSH bootstrap diagnostics.
+  Protocol v6 has no terminal-stdin half-close: a raw `-T` command that requires
+  stdin EOF (for example `cat`) cannot finish from redirected local EOF alone.
+  Use a command with explicit framing/length instead; `-W` has separate half-close semantics.
 - SSH bootstrap (`IDPASSKEY` handshake), remote PTY, window resize, keepalives, `--command`
   execution, and `--no-terminal` mode.
 - Forward, reverse, Unix-socket, port-range, environment-variable named-pipe, and ssh-style
@@ -313,8 +320,11 @@ terminal types are forwarded unchanged.
 
 ## Tests
 
+Unix integration tests require system OpenSSH (`ssh`) for independent mux
+interoperability coverage. PTY/process tests should run serially on shared runners.
+
 ```sh
-cargo test --workspace
+cargo test --workspace -- --test-threads=1
 ```
 
 ## License

@@ -354,6 +354,7 @@ impl LocalListener {
         mut source: BoundSource,
         commands: CommandSender,
         cancel: channel::Receiver<()>,
+        worker_stopped: Arc<AtomicBool>,
         next_client_fd: Arc<AtomicI32>,
     ) -> Result<Self, ForwardError> {
         let request = source
@@ -366,7 +367,14 @@ impl LocalListener {
         let stop = Arc::new(AtomicBool::new(false));
         #[cfg(windows)]
         let reader = stop.clone();
-        let thread = spawn_listener(source, commands, cancel, reader, next_client_fd);
+        let thread = spawn_listener(
+            source,
+            commands,
+            cancel,
+            reader,
+            worker_stopped,
+            next_client_fd,
+        );
         Ok(Self {
             request,
             stop,
@@ -497,7 +505,13 @@ fn start_forwarder_hook(
     before_publish: impl FnOnce(),
     worker_start: impl FnOnce() + Send + 'static,
 ) -> Result<(Forwarder, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
-    let (sources, environment, skipped) = bind_sources(sources, owner, deadline, resolver.clone())?;
+    let (sources, environment, skipped) = bind_sources(
+        sources,
+        owner,
+        deadline,
+        resolver.clone(),
+        MAX_SESSION_LISTENERS,
+    )?;
     ensure_setup_deadline(deadline)?;
     let session_user = owner;
     let (commands_tx, commands_rx) = command_channel(CHANNEL_CAPACITY);
@@ -541,6 +555,7 @@ fn start_forwarder_hook(
                 source,
                 commands_tx.clone(),
                 cancel_rx.clone(),
+                shutdown.clone(),
                 next_client_fd.clone(),
             )?);
         } else {
@@ -565,8 +580,9 @@ fn start_forwarder_hook(
                 },
                 #[cfg(unix)]
                 wake_writer,
-                (listener_stop_reader, session_user, worker_shutdown),
+                (listener_stop_reader, session_user, worker_shutdown.clone()),
             );
+            worker_shutdown.store(true, Ordering::Release);
             #[cfg(unix)]
             drop(listener_stop);
             #[cfg(windows)]
@@ -613,6 +629,12 @@ impl Forwarder {
     ) -> Result<(), ForwardError> {
         self.check_local_mutation(&request)?;
         ensure_setup_deadline(deadline)?;
+        self.local_listeners.retain(|listener| {
+            listener
+                .thread
+                .as_ref()
+                .is_some_and(|thread| !thread.is_finished())
+        });
         if self
             .local_listeners
             .iter()
@@ -620,17 +642,14 @@ impl Forwarder {
         {
             return Ok(());
         }
+        let remaining = MAX_SESSION_LISTENERS.saturating_sub(self.local_listeners.len());
         let (sources, _, _) = bind_sources(
             vec![ForwardSource::explicit(request)],
             None,
             deadline,
             self.resolver.clone(),
+            remaining,
         )?;
-        if self.local_listeners.len() + sources.len() > MAX_SESSION_LISTENERS {
-            return Err(ForwardError::Protocol(
-                "too many local forwarding listeners",
-            ));
-        }
         ensure_setup_deadline(deadline)?;
         let mut listeners = Vec::new();
         for source in sources {
@@ -638,6 +657,7 @@ impl Forwarder {
                 source,
                 self.commands.clone(),
                 self.listener_cancel.clone(),
+                self.shutdown.clone(),
                 self.next_client_fd.clone(),
             )?);
         }
@@ -646,7 +666,9 @@ impl Forwarder {
     }
 
     /// Stop accepting on an exact local source/destination request. Existing
-    /// accepted streams keep running. Unknown requests return NotFound.
+    /// worker-admitted streams keep running. A concurrently accepted stream
+    /// still waiting for bounded queue admission is dropped. Unknown requests
+    /// return NotFound.
     pub fn cancel_local_forward(
         &mut self,
         request: &PortForwardSourceRequest,
@@ -881,6 +903,7 @@ fn bind_sources(
     owner: Option<(u32, u32)>,
     deadline: Instant,
     resolver: Arc<dyn ForwardResolver>,
+    listener_limit: usize,
 ) -> Result<(Vec<BoundSource>, ForwardEnvironment, Vec<SkippedForward>), ForwardError> {
     let mut plans = Vec::with_capacity(sources.len());
     let mut skipped = Vec::new();
@@ -981,8 +1004,8 @@ fn bind_sources(
         listener_count = listener_count
             .checked_add(additional_listeners)
             .ok_or(ForwardError::Protocol("reverse listener limit exceeded"))?;
-        if owner.is_some() && listener_count > MAX_SESSION_LISTENERS {
-            return Err(ForwardError::Protocol("reverse listener limit exceeded"));
+        if listener_count > listener_limit {
+            return Err(ForwardError::Protocol("local listener limit exceeded"));
         }
         plans.push(plan);
     }

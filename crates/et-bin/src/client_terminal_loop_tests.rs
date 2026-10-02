@@ -519,9 +519,12 @@ fn non_tty_eof_or_read_error_disables_input_but_keeps_keepalive_forwarding_and_r
         let (reads, observed) = mpsc::channel();
         let (client, server) = tcp_streams();
         let mut peer = Connection::new_server(server, &[19; 32]);
+        let (recovered_client, recovered_server) = tcp_streams();
+        let mut recovered_peer = Connection::new_server(recovered_server, &[19; 32]);
         let (done_tx, done_rx) = mpsc::channel();
         let worker = thread::spawn(move || {
             let mut connection = Connection::new_client(client, &[19; 32]);
+            let mut recovered_client = Some(recovered_client);
             let (mut wake, _writer) = UnixStream::pair().unwrap();
             wake.set_nonblocking(true).unwrap();
             let mut recoveries = 0;
@@ -541,9 +544,14 @@ fn non_tty_eof_or_read_error_disables_input_but_keeps_keepalive_forwarding_and_r
                     stdio_forward: false,
                 },
                 &mut Forwarder::start(Vec::new()).unwrap(),
-                |_| {
+                |connection| {
                     recoveries += 1;
-                    Ok(ReconnectOutcome::SessionEnded)
+                    if let Some(stream) = recovered_client.take() {
+                        *connection = Connection::new_client(stream, &[19; 32]);
+                        Ok(ReconnectOutcome::Recovered)
+                    } else {
+                        Ok(ReconnectOutcome::SessionEnded)
+                    }
                 },
                 ObservedInput {
                     ready,
@@ -583,10 +591,17 @@ fn non_tty_eof_or_read_error_disables_input_but_keeps_keepalive_forwarding_and_r
         let _application = destination.accept().unwrap();
         assert!(done_rx.try_recv().is_err(), "input closure ended ET");
         peer.shutdown().unwrap();
+        let keepalive = recovered_peer.read_packet().unwrap();
+        assert_eq!(keepalive.header(), TerminalPacketType::KeepAlive as u8);
+        recovered_peer
+            .write_packet(TerminalPacketType::KeepAlive as u8, &[])
+            .unwrap();
+        assert!(done_rx.try_recv().is_err(), "recovery did not remain live");
+        recovered_peer.shutdown().unwrap();
         let (result, recoveries) = done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         worker.join().unwrap();
         assert!(result.is_ok(), "{result:?}");
-        assert_eq!(recoveries, 1, "only the remote disconnect should finish ET");
+        assert_eq!(recoveries, 2, "one recovery should precede final shutdown");
         assert!(
             observed.try_recv().is_err(),
             "closed input was polled again"

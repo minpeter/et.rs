@@ -141,6 +141,27 @@ impl RawSockets {
         }
         Ok(())
     }
+
+    /// Call while holding the session-table lock during expiry. This check
+    /// observes authentication under the raw-socket lock, before removing the
+    /// session; an unproven challenge cannot extend the deadline. Authentication
+    /// publishes here before attempting to claim the session table.
+    pub(crate) fn has_authenticated_registration(
+        &self,
+        identity: &RegistrationIdentity,
+    ) -> Result<bool, RuntimeError> {
+        let streams = self
+            .streams
+            .lock()
+            .map_err(|_| RuntimeError::WorkerUnavailable)?;
+        Ok(streams.values().any(|tracked| {
+            tracked.authenticated
+                && tracked
+                    .registration
+                    .as_ref()
+                    .is_some_and(|current| current.same_generation(identity))
+        }))
+    }
 }
 
 impl RawSocketGuard {

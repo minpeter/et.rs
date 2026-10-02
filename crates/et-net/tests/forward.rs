@@ -26,6 +26,32 @@ const REFUSED_DESTINATION_TIMEOUT: Duration = Duration::from_secs(7);
 const HARD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[test]
+fn worker_failure_releases_locally_owned_listeners_without_forwarder_drop() {
+    let port = reserve_port();
+    let source = Forwarder::start(vec![request(port, 79)]).unwrap();
+    source
+        .receive(Packet::new(
+            TerminalPacketType::PortForwardData as u8,
+            vec![0xff],
+        ))
+        .unwrap();
+    assert!(source.wait_outbound(TIMEOUT).is_err());
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+            drop(listener);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "failed worker retained its listening port"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    drop(source);
+}
+
+#[test]
 fn cancelling_local_listener_preserves_accepted_streams_and_exact_identity() {
     for preconfigured in [false, true] {
         let remote = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -72,16 +98,14 @@ fn cancelling_local_listener_preserves_accepted_streams_and_exact_identity() {
         destination
             .receive(source.wait_outbound(TIMEOUT).unwrap())
             .unwrap();
-        loop {
+        let mut relayed = 0;
+        while relayed < 8 {
             let packet = destination.wait_outbound(TIMEOUT).unwrap();
-            let has_reply = PortForwardData::decode(packet.payload())
+            relayed += PortForwardData::decode(packet.payload())
                 .ok()
                 .and_then(|data| data.buffer)
-                .is_some_and(|bytes| !bytes.is_empty());
+                .map_or(0, |bytes| bytes.len());
             source.receive(packet).unwrap();
-            if has_reply {
-                break;
-            }
         }
         let mut reply = [0; 8];
         application.read_exact(&mut reply).unwrap();
@@ -703,7 +727,7 @@ fn imported_local_wildcard_is_externally_reachable_while_loopback_is_not() {
 
 #[cfg(unix)]
 #[test]
-fn local_forwarding_exceeds_reverse_cap_while_reverse_limit_is_transactional() {
+fn local_and_reverse_listener_limits_fail_before_binding() {
     struct RemoveDir(std::path::PathBuf);
     impl Drop for RemoveDir {
         fn drop(&mut self) {
@@ -732,12 +756,16 @@ fn local_forwarding_exceeds_reverse_cap_while_reverse_limit_is_transactional() {
         })
         .collect();
 
-    // When: client-local forwarding owns more than the server reverse cap.
-    let local = Forwarder::start(requests.clone()).unwrap();
-
-    // Then: every local listener is usable and cleanup is deterministic.
-    assert!(paths.iter().all(|path| path.exists()));
-    local.shutdown().unwrap();
+    // Both client-local and authenticated reverse limits are checked before
+    // any sibling address is bound.
+    let local_error = match Forwarder::start(requests.clone()) {
+        Ok(forwarder) => {
+            forwarder.shutdown().unwrap();
+            panic!("local listener cap was not enforced");
+        }
+        Err(error) => error,
+    };
+    assert!(local_error.to_string().contains("listener limit"));
     assert!(paths.iter().all(|path| !path.exists()));
 
     // When: the same multiset is requested as authenticated server reverse forwarding.

@@ -200,26 +200,40 @@ where
         }
 
         // 1. Redirected bytes, or console input and resize notifications.
-        // Take only one raw chunk per turn so a full pipe cannot starve output.
+        // Bound each batch so a full pipe cannot starve output or forwarding.
+        let mut redirected_progress = false;
         if let Some(input) = raw_input.as_ref() {
-            match input.try_recv() {
-                Ok(bytes) => {
-                    if !binary_stdio && interrupt_input.feed(&bytes) {
-                        console_output
-                            .interrupt()
-                            .map_err(|error| terminal_io("interrupting console output", error))?;
+            let mut disconnected = false;
+            for _ in 0..64 {
+                let bytes = match input.try_recv() {
+                    Ok(bytes) => bytes,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
                     }
-                    let payload = encoded_buffer(&bytes);
-                    if matches!(
-                        write_owned_recovering(
-                            connection,
-                            TerminalPacketType::TerminalBuffer as u8,
-                            &payload,
-                            &mut reconnect,
-                            terminal_enabled,
-                        )?,
-                        OwnedWriteOutcome::SessionEnded
-                    ) {
+                };
+                redirected_progress = true;
+                if !binary_stdio && interrupt_input.feed(&bytes) {
+                    console_output
+                        .interrupt()
+                        .map_err(|error| terminal_io("interrupting console output", error))?;
+                }
+                let payload = encoded_buffer(&bytes);
+                match write_owned_recovering(
+                    connection,
+                    TerminalPacketType::TerminalBuffer as u8,
+                    &payload,
+                    &mut reconnect,
+                    terminal_enabled,
+                )? {
+                    OwnedWriteOutcome::Written => {}
+                    OwnedWriteOutcome::Recovered => {
+                        reconnect_needed = false;
+                        last_received = Instant::now();
+                        next_keepalive = last_received + interval;
+                    }
+                    OwnedWriteOutcome::SessionEnded => {
                         return finish_remote_completion(
                             console_output,
                             pending_output,
@@ -230,11 +244,12 @@ where
                             forwarder,
                             None,
                             remote_exit,
-                        );
+                        )
                     }
                 }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => raw_input = None,
+            }
+            if disconnected {
+                raw_input = None;
             }
         }
         if console_input {
@@ -462,7 +477,7 @@ where
         // observed on the next tick, exactly like upstream's select() timeout.
         if console_input {
             let _ = crossterm::event::poll(POLL_INTERVAL);
-        } else {
+        } else if !redirected_progress {
             std::thread::sleep(POLL_INTERVAL);
         }
     }

@@ -1,11 +1,13 @@
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::unix::Proxy;
+use super::unix::{validate_proxy_path, Proxy};
 
 struct Session {
     id: String,
@@ -20,7 +22,11 @@ impl Session {
     }
 
     fn proxy(&self, pinned: Option<String>) -> Proxy {
-        Proxy::open(&self.id, pinned, true).unwrap().unwrap()
+        let mut proxy = Proxy::open(&self.id, pinned.map(OsString::from), true)
+            .unwrap()
+            .unwrap();
+        proxy.mark_established();
+        proxy
     }
 }
 
@@ -61,9 +67,9 @@ fn stable_endpoint_retargets_real_requests_and_leaves_old_agent_unused() {
     new.set_nonblocking(true).unwrap();
     let stable_path = proxy.path().to_owned();
 
-    proxy.refresh(old_path.to_str()).unwrap();
+    proxy.refresh(Some(old_path.as_os_str())).unwrap();
     request(&proxy, &old, 13);
-    proxy.refresh(new_path.to_str()).unwrap();
+    proxy.refresh(Some(new_path.as_os_str())).unwrap();
     assert_eq!(proxy.path(), stable_path);
     request(&proxy, &new, 29);
     assert_eq!(
@@ -87,7 +93,7 @@ fn stable_endpoint_retargets_real_requests_and_leaves_old_agent_unused() {
     // Process exit does not unlink the stable endpoint; attach reopens it.
     drop(proxy);
     let attached = session.proxy(None);
-    attached.refresh(old_path.to_str()).unwrap();
+    attached.refresh(Some(old_path.as_os_str())).unwrap();
     request(&attached, &old, 47);
     assert_eq!(attached.path(), stable_path);
     assert_eq!(
@@ -100,7 +106,9 @@ fn stable_endpoint_retargets_real_requests_and_leaves_old_agent_unused() {
 fn explicit_socket_is_pinned_but_attach_uses_the_new_environment() {
     let session = Session::new();
     let first = session.proxy(Some("/tmp/explicit-agent.sock".into()));
-    first.refresh(Some("/tmp/env-agent.sock")).unwrap();
+    first
+        .refresh(Some(OsStr::new("/tmp/env-agent.sock")))
+        .unwrap();
     assert_eq!(
         fs::read_link(first.path()).unwrap(),
         PathBuf::from("/tmp/explicit-agent.sock")
@@ -112,7 +120,9 @@ fn explicit_socket_is_pinned_but_attach_uses_the_new_environment() {
     );
     drop(first);
     let attached = session.proxy(None);
-    attached.refresh(Some("/tmp/new-agent.sock")).unwrap();
+    attached
+        .refresh(Some(OsStr::new("/tmp/new-agent.sock")))
+        .unwrap();
     assert_eq!(
         fs::read_link(attached.path()).unwrap(),
         PathBuf::from("/tmp/new-agent.sock")
@@ -127,8 +137,8 @@ fn missing_invalid_and_dead_targets_never_fall_back_to_the_old_agent() {
     let old = UnixListener::bind(&old_path).unwrap();
     old.set_nonblocking(true).unwrap();
     for missing in [None, Some("")] {
-        proxy.refresh(old_path.to_str()).unwrap();
-        proxy.refresh(missing).unwrap();
+        proxy.refresh(Some(old_path.as_os_str())).unwrap();
+        proxy.refresh(missing.map(OsStr::new)).unwrap();
         assert!(fs::symlink_metadata(proxy.path()).is_err());
         assert!(UnixStream::connect(proxy.path()).is_err());
     }
@@ -137,13 +147,15 @@ fn missing_invalid_and_dead_targets_never_fall_back_to_the_old_agent() {
         "/tmp/bad\0sock",
         proxy.path().to_str().unwrap(),
     ] {
-        proxy.refresh(old_path.to_str()).unwrap();
-        assert!(proxy.refresh(Some(invalid)).is_err());
+        proxy.refresh(Some(old_path.as_os_str())).unwrap();
+        proxy.refresh(Some(OsStr::new(invalid))).unwrap();
         assert!(fs::symlink_metadata(proxy.path()).is_err());
     }
-    proxy.refresh(old_path.to_str()).unwrap();
+    let pinned = session.proxy(Some("relative.sock".into()));
+    assert!(pinned.refresh(None).is_err());
+    proxy.refresh(Some(old_path.as_os_str())).unwrap();
     proxy
-        .refresh(session.directory.join("absent.sock").to_str())
+        .refresh(Some(session.directory.join("absent.sock").as_os_str()))
         .unwrap();
     assert!(UnixStream::connect(proxy.path()).is_err());
     assert_eq!(
@@ -151,8 +163,65 @@ fn missing_invalid_and_dead_targets_never_fall_back_to_the_old_agent() {
         std::io::ErrorKind::WouldBlock
     );
     // Reestablishment is allowed after a target temporarily disappears.
-    proxy.refresh(old_path.to_str()).unwrap();
+    proxy.refresh(Some(old_path.as_os_str())).unwrap();
     request(&proxy, &old, 83);
+}
+
+#[test]
+fn environment_targets_fail_closed_without_rejecting_attach() {
+    let session = Session::new();
+    let proxy = session.proxy(None);
+    let old_path = session.directory.join("old.sock");
+    proxy.refresh(Some(old_path.as_os_str())).unwrap();
+    for invalid in [
+        OsString::from("relative.sock"),
+        OsString::from("/tmp/bad\0sock"),
+        session
+            .directory
+            .join("./sub/../agent.sock")
+            .into_os_string(),
+    ] {
+        proxy.refresh(Some(old_path.as_os_str())).unwrap();
+        proxy.refresh(Some(&invalid)).unwrap();
+        assert!(fs::symlink_metadata(proxy.path()).is_err());
+    }
+}
+
+#[test]
+fn non_utf8_environment_target_is_preserved() {
+    let session = Session::new();
+    let proxy = session.proxy(None);
+    let mut bytes = session.directory.as_os_str().as_encoded_bytes().to_vec();
+    bytes.extend_from_slice(b"/agent-\xff.sock");
+    let target = OsString::from_vec(bytes);
+    proxy.refresh(Some(&target)).unwrap();
+    assert_eq!(fs::read_link(proxy.path()).unwrap().as_os_str(), target);
+}
+
+#[test]
+fn unestablished_proxy_is_removed_but_established_proxy_is_retained() {
+    let unestablished = Session::new();
+    let proxy = Proxy::open(&unestablished.id, None, true).unwrap().unwrap();
+    proxy
+        .refresh(Some(std::ffi::OsStr::new("/tmp/agent.sock")))
+        .unwrap();
+    drop(proxy);
+    assert!(!unestablished.directory.exists());
+
+    let established = Session::new();
+    let proxy = established.proxy(None);
+    proxy
+        .refresh(Some(std::ffi::OsStr::new("/tmp/agent.sock")))
+        .unwrap();
+    drop(proxy);
+    assert!(established.directory.exists());
+}
+
+#[test]
+fn oversized_proxy_path_is_rejected_before_wire_use() {
+    let path = PathBuf::from(format!("/{}", "x".repeat(256)));
+    let error = validate_proxy_path(&path).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
 
 #[test]
@@ -178,7 +247,7 @@ fn unsafe_directory_and_non_symlink_proxy_are_not_modified() {
     fs::set_permissions(&session.directory, fs::Permissions::from_mode(0o700)).unwrap();
     let proxy = session.proxy(None);
     fs::write(proxy.path(), "do not replace").unwrap();
-    assert!(proxy.refresh(Some("/tmp/agent.sock")).is_err());
+    assert!(proxy.refresh(Some(OsStr::new("/tmp/agent.sock"))).is_err());
     assert!(proxy.refresh(None).is_err());
     assert_eq!(fs::read_to_string(proxy.path()).unwrap(), "do not replace");
     for invalid in ["../abcdefghijklmn", "", "short", "abcdefghijklmnop/child"] {
@@ -190,13 +259,17 @@ fn unsafe_directory_and_non_symlink_proxy_are_not_modified() {
 fn missing_proxy_directory_is_recreated_for_attach() {
     let session = Session::new();
     let first = session.proxy(None);
-    first.refresh(Some("/tmp/old-agent.sock")).unwrap();
+    first
+        .refresh(Some(OsStr::new("/tmp/old-agent.sock")))
+        .unwrap();
     let path = first.path().to_owned();
     drop(first);
     fs::remove_dir_all(&session.directory).unwrap();
     assert!(Proxy::open(&session.id, None, false).unwrap().is_none());
     let attached = session.proxy(None);
-    attached.refresh(Some("/tmp/new-agent.sock")).unwrap();
+    attached
+        .refresh(Some(OsStr::new("/tmp/new-agent.sock")))
+        .unwrap();
     assert_eq!(attached.path(), path);
     assert_eq!(
         fs::read_link(path).unwrap(),

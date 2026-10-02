@@ -102,7 +102,6 @@ struct Passenger {
     queued: Vec<u8>,
     marker: Option<ExitMarker>,
     status: Option<u32>,
-    last_progress: Instant,
     size: Option<(u16, u16)>,
 }
 impl Passenger {
@@ -131,7 +130,6 @@ impl Passenger {
             queued: Vec::new(),
             marker: command.then(ExitMarker::new),
             status: None,
-            last_progress: Instant::now(),
             size: None,
         })
     }
@@ -164,15 +162,7 @@ impl Passenger {
         }
     }
     fn flush(&mut self) -> io::Result<()> {
-        let before = self.queued.len();
-        ipc::flush(&mut self.output.file, &mut self.queued)?;
-        if before != self.queued.len() {
-            self.last_progress = Instant::now();
-        }
-        if !self.queued.is_empty() && self.last_progress.elapsed() > Duration::from_secs(30) {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
-        Ok(())
+        ipc::flush(&mut self.output.file, &mut self.queued)
     }
 }
 
@@ -243,6 +233,13 @@ pub fn prepare(args: &ClientArgs) -> Result<Option<Prepared>, ClientError> {
 
 impl Runtime {
     fn new(args: &ClientArgs, prepared: Prepared) -> io::Result<Self> {
+        if args
+            .command
+            .as_ref()
+            .is_some_and(|command| command.len() + 128 > MAX_PENDING * 16 * 1024)
+        {
+            return Err(ipc::invalid("initial command exceeds input queue limit"));
+        }
         let mut runtime = Self {
             mux: prepared.mux,
             ctl: prepared.ctl,
@@ -365,10 +362,14 @@ impl Runtime {
                     )?;
                     peer.reply(ipc::mux_frame(&ipc::words(&[mux::OPENED, request, id])))?;
                     peer.attached = true;
+                    let input = passenger
+                        .marker
+                        .as_ref()
+                        .map(|marker| marker.command(&command));
                     self.passenger = Some(passenger);
                     self.idle = Instant::now();
-                    if !command.is_empty() {
-                        self.input(ExitMarker::command(&command).as_bytes());
+                    if let Some(input) = input {
+                        self.input(input.as_bytes());
                     }
                     return Ok(true);
                 }
@@ -476,7 +477,7 @@ impl Runtime {
                     return Err(ipc::invalid("input queue full; retry later"));
                 }
                 decoder.string()?;
-                let _tty = decoder.u32()?;
+                let tty = decoder.u32()?;
                 let x11 = decoder.u32()?;
                 let agent = decoder.u32()?;
                 let subsystem = decoder.u32()?;
@@ -485,6 +486,9 @@ impl Runtime {
                 let command = decoder.text()?;
                 while !decoder.0.is_empty() {
                     decoder.string()?;
+                }
+                if tty == 0 {
+                    return Err(ipc::invalid("raw no-PTY mux passengers are unsupported"));
                 }
                 if x11 != 0 || agent != 0 || subsystem != 0 {
                     return Err(ipc::invalid(
@@ -570,6 +574,11 @@ impl Runtime {
         }
         self.input(&input);
     }
+    fn output_blocked(&self, count: usize) -> bool {
+        self.passenger
+            .as_ref()
+            .is_some_and(|p| !p.orphaned && p.queued.len() + count + 128 > ipc::MAX_REPLY)
+    }
     fn output(&mut self, bytes: &[u8]) {
         self.control.output(bytes);
         if let Some(passenger) = self.passenger.as_mut() {
@@ -612,7 +621,17 @@ where
         &mut reconnect,
     );
     if let Some(passenger) = runtime.passenger.as_mut() {
-        passenger.status = Some(result.as_ref().copied().unwrap_or(255) as u32);
+        if passenger.status.is_none() {
+            passenger.status = Some(
+                if passenger.peer.is_none()
+                    || (passenger.marker.is_none() && runtime.stopping.is_none())
+                {
+                    result.as_ref().copied().unwrap_or(255) as u32
+                } else {
+                    255
+                },
+            );
+        }
     }
     let drain_deadline = Instant::now() + ipc::TIMEOUT;
     while runtime.passenger.is_some() && Instant::now() < drain_deadline {
@@ -670,6 +689,7 @@ where
             .push(signal_hook::flag::register(signal, stopped.clone()).map_err(error)?);
     }
     let mut pending_forward = None;
+    let mut pending_output: Option<Vec<u8>> = None;
     let mut last_received = Instant::now();
     let mut keepalive = Instant::now();
     let mut retry = Instant::now();
@@ -686,6 +706,16 @@ where
             .local(forwarder, connection.connected(), args.no_remote_command)
             .map_err(error)?;
         runtime.pump_passenger();
+        if let Some(bytes) = pending_output.take() {
+            // Local backpressure is not transport silence. Keep servicing IPC,
+            // outgoing keepalives and forwarding while the consumer catches up.
+            last_received = Instant::now();
+            if runtime.output_blocked(bytes.len()) {
+                pending_output = Some(bytes);
+            } else {
+                runtime.output(&bytes);
+            }
+        }
         if let Some(stopped) = runtime.stopping {
             let replies_flushed = runtime.peers.values().all(|p| p.output.is_empty());
             if (runtime.pending.is_empty() && !connection.write_pending() && replies_flushed)
@@ -743,7 +773,7 @@ where
             pending_forward = forwarder.try_receive(packet).map_err(error)?;
         }
         for _ in 0..32 {
-            if pending_forward.is_some() {
+            if pending_forward.is_some() || pending_output.is_some() {
                 break;
             }
             match connection.try_read_packet() {
@@ -757,7 +787,15 @@ where
                         }
                     } else if packet.header() == Kind::TerminalBuffer as u8 {
                         let bytes = TerminalBuffer::decode(packet.payload()).map_err(error)?;
-                        runtime.output(bytes.buffer.as_deref().unwrap_or_default());
+                        let bytes = bytes.buffer.unwrap_or_default();
+                        if bytes.len() + 128 > ipc::MAX_REPLY {
+                            return Err(error("terminal output packet exceeds local queue limit"));
+                        }
+                        if runtime.output_blocked(bytes.len()) {
+                            pending_output = Some(bytes);
+                        } else {
+                            runtime.output(&bytes);
+                        }
                     } else if packet.header() == Kind::TerminalExitStatus as u8 {
                         let code = TerminalExitStatus::decode(packet.payload())
                             .map_err(error)?

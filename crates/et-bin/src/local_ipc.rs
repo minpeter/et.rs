@@ -3,7 +3,7 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -17,6 +17,22 @@ pub fn invalid(message: &str) -> io::Error {
 }
 
 pub fn private_dir(path: &Path) -> io::Result<()> {
+    // Permit root-managed aliases such as Darwin's /tmp -> /private/tmp,
+    // but never create IPC through a user-controlled symlink ancestor.
+    for ancestor in path
+        .ancestors()
+        .skip(1)
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        if let Ok(metadata) = fs::symlink_metadata(ancestor) {
+            if metadata.file_type().is_symlink() && metadata.uid() != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "unsafe IPC directory ancestor",
+                ));
+            }
+        }
+    }
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
@@ -25,7 +41,11 @@ pub fn private_dir(path: &Path) -> io::Result<()> {
                     private_dir(parent)?;
                 }
             }
-            fs::DirBuilder::new().mode(0o700).create(path)?;
+            match fs::DirBuilder::new().mode(0o700).create(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
         }
         Err(error) => return Err(error),
         Ok(_) => {}
@@ -41,6 +61,48 @@ pub fn private_dir(path: &Path) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Stable advisory lock shared by bind/stale replacement and listener cleanup.
+/// Keep the lock file: removing it would permit locking two different inodes.
+pub fn lock_directory(directory: &Path) -> io::Result<fs::File> {
+    private_dir(directory)?;
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(directory.join(".et-lock"))?;
+    let metadata = lock.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe local lock",
+        ));
+    }
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(fs::TryLockError::WouldBlock) => return Err(io::ErrorKind::TimedOut.into()),
+            Err(fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+}
+
+fn connect_bounded(path: &Path) -> io::Result<UnixStream> {
+    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+    socket.connect_timeout(&socket2::SockAddr::unix(path)?, TIMEOUT)?;
+    Ok(socket.into())
 }
 
 pub fn authorized(socket: &UnixStream) -> io::Result<bool> {
@@ -85,7 +147,7 @@ pub struct Listener {
 
 impl Listener {
     pub fn bind(path: &Path) -> io::Result<Self> {
-        private_dir(
+        let _lock = lock_directory(
             path.parent()
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or(Path::new(".")),
@@ -100,7 +162,7 @@ impl Listener {
                     "unsafe existing IPC path",
                 ));
             }
-            match UnixStream::connect(path) {
+            match connect_bounded(path) {
                 Ok(_) => {
                     return Err(io::Error::new(
                         io::ErrorKind::AddrInUse,
@@ -142,6 +204,14 @@ impl Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
+        let parent = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let Ok(_lock) = lock_directory(parent) else {
+            return;
+        };
         if let Ok(metadata) = fs::symlink_metadata(&self.path) {
             if (metadata.dev(), metadata.ino()) == self.identity {
                 let _ = fs::remove_file(&self.path);
@@ -166,7 +236,7 @@ pub fn connect(path: &Path) -> io::Result<UnixStream> {
             "unsafe IPC socket",
         ));
     }
-    let socket = UnixStream::connect(path)?;
+    let socket = connect_bounded(path)?;
     if !authorized(&socket)? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -208,13 +278,6 @@ impl FrameReader {
                 header + length
             };
             if self.bytes.len() == target && target >= header {
-                if target == header && self.bytes.len() == header {
-                    let length =
-                        u32::from_be_bytes(self.bytes[header - 4..header].try_into().unwrap());
-                    if length != 0 {
-                        continue;
-                    }
-                }
                 self.started = Instant::now();
                 return Ok(Some(std::mem::take(&mut self.bytes)));
             }

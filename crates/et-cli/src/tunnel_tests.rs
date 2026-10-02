@@ -18,6 +18,13 @@ fn three_part_openssh_forwards_default_only_the_bind_address() {
         })
     );
     assert_eq!(
+        requests[1].source,
+        Some(SocketEndpoint {
+            name: Some("localhost".into()),
+            port: Some(9090)
+        })
+    );
+    assert_eq!(
         requests[1].destination,
         Some(SocketEndpoint {
             name: Some("2001:db8::7".into()),
@@ -25,6 +32,7 @@ fn three_part_openssh_forwards_default_only_the_bind_address() {
         })
     );
     assert!(parse_tunnels(&["/tmp/source:db.internal:5432".into()]).is_err());
+    assert!(parse_tunnels(&["8080::5432".into()]).is_err());
 }
 
 #[test]

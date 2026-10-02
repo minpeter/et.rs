@@ -81,7 +81,7 @@ fn attach(stack: &Stack, agent: Option<&Path>) -> Client {
     )
 }
 
-fn wait(client: &mut Client, mut condition: impl FnMut() -> bool) {
+fn wait(client: &mut Client, description: &str, mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline {
         if condition() {
@@ -100,13 +100,13 @@ fn wait(client: &mut Client, mut condition: impl FnMut() -> bool) {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    panic!("agent forwarding did not become ready");
+    panic!("timed out waiting for {description}");
 }
 
 fn paths(stack: &Stack, client: &mut Client) -> (PathBuf, PathBuf) {
     let remote_file = stack.directory.join("remote-agent");
     let saved_file = stack.directory.join(".et/sessions/agent-test");
-    wait(client, || {
+    wait(client, "session record and remote agent path", || {
         fs::metadata(&remote_file).is_ok_and(|meta| meta.len() > 0) && saved_file.exists()
     });
     let remote = PathBuf::from(fs::read_to_string(remote_file).unwrap());
@@ -124,7 +124,7 @@ fn request(client: &mut Client, remote: &Path, agent: &UnixListener, answer: &[u
     connection.set_read_timeout(Some(TIMEOUT)).unwrap();
     connection.write_all(b"agent-request").unwrap();
     let mut accepted = None;
-    wait(client, || {
+    wait(client, "agent request acceptance", || {
         accepted = match agent.accept() {
             Ok((stream, _)) => Some(stream),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
@@ -197,7 +197,7 @@ fn named_attach_retargets_to_new_agent_without_changing_remote_socket() {
     drop(denied);
 
     let mut second = attach(&stack, Some(&new_path));
-    wait(&mut second, || {
+    wait(&mut second, "proxy retarget to the new agent", || {
         fs::read_link(&local).ok().as_ref() == Some(&new_path)
     });
     request(&mut second, &remote, &new, b"new-and-different-identity");
@@ -214,7 +214,9 @@ fn named_attach_retargets_to_new_agent_without_changing_remote_socket() {
 
     // Missing environment clears the previous agent instead of leaving it exposed.
     let mut no_agent = attach(&stack, None);
-    wait(&mut no_agent, || fs::symlink_metadata(&local).is_err());
+    wait(&mut no_agent, "proxy removal without an agent", || {
+        fs::symlink_metadata(&local).is_err()
+    });
     let mut rejected = UnixStream::connect(&remote).unwrap();
     rejected.set_read_timeout(Some(TIMEOUT)).unwrap();
     let _ = rejected.write_all(b"no-agent");
@@ -235,7 +237,7 @@ fn named_attach_retargets_to_new_agent_without_changing_remote_socket() {
     // A removed local directory is also reestablished on the next attach.
     fs::remove_dir(local.parent().unwrap()).unwrap();
     let mut restored = attach(&stack, Some(&new_path));
-    wait(&mut restored, || {
+    wait(&mut restored, "removed proxy directory restoration", || {
         fs::read_link(&local).ok().as_ref() == Some(&new_path)
     });
     request(&mut restored, &remote, &new, b"restored");
@@ -262,7 +264,7 @@ fn reconnect_reestablishes_the_agent_proxy_before_new_requests() {
     fs::remove_file(&agent_path).unwrap();
     let replacement = listener(&agent_path);
     transport.resume();
-    wait(&mut client, || {
+    wait(&mut client, "proxy restoration after reconnect", || {
         fs::read_link(&local).ok().as_ref() == Some(&agent_path)
     });
     request(&mut client, &remote, &replacement, b"replacement-agent");

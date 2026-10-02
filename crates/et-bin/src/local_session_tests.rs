@@ -163,6 +163,22 @@ fn local_socket_ownership_permissions_stale_reuse_and_identity_cleanup() {
 }
 
 #[test]
+fn local_listener_authenticates_buffered_readiness_after_sender_closes() {
+    let directory = Directory::new();
+    let path = directory.0.join("ready");
+    let listener = Listener::bind(&path).unwrap();
+    let mut peer = ipc::connect(&path).unwrap();
+    peer.write_all(&[0]).unwrap();
+    drop(peer);
+    let mut accepted = listener.accept().unwrap().unwrap();
+    accepted.set_nonblocking(false).unwrap();
+    accepted.set_read_timeout(Some(ipc::TIMEOUT)).unwrap();
+    let mut status = Vec::new();
+    accepted.read_to_end(&mut status).unwrap();
+    assert_eq!(status, [0]);
+}
+
+#[test]
 fn local_tombstone_replaces_symlink_without_touching_target() {
     let directory = Directory::new();
     let target = directory.0.join("target");

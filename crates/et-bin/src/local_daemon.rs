@@ -57,7 +57,8 @@ pub fn prepare(parsed: &mut ClientArgs, raw: &[OsString]) -> io::Result<Option<i
     let directory = std::env::temp_dir().join(format!("et-ready-{}", nonce()));
     local_ipc::private_dir(&directory)?;
     let path = directory.join("status");
-    let listener = local_ipc::Listener::bind(&path)?;
+    let listener = local_ipc::Listener::bind(&path)
+        .map_err(|e| io::Error::new(e.kind(), format!("binding daemon readiness socket: {e}")))?;
     let result = (|| {
         let executable = std::env::current_exe()?.canonicalize()?;
         let mut command = crate::detach::direct_command(executable.as_os_str());
@@ -73,14 +74,31 @@ pub fn prepare(parsed: &mut ClientArgs, raw: &[OsString]) -> io::Result<Option<i
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = crate::detach::spawn(&mut command)?;
+        let mut child = crate::detach::spawn(&mut command)
+            .map_err(|e| io::Error::new(e.kind(), format!("spawning background client: {e}")))?;
         let deadline = Instant::now() + Duration::from_secs(45);
         let startup = loop {
-            if let Some(socket) = listener.accept()? {
-                socket.set_nonblocking(false)?;
-                socket.set_read_timeout(Some(local_ipc::TIMEOUT))?;
+            if let Some(socket) = listener.accept().map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("accepting daemon readiness connection: {e}"),
+                )
+            })? {
+                socket.set_nonblocking(false).map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("configuring daemon readiness socket: {e}"),
+                    )
+                })?;
+                socket
+                    .set_read_timeout(Some(local_ipc::TIMEOUT))
+                    .map_err(|e| {
+                        io::Error::new(e.kind(), format!("setting daemon readiness timeout: {e}"))
+                    })?;
                 let mut status = Vec::new();
-                let received = socket.take(8192).read_to_end(&mut status);
+                let received = socket.take(8192).read_to_end(&mut status).map_err(|e| {
+                    io::Error::new(e.kind(), format!("reading daemon readiness response: {e}"))
+                });
                 break received.and_then(|_| match status.split_first() {
                     Some((0, _)) => Ok(()),
                     Some((_, message)) => Err(io::Error::other(format!(

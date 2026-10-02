@@ -330,3 +330,45 @@ fn local_initial_command_cannot_overfill_pending_queue() {
     )
     .is_err());
 }
+
+#[test]
+fn passenger_progress_distinguishes_draining_from_idle_and_backpressure() {
+    let args = ClientArgs::try_parse_from(["et", "--no-terminal", "host"]).unwrap();
+    let mut runtime = Runtime::new(
+        &args,
+        Prepared {
+            mux: None,
+            ctl: None,
+        },
+    )
+    .unwrap();
+    let (writer, mut reader) = UnixStream::pair().unwrap();
+    runtime.passenger = Some(
+        Passenger::new(
+            None,
+            vec![
+                File::open("/dev/null").unwrap().into(),
+                writer.into(),
+                File::open("/dev/null").unwrap().into(),
+            ],
+            false,
+        )
+        .unwrap(),
+    );
+    assert!(!runtime.pump_passenger());
+    runtime.output(b"hello");
+    assert!(runtime.pump_passenger());
+    let mut bytes = [0; 5];
+    reader.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"hello");
+    assert!(!runtime.pump_passenger());
+    runtime.output(&vec![0; ipc::MAX_REPLY]);
+    assert!(runtime.pump_passenger());
+    for _ in 0..1024 {
+        if !runtime.pump_passenger() {
+            assert!(!runtime.passenger.as_ref().unwrap().queued.is_empty());
+            return;
+        }
+    }
+    panic!("a full consumer must stop reporting progress");
+}

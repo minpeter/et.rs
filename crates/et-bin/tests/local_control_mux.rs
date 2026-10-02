@@ -1005,6 +1005,12 @@ fn slow_passenger_output_applies_backpressure_without_failing_command() {
         let _ = passenger.wait();
     }
     let bytes = reader.join().unwrap();
+    let zeros = bytes.iter().filter(|&&byte| byte == 0).count();
+    assert!(
+        status.is_some(),
+        "passenger did not finish; received {zeros}/6000000 zero bytes ({} total)",
+        bytes.len()
+    );
     assert_eq!(status.unwrap().code(), Some(19));
-    assert_eq!(bytes.iter().filter(|&&byte| byte == 0).count(), 6_000_000);
+    assert_eq!(zeros, 6_000_000);
 }

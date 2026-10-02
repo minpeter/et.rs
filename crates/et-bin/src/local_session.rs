@@ -512,12 +512,14 @@ impl Runtime {
             }
         }
     }
-    fn pump_passenger(&mut self) {
+    fn pump_passenger(&mut self) -> bool {
         let Some(passenger) = self.passenger.as_mut() else {
-            return;
+            return false;
         };
         let mut input = Vec::new();
+        let queued = passenger.queued.len();
         let mut failed = passenger.flush().is_err();
+        let output_progress = passenger.queued.len() < queued;
         if self.pending.len() < MAX_PENDING && self.stopping.is_none() {
             if let Ok(size) = rustix::termios::tcgetwinsize(&passenger.input.file) {
                 let dimensions = (size.ws_row, size.ws_col);
@@ -573,6 +575,7 @@ impl Runtime {
             self.idle = Instant::now();
         }
         self.input(&input);
+        output_progress || done || !input.is_empty()
     }
     fn output_blocked(&self, count: usize) -> bool {
         self.passenger
@@ -705,7 +708,7 @@ where
         runtime
             .local(forwarder, connection.connected(), args.no_remote_command)
             .map_err(error)?;
-        runtime.pump_passenger();
+        let mut progressed = runtime.pump_passenger();
         if let Some(bytes) = pending_output.take() {
             // Local backpressure is not transport silence. Keep servicing IPC,
             // outgoing keepalives and forwarding while the consumer catches up.
@@ -714,6 +717,7 @@ where
                 pending_output = Some(bytes);
             } else {
                 runtime.output(&bytes);
+                progressed = true;
             }
         }
         if let Some(stopped) = runtime.stopping {
@@ -778,6 +782,7 @@ where
             }
             match connection.try_read_packet() {
                 Ok(Some(packet)) => {
+                    progressed = true;
                     last_received = Instant::now();
                     if is_forward_packet(packet.header()) {
                         pending_forward = forwarder.try_receive(packet).map_err(error)?;
@@ -852,7 +857,12 @@ where
         if last_received.elapsed() > Duration::from_secs(u64::from(args.keepalive) * 3) {
             connection.disconnect();
         }
-        std::thread::sleep(Duration::from_millis(5));
+        // All batches above are bounded and service IPC on every turn. A
+        // fixed sleep after progress throttles short PTY packets and partial
+        // pipe writes; sleep only when input/output could not advance.
+        if !progressed {
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 

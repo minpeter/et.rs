@@ -815,7 +815,7 @@ mod tests {
     }
 
     fn check_close_with_full_writer_queue(close: fn(&mut Worker), drain: bool) {
-        let (mut worker, _commands, outbound, cancel) = worker();
+        let (mut worker, commands, outbound, cancel) = worker();
         let abandoned = worker.abandoned.clone();
         let (stream, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(EVENT_TIMEOUT)).unwrap();
@@ -855,9 +855,9 @@ mod tests {
         let progressed = done_rx.recv_timeout(EVENT_TIMEOUT).is_ok();
         let mut received = Vec::new();
         let drained = if drain && progressed {
-            peer.read_to_end(&mut received).is_ok()
+            peer.read_to_end(&mut received)
         } else {
-            false
+            Err(std::io::ErrorKind::Interrupted.into())
         };
         // Cancellation must join even a removed writer whose peer never reads.
         // Keep a control clone only as emergency cleanup on test failure.
@@ -879,13 +879,24 @@ mod tests {
             saturator.shutdown(std::net::Shutdown::Both).unwrap();
         }
         joining.join().unwrap();
+        let mut io_errors = Vec::new();
+        while let Ok(command) = commands.recv_timeout(Duration::ZERO) {
+            if let Command::IoFailed { error, .. } = command {
+                io_errors.push(error);
+            }
+        }
         assert!(
             progressed,
             "close blocked the forwarding worker behind a full writer queue"
         );
         assert!(joined, "removed writer did not observe hard cancellation");
         if drain {
-            assert!(drained, "writer did not close after draining queued bytes");
+            assert!(
+                drained.is_ok(),
+                "writer did not close: {drained:?}; received {}/{} bytes; I/O errors: {io_errors:?}",
+                received.len(),
+                expected.len(),
+            );
             assert_eq!(received, expected);
             assert!(!abandoned.load(Ordering::Acquire));
         } else {

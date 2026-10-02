@@ -372,3 +372,49 @@ fn passenger_progress_distinguishes_draining_from_idle_and_backpressure() {
     }
     panic!("a full consumer must stop reporting progress");
 }
+
+#[test]
+fn local_reply_progress_distinguishes_draining_from_idle_and_backpressure() {
+    let args = ClientArgs::try_parse_from(["et", "--no-terminal", "host"]).unwrap();
+    let mut runtime = Runtime::new(
+        &args,
+        Prepared {
+            mux: None,
+            ctl: None,
+        },
+    )
+    .unwrap();
+    let mut forwarder = Forwarder::start(Vec::new()).unwrap();
+    let (writer, mut reader) = UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    reader
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    runtime.peers.insert(1, Peer::new(writer, true));
+    assert!(!runtime.local(&mut forwarder, true, false).unwrap());
+    runtime
+        .peers
+        .get_mut(&1)
+        .unwrap()
+        .reply(b"hello".to_vec())
+        .unwrap();
+    assert!(runtime.local(&mut forwarder, true, false).unwrap());
+    let mut bytes = [0; 5];
+    reader.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"hello");
+    assert!(!runtime.local(&mut forwarder, true, false).unwrap());
+    runtime
+        .peers
+        .get_mut(&1)
+        .unwrap()
+        .reply(vec![0; ipc::MAX_REPLY])
+        .unwrap();
+    assert!(runtime.local(&mut forwarder, true, false).unwrap());
+    for _ in 0..1024 {
+        if !runtime.local(&mut forwarder, true, false).unwrap() {
+            assert!(!runtime.peers[&1].output.is_empty());
+            return;
+        }
+    }
+    panic!("a blocked local reply must stop reporting progress");
+}

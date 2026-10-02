@@ -319,13 +319,16 @@ impl Runtime {
         forwarder: &mut Forwarder,
         connected: bool,
         no_shell: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         self.accept()?;
+        let mut progressed = false;
         let ids: Vec<_> = self.peers.keys().copied().collect();
         for id in ids {
             let mut peer = self.peers.remove(&id).unwrap();
             let result = (|| {
+                let queued = peer.output.len();
                 ipc::flush(&mut peer.socket, &mut peer.output)?;
+                progressed |= peer.output.len() < queued;
                 if peer.closing {
                     return Ok(!peer.output.is_empty() && peer.started.elapsed() < ipc::TIMEOUT);
                 }
@@ -347,6 +350,7 @@ impl Runtime {
                             return Ok(true);
                         };
                         peer.fds.push(fd);
+                        progressed = true;
                     }
                     let (request, command) = peer.pending_session.take().unwrap();
                     if self.passenger.is_some() || no_shell || self.pending.len() + 16 > MAX_PENDING
@@ -376,6 +380,7 @@ impl Runtime {
                 let Some(frame) = peer.reader.poll(&mut peer.socket)? else {
                     return Ok(true);
                 };
+                progressed = true;
                 peer.started = Instant::now();
                 if peer.control {
                     if matches!(frame[0], 1 | 2 | 7) && self.pending.len() + 16 > MAX_PENDING {
@@ -435,7 +440,7 @@ impl Runtime {
                 }
             }
         }
-        Ok(())
+        Ok(progressed)
     }
     fn request(
         &mut self,
@@ -705,10 +710,10 @@ where
                     .push_back(Packet::new(Kind::TerminalClose as u8, Vec::new()));
             }
         }
-        runtime
+        let mut progressed = runtime
             .local(forwarder, connection.connected(), args.no_remote_command)
             .map_err(error)?;
-        let mut progressed = runtime.pump_passenger();
+        progressed |= runtime.pump_passenger();
         if let Some(bytes) = pending_output.take() {
             // Local backpressure is not transport silence. Keep servicing IPC,
             // outgoing keepalives and forwarding while the consumer catches up.

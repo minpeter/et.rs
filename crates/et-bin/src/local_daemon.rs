@@ -78,28 +78,16 @@ pub fn prepare(parsed: &mut ClientArgs, raw: &[OsString]) -> io::Result<Option<i
             .map_err(|e| io::Error::new(e.kind(), format!("spawning background client: {e}")))?;
         let deadline = Instant::now() + Duration::from_secs(45);
         let startup = loop {
-            if let Some(socket) = listener.accept().map_err(|e| {
+            if let Some(mut socket) = listener.accept().map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!("accepting daemon readiness connection: {e}"),
                 )
             })? {
-                socket.set_nonblocking(false).map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        format!("configuring daemon readiness socket: {e}"),
-                    )
-                })?;
-                socket
-                    .set_read_timeout(Some(local_ipc::TIMEOUT))
-                    .map_err(|e| {
-                        io::Error::new(e.kind(), format!("setting daemon readiness timeout: {e}"))
-                    })?;
-                let mut status = Vec::new();
-                let received = socket.take(8192).read_to_end(&mut status).map_err(|e| {
+                let received = read_status(&mut socket).map_err(|e| {
                     io::Error::new(e.kind(), format!("reading daemon readiness response: {e}"))
                 });
-                break received.and_then(|_| match status.split_first() {
+                break received.and_then(|status| match status.split_first() {
                     Some((0, _)) => Ok(()),
                     Some((_, message)) => Err(io::Error::other(format!(
                         "background client startup failed: {}",
@@ -142,6 +130,30 @@ pub fn prepare(parsed: &mut ClientArgs, raw: &[OsString]) -> io::Result<Option<i
         );
     }
     Ok(Some(0))
+}
+
+/// The accepted socket stays nonblocking: Darwin rejects SO_RCVTIMEO after
+/// the sender has closed, even when its complete response is still buffered.
+pub(super) fn read_status(socket: &mut std::os::unix::net::UnixStream) -> io::Result<Vec<u8>> {
+    let deadline = Instant::now() + local_ipc::TIMEOUT;
+    let mut status = Vec::new();
+    let mut buffer = [0; 8192];
+    while status.len() < buffer.len() {
+        if Instant::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let remaining = buffer.len() - status.len();
+        match socket.read(&mut buffer[..remaining]) {
+            Ok(0) => break,
+            Ok(count) => status.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(status)
 }
 
 pub fn ready() -> io::Result<()> {

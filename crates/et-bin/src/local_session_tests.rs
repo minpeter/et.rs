@@ -171,11 +171,24 @@ fn local_listener_authenticates_buffered_readiness_after_sender_closes() {
     peer.write_all(&[0]).unwrap();
     drop(peer);
     let mut accepted = listener.accept().unwrap().unwrap();
-    accepted.set_nonblocking(false).unwrap();
-    accepted.set_read_timeout(Some(ipc::TIMEOUT)).unwrap();
-    let mut status = Vec::new();
-    accepted.read_to_end(&mut status).unwrap();
+    let status = crate::local_daemon::read_status(&mut accepted).unwrap();
     assert_eq!(status, [0]);
+}
+
+#[test]
+fn local_readiness_partial_response_times_out_without_peer_close() {
+    let directory = Directory::new();
+    let path = directory.0.join("ready");
+    let listener = Listener::bind(&path).unwrap();
+    let mut peer = ipc::connect(&path).unwrap();
+    peer.write_all(&[1, b'x']).unwrap();
+    let mut accepted = listener.accept().unwrap().unwrap();
+    let started = std::time::Instant::now();
+    let error = crate::local_daemon::read_status(&mut accepted).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(started.elapsed() >= ipc::TIMEOUT);
+    assert!(started.elapsed() < ipc::TIMEOUT + Duration::from_secs(2));
+    drop(peer);
 }
 
 #[test]

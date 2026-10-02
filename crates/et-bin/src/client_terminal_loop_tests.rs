@@ -480,20 +480,27 @@ fn stdin_in_hup_drains_all_chunks_and_pending_frames_then_waits_for_remote_exit(
 }
 
 struct ObservedInput {
-    file: std::fs::File,
+    ready: UnixStream,
+    fail_read: bool,
     reads: mpsc::Sender<()>,
 }
 
 impl std::os::fd::AsFd for ObservedInput {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        self.file.as_fd()
+        self.ready.as_fd()
     }
 }
 
 impl Read for ObservedInput {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+    fn read(&mut self, _bytes: &mut [u8]) -> io::Result<usize> {
         self.reads.send(()).unwrap();
-        self.file.read(bytes)
+        if self.fail_read {
+            Err(io::Error::from_raw_os_error(
+                rustix::io::Errno::BADF.raw_os_error(),
+            ))
+        } else {
+            Ok(0)
+        }
     }
 }
 
@@ -503,14 +510,12 @@ fn non_tty_eof_or_read_error_disables_input_but_keeps_keepalive_forwarding_and_r
         PortForwardDestinationRequest, PortForwardDestinationResponse, SocketEndpoint,
     };
 
-    for readable in [true, false] {
-        // /dev/null is always readable to poll: a read-only fd returns EOF,
-        // while a write-only fd reports EBADF. Neither may spin or end ET.
-        let file = std::fs::OpenOptions::new()
-            .read(readable)
-            .write(!readable)
-            .open("/dev/null")
-            .unwrap();
+    for fail_read in [false, true] {
+        // Character-device poll readiness differs on Darwin. A socket with an
+        // unread byte gives both platforms persistent IN; inject EOF/EBADF at
+        // the Read seam and verify neither spins nor ends the ET transport.
+        let (ready, mut input_peer) = UnixStream::pair().unwrap();
+        input_peer.write_all(b"x").unwrap();
         let (reads, observed) = mpsc::channel();
         let (client, server) = tcp_streams();
         let mut peer = Connection::new_server(server, &[19; 32]);
@@ -540,7 +545,11 @@ fn non_tty_eof_or_read_error_disables_input_but_keeps_keepalive_forwarding_and_r
                     recoveries += 1;
                     Ok(ReconnectOutcome::SessionEnded)
                 },
-                ObservedInput { file, reads },
+                ObservedInput {
+                    ready,
+                    fail_read,
+                    reads,
+                },
             );
             done_tx.send((result, recoveries)).unwrap();
         });

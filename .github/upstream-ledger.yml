@@ -13,7 +13,7 @@
 # Classified 2026-09-21. #804 passed independent review in et.rs #100.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-09-30"
+classified: "2026-10-02"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -436,5 +436,29 @@ commits:
     date: "2026-09-30"
     kind: product
     status: ported
-    note: "#874 non-TTY EOF survival and SSH diagnostic phrases, including Windows redirected raw bytes. Linux heredoc/reconnect suite passes; no actual VS Code sleep cycle, native Windows/macOS or live C++ peer verification in this port. Pin tip. PROTOCOL_VERSION stays 6."
+    note: "#874 non-TTY EOF survival and SSH diagnostic phrases, including Windows redirected raw bytes. Linux heredoc/reconnect suite passes; no actual VS Code sleep cycle, native Windows/macOS or live C++ peer verification in this port. PROTOCOL_VERSION stays 6."
     et_pr: 874
+  - sha: ea2542fade29191703356e0abf00b78e72bb58e2
+    date: "2026-09-30"
+    kind: ci
+    status: skip
+    note: "#875 C++ mains testable (MainEntry split) + setup-failure CI coverage. C++ harness only; not et.rs wire. PROTOCOL_VERSION stays 6."
+    et_pr: 875
+  - sha: a5e29afdf97b163cdc74331a58fbdb0514a466c5
+    date: "2026-09-30"
+    kind: product
+    status: skip
+    note: "#873 client setup failures throw instead of exit(1); Connection drops writes when no handshake writer (hang fix). Product/reliability; et.rs already uses Result paths. No wire/auth change. PROTOCOL_VERSION stays 6."
+    et_pr: 873
+  - sha: dc1dc63dc6b6175168d4dbc52227608ed3cbc6d0
+    date: "2026-09-30"
+    kind: ci
+    status: skip
+    note: "#877 OpenWrt package installs et1. Packaging/CI only. PROTOCOL_VERSION stays 6."
+    et_pr: 877
+  - sha: bcc28abc39d5445bd6f80efe518c8e5fdae125c4
+    date: "2026-10-01"
+    kind: product
+    status: skip
+    note: "#878/#769 SSH auth banners on terminal after stderr→log redirect (preserve original stderr). Same product/UX family as #843/#769 skip; not wire/auth. PROTOCOL_VERSION stays 6. Pin tip."
+    et_pr: 878

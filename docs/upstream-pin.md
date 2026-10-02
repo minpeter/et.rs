@@ -10,7 +10,7 @@ Canonical machine files:
 - Ledger (every `master` commit after baseline):
   [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml)
 
-Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-30.
+Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-10-02.
 `#784` marked `ported` after et.rs [#31](https://github.com/minpeter/et.rs/pull/31) / `906a7ca86691f00a82f88b99b21d7afceb07bf97`.
 `#798` marked `ported` after et.rs [#77](https://github.com/minpeter/et.rs/pull/77).
 
@@ -20,13 +20,13 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-09-30.
 | Baseline / latest release tag | [`et-v7.0.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.0.0) |
 | Baseline / release commit | [`7656a32a5bc15c6746726a27a5a4ba1e468fab6e`](https://github.com/MisterTea/EternalTerminal/commit/7656a32a5bc15c6746726a27a5a4ba1e468fab6e) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`b5b009b`](https://github.com/MisterTea/EternalTerminal/commit/b5b009bf9ad91fda30eb2b394c6936c69e2b9806) (#874, reviewed 2026-09-30) |
+| Pin tip (last classified) | [`bcc28abc`](https://github.com/MisterTea/EternalTerminal/commit/bcc28abc39d5445bd6f80efe518c8e5fdae125c4) (#878 tip, SSH auth banner skip, reviewed 2026-10-02) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
 | ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.0.0` and `master`) |
 
-The reviewed baseline-to-tip range contains 72 classified commits. Unclassified commits would be drift. The product-parity ports below passed combined Linux verification: 824 tests passed, none failed, and two existing tests were ignored. Formatting, workspace clippy, Windows GNU/macOS ARM binary cross-checks, and release/AUR packaging checks passed. Real OpenSSH mux clients exercised the Rust master; no live C++ peer, native Windows/macOS runtime, or actual VS Code sleep cycle was tested in this port. `ported` covers the behavior described in each row, including its explicit limitations, not unrestricted product parity. Protocol remains v6.
+The reviewed baseline-to-tip range contains 76 classified commits. Unclassified commits would be drift. The product-parity ports below passed combined Linux verification: 824 tests passed, none failed, and two existing tests were ignored. Formatting, workspace clippy, Windows GNU/macOS ARM binary cross-checks, and release/AUR packaging checks passed. Real OpenSSH mux clients exercised the Rust master; no live C++ peer, native Windows/macOS runtime, or actual VS Code sleep cycle was tested in this port. `ported` covers the behavior described in each row, including its explicit limitations, not unrestricted product parity. Protocol remains v6.
 
-## Ledger (classified 2026-09-30)
+## Ledger (classified 2026-10-02)
 
 | sha | date | kind | status | note |
 | --- | --- | --- | --- | --- |
@@ -101,7 +101,11 @@ The reviewed baseline-to-tip range contains 72 classified commits. Unclassified 
 | [`f50f878`](https://github.com/MisterTea/EternalTerminal/commit/f50f878d21355e986a07582b4183f47a2ca309b7) | 2026-09-28 | product | skip | #823/#298 C++ per-connection port-forward 64KiB event-loop budget. Product/fairness; no wire change. PROTOCOL_VERSION stays 6. |
 | [`5b0f17a`](https://github.com/MisterTea/EternalTerminal/commit/5b0f17a56e2a664ce506f3266d7cf770561e55b6) | 2026-09-28 | product | **ported** | #819 Unix ctl, cursors, transcript and lifecycle; raw -T/-W and Windows unsupported |
 | [`eb518af`](https://github.com/MisterTea/EternalTerminal/commit/eb518af9f06dc338660c020cdc11fc7bede7c35e) | 2026-09-29 | product | skip | #872 C++ platform split N/A; equivalent `CLIENT_READ_BATCH=64`, bounded per-stream queues, and async pending writes |
-| [`b5b009b`](https://github.com/MisterTea/EternalTerminal/commit/b5b009bf9ad91fda30eb2b394c6936c69e2b9806) | 2026-09-30 | product | **ported** | #874 EOF survival and SSH diagnostics; no actual VS Code sleep-cycle test. Pin tip. |
+| [`b5b009b`](https://github.com/MisterTea/EternalTerminal/commit/b5b009bf9ad91fda30eb2b394c6936c69e2b9806) | 2026-09-30 | product | **ported** | #874 EOF survival and SSH diagnostics; no actual VS Code sleep-cycle test. |
+| [`ea2542f`](https://github.com/MisterTea/EternalTerminal/commit/ea2542fade29191703356e0abf00b78e72bb58e2) | 2026-09-30 | ci | skip | #875 C++ mains testable (MainEntry split) + setup-failure CI coverage. C++ harness only; not et.rs wire. PROTOCOL_VERSION stays 6. |
+| [`a5e29af`](https://github.com/MisterTea/EternalTerminal/commit/a5e29afdf97b163cdc74331a58fbdb0514a466c5) | 2026-09-30 | product | skip | #873 client setup failures throw instead of exit(1); Connection drops writes when no handshake writer (hang fix). Product/reliability; et.rs already uses Result paths. No wire/auth change. PROTOCOL_VERSION stays 6. |
+| [`dc1dc63`](https://github.com/MisterTea/EternalTerminal/commit/dc1dc63dc6b6175168d4dbc52227608ed3cbc6d0) | 2026-09-30 | ci | skip | #877 OpenWrt package installs et1. Packaging/CI only. PROTOCOL_VERSION stays 6. |
+| [`bcc28abc`](https://github.com/MisterTea/EternalTerminal/commit/bcc28abc39d5445bd6f80efe518c8e5fdae125c4) | 2026-10-01 | product | skip | #878/#769 SSH auth banners on terminal after stderr→log redirect (preserve original stderr). Same product/UX family as #843/#769 skip; not wire/auth. PROTOCOL_VERSION stays 6. Pin tip. |
 
 
 ## Ported and residual
@@ -418,14 +422,35 @@ platform split and `FdPoller` lifetime do not map to Rust. This does not claim
 native macOS/Windows runtime or C++ live-peer testing. `PROTOCOL_VERSION` stays 6.
 
 [`b5b009b`](https://github.com/MisterTea/EternalTerminal/commit/b5b009bf9ad91fda30eb2b394c6936c69e2b9806)
-(`#874`, “keep VS Code Remote-SSH sessions alive over et across sleep”) is the
-pin tip and `status: ported`. It shares #788's non-TTY EOF survival and SSH
+(`#874`, “keep VS Code Remote-SSH sessions alive over et across sleep”) is
+`status: ported`. It shares #788's non-TTY EOF survival and SSH
 diagnostic handling, including redirected Windows raw bytes. Linux heredoc and
 reconnect tests pass; no actual VS Code sleep cycle, native Windows/macOS runtime
 or live C++ peer was exercised in this port. `PROTOCOL_VERSION` stays 6.
 
+[`ea2542f`](https://github.com/MisterTea/EternalTerminal/commit/ea2542fade29191703356e0abf00b78e72bb58e2)
+(`#875`) stays `status: skip`. C++ mains testable (`MainEntry` split) plus
+setup-failure CI coverage. C++ harness only; not et.rs wire.
+`PROTOCOL_VERSION` stays 6.
+
+[`a5e29af`](https://github.com/MisterTea/EternalTerminal/commit/a5e29afdf97b163cdc74331a58fbdb0514a466c5)
+(`#873`) stays `status: skip`. Client setup failures throw instead of
+`exit(1)`; `Connection` drops writes when no handshake writer (hang fix).
+Product/reliability; et.rs already uses `Result` paths. No wire/auth change.
+`PROTOCOL_VERSION` stays 6.
+
+[`dc1dc63`](https://github.com/MisterTea/EternalTerminal/commit/dc1dc63dc6b6175168d4dbc52227608ed3cbc6d0)
+(`#877`) stays `status: skip`. OpenWrt package installs
+`et1`. Packaging/CI only. `PROTOCOL_VERSION` stays 6.
+
+[`bcc28abc`](https://github.com/MisterTea/EternalTerminal/commit/bcc28abc39d5445bd6f80efe518c8e5fdae125c4)
+(`#878` / `#769`) is the pin tip and stays `status: skip`. SSH auth banners
+show on the terminal after the stderr→log redirect (preserve original stderr).
+Same product/UX family as `#843`/`#769`. Not wire/auth. Pin ≠ a claim that
+every product backlog item is finished. `PROTOCOL_VERSION` stays 6.
+
 et.rs still claims **protocol v6**. EternalTerminal’s latest product release is
-**v7.0.0**, and the reviewed tip is seventy-two classified commits past that tag.
+**v7.0.0**, and the reviewed tip is seventy-six classified commits past that tag.
 
 Review ports against the conflict policy in
 [`docs/upstream-factory.md`](upstream-factory.md). Gate any later port with

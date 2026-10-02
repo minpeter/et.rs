@@ -13,7 +13,7 @@
 # Classified 2026-09-21. #804 passed independent review in et.rs #100.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-10-01"
+classified: "2026-10-02"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -454,5 +454,11 @@ commits:
     date: "2026-09-30"
     kind: ci
     status: skip
-    note: "#877 OpenWrt package installs et1. Packaging/CI only. PROTOCOL_VERSION stays 6. Pin tip."
+    note: "#877 OpenWrt package installs et1. Packaging/CI only. PROTOCOL_VERSION stays 6."
     et_pr: 877
+  - sha: bcc28abc39d5445bd6f80efe518c8e5fdae125c4
+    date: "2026-10-01"
+    kind: product
+    status: skip
+    note: "#878/#769 SSH auth banners on terminal after stderr→log redirect (preserve original stderr). Same product/UX family as #843/#769 skip; not wire/auth. PROTOCOL_VERSION stays 6. Pin tip."
+    et_pr: 878

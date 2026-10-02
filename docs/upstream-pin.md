@@ -10,7 +10,7 @@ Canonical machine files:
 - Ledger (every `master` commit after baseline):
   [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml)
 
-Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-10-01.
+Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-10-02.
 `#784` marked `ported` after et.rs [#31](https://github.com/minpeter/et.rs/pull/31) / `906a7ca86691f00a82f88b99b21d7afceb07bf97`.
 `#798` marked `ported` after et.rs [#77](https://github.com/minpeter/et.rs/pull/77).
 
@@ -20,13 +20,13 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-10-01.
 | Baseline / latest release tag | [`et-v7.0.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.0.0) |
 | Baseline / release commit | [`7656a32a5bc15c6746726a27a5a4ba1e468fab6e`](https://github.com/MisterTea/EternalTerminal/commit/7656a32a5bc15c6746726a27a5a4ba1e468fab6e) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`dc1dc63`](https://github.com/MisterTea/EternalTerminal/commit/dc1dc63dc6b6175168d4dbc52227608ed3cbc6d0) (#877 tip, OpenWrt et1 packaging skip, reviewed 2026-10-01) |
+| Pin tip (last classified) | [`bcc28abc`](https://github.com/MisterTea/EternalTerminal/commit/bcc28abc39d5445bd6f80efe518c8e5fdae125c4) (#878 tip, SSH auth banner skip, reviewed 2026-10-02) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
 | ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.0.0` and `master`) |
 
-The reviewed baseline-to-tip range contains 75 classified commits. Unclassified commits would be drift. `#854` (raw pipe command channel) is `ported`. `#851` (remote exit status) and `#849` (`-D`/`-W` forwards) are `ported` for wire parity. `#858` (per-session disconnect timeout), `#864`/`#868` (catchup order and connect/recover), `#793` (named sessions and the authenticated handshake), and `#863` (TERM split) are `ported`. `#837` (`TERMINAL_CLOSE` / `--close-on-hangup`) is `ported`. Pin ≠ a claim that every product backlog item past the wire port is finished.
+The reviewed baseline-to-tip range contains 76 classified commits. Unclassified commits would be drift. `#854` (raw pipe command channel) is `ported`. `#851` (remote exit status) and `#849` (`-D`/`-W` forwards) are `ported` for wire parity. `#858` (per-session disconnect timeout), `#864`/`#868` (catchup order and connect/recover), `#793` (named sessions and the authenticated handshake), and `#863` (TERM split) are `ported`. `#837` (`TERMINAL_CLOSE` / `--close-on-hangup`) is `ported`. Pin ≠ a claim that every product backlog item past the wire port is finished.
 
-## Ledger (classified 2026-10-01)
+## Ledger (classified 2026-10-02)
 
 | sha | date | kind | status | note |
 | --- | --- | --- | --- | --- |
@@ -104,7 +104,8 @@ The reviewed baseline-to-tip range contains 75 classified commits. Unclassified 
 | [`b5b009b`](https://github.com/MisterTea/EternalTerminal/commit/b5b009bf9ad91fda30eb2b394c6936c69e2b9806) | 2026-09-30 | product | skip | #874 VS Code Remote-SSH keep-alive: console EOF checks the fd actually read; OpenSSH-style connect error text via getLastConnectError. Client UX/interop only; no .proto/wire/auth. PROTOCOL_VERSION stays 6. |
 | [`ea2542f`](https://github.com/MisterTea/EternalTerminal/commit/ea2542fade29191703356e0abf00b78e72bb58e2) | 2026-09-30 | ci | skip | #875 C++ mains testable (MainEntry split) + setup-failure CI coverage. C++ harness only; not et.rs wire. PROTOCOL_VERSION stays 6. |
 | [`a5e29af`](https://github.com/MisterTea/EternalTerminal/commit/a5e29afdf97b163cdc74331a58fbdb0514a466c5) | 2026-09-30 | product | skip | #873 client setup failures throw instead of exit(1); Connection drops writes when no handshake writer (hang fix). Product/reliability; et.rs already uses Result paths. No wire/auth change. PROTOCOL_VERSION stays 6. |
-| [`dc1dc63`](https://github.com/MisterTea/EternalTerminal/commit/dc1dc63dc6b6175168d4dbc52227608ed3cbc6d0) | 2026-09-30 | ci | skip | #877 OpenWrt package installs et1. Packaging/CI only. PROTOCOL_VERSION stays 6. Pin tip. |
+| [`dc1dc63`](https://github.com/MisterTea/EternalTerminal/commit/dc1dc63dc6b6175168d4dbc52227608ed3cbc6d0) | 2026-09-30 | ci | skip | #877 OpenWrt package installs et1. Packaging/CI only. PROTOCOL_VERSION stays 6. |
+| [`bcc28abc`](https://github.com/MisterTea/EternalTerminal/commit/bcc28abc39d5445bd6f80efe518c8e5fdae125c4) | 2026-10-01 | product | skip | #878/#769 SSH auth banners on terminal after stderr→log redirect (preserve original stderr). Same product/UX family as #843/#769 skip; not wire/auth. PROTOCOL_VERSION stays 6. Pin tip. |
 
 
 ## Ported and residual
@@ -420,12 +421,17 @@ Product/reliability; et.rs already uses `Result` paths. No wire/auth change.
 `PROTOCOL_VERSION` stays 6.
 
 [`dc1dc63`](https://github.com/MisterTea/EternalTerminal/commit/dc1dc63dc6b6175168d4dbc52227608ed3cbc6d0)
-(`#877`) is the pin tip and stays `status: skip`. OpenWrt package installs
-`et1`. Packaging/CI only. Pin ≠ a claim that every product backlog item is
-finished. `PROTOCOL_VERSION` stays 6.
+(`#877`) stays `status: skip`. OpenWrt package installs
+`et1`. Packaging/CI only. `PROTOCOL_VERSION` stays 6.
+
+[`bcc28abc`](https://github.com/MisterTea/EternalTerminal/commit/bcc28abc39d5445bd6f80efe518c8e5fdae125c4)
+(`#878` / `#769`) is the pin tip and stays `status: skip`. SSH auth banners
+show on the terminal after the stderr→log redirect (preserve original stderr).
+Same product/UX family as `#843`/`#769`. Not wire/auth. Pin ≠ a claim that
+every product backlog item is finished. `PROTOCOL_VERSION` stays 6.
 
 et.rs still claims **protocol v6**. EternalTerminal’s latest product release is
-**v7.0.0**, and the reviewed tip is seventy-five classified commits past that tag.
+**v7.0.0**, and the reviewed tip is seventy-six classified commits past that tag.
 
 Review ports against the conflict policy in
 [`docs/upstream-factory.md`](upstream-factory.md). Gate any later port with

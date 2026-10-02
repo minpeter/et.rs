@@ -460,5 +460,11 @@ commits:
     date: "2026-10-01"
     kind: product
     status: skip
-    note: "#878/#769 SSH auth banners on terminal after stderr→log redirect (preserve original stderr). Same product/UX family as #843/#769 skip; not wire/auth. PROTOCOL_VERSION stays 6. Pin tip."
+    note: "#878/#769 SSH auth banners on terminal after stderr→log redirect (preserve original stderr). Same product/UX family as #843/#769 skip; not wire/auth. PROTOCOL_VERSION stays 6."
     et_pr: 878
+  - sha: 5129342ef5ce3185125d907b95ad6d15a36b1cb6
+    date: "2026-10-02"
+    kind: docs
+    status: skip
+    note: "#876 README-only VS Code/Cursor Remote-SSH setup for upstream et1. et.rs does not package et1 and does not claim an actual editor sleep-cycle test; do not copy upstream's installed-wrapper claim. No runtime or wire change. Pin tip."
+    et_pr: 876

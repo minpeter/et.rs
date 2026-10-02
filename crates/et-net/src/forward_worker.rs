@@ -879,12 +879,18 @@ mod tests {
             saturator.shutdown(std::net::Shutdown::Both).unwrap();
         }
         joining.join().unwrap();
-        let mut io_errors = Vec::new();
-        while let Ok(command) = commands.recv_timeout(Duration::ZERO) {
-            if let Command::IoFailed { error, .. } = command {
-                io_errors.push(error);
-            }
-        }
+        let io_errors: Vec<_> = commands
+            .queue
+            .state
+            .lock()
+            .unwrap()
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::IoFailed { error, .. } => Some(error.to_string()),
+                _ => None,
+            })
+            .collect();
         assert!(
             progressed,
             "close blocked the forwarding worker behind a full writer queue"

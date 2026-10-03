@@ -349,20 +349,22 @@ fn mux_reuses_transport_commands_propagate_exit_and_forward_cancel_keeps_streams
             "ControlMaster=auto",
             "printf 'COM%s\\n' MENT; true # trailing comment",
             "COMMENT",
-            0,
+            Some(0),
         ),
-        ("ControlMaster=auto", "if", "", 2),
+        // Syntax-error status differs between shells; it must be a normal
+        // nonzero exit and must not prevent the following passenger's command.
+        ("ControlMaster=auto", "if", "", None),
         (
             "ControlMaster=auto",
             "printf 'MU%s\\n' 'X-ONE'; exit 23",
             "MUX-ONE",
-            23,
+            Some(23),
         ),
         (
             "ControlMaster=no",
             "printf 'MU%s\\n' 'X-TWO'; exit 7",
             "MUX-TWO",
-            7,
+            Some(7),
         ),
     ] {
         let result = output(
@@ -373,7 +375,14 @@ fn mux_reuses_transport_commands_propagate_exit_and_forward_cancel_keeps_streams
                 .args(["-o", mode])
                 .args(["--command", command, "127.0.0.1"]),
         );
-        assert_eq!(result.status.code(), Some(code), "{result:?}");
+        if let Some(code) = code {
+            assert_eq!(result.status.code(), Some(code), "{result:?}");
+        } else {
+            assert!(
+                result.status.code().is_some_and(|code| code != 0),
+                "{result:?}"
+            );
+        }
         assert!(
             String::from_utf8_lossy(&result.stdout).contains(expected),
             "{result:?}"

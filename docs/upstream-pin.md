@@ -458,6 +458,12 @@ wrapper preserves `unsafe_code = "forbid"`; bootstrap/recovery synchronous I/O
 waits for readiness without toggling another socket clone back to blocking.
 These are deliberate Rust adaptations, not a copy of the C++ locking loop.
 
+The Windows pump retains the next producer's preference across pending writes:
+a local-input batch yields to forwarding, and a forwarding batch yields to
+local input. This adapts #823's bounded-yield intent to retained frames. A
+native Windows regression fails with the old preference reset and passes with
+alternation, verifying forwarding runs before the next queued input frame.
+
 Review follow-up: capped `WSAPoll` intervals retain the caller's absolute
 deadline. The PID-path test now checks each platform's existing default;
 upstream Windows uses its temporary directory while Rust keeps the existing

@@ -67,6 +67,10 @@ where
     } else {
         None
     };
+    #[cfg(test)]
+    if let Some(input) = transport_tests::take_input() {
+        raw_input = Some(input);
+    }
     let console_output = if stdio_forward {
         crate::client_output::ConsoleOutput::new(flow_control, Box::new(std::io::sink()))
     } else {
@@ -83,7 +87,9 @@ where
     let mut pending_forward = VecDeque::with_capacity(FORWARD_BACKLOG_CAPACITY);
     let mut pending_output: Option<et_core::packet::Packet> = None;
     let mut pending_cursor_reports = 0usize;
-    let mut local_turn = false;
+    // Alternate producer batches even when one leaves a retained frame.
+    // Keep the next producer's preference across partial-write completion.
+    let mut local_turn = true;
     let mut interrupt_input = et_core::output_interrupt::InterruptInput::default();
     loop {
         #[cfg(test)]
@@ -237,10 +243,8 @@ where
         // 1. Redirected bytes, or console input and resize notifications.
         // Bound each batch so a full pipe cannot starve output or forwarding.
         let mut redirected_progress = false;
-        if !connection.write_pending() {
-            local_turn = false;
-        }
-        if !connection.write_pending() {
+        let producers_polled = !connection.write_pending() && local_turn;
+        if producers_polled {
             if let Some(input) = raw_input.as_ref() {
                 let mut disconnected = false;
                 for _ in 0..64 {
@@ -295,7 +299,7 @@ where
                 }
             }
         }
-        if console_input && !connection.write_pending() {
+        if console_input && producers_polled && !connection.write_pending() {
             for _ in 0..64 {
                 if !crossterm::event::poll(Duration::from_millis(0))
                     .map_err(|error| terminal_text(format!("polling console input: {error}")))?
@@ -373,6 +377,9 @@ where
                 }
             }
         }
+        if producers_polled {
+            local_turn = false;
+        }
 
         // 2. Server packets.
         for _ in 0..64 {
@@ -447,8 +454,7 @@ where
 
         if connection.write_pending() {
             match connection.advance_write() {
-                Ok(true) => local_turn = true,
-                Ok(false) => {}
+                Ok(_) => {}
                 Err(error) => {
                     let error = error.into_inner();
                     if !connection_ended(&error) {
@@ -461,6 +467,7 @@ where
 
         // 3. Outbound forwarding packets.
         if !connection.write_pending() && !local_turn && !reconnect_needed {
+            local_turn = true;
             for _ in 0..64 {
                 let Some(packet) = forwarder
                     .try_outbound()

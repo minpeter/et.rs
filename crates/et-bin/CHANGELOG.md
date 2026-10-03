@@ -1,3 +1,63 @@
+## et@0.0.26
+
+### Close forwarded sockets like upstream ET
+
+Port-forward EOF handling now matches upstream EternalTerminal (checked against
+master `5b0f17a`). For `-t`, `-r`, and `-D`, EOF closes the forwarded socket in
+full. Bytes already sent toward the side that receives `closed` are delivered;
+unread local writes and reply packets still in flight in the other direction
+are discarded, like upstream C++ `close(fd)`. The earlier et.rs-only behavior
+that kept a reply direction open after a local write half-close is removed.
+
+On a peer close, et.rs answers once with `closed` so peers running earlier
+et.rs releases free their socket. Mixed old/new et.rs forwarding stays
+compatible, and C++ peers harmlessly ignore the extra close.
+
+`-W` keeps upstream's half-close: stdin EOF shuts only the request direction,
+and the reply still reaches stdout. When the remote side closes first, `et -W`
+now exits as upstream does instead of waiting for stdin EOF, and only after the
+final reply bytes are flushed to stdout.
+
+### Keep sessions responsive while a forwarded peer reads slowly
+
+A large port-forward frame sent into a slow TCP window no longer blocks the
+client or server transport reader. The partially written frame stays owned by
+replay and completes on writable readiness, so inbound terminal output and
+keepalives are still read while it drains. Between forwarding frames, the
+client gives keystrokes, resize, cursor replies, and keepalives a turn, so a
+saturated upload cannot starve them.
+
+A peer that stops reading entirely still hits the live write deadline and
+reconnects, as before. On Windows, the client and the server's terminal bridge
+still write synchronously, so reads wait for an in-progress forwarding write.
+
+### SSH-compatible client options and persistent local sessions
+
+Client arguments now follow SSH's host boundary: all options must precede the
+host, and everything after it is the remote command. Short options have changed:
+use `--port` for the ET port (`-p` now selects the SSH port), `--command` instead
+of `-c`, `--tunnel`/`-L` instead of `-t`, and `--forward-ssh-agent` instead of `-f`
+(now background mode). `-N` means no remote command; `--no-terminal` still starts
+a shell. See README for the complete migration table.
+
+Adds Unix ControlMaster/ControlPath/ControlPersist multiplexing, `--ctl` sessions,
+and runtime local TCP/Unix forwarding. Agent forwarding retargets across reconnect
+and saved-session attach. Redirected stdin EOF no longer discards delayed remote
+output, including on Windows. SSH configuration supplies session commands,
+environment, forwarding, and connection options without leaking those settings
+onto the bootstrap SSH connection.
+
+Background authentication retains its controlling terminal until authentication
+finishes. Saved control sessions validate the remote user and recover expired
+credentials without discarding them on a transient transport error. Mux commands
+with comments or syntax errors report completion without wedging the shared shell.
+
+Server disconnect defaults, SSH_TTY, and bounded tmux control filtering are also
+included. Protocol v6 is unchanged: EOF-dependent raw terminal commands still need
+explicit framing. Local mux/control/background remains unsupported on Windows;
+raw `-T` mux sessions (except `-NT` forwarding-only masters), remote/dynamic mux
+forwarding, and reverse SOCKS/allocated remote port zero are explicitly unsupported.
+
 ## et@0.0.25
 
 ### Interrupt large terminal output without losing session state

@@ -424,6 +424,12 @@ read bytes. It now forces output between two full snapshots and checks prefix
 preservation, replacing a suffix assertion that raced normal PTY output.
 This is a test correction; Rust history and cursor behavior are unchanged.
 
+Upstream's [`MuxProtocol`](https://github.com/MisterTea/EternalTerminal/blob/eac0d1d892bd09ec9f6dffe8ab9f8b7195315f6f/src/terminal/MuxProtocol.cpp#L126-L155)
+bounds individual waits rather than total transfer throughput. The Rust-only
+6 MB slow-passenger test now uses a 15-second no-progress watchdog plus a
+60-second total cap, retaining exact byte-count and exit-status checks; its
+former 15-second total cap expired on hosted macOS after 5–5.77 MB of output.
+
 [`eb518af`](https://github.com/MisterTea/EternalTerminal/commit/eb518af9f06dc338660c020cdc11fc7bede7c35e)
 (`#872`) stays `status: skip` with equivalent evidence where applicable:
 `CLIENT_READ_BATCH=64` bounds server client reads, and forwarding uses bounded

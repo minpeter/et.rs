@@ -1013,12 +1013,40 @@ fn slow_passenger_output_applies_backpressure_without_failing_command() {
     assert!(passenger.try_wait().unwrap().is_none());
     assert!(output(&mut stack.mux(&socket, "check")).status.success());
     let mut stdout = passenger.stdout.take().unwrap();
+    let received = std::sync::Arc::new(AtomicUsize::new(0));
+    let reader_progress = received.clone();
     let reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).unwrap();
+        let mut buffer = [0; 16 * 1024];
+        loop {
+            let count = stdout.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+            reader_progress.store(bytes.len(), Ordering::Relaxed);
+        }
         bytes
     });
-    let status = passenger.wait_timeout(LIMIT).unwrap();
+    // This checks backpressure and lossless completion, not a 6 MB / 15s
+    // throughput floor on shared macOS runners. Bound both stalls and total
+    // duration, so progress cannot hide a hung or endlessly producing child.
+    let deadline = Instant::now() + LIMIT * 4;
+    let mut progress_at = Instant::now();
+    let mut observed = 0;
+    let status = loop {
+        if let Some(status) = passenger.wait_timeout(Duration::from_millis(100)).unwrap() {
+            break Some(status);
+        }
+        let current = received.load(Ordering::Relaxed);
+        if current != observed {
+            observed = current;
+            progress_at = Instant::now();
+        }
+        if progress_at.elapsed() >= LIMIT || Instant::now() >= deadline {
+            break None;
+        }
+    };
     if status.is_none() {
         let _ = passenger.kill();
         let _ = passenger.wait();

@@ -75,7 +75,6 @@ impl Connection {
             writer: self.writer.clone(),
             reader: self.reader.clone(),
             live_write_timeout: self.live_write_timeout,
-            #[cfg(unix)]
             pending_live: None,
         };
         candidate.disconnect();

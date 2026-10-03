@@ -1153,6 +1153,7 @@ mod tests {
         worker.join().unwrap().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn maximum_motd_is_split_into_local_frame_sized_chunks() {
         let output = vec![b'x'; crate::terminal_motd::MAX_MOTD_TOTAL];

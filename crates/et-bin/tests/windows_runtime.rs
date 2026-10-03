@@ -2,12 +2,19 @@
 #![cfg(windows)]
 #![forbid(unsafe_code)]
 
+#[path = "windows_runtime_support/issue134.rs"]
+mod issue134;
 mod windows_runtime_support;
 
 use std::net::Shutdown;
 
 use et_core::proto::ConnectStatus;
 use windows_runtime_support::{ProcessExitObserver, Shell, Stack};
+
+#[test]
+fn issue134_real_forwarding_transfers_16_mib_duplex_and_propagates_eof() {
+    issue134::run();
+}
 
 #[test]
 fn conpty_shell_state_survives_same_session_recovery_and_exit_reaps_descendants() {

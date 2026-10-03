@@ -297,13 +297,17 @@ mod tests {
 
     #[test]
     fn pid_file_defaults_to_the_upstream_location() {
+        #[cfg(unix)]
         assert_eq!(pid_file_path(None), PathBuf::from("/var/run/etserver.pid"));
+        #[cfg(windows)]
+        assert_eq!(pid_file_path(None), PathBuf::from("etserver.pid"));
         assert_eq!(
             pid_file_path(Some(Path::new("/tmp/custom.pid"))),
             PathBuf::from("/tmp/custom.pid")
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn pid_file_is_written_with_owner_only_permissions() {
         use std::os::unix::fs::PermissionsExt;

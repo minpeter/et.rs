@@ -24,6 +24,10 @@ privdrop = "0.5.6"
 rustix = { version = "1.1.4", features = ["event", "fs", "net", "process"] }
 wait-timeout = "0.2.1"
 
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winsock2"] }
+winapi-wsapoll = "0.1.2"
+
 [[bin]]
 name = "et-user-socket-helper"
 path = "src/bin/et_user_socket_helper.rs"

@@ -24,9 +24,9 @@ use et_net::forward::{is_forward_packet, Forwarder};
 use crate::client_output::{ConsoleCompletion, GRACEFUL_DRAIN_STALL_TIMEOUT};
 use crate::client_terminal::{
     classify_forward_completion, connection_ended, encoded_buffer, recover_transport,
-    terminal_error, terminal_io, terminal_size_payload, terminal_text, write_owned_recovering,
-    write_terminal_size_recovering, DisplayOutcome, OwnedWriteOutcome, RetainedCompletion,
-    TerminalModeState,
+    terminal_error, terminal_io, terminal_size_payload, terminal_text, write_owned_recovering_with,
+    write_owned_with_policy, DisplayOutcome, OwnedWriteOutcome, OwnedWritePolicy,
+    RetainedCompletion, TerminalModeState,
 };
 use crate::client_terminal_loop::redirected_input;
 use crate::error::ClientError;
@@ -80,21 +80,33 @@ where
     if let Ok(path) = std::env::var("ET_SSH_READY") {
         let _ = std::fs::write(path, b"ready");
     }
-    let mut pending_forward = VecDeque::new();
+    let mut pending_forward = VecDeque::with_capacity(FORWARD_BACKLOG_CAPACITY);
     let mut pending_output: Option<et_core::packet::Packet> = None;
+    let mut pending_cursor_reports = 0usize;
+    let mut local_turn = false;
     let mut interrupt_input = et_core::output_interrupt::InterruptInput::default();
     loop {
+        #[cfg(test)]
+        if connection.write_pending() {
+            transport_tests::note_pending_write();
+        }
         if crate::client_hangup::take_hangup_close(connection, hangup) {
             return Ok(remote_exit.finish_code());
         }
         if stdio_forward && !forwarder.stdio_bridge_open() {
-            let _ = write_owned_recovering(
-                connection,
-                TerminalPacketType::TerminalClose as u8,
-                &[],
-                &mut reconnect,
-                terminal_enabled,
-            )?;
+            if finish_pending_recovering(connection, &mut reconnect, terminal_enabled)? {
+                let outcome = write_owned_recovering_with(
+                    connection,
+                    TerminalPacketType::TerminalClose as u8,
+                    &[],
+                    &mut reconnect,
+                    terminal_enabled,
+                    Connection::write_packet_owned,
+                )?;
+                if matches!(outcome, OwnedWriteOutcome::Written) && !connection.connected() {
+                    let _ = recover_transport(connection, &mut reconnect, terminal_enabled)?;
+                }
+            }
             return finish_remote_completion(
                 console_output,
                 pending_output,
@@ -137,7 +149,9 @@ where
                 .take_cursor_reports()
                 .map_err(|error| terminal_io("reading console confirmations", error))?
             {
-                if matches!(
+                if connection.write_pending() {
+                    pending_cursor_reports += 1;
+                } else if matches!(
                     write_cursor_report(connection, &mut reconnect, terminal_enabled)?,
                     OwnedWriteOutcome::SessionEnded
                 ) {
@@ -153,6 +167,25 @@ where
                         remote_exit,
                     );
                 }
+            }
+        }
+        while pending_cursor_reports > 0 && !connection.write_pending() {
+            pending_cursor_reports -= 1;
+            if matches!(
+                write_cursor_report(connection, &mut reconnect, terminal_enabled)?,
+                OwnedWriteOutcome::SessionEnded
+            ) {
+                return finish_remote_completion(
+                    console_output,
+                    pending_output,
+                    pending_forward,
+                    terminal_enabled,
+                    binary_stdio,
+                    terminal_modes,
+                    forwarder,
+                    None,
+                    remote_exit,
+                );
             }
         }
         let mut reconnect_needed = false;
@@ -177,7 +210,9 @@ where
                 DisplayOutcome::Displayed { cursor_report }
                     if cursor_report && auto_cursor_report && !console_output.is_async() =>
                 {
-                    if matches!(
+                    if connection.write_pending() {
+                        pending_cursor_reports += 1;
+                    } else if matches!(
                         write_cursor_report(connection, &mut reconnect, terminal_enabled)?,
                         OwnedWriteOutcome::SessionEnded
                     ) {
@@ -202,60 +237,71 @@ where
         // 1. Redirected bytes, or console input and resize notifications.
         // Bound each batch so a full pipe cannot starve output or forwarding.
         let mut redirected_progress = false;
-        if let Some(input) = raw_input.as_ref() {
-            let mut disconnected = false;
-            for _ in 0..64 {
-                let bytes = match input.try_recv() {
-                    Ok(bytes) => bytes,
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        disconnected = true;
+        if !connection.write_pending() {
+            local_turn = false;
+        }
+        if !connection.write_pending() {
+            if let Some(input) = raw_input.as_ref() {
+                let mut disconnected = false;
+                for _ in 0..64 {
+                    let bytes = match input.try_recv() {
+                        Ok(bytes) => bytes,
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    };
+                    redirected_progress = true;
+                    if !binary_stdio && interrupt_input.feed(&bytes) {
+                        console_output
+                            .interrupt()
+                            .map_err(|error| terminal_io("interrupting console output", error))?;
+                    }
+                    let payload = encoded_buffer(&bytes);
+                    match write_owned(
+                        connection,
+                        TerminalPacketType::TerminalBuffer as u8,
+                        &payload,
+                        &mut reconnect,
+                        terminal_enabled,
+                    )? {
+                        OwnedWriteOutcome::Written => {}
+                        OwnedWriteOutcome::Recovered => {
+                            reconnect_needed = false;
+                            last_received = Instant::now();
+                            next_keepalive = last_received + interval;
+                        }
+                        OwnedWriteOutcome::SessionEnded => {
+                            return finish_remote_completion(
+                                console_output,
+                                pending_output,
+                                pending_forward,
+                                terminal_enabled,
+                                binary_stdio,
+                                terminal_modes,
+                                forwarder,
+                                None,
+                                remote_exit,
+                            )
+                        }
+                    }
+                    if connection.write_pending() {
                         break;
                     }
-                };
-                redirected_progress = true;
-                if !binary_stdio && interrupt_input.feed(&bytes) {
-                    console_output
-                        .interrupt()
-                        .map_err(|error| terminal_io("interrupting console output", error))?;
                 }
-                let payload = encoded_buffer(&bytes);
-                match write_owned_recovering(
-                    connection,
-                    TerminalPacketType::TerminalBuffer as u8,
-                    &payload,
-                    &mut reconnect,
-                    terminal_enabled,
-                )? {
-                    OwnedWriteOutcome::Written => {}
-                    OwnedWriteOutcome::Recovered => {
-                        reconnect_needed = false;
-                        last_received = Instant::now();
-                        next_keepalive = last_received + interval;
-                    }
-                    OwnedWriteOutcome::SessionEnded => {
-                        return finish_remote_completion(
-                            console_output,
-                            pending_output,
-                            pending_forward,
-                            terminal_enabled,
-                            binary_stdio,
-                            terminal_modes,
-                            forwarder,
-                            None,
-                            remote_exit,
-                        )
-                    }
+                if disconnected {
+                    raw_input = None;
                 }
-            }
-            if disconnected {
-                raw_input = None;
             }
         }
-        if console_input {
-            while crossterm::event::poll(Duration::from_millis(0))
-                .map_err(|error| terminal_text(format!("polling console input: {error}")))?
-            {
+        if console_input && !connection.write_pending() {
+            for _ in 0..64 {
+                if !crossterm::event::poll(Duration::from_millis(0))
+                    .map_err(|error| terminal_text(format!("polling console input: {error}")))?
+                {
+                    break;
+                }
                 let event = crossterm::event::read()
                     .map_err(|error| terminal_text(format!("reading console input: {error}")))?;
                 match event {
@@ -270,7 +316,7 @@ where
                             })?;
                         }
                         let payload = encoded_buffer(&bytes);
-                        match write_owned_recovering(
+                        match write_owned(
                             connection,
                             TerminalPacketType::TerminalBuffer as u8,
                             &payload,
@@ -293,14 +339,13 @@ where
                                 );
                             }
                         }
+                        if connection.write_pending() {
+                            break;
+                        }
                     }
                     Event::Resize(_, _) if terminal_enabled => {
                         if let Some(payload) = terminal_size_payload() {
-                            match write_terminal_size_recovering(
-                                connection,
-                                &payload,
-                                &mut reconnect,
-                            )? {
+                            match write_terminal_size(connection, &payload, &mut reconnect)? {
                                 OwnedWriteOutcome::Written => {}
                                 OwnedWriteOutcome::Recovered => reconnect_needed = false,
                                 OwnedWriteOutcome::SessionEnded => {
@@ -317,6 +362,9 @@ where
                                     );
                                 }
                             }
+                            if connection.write_pending() {
+                                break;
+                            }
                         }
                     }
                     // Upstream forwards neither mouse nor focus records.
@@ -327,7 +375,10 @@ where
         }
 
         // 2. Server packets.
-        while pending_forward.len() < FORWARD_BACKLOG_CAPACITY && pending_output.is_none() {
+        for _ in 0..64 {
+            if pending_forward.len() >= FORWARD_BACKLOG_CAPACITY || pending_output.is_some() {
+                break;
+            }
             match connection.try_read_packet() {
                 Ok(Some(packet)) => {
                     last_received = Instant::now();
@@ -357,7 +408,9 @@ where
                                     && auto_cursor_report
                                     && !console_output.is_async() =>
                             {
-                                if matches!(
+                                if connection.write_pending() {
+                                    pending_cursor_reports += 1;
+                                } else if matches!(
                                     write_cursor_report(
                                         connection,
                                         &mut reconnect,
@@ -392,32 +445,54 @@ where
             }
         }
 
+        if connection.write_pending() {
+            match connection.advance_write() {
+                Ok(true) => local_turn = true,
+                Ok(false) => {}
+                Err(error) => {
+                    let error = error.into_inner();
+                    if !connection_ended(&error) {
+                        return Err(terminal_error(error));
+                    }
+                    reconnect_needed = true;
+                }
+            }
+        }
+
         // 3. Outbound forwarding packets.
-        while let Some(packet) = forwarder
-            .try_outbound()
-            .map_err(|error| terminal_text(error.to_string()))?
-        {
-            match write_owned_recovering(
-                connection,
-                packet.header(),
-                packet.payload(),
-                &mut reconnect,
-                terminal_enabled,
-            )? {
-                OwnedWriteOutcome::Written => {}
-                OwnedWriteOutcome::Recovered => reconnect_needed = false,
-                OwnedWriteOutcome::SessionEnded => {
-                    return finish_remote_completion(
-                        console_output,
-                        pending_output,
-                        pending_forward,
-                        terminal_enabled,
-                        binary_stdio,
-                        terminal_modes,
-                        forwarder,
-                        Some(packet),
-                        remote_exit,
-                    );
+        if !connection.write_pending() && !local_turn && !reconnect_needed {
+            for _ in 0..64 {
+                let Some(packet) = forwarder
+                    .try_outbound()
+                    .map_err(|error| terminal_text(error.to_string()))?
+                else {
+                    break;
+                };
+                match write_owned(
+                    connection,
+                    packet.header(),
+                    packet.payload(),
+                    &mut reconnect,
+                    terminal_enabled,
+                )? {
+                    OwnedWriteOutcome::Written => {}
+                    OwnedWriteOutcome::Recovered => reconnect_needed = false,
+                    OwnedWriteOutcome::SessionEnded => {
+                        return finish_remote_completion(
+                            console_output,
+                            pending_output,
+                            pending_forward,
+                            terminal_enabled,
+                            binary_stdio,
+                            terminal_modes,
+                            forwarder,
+                            Some(packet),
+                            remote_exit,
+                        );
+                    }
+                }
+                if connection.write_pending() {
+                    break;
                 }
             }
         }
@@ -427,6 +502,9 @@ where
             reconnect_needed = true;
         }
         if reconnect_needed {
+            // Replay owns the whole encrypted frame. Drop its partial live
+            // socket bytes before recovery and never resubmit plaintext.
+            connection.disconnect();
             if !recover_transport(connection, &mut reconnect, terminal_enabled)? {
                 return finish_remote_completion(
                     console_output,
@@ -444,12 +522,12 @@ where
             next_keepalive = last_received + interval;
             continue;
         }
-        if Instant::now() >= next_keepalive {
+        if !connection.write_pending() && Instant::now() >= next_keepalive {
             // The payload acknowledges everything read so far, so the server
             // can trim its replay backup; legacy servers ignore it.
             let ack = connection.keepalive_ack();
             if matches!(
-                write_owned_recovering(
+                write_owned(
                     connection,
                     TerminalPacketType::KeepAlive as u8,
                     &ack,
@@ -475,9 +553,9 @@ where
 
         // 4. Idle wait. Console events wake this immediately; socket data is
         // observed on the next tick, exactly like upstream's select() timeout.
-        if console_input {
+        if console_input && !connection.write_pending() {
             let _ = crossterm::event::poll(POLL_INTERVAL);
-        } else if !redirected_progress {
+        } else if !redirected_progress || connection.write_pending() {
             std::thread::sleep(POLL_INTERVAL);
         }
     }
@@ -592,13 +670,72 @@ where
     F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
 {
     let payload = encoded_buffer(crate::client_terminal::CURSOR_REPORT_REPLY);
-    write_owned_recovering(
+    write_owned(
         connection,
         TerminalPacketType::TerminalBuffer as u8,
         &payload,
         reconnect,
         send_terminal_size,
     )
+}
+
+fn write_owned<F>(
+    connection: &mut Connection,
+    header: u8,
+    payload: &[u8],
+    reconnect: &mut F,
+    send_terminal_size: bool,
+) -> Result<OwnedWriteOutcome, ClientError>
+where
+    F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
+{
+    write_owned_recovering_with(
+        connection,
+        header,
+        payload,
+        reconnect,
+        send_terminal_size,
+        Connection::start_write_packet_owned,
+    )
+}
+
+fn write_terminal_size<F>(
+    connection: &mut Connection,
+    payload: &[u8],
+    reconnect: &mut F,
+) -> Result<OwnedWriteOutcome, ClientError>
+where
+    F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
+{
+    write_owned_with_policy(
+        connection,
+        TerminalPacketType::TerminalInfo as u8,
+        payload,
+        OwnedWritePolicy::ReplaceableTerminalSize,
+        Connection::start_write_packet_owned,
+        |connection, _| recover_transport(connection, reconnect, true),
+    )
+}
+
+fn finish_pending_recovering<F>(
+    connection: &mut Connection,
+    reconnect: &mut F,
+    send_terminal_size: bool,
+) -> Result<bool, ClientError>
+where
+    F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
+{
+    match connection.finish_pending_write() {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            let error = error.into_inner();
+            if !connection_ended(&error) {
+                return Err(terminal_error(error));
+            }
+            connection.disconnect();
+            recover_transport(connection, reconnect, send_terminal_size)
+        }
+    }
 }
 
 /// Returns `true` when a cursor position report must be sent back.
@@ -787,3 +924,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "client_terminal_windows_tests.rs"]
+mod transport_tests;

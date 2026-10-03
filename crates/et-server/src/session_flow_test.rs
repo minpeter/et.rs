@@ -17,6 +17,67 @@ use super::{
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[test]
+fn stalled_live_writer_releases_connection_lock_but_retains_write_serialization() {
+    use et_core::packet::Packet;
+    use std::time::Instant;
+
+    let (mut server, mut client) = connection_pair();
+    server.minimize_output_buffering().unwrap();
+    let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
+    let session = Arc::new(ActiveSession::new(server, &terminal, None).unwrap());
+    let packet = Packet::new(46, vec![0x93; 1024 * 1024]);
+    let (reached_tx, reached_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    *session.prepared_write_hook.lock().unwrap() = Some((reached_tx, release_rx));
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let writing = Arc::clone(&session);
+    let expected = packet.clone();
+    let worker = thread::spawn(move || {
+        let result = super::session_flow::writer::write_packet(
+            &writing,
+            &FlowControl::new_default(),
+            &packet,
+        );
+        done_tx.send(result).unwrap();
+    });
+    // Encryption is setup, not the live-write wait measured below.
+    reached_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    release_tx.send(()).unwrap();
+
+    // The peer never drains the large frame until its reverse-direction
+    // packet is read. Holding connection during send deadlocks this exchange.
+    client.write_packet(47, b"read-before-drain").unwrap();
+    let started = Instant::now();
+    let incoming = loop {
+        if let Some(packet) = session.try_read_packet().unwrap() {
+            break packet;
+        }
+        assert!(started.elapsed() < Duration::from_secs(1));
+        thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(incoming, Packet::new(47, b"read-before-drain"));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(done_rx.try_recv().is_err());
+    // Recovery installation and later writers use this same guard; they
+    // cannot replace the transport under a still-running prepared write.
+    assert!(session.write_serial.try_lock().is_err());
+    assert_eq!(session.connection.lock().unwrap().writer_sequence(), 1);
+
+    assert_eq!(client.read_packet().unwrap(), expected);
+    assert!(matches!(
+        done_rx.recv_timeout(TEST_TIMEOUT).unwrap(),
+        (FlowWriteResult::Delivered, true)
+    ));
+    worker.join().unwrap();
+    session.send_packet(48, b"after-drain").unwrap();
+    assert_eq!(
+        client.read_packet().unwrap(),
+        Packet::new(48, b"after-drain")
+    );
+    assert_eq!(client.reader_sequence(), 2);
+}
+
+#[test]
 fn exit_status_waits_for_queued_and_in_flight_output() {
     use et_core::packet::Packet;
     use et_core::proto::{TerminalBuffer, TerminalExitStatus, TerminalPacketType};

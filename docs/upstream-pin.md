@@ -417,12 +417,58 @@ matching saved credentials, so the same name can bootstrap afresh. Tests cover
 both paths, startup-command non-replay and replacement-ID preservation.
 Raw `-T`/`-W` control and Windows local control are unsupported.
 
+The local-control regression test follows upstream's
+[`AppendAfterRead`](https://github.com/MisterTea/EternalTerminal/blob/eac0d1d892bd09ec9f6dffe8ab9f8b7195315f6f/test/unit_tests/SessionScrollbackTest.cpp#L68-L81)
+contract: reads do not consume history, and appended output follows previously
+read bytes. It now forces output between two full snapshots and checks prefix
+preservation, replacing a suffix assertion that raced normal PTY output.
+This is a test correction; Rust history and cursor behavior are unchanged.
+
 [`eb518af`](https://github.com/MisterTea/EternalTerminal/commit/eb518af9f06dc338660c020cdc11fc7bede7c35e)
 (`#872`) stays `status: skip` with equivalent evidence where applicable:
 `CLIENT_READ_BATCH=64` bounds server client reads, and forwarding uses bounded
 per-stream reader queues plus asynchronous pending connection writes. The C++
 platform split and `FdPoller` lifetime do not map to Rust. This does not claim
 native macOS/Windows runtime or C++ live-peer testing. `PROTOCOL_VERSION` stays 6.
+
+### Windows transport follow-up (#134)
+
+The original #823/#872 equivalence claim omitted Windows live writes. Reviewed
+[#823](https://github.com/MisterTea/EternalTerminal/pull/823) and
+[#872](https://github.com/MisterTea/EternalTerminal/pull/872) before this fix:
+#823 bounds each forwarding update to four 16 KiB reads; #872 supplies the
+Windows nonblocking socket and `WSAPoll` implementation. Upstream's
+[`BackedWriter`](https://github.com/MisterTea/EternalTerminal/blob/eb518af9f06dc338660c020cdc11fc7bede7c35e/src/base/BackedWriter.cpp)
+and [`Connection`](https://github.com/MisterTea/EternalTerminal/blob/eb518af9f06dc338660c020cdc11fc7bede7c35e/src/base/Connection.cpp)
+still finish the entire write while holding the connection mutex. That part
+does not solve the reported head-of-line blocking.
+
+Rust now shares its existing pending-frame contract between Unix and Windows:
+one send of at most 64 KiB per advancement, permanent nonblocking Winsock mode,
+and bounded client producer/read batches. The server prepares under the
+connection mutex, sends outside it, and retains `write_serial` through completion
+so recovery installation cannot race the old writer. A safe `winapi-wsapoll`
+wrapper preserves `unsafe_code = "forbid"`; bootstrap/recovery synchronous I/O
+waits for readiness without toggling another socket clone back to blocking.
+These are deliberate Rust adaptations, not a copy of the C++ locking loop.
+
+Replay accepts each frame once before live transmission, with unchanged nonce
+and sequence ordering. A failed partial frame shuts down its old transport;
+recovery sends the complete replay record before later live traffic. Deadlines
+remain absolute: two seconds normally, five with flow control. Final close
+follows retained data, and redirected stdin EOF does not end the remote session.
+
+Native Windows loopback tests cover stalled forwarding with inbound dispatch,
+server output with independent reverse-direction reads, concurrent
+2 MiB/3 MiB transfers, EOF, final-close ordering, replay after partial writes,
+and deadline expiry. The Windows runtime harness also starts the shipped server
+and terminal, transfers 16 MiB in each direction through a real TCP forward,
+checks every echoed byte, and verifies source and destination EOF. Its client
+is a protocol test pump; the actual Windows client pump has separate stalled
+forwarding coverage. The executables are cross-built for Windows GNU on Linux
+and **executed on Windows**, separately from cross-checking. No C++ live peer,
+editor sleep cycle, or native macOS execution is claimed. Windows CI now runs
+these transport/session/client tests in addition to ConPTY and HTM coverage.
 
 [`b5b009b`](https://github.com/MisterTea/EternalTerminal/commit/b5b009bf9ad91fda30eb2b394c6936c69e2b9806)
 (`#874`, “keep VS Code Remote-SSH sessions alive over et across sleep”) is

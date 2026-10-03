@@ -304,6 +304,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn pid_file_is_written_with_owner_only_permissions() {
         use std::os::unix::fs::PermissionsExt;

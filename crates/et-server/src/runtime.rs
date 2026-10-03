@@ -296,7 +296,7 @@ fn remember(first: &mut Option<RuntimeError>, error: RuntimeError) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::fs;
     use std::io::{self, Read};

@@ -1,11 +1,12 @@
 //! A single replay-owned live frame, advanced without monopolizing the reader.
 use std::io;
+#[cfg(windows)]
+use std::io::Write;
 use std::net::{Shutdown, TcpStream};
 use std::time::Instant;
 
-use rustix::event::{poll, PollFd, PollFlags, Timespec};
-
 use super::{ConnError, Connection, PreparedWrite, WritePacketError};
+use crate::connection_nonblocking::wait_writable;
 
 // One syscall and at most this many bytes per pump turn, even on a fast socket.
 const WRITE_QUANTUM: usize = 64 * 1024;
@@ -14,7 +15,7 @@ pub(super) struct PendingWrite {
     stream: TcpStream,
     frame: Vec<u8>,
     offset: usize,
-    deadline: Instant,
+    pub(super) deadline: Instant,
 }
 
 impl PreparedWrite {
@@ -40,7 +41,7 @@ impl PendingWrite {
         // Darwin's MSG_DONTWAIT only avoids the send-buffer lock; it does
         // not avoid waiting for buffer space. Keep O_NONBLOCK on all clones
         // permanently; synchronous Connection I/O waits for readiness.
-        #[cfg(target_vendor = "apple")]
+        #[cfg(all(unix, target_vendor = "apple"))]
         let flags = {
             if self.offset == 0 {
                 rustix::net::sockopt::set_socket_nosigpipe(&self.stream, true)?;
@@ -48,8 +49,9 @@ impl PendingWrite {
             }
             rustix::net::SendFlags::DONTWAIT
         };
-        #[cfg(not(target_vendor = "apple"))]
+        #[cfg(all(unix, not(target_vendor = "apple")))]
         let flags = rustix::net::SendFlags::DONTWAIT | rustix::net::SendFlags::NOSIGNAL;
+        #[cfg(unix)]
         match rustix::net::send(&self.stream, &self.frame[self.offset..end], flags) {
             Ok(0) => Err(io::ErrorKind::WriteZero.into()),
             Ok(count) => {
@@ -59,6 +61,27 @@ impl PendingWrite {
             Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => Ok(false),
             Err(error) => Err(error.into()),
         }
+        #[cfg(windows)]
+        {
+            // Preparation enabled nonblocking mode before replay admission;
+            // cloned Winsock handles keep that shared mode permanently.
+            match self.stream.write(&self.frame[self.offset..end]) {
+                Ok(0) => Err(io::ErrorKind::WriteZero.into()),
+                Ok(count) => {
+                    self.offset += count;
+                    Ok(self.offset == self.frame.len())
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    Ok(false)
+                }
+                Err(error) => Err(error),
+            }
+        }
     }
 
     // Synchronous callers (including the server's independent output worker)
@@ -66,13 +89,12 @@ impl PendingWrite {
     pub(super) fn finish(mut self) -> Result<(), WritePacketError> {
         (|| {
             while !self.advance()? {
-                let remaining = self.deadline.saturating_duration_since(Instant::now());
-                let timeout = Timespec::try_from(remaining)
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "write poll range"))?;
-                let mut descriptors = [PollFd::new(&self.stream, PollFlags::OUT)];
-                match poll(&mut descriptors, Some(&timeout)) {
-                    Ok(_) | Err(rustix::io::Errno::INTR) => {}
-                    Err(error) => return Err(io::Error::from(error)),
+                match wait_writable(&self.stream, self.deadline) {
+                    Ok(()) => {}
+                    // Re-enter advance's absolute-deadline check, preserving
+                    // the live-write timeout diagnostic on every platform.
+                    Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+                    Err(error) => return Err(error),
                 }
             }
             Ok(())

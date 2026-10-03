@@ -2,7 +2,7 @@ use std::io;
 use std::net::{Shutdown, TcpStream};
 use std::time::{Duration, Instant};
 
-use crate::connection_nonblocking::{read_blocking, write_blocking};
+use crate::connection_nonblocking::read_blocking;
 use et_core::backed_reader::{BackedReader, ReadError, ReadItem};
 use et_core::backed_writer::{BackedWriter, RecoverError, WriterOutcome};
 use et_core::crypto::{
@@ -10,7 +10,6 @@ use et_core::crypto::{
 };
 use et_core::packet::Packet;
 use socket2::SockRef;
-#[cfg(unix)]
 #[path = "connection_pending.rs"]
 mod pending;
 #[path = "connection_recovery.rs"]
@@ -24,7 +23,7 @@ pub use recovery::{RecoveryExchange, DEFAULT_RECOVERY_TIMEOUT, MAX_RECOVERY_PROT
 /// used to make an unbounded write hang for minutes while holding the server
 /// session's connection mutex. That blocked `ActiveSession::recover` and left
 /// clients stuck after `ReturningClient`. Live frames go through
-/// [`write_all_until`] with this deadline so the transport soft-disconnects
+/// a retained pending write with this deadline so the transport soft-disconnects
 /// and recovery can proceed.
 pub const DEFAULT_LIVE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const FLOW_CONTROL_LIVE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -47,7 +46,6 @@ pub struct Connection {
     writer: BackedWriter,
     reader: BackedReader,
     live_write_timeout: Duration,
-    #[cfg(unix)]
     pending_live: Option<pending::PendingWrite>,
 }
 
@@ -70,7 +68,6 @@ impl WritePacketError {
 }
 
 impl PreparedWrite {
-    #[cfg(unix)]
     pub fn send(self) -> Result<(), WritePacketError> {
         match self.into_pending() {
             Some(pending) => pending.finish(),
@@ -78,23 +75,12 @@ impl PreparedWrite {
         }
     }
 
-    #[cfg(windows)]
-    pub fn send(self) -> Result<(), WritePacketError> {
-        let Some((mut stream, frame, timeout)) = self.live else {
-            return Ok(());
-        };
-        write_live_frame(&mut stream, &frame, timeout)
-            .map_err(ConnError::Io)
-            .map_err(WritePacketError::ReplayOwned)
-    }
-
     fn send_until(self, deadline: Instant) -> Result<(), WritePacketError> {
-        let Some((mut stream, frame, _timeout)) = self.live else {
+        let Some(mut pending) = self.into_pending() else {
             return Ok(());
         };
-        write_live_frame_until(&mut stream, &frame, deadline)
-            .map_err(ConnError::Io)
-            .map_err(WritePacketError::ReplayOwned)
+        pending.deadline = deadline;
+        pending.finish()
     }
 }
 
@@ -113,7 +99,6 @@ impl Connection {
             writer: BackedWriter::new(CryptoHandler::new(key, encrypt), true),
             reader: BackedReader::new(CryptoHandler::new(key, decrypt), true),
             live_write_timeout: DEFAULT_LIVE_WRITE_TIMEOUT,
-            #[cfg(unix)]
             pending_live: None,
         }
     }
@@ -170,18 +155,24 @@ impl Connection {
     {
         // No later frame may acquire a nonce or reach the socket ahead of a
         // retained partial frame, including synchronous/bootstrap callers.
-        #[cfg(unix)]
         if self.pending_live.is_some() {
             return Err(WritePacketError::BeforeReplay(ConnError::Backpressure));
         }
         // Probe first so a half-closed peer (laptop sleep, Wi-Fi drop) moves
         // the writer into the disconnected catch-up buffer before we try to
         // push bytes onto a dead socket.
+        #[cfg(unix)]
         if self.refresh_connectivity().is_err() {
             self.disconnect();
         }
-        // Cloning is the only fallible transport preparation. Do it before
-        // encryption advances the nonce/sequence and inserts replay history.
+        #[cfg(windows)]
+        if let Err(error) = self.refresh_connectivity() {
+            self.disconnect();
+            return Err(WritePacketError::BeforeReplay(error));
+        }
+        // Clone before encryption advances the nonce/sequence and inserts
+        // replay history; all fallible Windows nonblocking setup above is
+        // likewise complete before the writer owns this frame.
         let live_stream = self
             .writer
             .connected()
@@ -337,10 +328,7 @@ impl Connection {
     }
 
     pub fn disconnect(&mut self) {
-        #[cfg(unix)]
-        {
-            self.pending_live = None;
-        }
+        self.pending_live = None;
         self.writer.invalidate();
         self.reader.invalidate();
     }
@@ -354,7 +342,7 @@ impl Connection {
         }
     }
 
-    /// Clone the transport for readiness polling or shutdown. On Apple,
+    /// Clone the transport for readiness polling or shutdown. On Apple and Windows,
     /// live sends leave the shared socket nonblocking; use Connection's
     /// packet APIs rather than assuming blocking I/O on this raw clone.
     pub fn try_clone_stream(&self) -> Result<TcpStream, ConnError> {
@@ -431,7 +419,7 @@ impl Connection {
             return Ok(());
         }
         let mut byte = [0u8; 1];
-        // Unix socket clones share the same open-file-description flags.
+        // Socket clones share the same underlying nonblocking mode.
         // Toggling O_NONBLOCK here can make an in-flight PreparedWrite on a
         // sibling clone fail with EAGAIN and tear down a healthy transport.
         #[cfg(unix)]
@@ -444,16 +432,8 @@ impl Connection {
         .map_err(io::Error::from);
         #[cfg(windows)]
         let probe = {
-            if let Err(error) = self.stream.set_nonblocking(true) {
-                self.disconnect();
-                return Err(ConnError::Io(error));
-            }
-            let probe = self.stream.peek(&mut byte);
-            if let Err(error) = self.stream.set_nonblocking(false) {
-                self.disconnect();
-                return Err(ConnError::Io(error));
-            }
-            probe
+            self.stream.set_nonblocking(true)?;
+            self.stream.peek(&mut byte)
         };
         match probe {
             Ok(0) => self.disconnect(),
@@ -478,59 +458,6 @@ impl Connection {
         }
         Ok(())
     }
-}
-
-#[cfg(windows)]
-fn write_live_frame(stream: &mut TcpStream, frame: &[u8], timeout: Duration) -> io::Result<()> {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "live write deadline"))?;
-    write_live_frame_until(stream, frame, deadline)
-}
-
-/// Write a framed packet to a still-connected peer before an absolute deadline.
-///
-/// On an incomplete write, shut down the abandoned transport so a partial
-/// frame cannot desynchronize a later recovery on a replacement stream.
-fn write_live_frame_until(
-    stream: &mut TcpStream,
-    frame: &[u8],
-    deadline: Instant,
-) -> io::Result<()> {
-    let result = write_all_until(stream, frame, deadline);
-    // Best-effort restore: a failed clear must not hide a write error.
-    let clear = stream.set_write_timeout(None);
-    match (result, clear) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), _) => {
-            // Force the peer off the half-written frame so it reconnects
-            // rather than blocking on the rest of a truncated record.
-            let _ = stream.shutdown(Shutdown::Both);
-            Err(error)
-        }
-        (Ok(()), Err(error)) => Err(error),
-    }
-}
-
-/// Write the full buffer before `deadline`, refreshing the socket write
-/// timeout on each attempt so a blackholed peer cannot pin the caller.
-fn write_all_until(stream: &mut TcpStream, mut buffer: &[u8], deadline: Instant) -> io::Result<()> {
-    while !buffer.is_empty() {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|duration| !duration.is_zero())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::TimedOut, "live write deadline elapsed")
-            })?;
-        stream.set_write_timeout(Some(remaining))?;
-        match write_blocking(stream, buffer) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(count) => buffer = &buffer[count..],
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

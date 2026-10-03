@@ -207,9 +207,12 @@ fn control_protocol_cursors_secret_resize_tombstone_and_adoption() {
         stack.start_control("stty -echo; export ONCE=original; printf 'CT%s\\n' 'L-READY'");
     let first = read_until(&socket, "CTL-READY");
     let cursor: [u8; 8] = first[..8].try_into().unwrap();
-    let same = ctl(&socket, 3, &(-1_i64).to_be_bytes());
+    // Force growth between snapshots: a repeated full read must preserve
+    // the old prefix even when new terminal output has arrived.
+    assert_eq!(ctl(&socket, 1, b"printf 'APP%s\\n' 'ENDED'\n").0, 64);
+    let appended = read_until(&socket, "APPENDED");
     assert!(
-        same.1.ends_with(&first[9..]),
+        appended[9..].starts_with(&first[9..]),
         "read must be non-destructive"
     );
     let info = String::from_utf8(ctl(&socket, 4, &[]).1).unwrap();

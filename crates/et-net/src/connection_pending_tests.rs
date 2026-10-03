@@ -25,13 +25,11 @@ fn pair() -> (Connection, Connection) {
 fn drain(sender: &mut Connection) {
     let stream = sender.try_clone_stream().unwrap();
     while sender.write_pending() {
-        let remaining = sender
-            .pending_write_deadline()
-            .unwrap()
-            .saturating_duration_since(Instant::now());
-        let timeout = Timespec::try_from(remaining).unwrap();
-        let mut descriptors = [PollFd::new(&stream, PollFlags::OUT)];
-        assert_eq!(poll(&mut descriptors, Some(&timeout)).unwrap(), 1);
+        crate::connection_nonblocking::wait_writable(
+            &stream,
+            sender.pending_write_deadline().unwrap(),
+        )
+        .unwrap();
         sender.advance_write().unwrap();
     }
 }
@@ -147,6 +145,69 @@ fn partial_frame_services_reads_and_serializes_competing_writes() {
     assert_eq!(second, Packet::new(0, b"next"));
     assert_eq!(sequence, 2);
     assert_eq!(sender.writer_sequence(), 2);
+}
+
+#[test]
+fn bidirectional_partial_frames_complete_before_transport_eof() {
+    let (client, server) = streams();
+    let mut client = Connection::new_client(client, &[19; 32]);
+    let mut server = Connection::new_server(server, &[19; 32]);
+    // Bound the send queues, but retain normally negotiated receive windows:
+    // this exercises duplex scheduling rather than zero-window probe timers.
+    client.minimize_output_buffering().unwrap();
+    server.minimize_output_buffering().unwrap();
+    let upload = Packet::new(7, vec![0x53; 2 * 1024 * 1024]);
+    let download = Packet::new(8, vec![0xa7; 3 * 1024 * 1024]);
+    client
+        .start_write_packet_owned(upload.header(), upload.payload())
+        .unwrap();
+    server
+        .start_write_packet_owned(download.header(), download.payload())
+        .unwrap();
+    assert!(client.write_pending() && server.write_pending());
+    let deadlines = (
+        client.pending_write_deadline(),
+        server.pending_write_deadline(),
+    );
+    assert_eq!(client.live_write_timeout, Duration::from_secs(5));
+
+    // Neither side can finish a whole write before servicing the other
+    // direction. Both share the same nonblocking socket mode with their reader.
+    let started = Instant::now();
+    let (mut received_upload, mut received_download) = (None, None);
+    while received_upload.is_none()
+        || received_download.is_none()
+        || client.write_pending()
+        || server.write_pending()
+    {
+        assert!(started.elapsed() < Duration::from_secs(5));
+        if received_upload.is_none() {
+            received_upload = server.try_read_packet().unwrap();
+        }
+        if received_download.is_none() {
+            received_download = client.try_read_packet().unwrap();
+        }
+        client.advance_write().unwrap();
+        server.advance_write().unwrap();
+        if client.write_pending() {
+            assert_eq!(client.pending_write_deadline(), deadlines.0);
+        }
+        if server.write_pending() {
+            assert_eq!(server.pending_write_deadline(), deadlines.1);
+        }
+    }
+    assert_eq!(received_upload.unwrap(), upload);
+    assert_eq!(received_download.unwrap(), download);
+    assert_eq!((client.reader_sequence(), server.reader_sequence()), (1, 1));
+    assert!(client.connected() && server.connected());
+
+    server.stream.shutdown(Shutdown::Write).unwrap();
+    assert!(
+        matches!(client.read_packet_deadline(Instant::now() + Duration::from_secs(1)),
+        Err(ConnError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof)
+    );
+    assert!(!client.connected());
+    assert_eq!(client.reader_sequence(), 1);
 }
 
 #[test]

@@ -113,6 +113,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Exercise native Windows transport backpressure and replay
+        shell: pwsh
+        run: |
+          cargo test --locked -p et-net --lib connection:: -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p et-server --lib session:: -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p et --bin et client_terminal_windows:: -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p et --bin et client_hangup:: -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Build relocatable native runtime QA artifacts
         shell: pwsh
         run: |

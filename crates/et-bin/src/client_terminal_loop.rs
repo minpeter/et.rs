@@ -200,6 +200,11 @@ where
     let mut pending_cursor_reports = 0usize;
     let mut outbound_ready = false;
     let mut inbound_ready = false;
+    // Set when a retained frame completes. Forwarding output may not start
+    // another frame until local producers (cursor replies, resize, stdin,
+    // keepalive) have been polled once, so a saturated upload cannot keep
+    // the transport permanently pending and starve them.
+    let mut local_turn = false;
     let mut interrupt_input = et_core::output_interrupt::InterruptInput::default();
     let forward_wake = forwarder
         .wake()
@@ -351,24 +356,25 @@ where
         {
             deadline = Instant::now();
         }
-        let producer_flags = if connection.write_pending() {
-            PollFlags::empty()
-        } else {
-            PollFlags::IN | PollFlags::HUP
-        };
-        let (network, resize, _forwarding, output_ready, output_status, input) = {
+        // While a frame is pending, producers are left out of the poll set:
+        // poll(2) reports HUP/ERR even for an empty event mask, so a hung-up
+        // wake fd would spin this loop until the frame deadline.
+        let producers_polled = !connection.write_pending();
+        let (network, resize, output_ready, output_status, input) = {
             let mut descriptors = vec![
                 PollFd::new(&stream, network_flags),
-                PollFd::new(&*wake, producer_flags),
-                PollFd::new(forward_wake, producer_flags),
                 PollFd::new(console_output.wake(), PollFlags::IN | PollFlags::HUP),
                 PollFd::new(console_output.status_wake(), PollFlags::IN | PollFlags::HUP),
             ];
-            if read_stdin && !connection.write_pending() {
-                descriptors.push(PollFd::new(
-                    &stdin,
-                    PollFlags::IN | PollFlags::HUP | PollFlags::ERR,
-                ));
+            if producers_polled {
+                descriptors.push(PollFd::new(&*wake, PollFlags::IN | PollFlags::HUP));
+                descriptors.push(PollFd::new(forward_wake, PollFlags::IN | PollFlags::HUP));
+                if read_stdin {
+                    descriptors.push(PollFd::new(
+                        &stdin,
+                        PollFlags::IN | PollFlags::HUP | PollFlags::ERR,
+                    ));
+                }
             }
             // poll() is never auto-restarted by SA_RESTART, so any signal
             // delivered to this thread (e.g. SIGWINCH from a window resize,
@@ -398,18 +404,17 @@ where
                     }
                 }
             }
-            (
-                descriptors[0].revents(),
-                descriptors[1].revents(),
-                descriptors[2].revents(),
-                descriptors[3].revents(),
-                descriptors[4].revents(),
+            let revents = |index: usize| {
                 descriptors
-                    .get(5)
+                    .get(index)
                     .map(PollFd::revents)
-                    .unwrap_or(PollFlags::empty()),
-            )
+                    .unwrap_or(PollFlags::empty())
+            };
+            // Index 4 is the forwarding wake; try_outbound drains it below.
+            (revents(0), revents(3), revents(1), revents(2), revents(5))
         };
+        #[cfg(test)]
+        tests::note_poll_return();
         if let Some(probe) = pump_probe.as_mut() {
             probe.progressed()?;
         }
@@ -551,15 +556,19 @@ where
         }
         inbound_ready = read_batch == 64;
         if connection.write_pending() {
-            if let Err(error) = connection.advance_write() {
-                let error = error.into_inner();
-                if !connection_ended(&error) {
-                    return Err(terminal_error(error));
+            match connection.advance_write() {
+                Ok(true) => local_turn = true,
+                Ok(false) => {}
+                Err(error) => {
+                    let error = error.into_inner();
+                    if !connection_ended(&error) {
+                        return Err(terminal_error(error));
+                    }
+                    reconnect_needed = true;
                 }
-                reconnect_needed = true;
             }
         }
-        if !reconnect_needed && !connection.write_pending() {
+        if !reconnect_needed && !connection.write_pending() && !local_turn {
             // try_outbound drains its wake socket even when queue entries
             // remain. Remember that readiness until the queue is empty.
             for _ in 0..64 {
@@ -741,6 +750,9 @@ where
                 );
             }
             next_keepalive = Instant::now() + interval;
+        }
+        if producers_polled {
+            local_turn = false;
         }
     }
 }

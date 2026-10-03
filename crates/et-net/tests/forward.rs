@@ -257,6 +257,101 @@ fn forwarded_tcp_write_shutdown_closes_the_tunnel_like_upstream() {
 }
 
 #[test]
+fn close_handshake_replies_once_only_when_peer_initiates() {
+    // Given: an active destination socket controlled by an old-style peer.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let destination_port = listener.local_addr().unwrap().port();
+    let destination = Forwarder::start(Vec::new()).unwrap();
+    destination
+        .receive(Packet::new(
+            TerminalPacketType::PortForwardDestinationRequest as u8,
+            PortForwardDestinationRequest {
+                destination: Some(SocketEndpoint {
+                    name: Some(Ipv4Addr::LOCALHOST.to_string()),
+                    port: Some(i32::from(destination_port)),
+                }),
+                fd: Some(1),
+                window: None,
+            }
+            .encode_to_vec(),
+        ))
+        .unwrap();
+    let response = destination.wait_outbound(TIMEOUT).unwrap();
+    let socket_id = et_core::proto::PortForwardDestinationResponse::decode(response.payload())
+        .unwrap()
+        .socketid
+        .unwrap();
+    let (first_peer, _) = listener.accept().unwrap();
+
+    // When: the old peer initiates the close handshake.
+    destination
+        .receive(Packet::new(
+            TerminalPacketType::PortForwardData as u8,
+            PortForwardData {
+                sourcetodestination: Some(true),
+                socketid: Some(socket_id),
+                closed: Some(true),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+        .unwrap();
+    let reply = destination.wait_outbound(TIMEOUT).unwrap();
+
+    // Then: we answer exactly once so the old peer releases its socket.
+    assert_eq!(closed_socket_id(&reply), Some(socket_id));
+    assert!(!PortForwardData::decode(reply.payload())
+        .unwrap()
+        .sourcetodestination
+        .unwrap());
+    assert_no_close_before_barrier(&destination, socket_id, 101);
+    drop(first_peer);
+
+    // Given: a second destination socket whose local application reaches EOF.
+    destination
+        .receive(Packet::new(
+            TerminalPacketType::PortForwardDestinationRequest as u8,
+            PortForwardDestinationRequest {
+                destination: Some(SocketEndpoint {
+                    name: Some(Ipv4Addr::LOCALHOST.to_string()),
+                    port: Some(i32::from(destination_port)),
+                }),
+                fd: Some(2),
+                window: None,
+            }
+            .encode_to_vec(),
+        ))
+        .unwrap();
+    let response = destination.wait_outbound(TIMEOUT).unwrap();
+    let socket_id = et_core::proto::PortForwardDestinationResponse::decode(response.payload())
+        .unwrap()
+        .socketid
+        .unwrap();
+    let (second_peer, _) = listener.accept().unwrap();
+
+    // When: local EOF sends the first close and the old peer acknowledges it.
+    drop(second_peer);
+    let local_close = destination.wait_outbound(TIMEOUT).unwrap();
+    assert_eq!(closed_socket_id(&local_close), Some(socket_id));
+    destination
+        .receive(Packet::new(
+            TerminalPacketType::PortForwardData as u8,
+            PortForwardData {
+                sourcetodestination: Some(true),
+                socketid: Some(socket_id),
+                closed: Some(true),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ))
+        .unwrap();
+
+    // Then: the acknowledgement finds no owned socket and emits no second close.
+    assert_no_close_before_barrier(&destination, socket_id, 102);
+    destination.shutdown().unwrap();
+}
+
+#[test]
 fn refused_destination_closes_the_accepted_source() {
     let destination_port = reserve_port();
     let source_port = reserve_port();
@@ -902,6 +997,42 @@ fn port_forward_data_closed(packet: &Packet) -> bool {
     et_core::proto::PortForwardData::decode(packet.payload())
         .ok()
         .is_some_and(|data| data.closed.unwrap_or(false) || data.error.is_some())
+}
+
+fn closed_socket_id(packet: &Packet) -> Option<i32> {
+    (packet.header() == TerminalPacketType::PortForwardData as u8)
+        .then(|| PortForwardData::decode(packet.payload()).ok())
+        .flatten()
+        .filter(|data| data.closed.unwrap_or(false))
+        .and_then(|data| data.socketid)
+}
+
+fn assert_no_close_before_barrier(forwarder: &Forwarder, socket_id: i32, fd: i32) {
+    forwarder
+        .receive(Packet::new(
+            TerminalPacketType::PortForwardDestinationRequest as u8,
+            PortForwardDestinationRequest {
+                destination: Some(SocketEndpoint {
+                    name: None,
+                    port: Some(0),
+                }),
+                fd: Some(fd),
+                window: None,
+            }
+            .encode_to_vec(),
+        ))
+        .unwrap();
+    loop {
+        let packet = forwarder.wait_outbound(TIMEOUT).unwrap();
+        assert_ne!(closed_socket_id(&packet), Some(socket_id));
+        if packet.header() == TerminalPacketType::PortForwardDestinationResponse as u8 {
+            let response =
+                et_core::proto::PortForwardDestinationResponse::decode(packet.payload()).unwrap();
+            assert_eq!(response.clientfd, Some(fd));
+            assert!(response.error.is_some());
+            return;
+        }
+    }
 }
 
 fn wait_for_destination_response(from: &Forwarder, peer: &Forwarder) -> Packet {

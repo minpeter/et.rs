@@ -277,6 +277,9 @@ impl Worker {
             // either role (`destinationHandlers.erase`, `closeSourceSocketId`).
             // Writes already queued still flush first: upstream wrote them
             // synchronously before it handled this packet.
+            if self.map_ref(role).contains_key(&socket_id) {
+                self.send_data(role, socket_id, Vec::new(), true, None)?;
+            }
             self.remove(role, socket_id);
             return Ok(());
         }

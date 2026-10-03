@@ -347,6 +347,13 @@ fn mux_reuses_transport_commands_propagate_exit_and_forward_cancel_keeps_streams
     for (mode, command, expected, code) in [
         (
             "ControlMaster=auto",
+            "printf 'COM%s\\n' MENT; true # trailing comment",
+            "COMMENT",
+            0,
+        ),
+        ("ControlMaster=auto", "if", "", 2),
+        (
+            "ControlMaster=auto",
             "printf 'MU%s\\n' 'X-ONE'; exit 23",
             "MUX-ONE",
             23,

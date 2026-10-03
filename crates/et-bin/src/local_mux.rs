@@ -250,7 +250,10 @@ impl ExitMarker {
         }
     }
     pub fn command(&self, command: &str) -> String {
-        format!("({command}); printf '\\n{}%d\\n' $?\n", self.marker)
+        // Parse user syntax inside the subshell, separately from the status
+        // wrapper: comments and syntax errors must not swallow its printf.
+        let command = command.replace('\'', "'\"'\"'");
+        format!("(eval '{command}'); printf '\\n{}%d\\n' $?\n", self.marker)
     }
     pub fn consume(&mut self, bytes: &[u8]) -> (Vec<u8>, Option<u32>) {
         let marker = self.marker.as_bytes();

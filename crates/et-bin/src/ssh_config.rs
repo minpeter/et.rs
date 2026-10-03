@@ -1,6 +1,5 @@
 use crate::bootstrap::{
-    append_ssh_config_flag, is_control_option, validate_ssh_destination, InvocationCompletion,
-    SshInvocation,
+    append_ssh_config_flag, validate_ssh_destination, InvocationCompletion, SshInvocation,
 };
 use crate::deadline::Deadline;
 use crate::error::ClientError;
@@ -37,6 +36,167 @@ pub struct ResolvedSshConfig {
     pub proxy_jump: Option<String>,
     pub forward_agent: bool,
     pub identity_agent: Option<String>,
+    pub remote_forwards: Vec<PortForwardSourceRequest>,
+    pub dynamic_forwards: Vec<SocketEndpoint>,
+    pub send_env: Vec<String>,
+    pub remote_command: Option<String>,
+    pub clear_all_forwardings: bool,
+    pub batch_mode: bool,
+    pub server_alive_interval: u32,
+    pub control_master: Option<et_cli::client::ControlMasterMode>,
+    pub control_path: Option<String>,
+    pub control_persist: Option<et_cli::client::ControlPersist>,
+    /// Original local query output, used by `et -G` without a connection.
+    pub dump: String,
+}
+
+impl ResolvedSshConfig {
+    /// Additive ET session options are applied after file resolution. They must
+    /// never accidentally create forwards or commands on the bootstrap SSH link.
+    pub fn apply_session_options(&mut self, options: &[String]) -> Result<(), ClientError> {
+        let mut changed = std::collections::BTreeSet::new();
+        for option in options {
+            let (key, value) = et_cli::client::split_ssh_option(option);
+            let key = key.to_ascii_lowercase();
+            if key.is_empty() || value.is_empty() || value.contains(['\0', '\n', '\r']) {
+                return Err(ClientError::SshConfigMalformed("-o option"));
+            }
+            match key.as_str() {
+                "localforward" | "remoteforward" => {
+                    let requests = if value.split_whitespace().count() == 1 {
+                        et_cli::tunnel::parse_tunnels(&[value.to_owned()])
+                            .map_err(crate::forward_config::ForwardConfigError::Tunnel)?
+                    } else {
+                        let record = parse_forward(
+                            value.split_whitespace(),
+                            ForwardPolicies {
+                                gateway_ports: if key == "localforward" {
+                                    GatewayPorts::No
+                                } else {
+                                    GatewayPorts::ClientSpecified
+                                },
+                                stream_local_bind: StreamLocalBindPolicy::Default,
+                            },
+                            if key == "localforward" {
+                                "localforward"
+                            } else {
+                                "remoteforward"
+                            },
+                        )?;
+                        match record {
+                            ForwardRecord::Supported(request) => vec![request],
+                            ForwardRecord::Unsupported(reason) => {
+                                warn_unsupported(&key, &reason);
+                                Vec::new()
+                            }
+                        }
+                    };
+                    if !self.clear_all_forwardings {
+                        if key == "localforward" {
+                            self.local_forwards.extend(requests);
+                        } else {
+                            self.remote_forwards.extend(requests);
+                        }
+                    }
+                }
+                "dynamicforward" => {
+                    let endpoint = et_cli::tunnel::parse_dynamic_forward(value)
+                        .map_err(crate::forward_config::ForwardConfigError::Tunnel)?;
+                    if !self.clear_all_forwardings {
+                        self.dynamic_forwards.push(endpoint);
+                    }
+                }
+                "sendenv" => {
+                    for pattern in value.split_whitespace() {
+                        if let Some(remove) = pattern.strip_prefix('-') {
+                            self.send_env.retain(|existing| {
+                                !crate::client_environment::environment_pattern_matches(
+                                    remove.as_bytes(),
+                                    existing.as_bytes(),
+                                )
+                            });
+                        } else {
+                            self.send_env.push(pattern.to_owned());
+                        }
+                    }
+                }
+                "setenv" => {
+                    for assignment in split_quoted_words(value)? {
+                        let (name, value) = assignment
+                            .split_once('=')
+                            .ok_or(ClientError::SshConfigMalformed("setenv"))?;
+                        if !crate::terminal_protocol::valid_environment_name(name)
+                            || value.len() > crate::terminal_protocol::MAX_ENV_VALUE
+                        {
+                            return Err(ClientError::SshConfigMalformed("setenv"));
+                        }
+                        self.set_env.retain(|(existing, _)| existing != name);
+                        self.set_env.push((name.to_owned(), value.to_owned()));
+                    }
+                }
+                _ => continue,
+            }
+            changed.insert(key);
+        }
+        if changed.is_empty() {
+            return Ok(());
+        }
+        self.dump = self
+            .dump
+            .lines()
+            .filter(|line| !changed.contains(line.split_whitespace().next().unwrap_or("")))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        for key in changed {
+            match key.as_str() {
+                "sendenv" => {
+                    for pattern in &self.send_env {
+                        self.dump.push_str(&format!("sendenv {pattern}\n"));
+                    }
+                }
+                "setenv" => {
+                    for (name, value) in &self.set_env {
+                        self.dump.push_str(&format!("setenv {name}={value}\n"));
+                    }
+                }
+                "dynamicforward" => {
+                    for endpoint in &self.dynamic_forwards {
+                        self.dump
+                            .push_str(&format!("dynamicforward {}\n", format_endpoint(endpoint)));
+                    }
+                }
+                _ => {
+                    let requests = if key == "localforward" {
+                        &self.local_forwards
+                    } else {
+                        &self.remote_forwards
+                    };
+                    for request in requests {
+                        if let (Some(source), Some(destination)) =
+                            (&request.source, &request.destination)
+                        {
+                            self.dump.push_str(&format!(
+                                "{key} {} {}\n",
+                                format_endpoint(source),
+                                format_endpoint(destination)
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn format_endpoint(endpoint: &SocketEndpoint) -> String {
+    match (endpoint.name.as_deref(), endpoint.port) {
+        (Some(name), Some(port)) if name.contains(':') => format!("[{name}]:{port}"),
+        (Some(name), Some(port)) => format!("{name}:{port}"),
+        (None, Some(port)) => format!("localhost:{port}"),
+        (Some(name), None) => name.to_owned(),
+        (None, None) => String::new(),
+    }
 }
 
 /// Inputs for `ssh -G` configuration expansion.
@@ -62,6 +222,7 @@ enum ForwardRecord {
     Unsupported(String),
 }
 
+#[cfg(test)]
 pub fn resolve_ssh_config(
     runner: &dyn SshRunner,
     host_alias: &str,
@@ -100,13 +261,7 @@ pub fn resolve_ssh_config_on_port(
     if let Some(port) = query.explicit_port {
         args.extend(["-p".to_string(), port.to_string()]);
     }
-    args.extend(
-        query
-            .ssh_options
-            .iter()
-            .filter(|option| !is_control_option(option))
-            .map(|option| format!("-o{option}")),
-    );
+    args.extend(query.ssh_options.iter().map(|option| format!("-o{option}")));
     let destination = match query.requested_user {
         Some(user) => format!("{user}@{}", query.host_alias),
         None => query.host_alias.to_string(),
@@ -132,6 +287,38 @@ pub fn resolve_ssh_config_on_port(
             .args
             .insert(2, "-oSetEnv=ET_RS_CONFIG_SENTINEL=1".to_owned());
         verify_setenv_block(&stdout, &run_checked(runner, &baseline, deadline)?)?;
+    }
+    if stdout
+        .split(|byte| *byte == b'\n')
+        .any(|line| line.starts_with(b"remotecommand "))
+    {
+        let mut baseline = invocation.clone();
+        baseline
+            .args
+            .insert(2, "-oRemoteCommand=ET_RS_CONFIG_SENTINEL".to_owned());
+        let baseline = run_checked(runner, &baseline, deadline)?;
+        let malformed = || ClientError::SshConfigMalformed("ambiguous RemoteCommand output");
+        let baseline = std::str::from_utf8(&baseline).map_err(|_| malformed())?;
+        let original = std::str::from_utf8(&stdout).map_err(|_| malformed())?;
+        let (before, after) = baseline
+            .split_once("remotecommand ET_RS_CONFIG_SENTINEL")
+            .ok_or_else(malformed)?;
+        let (newline, after) = if let Some(after) = after.strip_prefix("\r\n") {
+            ("\r\n", after)
+        } else {
+            ("\n", after.strip_prefix('\n').ok_or_else(malformed)?)
+        };
+        let command = original
+            .strip_prefix(before)
+            .and_then(|rest| rest.strip_suffix(after))
+            .ok_or_else(malformed)?;
+        let command = command
+            .strip_prefix("remotecommand ")
+            .and_then(|rest| rest.strip_suffix(newline))
+            .ok_or_else(malformed)?;
+        if command.contains(['\n', '\r', '\0']) {
+            return Err(malformed());
+        }
     }
     parse_ssh_config(&stdout, query.parse_local_forwards)
 }
@@ -204,22 +391,19 @@ fn parse_ssh_config(
                 .then(|| fields.next())
                 .flatten()
         })
-        .map(parse_yes_no)
+        .map(|value| parse_yes_no("exitonforwardfailure", value))
         .transpose()?
         .unwrap_or(false);
     let mut hostname = None;
     let mut user = None;
     let mut port = None;
     let mut local_forwards = Vec::new();
-    let mut extra = ResolvedSshConfig::default();
+    let mut extra = ResolvedSshConfig {
+        dump: text.to_owned(),
+        ..Default::default()
+    };
     let mut environment_names = std::collections::BTreeSet::new();
-    if parse_local_forwards {
-        for _ in unsupported_dynamic_forwards(text) {
-            et_cli::logging::warn(
-                "SSH dynamicforward is unsupported by ET protocol v6; skipping forwarding row",
-            );
-        }
-    }
+    let unsupported_dynamic = unsupported_dynamic_forwards(text);
     for line in text.lines() {
         let mut fields = line.split_whitespace();
         // OpenSSH prints the value verbatim, without shell quoting. In
@@ -250,10 +434,51 @@ fn parse_ssh_config(
                 extra.proxy_jump = (value != "none").then(|| value.to_owned());
             }
             Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("forwardagent") => {
-                extra.forward_agent = parse_yes_no(value)?;
+                extra.forward_agent = parse_yes_no("forwardagent", value)?;
             }
             Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("identityagent") => {
                 extra.identity_agent = Some(value.to_owned());
+            }
+            Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("sendenv") => {
+                extra
+                    .send_env
+                    .extend(value.split_whitespace().map(str::to_owned));
+            }
+            Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("remotecommand") => {
+                extra.remote_command = (!value.eq_ignore_ascii_case("none") && !value.is_empty())
+                    .then(|| value.to_owned());
+            }
+            Some(key)
+                if parse_local_forwards && key.eq_ignore_ascii_case("clearallforwardings") =>
+            {
+                extra.clear_all_forwardings = parse_yes_no("clearallforwardings", value)?;
+            }
+            Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("batchmode") => {
+                extra.batch_mode = parse_yes_no("batchmode", value)?;
+            }
+            Some(key)
+                if parse_local_forwards && key.eq_ignore_ascii_case("serveraliveinterval") =>
+            {
+                extra.server_alive_interval = value
+                    .parse()
+                    .map_err(|_| ClientError::SshConfigMalformed("serveraliveinterval"))?;
+            }
+            Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("controlmaster") => {
+                extra.control_master = Some(
+                    value
+                        .parse()
+                        .map_err(|_| ClientError::SshConfigMalformed("controlmaster"))?,
+                );
+            }
+            Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("controlpath") => {
+                extra.control_path = (value != "none").then(|| value.to_owned());
+            }
+            Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("controlpersist") => {
+                extra.control_persist = Some(
+                    value
+                        .parse()
+                        .map_err(|_| ClientError::SshConfigMalformed("controlpersist"))?,
+                );
             }
             Some(key) if key.eq_ignore_ascii_case("hostname") => {
                 hostname = fields.next().map(str::to_string);
@@ -264,9 +489,44 @@ fn parse_ssh_config(
             Some(key) if key.eq_ignore_ascii_case("port") => {
                 port = fields.next().and_then(|port| port.parse::<u16>().ok());
             }
-            Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("dynamicforward") => {}
+            Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("dynamicforward") => {
+                // Some OpenSSH versions print an additional dynamicforward for
+                // a LocalForward whose destination is a Unix socket.
+                if unsupported_dynamic.contains(&value) {
+                    let source = parse_source_endpoint(value, policies.gateway_ports, true)
+                        .ok_or(ClientError::SshConfigMalformed("dynamicforward"))?;
+                    extra.dynamic_forwards.push(source);
+                }
+            }
+            Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("remoteforward") => {
+                let fields: Vec<_> = fields.collect();
+                if fields.get(1) == Some(&"[socks]:0")
+                    || fields
+                        .first()
+                        .is_some_and(|source| *source == "0" || source.ends_with(":0"))
+                {
+                    warn_unsupported(
+                        "remoteforward",
+                        "reverse SOCKS and server-allocated ports are unsupported",
+                    );
+                    continue;
+                }
+                match parse_forward(
+                    fields.into_iter(),
+                    ForwardPolicies {
+                        gateway_ports: GatewayPorts::ClientSpecified,
+                        ..policies
+                    },
+                    "remoteforward",
+                )? {
+                    ForwardRecord::Supported(forward) => extra.remote_forwards.push(forward),
+                    ForwardRecord::Unsupported(reason) => {
+                        warn_unsupported("remoteforward", &reason)
+                    }
+                }
+            }
             Some(key) if parse_local_forwards && key.eq_ignore_ascii_case("localforward") => {
-                match parse_forward(fields, policies)? {
+                match parse_forward(fields, policies, "localforward")? {
                     ForwardRecord::Supported(forward) => local_forwards.push(forward),
                     ForwardRecord::Unsupported(reason) => {
                         warn_unsupported("localforward", &reason);
@@ -281,6 +541,11 @@ fn parse_ssh_config(
         .ok_or(ClientError::SshConfigMalformed("hostname"))?;
     let user = user.filter(|user| !user.is_empty());
     validate_ssh_destination(&hostname, user.as_deref())?;
+    if extra.clear_all_forwardings {
+        local_forwards.clear();
+        extra.remote_forwards.clear();
+        extra.dynamic_forwards.clear();
+    }
     Ok(ResolvedSshConfig {
         hostname,
         user,
@@ -329,8 +594,8 @@ fn warn_unsupported(directive: &str, reason: &str) {
 fn parse_forward<'a>(
     fields: impl Iterator<Item = &'a str>,
     policies: ForwardPolicies,
+    directive: &'static str,
 ) -> Result<ForwardRecord, ClientError> {
-    const DIRECTIVE: &str = "localforward";
     let fields: Vec<&str> = fields.collect();
     if fields.len() != 2 && fields.iter().any(|field| field.contains('/')) {
         return Ok(ForwardRecord::Unsupported(
@@ -339,7 +604,7 @@ fn parse_forward<'a>(
     }
     let [source, destination] = fields.as_slice() else {
         return Err(ClientError::SshConfigMalformedForward {
-            directive: DIRECTIVE,
+            directive,
             reason: "expected exactly two fields",
         });
     };
@@ -370,13 +635,13 @@ fn parse_forward<'a>(
     }
     let source = parse_source_endpoint(source, policies.gateway_ports, true).ok_or(
         ClientError::SshConfigMalformedForward {
-            directive: DIRECTIVE,
+            directive,
             reason: "invalid source endpoint",
         },
     )?;
     let destination =
         parse_destination_endpoint(destination).ok_or(ClientError::SshConfigMalformedForward {
-            directive: DIRECTIVE,
+            directive,
             reason: "invalid destination endpoint",
         })?;
     Ok(ForwardRecord::Supported(PortForwardSourceRequest {
@@ -390,12 +655,44 @@ fn is_relative_stream_path(value: &str) -> bool {
     !value.starts_with('/') && value.contains('/')
 }
 
-fn parse_yes_no(value: &str) -> Result<bool, ClientError> {
+fn parse_yes_no(directive: &'static str, value: &str) -> Result<bool, ClientError> {
     match value {
         "yes" => Ok(true),
         "no" => Ok(false),
-        _ => Err(ClientError::SshConfigMalformed("exitonforwardfailure")),
+        _ => Err(ClientError::SshConfigMalformed(directive)),
     }
+}
+
+fn split_quoted_words(value: &str) -> Result<Vec<String>, ClientError> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for character in value.chars() {
+        if escaped {
+            word.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if quote == Some(character) {
+            quote = None;
+        } else if quote.is_none() && matches!(character, '\'' | '"') {
+            quote = Some(character);
+        } else if quote.is_none() && character.is_whitespace() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+        } else {
+            word.push(character);
+        }
+    }
+    if escaped || quote.is_some() {
+        return Err(ClientError::SshConfigMalformed("setenv"));
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    Ok(words)
 }
 
 impl GatewayPorts {
@@ -591,6 +888,144 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn session_rows_preserve_remote_dynamic_and_additive_overrides() {
+        let mut config = parse_ssh_config(b"hostname host\nremoteforward [::1]:9000 [db.internal]:5432\ndynamicforward [127.0.0.1]:1080\nremotecommand echo configured\nserveraliveinterval 3\nbatchmode yes\ncontrolmaster auto\ncontrolpath /tmp/master\ncontrolpersist 17\nsendenv APP_* LC_*\nsetenv APP_FIXED=file\n", true).unwrap();
+        assert_eq!(
+            config.remote_forwards,
+            [request("::1", Some(9000), "db.internal", Some(5432))]
+        );
+        assert_eq!(
+            config.dynamic_forwards,
+            [SocketEndpoint {
+                name: Some("127.0.0.1".into()),
+                port: Some(1080)
+            }]
+        );
+        assert_eq!(config.remote_command.as_deref(), Some("echo configured"));
+        assert_eq!(config.server_alive_interval, 3);
+        assert!(config.batch_mode);
+        assert_eq!(
+            config.control_master,
+            Some(et_cli::client::ControlMasterMode::Auto)
+        );
+        assert_eq!(config.control_persist.unwrap().seconds, 17);
+        config
+            .apply_session_options(&[
+                "RemoteForward=9001:db.other:5433".into(),
+                "LocalForward=8000-8001:80-81".into(),
+                "DynamicForward=[::1]:1081".into(),
+                "SendEnv=-LC_* CUSTOM_?".into(),
+                "SetEnv=APP_FIXED=cli EMPTY=".into(),
+            ])
+            .unwrap();
+        assert_eq!(config.remote_forwards.len(), 2);
+        assert_eq!(config.local_forwards.len(), 2);
+        assert_eq!(config.dynamic_forwards.len(), 2);
+        assert_eq!(config.send_env, ["APP_*", "CUSTOM_?"]);
+        assert_eq!(
+            config.set_env,
+            [
+                ("APP_FIXED".into(), "cli".into()),
+                ("EMPTY".into(), "".into())
+            ]
+        );
+        assert!(config.dump.contains("setenv APP_FIXED=cli\n"));
+        assert!(!config.dump.contains("setenv APP_FIXED=file\n"));
+        let mut cleared = parse_ssh_config(b"hostname host\nclearallforwardings yes\nlocalforward 8000 localhost:80\nremoteforward 9000 localhost:90\ndynamicforward 1080\n", true).unwrap();
+        cleared
+            .apply_session_options(&[
+                "LocalForward=8001:81".into(),
+                "RemoteForward=9001:91".into(),
+                "DynamicForward=1081".into(),
+            ])
+            .unwrap();
+        assert!(
+            cleared.local_forwards.is_empty()
+                && cleared.remote_forwards.is_empty()
+                && cleared.dynamic_forwards.is_empty()
+        );
+        assert!(
+            parse_ssh_config(b"hostname host\nremotecommand none\n", true)
+                .unwrap()
+                .remote_command
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn remote_command_cannot_inject_config_routing() {
+        let runner = crate::ssh_process::SystemSsh::default();
+        let error = resolve_ssh_config(
+            &runner,
+            "host.invalid",
+            None,
+            &["RemoteCommand=echo ok\nhostname attacker.invalid".into()],
+            Some("none"),
+            true,
+            Deadline::after(Duration::from_secs(3)),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::SshConfigMalformed("ambiguous RemoteCommand output")
+        ));
+    }
+
+    #[test]
+    fn remote_command_verification_accepts_crlf_but_not_embedded_newlines() {
+        struct Runner<'a> {
+            command: &'a str,
+        }
+        impl SshRunner for Runner<'_> {
+            fn run(
+                &self,
+                invocation: &SshInvocation,
+                _: Deadline,
+            ) -> Result<SshOutput, ClientError> {
+                let command = if invocation
+                    .args
+                    .iter()
+                    .any(|arg| arg == "-oRemoteCommand=ET_RS_CONFIG_SENTINEL")
+                {
+                    "ET_RS_CONFIG_SENTINEL"
+                } else {
+                    self.command
+                };
+                Ok(SshOutput {
+                    status: Some(success_status()),
+                    stdout: format!("hostname host\r\nremotecommand {command}\r\nport 22\r\n")
+                        .into_bytes(),
+                })
+            }
+        }
+        for command in [
+            "echo hello",
+            "echo ok\nhostname attacker",
+            "echo ok\r\nhostname attacker",
+        ] {
+            let resolved = resolve_ssh_config(
+                &Runner { command },
+                "host",
+                None,
+                &[],
+                Some("none"),
+                true,
+                Deadline::after(Duration::from_secs(3)),
+            );
+            if command == "echo hello" {
+                assert_eq!(resolved.unwrap().remote_command.as_deref(), Some(command));
+            } else {
+                assert!(matches!(
+                    resolved,
+                    Err(ClientError::SshConfigMalformed(
+                        "ambiguous RemoteCommand output"
+                    ))
+                ));
+            }
+        }
+    }
+
     struct FakeRunner {
         stdout: Vec<u8>,
     }
@@ -635,6 +1070,7 @@ mod tests {
                 port: 22,
                 exit_on_forward_failure: false,
                 local_forwards: Vec::new(),
+                dump: String::from_utf8(runner.stdout.clone()).unwrap(),
                 ..Default::default()
             }
         );
@@ -1507,6 +1943,41 @@ mod tests {
             ))
         ));
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn session_option_forwarding_uses_two_endpoints_and_setenv_preserves_quotes() {
+        let mut config = ResolvedSshConfig::default();
+        config
+            .apply_session_options(&[
+                "LocalForward=12345 localhost:80".into(),
+                "RemoteForward=127.0.0.1:23456 [::1]:443".into(),
+                "SetEnv=LABEL=\"two words=a=b\" EMPTY= ESC=one\\ two".into(),
+            ])
+            .unwrap();
+        assert_eq!(
+            config.local_forwards[0].source.as_ref().unwrap().port,
+            Some(12345)
+        );
+        assert_eq!(
+            config.local_forwards[0].destination.as_ref().unwrap().port,
+            Some(80)
+        );
+        assert_eq!(
+            config.remote_forwards[0],
+            request("127.0.0.1", Some(23456), "::1", Some(443))
+        );
+        assert_eq!(
+            config.set_env,
+            [
+                ("LABEL".into(), "two words=a=b".into()),
+                ("EMPTY".into(), "".into()),
+                ("ESC".into(), "one two".into())
+            ]
+        );
+        assert!(config
+            .apply_session_options(&["SetEnv=BROKEN=\"unterminated".into()])
+            .is_err());
     }
 
     fn request(

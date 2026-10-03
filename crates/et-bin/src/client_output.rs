@@ -112,6 +112,7 @@ impl ConsoleOutput {
                 Box::new(CancellableStdout {
                     file,
                     cancel: cancel_reader,
+                    discard_device: None,
                 }),
                 cancel,
                 Box::new(|| Ok(())),
@@ -771,12 +772,14 @@ fn drain_stream(stream: &mut LocalStream) -> io::Result<()> {
 struct CancellableStdout {
     file: File,
     cancel: LocalStream,
+    discard_device: Option<bool>,
 }
 
 #[cfg(unix)]
 impl Write for CancellableStdout {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         use rustix::event::{poll, PollFd, PollFlags};
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
         let mut descriptors = [
             PollFd::new(&self.file, PollFlags::OUT),
             PollFd::new(&self.cancel, PollFlags::IN | PollFlags::HUP),
@@ -793,10 +796,30 @@ impl Write for CancellableStdout {
                         "console output cancelled",
                     ));
                 }
+                Ok(_) if descriptors[0].revents().contains(PollFlags::NVAL) => {
+                    // Darwin reports POLLNVAL for /dev/null even though writes
+                    // succeed immediately. Only bypass readiness for this
+                    // nonblocking discard device, never an arbitrary character
+                    // device that could stall the output worker indefinitely.
+                    let discard_device = *self.discard_device.get_or_insert_with(|| {
+                        self.file.metadata().is_ok_and(|metadata| {
+                            metadata.file_type().is_char_device()
+                                && std::fs::metadata("/dev/null")
+                                    .is_ok_and(|null| metadata.rdev() == null.rdev())
+                        })
+                    });
+                    if discard_device {
+                        return self.file.write(&bytes[..bytes.len().min(4096)]);
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "console output is unavailable",
+                    ));
+                }
                 Ok(_)
                     if descriptors[0]
                         .revents()
-                        .intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) =>
+                        .intersects(PollFlags::ERR | PollFlags::HUP) =>
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,

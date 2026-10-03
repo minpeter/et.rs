@@ -1,7 +1,7 @@
 #[cfg(unix)]
 use std::collections::VecDeque;
 #[cfg(unix)]
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 #[cfg(unix)]
@@ -101,6 +101,39 @@ pub(crate) struct PumpOptions<'a> {
     pub(crate) stdio_forward: bool,
 }
 
+// Windows redirected stdin is a byte stream, not console events. Keep its
+// blocking ReadFile-backed read off the socket/keepalive loop with a bounded
+// queue. On session completion a blocked reader is detached until stdin closes
+// or the client process exits; it owns no connection or output state.
+#[cfg(any(windows, test))]
+pub(crate) fn redirected_input<R: std::io::Read + Send + 'static>(
+    mut input: R,
+) -> std::io::Result<std::sync::mpsc::Receiver<Vec<u8>>> {
+    use std::{io, sync::mpsc};
+
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("et-stdin".to_owned())
+        .spawn(move || {
+            let mut buffer = [0; 16 * 1024];
+            loop {
+                match input.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        if sender.send(buffer[..count].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    // EOF, broken pipe, NUL and unusable redirected handles
+                    // disable input only, like upstream ConsoleWindows.
+                    Err(_) => break,
+                }
+            }
+        })?;
+    Ok(receiver)
+}
+
 #[cfg(unix)]
 pub fn pump<F>(
     connection: &mut Connection,
@@ -129,7 +162,7 @@ where
     R: Read + std::os::fd::AsFd,
 {
     let PumpOptions {
-        read_stdin,
+        mut read_stdin,
         keepalive_seconds,
         flow_control,
         terminal_enabled,
@@ -140,6 +173,9 @@ where
         remote_exit,
         stdio_forward,
     } = options;
+    // Test the descriptor we read, not stdout: a heredoc can feed a client
+    // whose output is still a real terminal. Only real TTY closure ends it.
+    let stdin_is_terminal = stdin.as_fd().is_terminal();
     let mut console_output = if stdio_forward {
         crate::client_output::ConsoleOutput::new(flow_control, Box::new(io::sink()))
     } else {
@@ -605,10 +641,27 @@ where
         }
         if !connection.write_pending() && input.contains(PollFlags::IN) {
             let mut bytes = [0u8; INPUT_CHUNK];
-            let count = stdin
-                .read(&mut bytes)
-                .map_err(|error| terminal_io("reading terminal input", error))?;
+            let count = match stdin.read(&mut bytes) {
+                Ok(count) => count,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    continue;
+                }
+                Err(_) if !stdin_is_terminal => {
+                    read_stdin = false;
+                    continue;
+                }
+                Err(error) => return Err(terminal_io("reading terminal input", error)),
+            };
             if count == 0 {
+                if !stdin_is_terminal {
+                    read_stdin = false;
+                    continue;
+                }
                 console_output
                     .complete(ConsoleCompletion::LocalInputClosed)
                     .map_err(|error| terminal_io("stopping terminal output", error))?;
@@ -651,11 +704,22 @@ where
         // IN|HUP still owns unread pipe bytes, possibly more than one input
         // chunk. Drain those on later turns, servicing pending writes first.
         if !input.contains(PollFlags::IN) && input.intersects(PollFlags::HUP | PollFlags::ERR) {
-            finish_pending_recovering(connection, &mut reconnect, &mut stream, terminal_enabled)?;
-            console_output
-                .complete(ConsoleCompletion::LocalInputClosed)
-                .map_err(|error| terminal_io("stopping terminal output", error))?;
-            return Ok(remote_exit.finish_code());
+            if stdin_is_terminal {
+                finish_pending_recovering(
+                    connection,
+                    &mut reconnect,
+                    &mut stream,
+                    terminal_enabled,
+                )?;
+                console_output
+                    .complete(ConsoleCompletion::LocalInputClosed)
+                    .map_err(|error| terminal_io("stopping terminal output", error))?;
+                return Ok(remote_exit.finish_code());
+            }
+            // Remove a closed pipe from poll to avoid a permanent HUP spin.
+            // Do not close the remote session or abandon a replay-owned frame;
+            // output, forwarding, recovery and keepalives still belong to it.
+            read_stdin = false;
         }
         let now = Instant::now();
         if !connection.write_pending() && now >= next_keepalive {

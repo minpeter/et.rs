@@ -25,8 +25,10 @@ pub struct Stack {
 
 impl Stack {
     pub fn start() -> Self {
+        // Darwin TMPDIR is already long. Leave sockaddr_un room for tests
+        // that use this directory as TMPDIR and append an agent proxy path.
         let directory = std::env::temp_dir().join(format!(
-            "et-rs-reconnect-{}-{}",
+            "etr-{}-{}",
             std::process::id(),
             NEXT_STACK.fetch_add(1, Ordering::Relaxed)
         ));

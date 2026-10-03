@@ -74,8 +74,8 @@ commits:
   - sha: b74a12efc567dbc1360ac0846f889c945a2eba60
     date: "2026-08-07"
     kind: product
-    status: skip
-    note: "#788 non-tty console keep-alive; not wire/security"
+    status: ported
+    note: "#788 non-TTY input EOF disables input without closing the session. Heredoc/EOF tests pass; diagnostic phrasing and Windows redirected bytes are tracked under #874."
     et_pr: 788
   - sha: fcce83924326ab5743878f2d58a534bd8a6bc22c
     date: "2026-09-01"
@@ -291,20 +291,20 @@ commits:
   - sha: 7a0fe09bc92eb80e7441c9d974daa9665c596113
     date: "2026-09-23"
     kind: product
-    status: skip
-    note: "#850 ssh-style positional remote command (ClientArgParsing). Product/CLI only; not wire. PROTOCOL_VERSION stays 6."
+    status: ported
+    note: "#850 strict host boundary and ssh-style positional remote command. CLI and integration tests pass; breaking invocation migration documented. PROTOCOL_VERSION stays 6."
     et_pr: 850
   - sha: bb4701d8a67be77496bd5926ca6a4fa2cc07e991
     date: "2026-09-23"
     kind: product
-    status: skip
-    note: "#855 etserver --disconnect-timeout closes disconnected etterminal sessions. Product/cfg; existing TERMINAL_CLOSE covers explicit close. Not a protocol bump. PROTOCOL_VERSION stays 6."
+    status: ported
+    note: "#855 global server disconnect timeout (minutes) via CLI and [Networking] disconnect_timeout; 0 disables, restart resolves the current default, unclaimed resumes use max(timeout, 60s grace). Restart, claim-race and real-time expiry tests pass. PROTOCOL_VERSION stays 6."
     et_pr: 855
   - sha: 2088bc4607e5239fe782b51a3b1f6f4bc375d9d6
     date: "2026-09-24"
     kind: product
-    status: skip
-    note: "#852 local OpenSSH -V and -G queries. Client-local CLI only; et.rs already resolves SSH config via real OpenSSH ssh -G. Not wire/auth. PROTOCOL_VERSION stays 6."
+    status: ported
+    note: "#852 local -V/-G queries, including bypass of daemon/mux dispatch. -G emits the system OpenSSH resolved dump rather than upstream's smaller subset. CLI and bootstrap tests pass. PROTOCOL_VERSION stays 6."
     et_pr: 852
   - sha: ce4963edfccf3ea38dbd320cc7751a2c8af4d882
     date: "2026-09-24"
@@ -316,13 +316,13 @@ commits:
     date: "2026-09-24"
     kind: protocol
     status: ported
-    note: "#849 runtime -D SOCKS and -W stdio forward. PortForwardData.half_close=6, InitialPayload.no_shell=7, TermInit.no_shell=5. et.rs flowcontrol left TermInit field 5; it now lives at field 8 after #793 took fields 6-7. PortForwardData.window stays at field 7. Existing -t/-r unchanged. PROTOCOL_VERSION stays 6."
+    note: "#849 runtime -D SOCKS and -W stdio forward. PortForwardData.half_close=6, InitialPayload.no_shell=7, TermInit.no_shell=5. et.rs flowcontrol left TermInit field 5; it now lives at field 8 after #793 took fields 6-7. PortForwardData.window stays at field 7. PROTOCOL_VERSION stays 6."
     et_pr: 849
   - sha: f90c6f4715f8f7e72afaf8085248ed7305c8aa6a
     date: "2026-09-24"
     kind: product
-    status: skip
-    note: "#857 drop journald wall text from tmux -CC streams. Product/HTM filter only; et.rs has its own HTM path. Not protocol/wire/auth. PROTOCOL_VERSION stays 6."
+    status: ported
+    note: "#857 PTY-only tmux -CC journald wall filter preserves responses and binary bytes with at most seven undecided prefix bytes. Megabyte streams, split terminators and byte-exact response tests pass. PROTOCOL_VERSION stays 6."
     et_pr: 857
   - sha: b834d6ebbd0ba4742f5278cc562bba551800c0c0
     date: "2026-09-25"
@@ -333,8 +333,8 @@ commits:
   - sha: 9a2d23092584606f8d0c55b111ed7416ca71d5ea
     date: "2026-09-25"
     kind: product
-    status: skip
-    note: "#853 local OpenSSH ControlMaster mux. Not ET wire. PROTOCOL_VERSION stays 6."
+    status: ported
+    note: "#853 Unix local mux v4: command/interactive passengers, local TCP/Unix forward open/cancel, background and persistence. Real OpenSSH interop and ET runtime tests pass. Remote/dynamic/stdio/X11/subsystem/agent mux requests, raw -T masters and Windows local mux remain unsupported. PROTOCOL_VERSION stays 6."
     et_pr: 853
   - sha: c5ddae79be824944df0e423cb49c032c60cf3394
     date: "2026-09-25"
@@ -352,7 +352,7 @@ commits:
     date: "2026-09-25"
     kind: product
     status: skip
-    note: "#843/#769 SSH banner stderr UX. Product only. PROTOCOL_VERSION stays 6."
+    note: "#843/#769 equivalent foreground behavior: SystemSsh inherits stderr for bootstrap and logging writes its own file without redirecting process stderr. Background -f intentionally detaches stdio. PROTOCOL_VERSION stays 6."
     et_pr: 843
   - sha: fe0795c1dc6c42d13b50445681bf6a5b341ca64e
     date: "2026-09-25"
@@ -369,8 +369,8 @@ commits:
   - sha: f3137cee7b805284d7c76a7a5538884946576fd1
     date: "2026-09-26"
     kind: product
-    status: skip
-    note: "#867 OpenSSH short-flag CLI remap. Breaking product CLI; et.rs short flags stay unchanged (-x remains --kill-other-sessions). PROTOCOL_VERSION stays 6."
+    status: ported
+    note: "#867 OpenSSH short-flag remap with strict host boundary; ET long flags preserve old meanings. CLI tests and migrated integration suite pass. PROTOCOL_VERSION stays 6."
     et_pr: 867
   - sha: 540367ac4509be41714769cf511d8c0aa90cde7a
     date: "2026-09-26"
@@ -381,8 +381,8 @@ commits:
   - sha: da977ba0fa212b775774c7e58a0f6d8f4c6ea175
     date: "2026-09-27"
     kind: product
-    status: skip
-    note: "#870 ssh_config forwards and SendEnv. Product only, not ET wire. PROTOCOL_VERSION stays 6."
+    status: ported
+    note: "#870 ordinary RemoteForward, DynamicForward, SendEnv, RemoteCommand and related ssh_config behavior; config and real forwarding tests pass. Remote bind errors remain fatal; reverse SOCKS/allocated port 0 and unsupported streamlocal bind policies are skipped with warnings. PROTOCOL_VERSION stays 6."
     et_pr: 870
   - sha: ca91fb5d5eaccaa464f1106cb946586ebc7789f9
     date: "2026-09-27"
@@ -394,13 +394,13 @@ commits:
     date: "2026-09-27"
     kind: product
     status: skip
-    note: "#827/#448 PTY/session teardown when a background process holds the slave. Uses already-ported TERMINAL_EXIT_STATUS=12; product/lifecycle only. Pin does not mean every product backlog item is finished. PROTOCOL_VERSION stays 6."
+    note: "#827/#448 already equivalent: terminal_pty waits for the foreground child independently of PTY EOF, bounds output draining, reports exit status and kills the remaining process group. No C++ port needed; protocol remains 6."
     et_pr: 827
   - sha: 16aec0c1d49b24027057541c7bb0f967b077bc2f
     date: "2026-09-28"
     kind: product
-    status: skip
-    note: "#828/#506 client-local SSH agent proxy symlink retarget on reconnect/reattach. Not ET wire/auth. PROTOCOL_VERSION stays 6."
+    status: ported
+    note: "#828/#506 stable secure SSH-agent proxy symlink retarget on reconnect/reattach. Actual different-agent traffic, missing directory recovery and rejected-auth tests pass. Missing agent clears stale links; saved attach uses current environment and consistent TMPDIR. PROTOCOL_VERSION stays 6."
     et_pr: 828
   - sha: 568b7ccc043eb632462d6f51f8219f188c5a25a3
     date: "2026-09-28"
@@ -411,32 +411,32 @@ commits:
   - sha: 662c332ba572364265ea84d350c4065b3dc3d52e
     date: "2026-09-28"
     kind: product
-    status: skip
-    note: "#825/#425 export SSH_TTY for remote PTY sessions. Product env only; not wire/auth. PROTOCOL_VERSION stays 6."
+    status: ported
+    note: "#825/#425 export the actual PTY path as SSH_TTY for remote Unix PTY sessions. PTY and no-PTY tests pass. PROTOCOL_VERSION stays 6."
     et_pr: 825
   - sha: f50f878d21355e986a07582b4183f47a2ca309b7
     date: "2026-09-28"
     kind: product
     status: skip
-    note: "#823/#298 C++ per-connection port-forward 64KiB event-loop budget. Product/fairness; no wire change. PROTOCOL_VERSION stays 6."
+    note: "#823/#298 equivalent fairness: per-stream readers feed bounded queues and pending connection writes are asynchronous. No C++ event-loop port needed. PROTOCOL_VERSION stays 6."
     et_pr: 823
   - sha: 5b0f17a56e2a664ce506f3266d7cf770561e55b6
     date: "2026-09-28"
     kind: product
-    status: skip
-    note: "#819 et --ctl local Unix control socket (ControlProtocol local IPC, not ET wire). Product/CLI; POSIX-only. PROTOCOL_VERSION stays 6."
+    status: ported
+    note: "#819 Unix et --ctl input/resize/cursors/status/redacted transcript/tombstones/adoption. Local kill retains the remote shell; definite remote end removes matching saved credentials. Real transport lifecycle tests pass. Raw -T/-W control and Windows local control remain unsupported. PROTOCOL_VERSION stays 6."
     et_pr: 819
   - sha: eb518af9f06dc338660c020cdc11fc7bede7c35e
     date: "2026-09-29"
     kind: product
     status: skip
-    note: "#872 C++ per-OS platform split (Unix/Windows source files), Windows console/PollSet fixes, 64-packet server fairness bound, FdPoller descriptor lifetime. No .proto/wire change; PROTOCOL_VERSION stays 6. et.rs already has ConPTY + forbid(unsafe) and no C++ FdPoller path. Same skip family as #823/#817."
+    note: "#872 C++ platform split is N/A; equivalent server fairness is CLIENT_READ_BATCH=64 and forwarding uses bounded per-stream queues with async pending writes. No native Mac/Windows or C++ live-peer claim. PROTOCOL_VERSION stays 6."
     et_pr: 872
   - sha: b5b009bf9ad91fda30eb2b394c6936c69e2b9806
     date: "2026-09-30"
     kind: product
-    status: skip
-    note: "#874 VS Code Remote-SSH keep-alive: console EOF checks the fd actually read; OpenSSH-style connect error text via getLastConnectError. Client UX/interop only; no .proto/wire/auth. PROTOCOL_VERSION stays 6."
+    status: ported
+    note: "#874 non-TTY EOF survival and SSH diagnostic phrases, including Windows redirected raw bytes. Linux heredoc/reconnect suite passes; no actual VS Code sleep cycle, native Windows/macOS or live C++ peer verification in this port. PROTOCOL_VERSION stays 6."
     et_pr: 874
   - sha: ea2542fade29191703356e0abf00b78e72bb58e2
     date: "2026-09-30"
@@ -460,5 +460,11 @@ commits:
     date: "2026-10-01"
     kind: product
     status: skip
-    note: "#878/#769 SSH auth banners on terminal after stderr→log redirect (preserve original stderr). Same product/UX family as #843/#769 skip; not wire/auth. PROTOCOL_VERSION stays 6. Pin tip."
+    note: "#878/#769 original-stderr preservation is unnecessary: et.rs file logging never redirects process stderr and SystemSsh inherits it. Background -f intentionally detaches stdio. PROTOCOL_VERSION stays 6."
     et_pr: 878
+  - sha: 5129342ef5ce3185125d907b95ad6d15a36b1cb6
+    date: "2026-10-02"
+    kind: docs
+    status: skip
+    note: "#876 README-only VS Code/Cursor Remote-SSH setup for upstream et1. et.rs does not package et1 and does not claim an actual editor sleep-cycle test; do not copy upstream's installed-wrapper claim. No runtime or wire change. Pin tip."
+    et_pr: 876

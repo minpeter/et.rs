@@ -27,26 +27,6 @@ pub(crate) fn ghostty_colorterm<'a>(
     }
 }
 
-/// Collect locale variables matched by OpenSSH's `SendEnv LANG LC_*`.
-pub(crate) fn ssh_locale_environment() -> impl Iterator<Item = (String, String)> {
-    let mut environment: Vec<_> = std::env::vars_os()
-        .filter_map(|(name, value)| {
-            let name = name.into_string().ok()?;
-            if (name != "LANG" && !name.starts_with("LC_")) || !valid_environment_name(&name) {
-                return None;
-            }
-            let value = value.into_string().ok()?;
-            (value.len() <= MAX_ENV_VALUE).then_some((name, value))
-        })
-        .collect();
-    environment.sort_unstable_by(|(left, _), (right, _)| {
-        locale_priority(left)
-            .cmp(&locale_priority(right))
-            .then_with(|| left.cmp(right))
-    });
-    environment.into_iter()
-}
-
 fn locale_priority(name: &str) -> u8 {
     match name {
         "LC_ALL" => 0,
@@ -54,6 +34,65 @@ fn locale_priority(name: &str) -> u8 {
         "LANG" => 2,
         _ => 3,
     }
+}
+
+/// Match arbitrary SendEnv patterns against the local environment. Values still
+/// pass through the same terminal protocol size/name validation as locale data.
+pub(crate) fn ssh_send_environment(patterns: &[String]) -> Vec<(String, String)> {
+    select_send_environment(
+        patterns,
+        std::env::vars_os().filter_map(|(name, value)| {
+            Some((name.into_string().ok()?, value.into_string().ok()?))
+        }),
+    )
+}
+
+fn select_send_environment(
+    patterns: &[String],
+    environment: impl IntoIterator<Item = (String, String)>,
+) -> Vec<(String, String)> {
+    let mut selected: Vec<_> = environment
+        .into_iter()
+        .filter(|(name, value)| {
+            name != "TERM"
+                && valid_environment_name(name)
+                && value.len() <= MAX_ENV_VALUE
+                && !value.contains('\0')
+                && patterns
+                    .iter()
+                    .any(|pattern| environment_pattern_matches(pattern.as_bytes(), name.as_bytes()))
+        })
+        .collect();
+    selected.sort_by(|a, b| {
+        locale_priority(&a.0)
+            .cmp(&locale_priority(&b.0))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    selected
+}
+
+pub(crate) fn environment_pattern_matches(pattern: &[u8], name: &[u8]) -> bool {
+    let (mut p, mut n, mut star, mut retry) = (0, 0, None, 0);
+    while n < name.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == name[n]) {
+            p += 1;
+            n += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            retry = n;
+        } else if let Some(index) = star {
+            p = index + 1;
+            retry += 1;
+            n = retry;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 pub(crate) fn reserved_environment_value_lengths<'a>(
@@ -186,6 +225,53 @@ mod tests {
     };
     use et_net::local_packet::MAX_LOCAL_PACKET_LEN;
     use prost::Message;
+
+    #[test]
+    fn arbitrary_sendenv_patterns_are_selected_bounded_and_setenv_wins() {
+        let selected = super::select_send_environment(
+            &[
+                "APP_*".into(),
+                "CUSTOM_?".into(),
+                "APP_F*".into(),
+                "TERM".into(),
+            ],
+            [
+                ("APP_FOO".into(), "local".into()),
+                ("CUSTOM_X".into(), "one".into()),
+                ("CUSTOM_XX".into(), "not-one".into()),
+                ("APP_BAD-NAME".into(), "invalid".into()),
+                ("APP_LARGE".into(), "x".repeat(4097)),
+                ("APP_NUL".into(), "a\0b".into()),
+                ("TERM".into(), "reserved".into()),
+                ("UNRELATED".into(), "secret".into()),
+            ],
+        );
+        assert_eq!(
+            selected,
+            [
+                ("APP_FOO".into(), "local".into()),
+                ("CUSTOM_X".into(), "one".into())
+            ]
+        );
+        let merged = super::bounded_locale_environment(
+            [("APP_FOO".into(), "configured".into())]
+                .into_iter()
+                .chain(selected),
+            &Default::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            merged,
+            [
+                ("APP_FOO".into(), "configured".into()),
+                ("CUSTOM_X".into(), "one".into())
+            ]
+        );
+        assert!(super::environment_pattern_matches(b"A*B?C", b"AXYBZBQC"));
+        assert!(!super::environment_pattern_matches(b"A*B?C", b"AXYBQCZ"));
+    }
 
     #[test]
     fn first_environment_value_wins_even_when_it_does_not_fit() {

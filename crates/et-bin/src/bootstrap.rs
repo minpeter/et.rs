@@ -11,12 +11,10 @@ const OPERATIONAL_SSH_OPTIONS: [&str; 4] = [
     "PermitLocalCommand=no",
     "SessionType=default",
 ];
-const FILTERED_SSH_OPTION_KEYS: [&str; 6] = [
+const FILTERED_SSH_OPTION_KEYS: [&str; 4] = [
     "ClearAllForwardings",
     "RemoteCommand",
     "PermitLocalCommand",
-    "ControlMaster",
-    "ControlPath",
     "SessionType",
 ];
 
@@ -244,14 +242,17 @@ fn append_operational_options(args: &mut Vec<String>, options: &[String]) {
 
 pub(crate) fn is_forced_operational_option(option: &str) -> bool {
     let key = ssh_option_key(option);
-    FILTERED_SSH_OPTION_KEYS
-        .iter()
-        .any(|filtered| key.eq_ignore_ascii_case(filtered))
+    is_control_option(option)
+        || FILTERED_SSH_OPTION_KEYS
+            .iter()
+            .any(|filtered| key.eq_ignore_ascii_case(filtered))
 }
 
 pub(crate) fn is_control_option(option: &str) -> bool {
     let key = ssh_option_key(option);
-    key.eq_ignore_ascii_case("ControlMaster") || key.eq_ignore_ascii_case("ControlPath")
+    key.eq_ignore_ascii_case("ControlMaster")
+        || key.eq_ignore_ascii_case("ControlPath")
+        || key.eq_ignore_ascii_case("ControlPersist")
 }
 
 fn ssh_option_key(option: &str) -> &str {
@@ -483,7 +484,7 @@ mod tests {
                 invocation.args
             );
         }
-        for key in ["ControlMaster", "ControlPath"] {
+        for key in ["ControlMaster", "ControlPath", "ControlPersist"] {
             assert!(
                 !invocation.args.iter().any(|argument| {
                     argument
@@ -506,6 +507,7 @@ mod tests {
             "ControlPath=~/.ssh/et-master".to_owned(),
             "controlmaster yes".to_owned(),
             "CONTROLPATH /tmp/et.sock".to_owned(),
+            "ControlPersist=60".to_owned(),
         ]);
         let credentials = provisional_credentials().unwrap();
         let destination = build_invocation(&request, &credentials);

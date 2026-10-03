@@ -258,6 +258,7 @@ pub(crate) struct WorkerChannels {
     pub(crate) cancel: channel::Receiver<()>,
     pub(crate) abandoned: Arc<AtomicBool>,
     pub(crate) stdio_open: Option<Arc<AtomicBool>>,
+    pub(crate) next_client_fd: Arc<AtomicI32>,
 }
 
 pub(crate) fn run(
@@ -274,6 +275,7 @@ pub(crate) fn run(
         cancel,
         abandoned,
         stdio_open,
+        next_client_fd,
     } = channels;
     let (listener_stop, session_user, shutdown) = control;
     #[cfg(unix)]
@@ -285,7 +287,16 @@ pub(crate) fn run(
         cancel.clone(),
         abandoned,
     )
-    .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user, stdio_open));
+    .and_then(|mut worker| {
+        worker.run(
+            sources,
+            commands,
+            listener_stop,
+            session_user,
+            stdio_open,
+            next_client_fd,
+        )
+    });
     #[cfg(windows)]
     let result = Worker::new(
         command_sender,
@@ -294,9 +305,21 @@ pub(crate) fn run(
         cancel.clone(),
         abandoned,
     )
-    .and_then(|mut worker| worker.run(sources, commands, listener_stop, session_user, stdio_open));
+    .and_then(|mut worker| {
+        worker.run(
+            sources,
+            commands,
+            listener_stop,
+            session_user,
+            stdio_open,
+            next_client_fd,
+        )
+    });
+    // Stop externally owned listeners even if publishing the failure is
+    // blocked by a full outbound queue.
+    let was_shutdown = shutdown.swap(true, Ordering::AcqRel);
     if let Err(error) = result {
-        if !shutdown.load(Ordering::Acquire) {
+        if !was_shutdown {
             channel::select! {
                 send(outbound, Err(error)) -> _ => {}
                 recv(cancel) -> _ => {}
@@ -380,10 +403,10 @@ impl Worker {
         listener_stop: ListenerStop,
         session_user: Option<(u32, u32)>,
         stdio_open: Option<Arc<AtomicBool>>,
+        next_client_fd: Arc<AtomicI32>,
     ) -> Result<(), ForwardError> {
         self.session_user = session_user;
         self.stdio_open = stdio_open;
-        let next_client_fd = Arc::new(AtomicI32::new(1));
         for source in sources {
             if source.stdio {
                 #[cfg(unix)]
@@ -413,18 +436,25 @@ impl Worker {
             let stop = listener_stop.try_clone().map_err(ForwardError::Io)?;
             #[cfg(windows)]
             let stop = listener_stop.clone();
-            let spawn = if source.socks {
-                spawn_socks_listener
+            let thread = if source.socks {
+                spawn_socks_listener(
+                    source,
+                    self.commands.clone(),
+                    self.cancel.clone(),
+                    stop,
+                    next_client_fd.clone(),
+                )
             } else {
-                spawn_listener
+                spawn_listener(
+                    source,
+                    self.commands.clone(),
+                    self.cancel.clone(),
+                    stop,
+                    Arc::new(AtomicBool::new(false)),
+                    next_client_fd.clone(),
+                )
             };
-            self.threads.push(spawn(
-                source,
-                self.commands.clone(),
-                self.cancel.clone(),
-                stop,
-                next_client_fd.clone(),
-            ));
+            self.threads.push(thread);
         }
         let result = loop {
             let Some(command) = commands.recv() else {
@@ -795,7 +825,7 @@ mod tests {
     }
 
     fn check_close_with_full_writer_queue(close: fn(&mut Worker), drain: bool) {
-        let (mut worker, _commands, outbound, cancel) = worker();
+        let (mut worker, commands, outbound, cancel) = worker();
         let abandoned = worker.abandoned.clone();
         let (stream, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(EVENT_TIMEOUT)).unwrap();
@@ -835,9 +865,9 @@ mod tests {
         let progressed = done_rx.recv_timeout(EVENT_TIMEOUT).is_ok();
         let mut received = Vec::new();
         let drained = if drain && progressed {
-            peer.read_to_end(&mut received).is_ok()
+            peer.read_to_end(&mut received)
         } else {
-            false
+            Err(std::io::ErrorKind::Interrupted.into())
         };
         // Cancellation must join even a removed writer whose peer never reads.
         // Keep a control clone only as emergency cleanup on test failure.
@@ -859,13 +889,30 @@ mod tests {
             saturator.shutdown(std::net::Shutdown::Both).unwrap();
         }
         joining.join().unwrap();
+        let io_errors: Vec<_> = commands
+            .queue
+            .state
+            .lock()
+            .unwrap()
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::IoFailed { error, .. } => Some(error.to_string()),
+                _ => None,
+            })
+            .collect();
         assert!(
             progressed,
             "close blocked the forwarding worker behind a full writer queue"
         );
         assert!(joined, "removed writer did not observe hard cancellation");
         if drain {
-            assert!(drained, "writer did not close after draining queued bytes");
+            assert!(
+                drained.is_ok(),
+                "writer did not close: {drained:?}; received {}/{} bytes; I/O errors: {io_errors:?}",
+                received.len(),
+                expected.len(),
+            );
             assert_eq!(received, expected);
             assert!(!abandoned.load(Ordering::Acquire));
         } else {

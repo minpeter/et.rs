@@ -45,7 +45,7 @@ fn client_retries_reconnect_through_network_outage() {
         "--logdir",
         stack.directory.to_str().unwrap(),
         "--keepalive=1",
-        "-p",
+        "--port",
         &proxy.port.to_string(),
         "127.0.0.1",
     ]);

@@ -12,6 +12,8 @@
 //! sequences a remote shell expects instead of being discarded.
 
 use std::collections::VecDeque;
+use std::io::{self, IsTerminal};
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
@@ -26,6 +28,7 @@ use crate::client_terminal::{
     write_terminal_size_recovering, DisplayOutcome, OwnedWriteOutcome, RetainedCompletion,
     TerminalModeState,
 };
+use crate::client_terminal_loop::redirected_input;
 use crate::error::ClientError;
 use crate::initial_connect::ReconnectOutcome;
 
@@ -55,6 +58,15 @@ where
         remote_exit,
         stdio_forward,
     } = options;
+    let console_input = read_stdin && io::stdin().is_terminal();
+    let mut raw_input = if read_stdin && !console_input {
+        Some(
+            redirected_input(io::stdin())
+                .map_err(|error| terminal_io("starting stdin reader", error))?,
+        )
+    } else {
+        None
+    };
     let console_output = if stdio_forward {
         crate::client_output::ConsoleOutput::new(flow_control, Box::new(std::io::sink()))
     } else {
@@ -187,8 +199,60 @@ where
             }
         }
 
-        // 1. Console input and resize notifications.
-        if read_stdin {
+        // 1. Redirected bytes, or console input and resize notifications.
+        // Bound each batch so a full pipe cannot starve output or forwarding.
+        let mut redirected_progress = false;
+        if let Some(input) = raw_input.as_ref() {
+            let mut disconnected = false;
+            for _ in 0..64 {
+                let bytes = match input.try_recv() {
+                    Ok(bytes) => bytes,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                };
+                redirected_progress = true;
+                if !binary_stdio && interrupt_input.feed(&bytes) {
+                    console_output
+                        .interrupt()
+                        .map_err(|error| terminal_io("interrupting console output", error))?;
+                }
+                let payload = encoded_buffer(&bytes);
+                match write_owned_recovering(
+                    connection,
+                    TerminalPacketType::TerminalBuffer as u8,
+                    &payload,
+                    &mut reconnect,
+                    terminal_enabled,
+                )? {
+                    OwnedWriteOutcome::Written => {}
+                    OwnedWriteOutcome::Recovered => {
+                        reconnect_needed = false;
+                        last_received = Instant::now();
+                        next_keepalive = last_received + interval;
+                    }
+                    OwnedWriteOutcome::SessionEnded => {
+                        return finish_remote_completion(
+                            console_output,
+                            pending_output,
+                            pending_forward,
+                            terminal_enabled,
+                            binary_stdio,
+                            terminal_modes,
+                            forwarder,
+                            None,
+                            remote_exit,
+                        )
+                    }
+                }
+            }
+            if disconnected {
+                raw_input = None;
+            }
+        }
+        if console_input {
             while crossterm::event::poll(Duration::from_millis(0))
                 .map_err(|error| terminal_text(format!("polling console input: {error}")))?
             {
@@ -411,9 +475,9 @@ where
 
         // 4. Idle wait. Console events wake this immediately; socket data is
         // observed on the next tick, exactly like upstream's select() timeout.
-        if read_stdin {
+        if console_input {
             let _ = crossterm::event::poll(POLL_INTERVAL);
-        } else {
+        } else if !redirected_progress {
             std::thread::sleep(POLL_INTERVAL);
         }
     }

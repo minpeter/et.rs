@@ -63,7 +63,20 @@ where
             if worker.join().is_err() {
                 return Err(ClientError::DnsWorkerPanicked);
             }
-            result.map_err(|source| ClientError::UnreachableEndpoint { endpoint, source })
+            let addresses = result.map_err(|source| ClientError::DnsResolution {
+                endpoint: endpoint.clone(),
+                source,
+            })?;
+            if addresses.is_empty() {
+                return Err(ClientError::DnsResolution {
+                    endpoint,
+                    source: io::Error::new(
+                        io::ErrorKind::AddrNotAvailable,
+                        "host resolved to no addresses",
+                    ),
+                });
+            }
+            Ok(addresses)
         }
         Err(RecvTimeoutError::Timeout) => {
             // getaddrinfo is not cancellable. This detached worker owns no
@@ -76,7 +89,7 @@ where
             if panicked {
                 Err(ClientError::DnsWorkerPanicked)
             } else {
-                Err(ClientError::UnreachableEndpoint {
+                Err(ClientError::DnsResolution {
                     endpoint,
                     source: io::Error::other("DNS resolver returned no result"),
                 })
@@ -91,6 +104,25 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn failed_or_empty_dns_answers_are_not_tcp_connection_errors() {
+        for result in [Err(io::Error::other("getaddrinfo detail")), Ok(Vec::new())] {
+            let error = resolve_operation(
+                "dns.invalid:2022".to_owned(),
+                Deadline::after(Duration::from_secs(1)),
+                move || result,
+            )
+            .unwrap_err();
+            assert!(matches!(error, ClientError::DnsResolution { .. }));
+            assert!(error
+                .to_string()
+                .starts_with("Could not resolve hostname dns.invalid:2022:"));
+            assert!(error.is_retryable_initial_connect());
+            assert!(error.is_transient_reconnect());
+            assert!(std::error::Error::source(&error).is_some());
+        }
+    }
 
     #[test]
     fn dns_operation_obeys_deadline_without_polling() {

@@ -1,7 +1,6 @@
 use std::ffi::OsString;
 use std::time::Duration;
 
-use clap::Parser;
 use et_cli::client::{ClientArgs, RemoteShellKind};
 use et_cli::host::parse_positional_host;
 
@@ -13,15 +12,13 @@ use crate::bootstrap::{
 };
 use crate::client_environment::{
     bound_jumphost_locale_environment, bounded_locale_environment, ghostty_colorterm,
-    normalize_terminal_type, reserved_environment_value_lengths, ssh_locale_environment,
+    normalize_terminal_type, reserved_environment_value_lengths,
 };
 use crate::deadline::Deadline;
 use crate::error::ClientError;
 use crate::initial_connect::{connect_initial, reconnect, Endpoint, ReconnectOutcome};
 use crate::resolver::{EndpointResolver, SystemResolver};
-use crate::ssh_config::{
-    resolve_ssh_config, resolve_ssh_config_on_port, validate_ssh_config_file, SshConfigQuery,
-};
+use crate::ssh_config::{resolve_ssh_config_on_port, validate_ssh_config_file, SshConfigQuery};
 use crate::ssh_process::{
     run_bootstrap, run_shell_probe, SshMasterTarget, SshRunner, SshSession, SystemSsh,
 };
@@ -66,8 +63,21 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
             .map(|value| OsString::from(*value))
             .chain(args.iter().cloned()),
     )?;
+    if parsed.ssh_version {
+        println!(
+            "OpenSSH_9.9p1 EternalTerminal_{}",
+            env!("CARGO_PKG_VERSION")
+        );
+        return Ok(0);
+    }
     parsed.verbose = et_cli::logging::effective_verbose(parsed.verbose);
     parsed.silent = et_cli::logging::effective_silent(parsed.silent);
+    #[cfg(unix)]
+    if let Some(code) = crate::local_daemon::prepare(&mut parsed, args)
+        .map_err(|error| clap::Error::raw(clap::error::ErrorKind::Io, error))?
+    {
+        return Ok(code);
+    }
     // `--telemetry` is accepted for upstream compatibility and ignored:
     // et.rs never collects telemetry, and upstream prints nothing here.
     init_logging(&parsed).map_err(|error| clap::Error::raw(clap::error::ErrorKind::Io, error))?;
@@ -77,6 +87,8 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
     match run_client(&parsed, &runner, &resolver, deadline) {
         Ok(code) => Ok(code),
         Err(error) => {
+            #[cfg(unix)]
+            crate::local_daemon::failed(&error.to_string());
             eprintln!("et: {error}");
             Ok(error.exit_code())
         }
@@ -89,6 +101,25 @@ fn run_client(
     resolver: &dyn EndpointResolver,
     deadline: Deadline,
 ) -> Result<i32, ClientError> {
+    #[cfg(unix)]
+    if !args.print_config && args.control_path.is_some() && crate::local_mux::passenger(args) {
+        if let Some(code) =
+            crate::local_mux::try_run(args).map_err(|e| ClientError::Terminal(e.to_string()))?
+        {
+            return Ok(code);
+        }
+    }
+    #[cfg(windows)]
+    if !args.print_config
+        && (args.ctl
+            || args.control_path.is_some()
+            || args.control_command.is_some()
+            || args.background)
+    {
+        return Err(ClientError::Unsupported(
+            "local mux/control/background sessions are not supported on Windows",
+        ));
+    }
     #[cfg(windows)]
     if args.stdio_forward.is_some() {
         return Err(ClientError::Unsupported(
@@ -112,25 +143,75 @@ fn run_client(
     let requested_user = command_user(destination.user, args.username.clone());
     validate_ssh_destination(&destination.host, requested_user.as_deref())?;
     let ssh_config = selected_ssh_config(args)?;
-    let mut query_options = args.ssh_option.clone();
+    let mut query_options = session_ssh_options(args);
     if let Some(jumphost) = args.jumphost.as_deref() {
         validate_jumphost(jumphost)?;
         query_options.insert(0, format!("ProxyJump={jumphost}"));
     }
     // The destination port is ET's port, not SSH's. Resolve configuration
     // before choosing forwarding, environment budgets, or the native relay.
-    let resolved = resolve_ssh_config(
+    let mut resolved = resolve_ssh_config_on_port(
         runner,
-        &destination.host,
-        requested_user.as_deref(),
-        &query_options,
-        ssh_config.as_deref(),
-        true,
+        SshConfigQuery {
+            host_alias: &destination.host,
+            requested_user: requested_user.as_deref(),
+            explicit_port: args.ssh_port,
+            ssh_options: &query_options,
+            ssh_config: ssh_config.as_deref(),
+            parse_local_forwards: true,
+        },
         deadline,
     )?;
+    resolved.apply_session_options(&args.session_options)?;
+    if args.print_config {
+        print!("{}", resolved.dump);
+        return Ok(0);
+    }
     let effective = effective_ssh_args(args, &resolved)?;
     let args = &effective;
+    #[cfg(unix)]
+    if crate::local_mux::passenger(args) {
+        if let Some(code) =
+            crate::local_mux::try_run(args).map_err(|e| ClientError::Terminal(e.to_string()))?
+        {
+            return Ok(code);
+        }
+    }
+    #[cfg(unix)]
+    if args.ctl && !args.no_persist {
+        if let Some(name) = args.session_name.as_deref() {
+            if let Some(saved) = crate::session_store::load_for(
+                name,
+                &resolved.hostname,
+                destination.port,
+                requested_user.as_deref().or(resolved.user.as_deref()),
+            )? {
+                let id = saved.id.clone();
+                match crate::session_store::attach_saved(saved, args, resolver, deadline) {
+                    Err(error @ ClientError::ServerInvalidKey(_)) => {
+                        if !crate::session_store::remove_if_matches(name, &id)? {
+                            return Err(error);
+                        }
+                    }
+                    result => return result,
+                }
+            }
+        }
+    }
     validate_bootstrap_mode(args)?;
+    #[cfg(unix)]
+    let local_session = match crate::local_session::prepare(args) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            // Another auto client may have won the bind after our first probe.
+            if args.control_master == Some(et_cli::client::ControlMasterMode::Auto) {
+                if let Ok(Some(code)) = crate::local_mux::try_run(args) {
+                    return Ok(code);
+                }
+            }
+            return Err(error);
+        }
+    };
     let mut forward_config =
         crate::forward_config::build(args, std::env::var("SSH_AUTH_SOCK").ok().as_deref())?;
     forward_config.apply_ssh_config(&resolved)?;
@@ -172,7 +253,9 @@ fn run_client(
             .iter()
             .filter(|(name, _)| name != "TERM")
             .cloned()
-            .chain(ssh_locale_environment()),
+            .chain(crate::client_environment::ssh_send_environment(
+                &resolved.send_env,
+            )),
         &reserved_environment,
         forward_config.initial_payload.flowcontrol,
         forward_config.initial_payload.command.as_deref(),
@@ -245,14 +328,17 @@ fn run_client(
             resolved
                 .set_env
                 .iter()
+                .cloned()
+                .chain(crate::client_environment::ssh_send_environment(
+                    &resolved.send_env,
+                ))
                 .filter(|(name, _)| {
                     !name.eq_ignore_ascii_case("TERM")
                         && !reserved
                             .keys()
                             .any(|reserved| reserved.eq_ignore_ascii_case(name))
                         && windows_names.insert(name.to_ascii_uppercase())
-                })
-                .cloned(),
+                }),
             &reserved,
             initial_payload.flowcontrol,
             initial_payload.command.as_deref(),
@@ -387,6 +473,8 @@ fn run_client(
                 .insert("COLORTERM".to_owned(), value.to_owned());
         }
     }
+    let mut agent_forward =
+        crate::agent_forward::AgentForward::prepare(args, &credentials.id, &mut initial_payload)?;
     et_cli::logging::info(format!("Connecting to {endpoint}"));
     let connection = connect_initial(
         &endpoint,
@@ -395,19 +483,30 @@ fn run_client(
         resolver,
         deadline,
     )?;
+    agent_forward.established();
     if let Some(name) = args.session_name.as_deref() {
-        if args.jumphost.is_none() && !args.no_pty {
+        if args.jumphost.is_none() && !args.no_pty && !args.no_persist {
             crate::session_store::save_direct(
                 name,
                 &endpoint.host,
                 endpoint.port,
+                probe_request.user.as_deref(),
                 &credentials.id,
                 &credentials.passkey,
             )?;
         }
     }
+    #[cfg(unix)]
+    crate::local_daemon::detach().map_err(|e| ClientError::Terminal(e.to_string()))?;
     et_cli::logging::verbose(1, format!("Client created with id: {}", credentials.id));
-    if args.no_terminal && !has_forwarding {
+    if args.no_terminal
+        && !has_forwarding
+        && !args.ctl
+        && args.control_path.is_none()
+        && !args.no_remote_command
+    {
+        #[cfg(unix)]
+        crate::local_daemon::ready().map_err(|e| ClientError::Terminal(e.to_string()))?;
         return Ok(0);
     }
     let (forwarder, skipped) = et_net::forward::Forwarder::start_with_origins_deadline(
@@ -429,6 +528,43 @@ fn run_client(
             skipped.error
         ));
     }
+    let local_mode = {
+        #[cfg(unix)]
+        {
+            crate::local_session::enabled(args)
+        }
+        #[cfg(windows)]
+        {
+            false
+        }
+    };
+    let reconnect_session = |connection: &mut Connection| {
+        let outcome = if local_mode {
+            reconnect(
+                connection,
+                &endpoint,
+                &credentials,
+                resolver,
+                Deadline::after(Duration::from_secs(2)),
+            )
+        } else {
+            reconnect_with_retry(connection, &endpoint, &credentials, resolver)
+        }?;
+        agent_forward.reconnected(outcome)
+    };
+    #[cfg(unix)]
+    if let Some(prepared) = local_session {
+        return crate::local_session::run(
+            connection,
+            args,
+            &credentials.id,
+            prepared,
+            forwarder,
+            reconnect_session,
+        );
+    }
+    #[cfg(unix)]
+    crate::local_daemon::ready().map_err(|e| ClientError::Terminal(e.to_string()))?;
     crate::client_terminal::run(
         connection,
         crate::client_terminal::TerminalOptions {
@@ -444,7 +580,7 @@ fn run_client(
             stdio_forward: args.stdio_forward.is_some(),
         },
         forwarder,
-        |connection| reconnect_with_retry(connection, &endpoint, &credentials, resolver),
+        reconnect_session,
     )
 }
 
@@ -599,11 +735,7 @@ fn selected_ssh_config(args: &ClientArgs) -> Result<Option<String>, ClientError>
 }
 
 fn command_user(positional: Option<String>, option: Option<String>) -> Option<String> {
-    match positional {
-        Some(user) if user.is_empty() => None,
-        Some(user) => Some(user),
-        None => option,
-    }
+    option.or_else(|| positional.filter(|user| !user.is_empty()))
 }
 
 #[cfg(test)]
@@ -627,9 +759,19 @@ fn validate_bootstrap_mode(args: &ClientArgs) -> Result<(), ClientError> {
     if args.no_exit && args.command.is_none() {
         return Err(ClientError::Unsupported("--no-exit requires --command"));
     }
-    if args.no_pty && args.command.as_deref().unwrap_or("").is_empty() {
+    if args.no_remote_command
+        && args
+            .command
+            .as_deref()
+            .is_some_and(|command| !command.is_empty())
+    {
         return Err(ClientError::Unsupported(
-            "-T/--no-pty requires -c/--command",
+            "-N cannot be combined with a remote command",
+        ));
+    }
+    if args.no_pty && !args.no_remote_command && args.command.as_deref().unwrap_or("").is_empty() {
+        return Err(ClientError::Unsupported(
+            "-T/--no-pty requires a remote command",
         ));
     }
     Ok(())
@@ -640,6 +782,44 @@ fn effective_ssh_args(
     config: &crate::ssh_config::ResolvedSshConfig,
 ) -> Result<ClientArgs, ClientError> {
     let mut args = args.clone();
+    args.ssh_option = session_ssh_options(&args);
+    if let Some(port) = args.ssh_port {
+        args.ssh_option.insert(0, format!("Port={port}"));
+    }
+    if let Some(cipher) = &args.cipher {
+        args.ssh_option.insert(0, format!("Ciphers={cipher}"));
+    }
+    for identity in &args.identity_files {
+        args.ssh_option.push(format!("IdentityFile={identity}"));
+    }
+    if config.batch_mode
+        && !args.ssh_option.iter().any(|option| {
+            et_cli::client::split_ssh_option(option)
+                .0
+                .eq_ignore_ascii_case("BatchMode")
+        })
+    {
+        args.ssh_option.push("BatchMode=yes".to_owned());
+    }
+    if !args.keepalive_explicit && config.server_alive_interval > 0 {
+        args.keepalive = config
+            .server_alive_interval
+            .min(et_cli::client::MAX_KEEPALIVE);
+    }
+    if !args.no_remote_command && args.command.as_deref().is_none_or(str::is_empty) {
+        args.command.clone_from(&config.remote_command);
+    }
+    args.no_terminal |= args.no_remote_command;
+    args.control_master = args.control_master.or(config.control_master);
+    if !args.control_path_explicit_none {
+        args.control_path = args.control_path.or_else(|| config.control_path.clone());
+    }
+    args.control_persist = args.control_persist.or(config.control_persist);
+    if config.clear_all_forwardings {
+        args.tunnel.clear();
+        args.reverse_tunnel.clear();
+        args.dynamic.clear();
+    }
     if args.jumphost.is_none() {
         args.jumphost.clone_from(&config.proxy_jump);
     }
@@ -660,6 +840,54 @@ fn effective_ssh_args(
         }
     }
     Ok(args)
+}
+
+/// Session `-o` scalars use the last value, while OpenSSH uses the first.
+/// Put those scalars first without reversing additive forwarding/environment rows.
+fn session_ssh_options(args: &ClientArgs) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut selected = Vec::new();
+    for option in args.session_options.iter().rev() {
+        let key = et_cli::client::split_ssh_option(option)
+            .0
+            .to_ascii_lowercase();
+        // ET applies additive forwarding/environment options after resolution;
+        // all other options must reach ssh -G so OpenSSH validates and resolves
+        // their scalar precedence.
+        if matches!(
+            key.as_str(),
+            "localforward" | "remoteforward" | "dynamicforward" | "sendenv" | "setenv" | "user"
+        ) {
+            continue;
+        }
+        if matches!(key.as_str(), "identityfile" | "certificatefile") || seen.insert(key) {
+            selected.push(option.clone());
+        }
+    }
+    selected.reverse();
+    if let Some(mode) = args.control_master {
+        let value = match mode {
+            et_cli::client::ControlMasterMode::No => "no",
+            et_cli::client::ControlMasterMode::Yes => "yes",
+            et_cli::client::ControlMasterMode::Auto => "auto",
+        };
+        selected.insert(0, format!("ControlMaster={value}"));
+    }
+    if let Some(path) = &args.control_path {
+        selected.insert(0, format!("ControlPath={path}"));
+    }
+    if let Some(persist) = args.control_persist {
+        let value = if !persist.enabled {
+            "no".to_owned()
+        } else if persist.seconds == 0 {
+            "yes".to_owned()
+        } else {
+            persist.seconds.to_string()
+        };
+        selected.insert(0, format!("ControlPersist={value}"));
+    }
+    selected.extend(args.ssh_option.iter().cloned());
+    selected
 }
 
 /// Validate `--jumphost` as an SSH ProxyJump target (OpenSSH `-J` argument).
@@ -731,16 +959,140 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_config_translates_commands_keepalive_and_bootstrap_options() {
+        use et_cli::client::{ControlMasterMode, ControlPersist};
+        let config = crate::ssh_config::ResolvedSshConfig {
+            remote_command: Some("echo from-config".into()),
+            server_alive_interval: 9,
+            batch_mode: true,
+            control_master: Some(ControlMasterMode::Auto),
+            control_path: Some("/tmp/config-master".into()),
+            control_persist: Some(ControlPersist {
+                enabled: true,
+                seconds: 42,
+            }),
+            clear_all_forwardings: true,
+            ..Default::default()
+        };
+        let cli =
+            ClientArgs::try_parse_from(["et", "-L8080:80", "-R8081:81", "-D1080", "host"]).unwrap();
+        let args = effective_ssh_args(&cli, &config).unwrap();
+        assert_eq!(args.command.as_deref(), Some("echo from-config"));
+        assert_eq!(args.keepalive, 5);
+        assert!(args.ssh_option.contains(&"BatchMode=yes".into()));
+        assert!(
+            args.tunnel.is_empty() && args.reverse_tunnel.is_empty() && args.dynamic.is_empty()
+        );
+        assert_eq!(args.control_master, config.control_master);
+        assert_eq!(args.control_path, config.control_path);
+        assert_eq!(args.control_persist, config.control_persist);
+
+        let explicit = ClientArgs::try_parse_from([
+            "et",
+            "-k2",
+            "-p2223",
+            "-caes256-ctr",
+            "-i/tmp/key",
+            "-S/tmp/cli",
+            "-oControlMaster=no",
+            "host",
+            "echo",
+            "cli",
+        ])
+        .unwrap();
+        let args = effective_ssh_args(&explicit, &config).unwrap();
+        assert_eq!(args.command.as_deref(), Some("echo cli"));
+        assert_eq!(args.keepalive, 2);
+        assert_eq!(args.control_master, Some(ControlMasterMode::No));
+        assert_eq!(args.control_path.as_deref(), Some("/tmp/cli"));
+        for option in ["Port=2223", "Ciphers=aes256-ctr", "IdentityFile=/tmp/key"] {
+            assert!(args.ssh_option.iter().any(|actual| actual == option));
+        }
+        let no_command = ClientArgs::try_parse_from(["et", "-NT", "host"]).unwrap();
+        let args = effective_ssh_args(&no_command, &config).unwrap();
+        assert_eq!(args.command, None);
+        assert!(validate_bootstrap_mode(&args).is_ok());
+        let payload = crate::forward_config::build(&args, None)
+            .unwrap()
+            .initial_payload;
+        assert_eq!(payload.no_shell, Some(true));
+        assert_eq!(payload.no_pty, None);
+        assert_eq!(payload.command, None);
+        let conflict = ClientArgs::try_parse_from(["et", "-N", "host", "true"]).unwrap();
+        assert!(validate_bootstrap_mode(&conflict).is_err());
+        for (interval, expected) in [(0, 5), (3, 3), (5, 5), (6, 5)] {
+            let config = crate::ssh_config::ResolvedSshConfig {
+                server_alive_interval: interval,
+                ..Default::default()
+            };
+            assert_eq!(
+                effective_ssh_args(&cli, &config).unwrap().keepalive,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn session_options_keep_last_scalars_and_separate_bootstrap_passthrough() {
+        let args = ClientArgs::try_parse_from([
+            "et",
+            "-oPort=22",
+            "-o",
+            "Port = 23",
+            "-oRemoteCommand=echo config",
+            "-oLocalForward=8080:80",
+            "--ssh-option",
+            "Port=24",
+            "--ssh-option",
+            "IdentityFile=/tmp/key",
+            "host",
+        ])
+        .unwrap();
+        assert_eq!(
+            session_ssh_options(&args),
+            [
+                "Port = 23",
+                "RemoteCommand=echo config",
+                "Port=24",
+                "IdentityFile=/tmp/key"
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_identity_and_certificate_options_reach_bootstrap_in_order() {
+        let args = ClientArgs::try_parse_from([
+            "et",
+            "-oIdentityFile=/key1",
+            "-oIdentityFile=/key2",
+            "-oCertificateFile=/cert1",
+            "-oCertificateFile=/cert2",
+            "host",
+        ])
+        .unwrap();
+        let effective = effective_ssh_args(&args, &Default::default()).unwrap();
+        assert_eq!(
+            effective.ssh_option,
+            [
+                "IdentityFile=/key1",
+                "IdentityFile=/key2",
+                "CertificateFile=/cert1",
+                "CertificateFile=/cert2"
+            ]
+        );
+    }
+
+    #[test]
     fn no_pty_requires_a_command() {
         let missing = et_cli::client::ClientArgs::try_parse_from(["et", "-T", "host"]).unwrap();
         assert!(matches!(
             validate_bootstrap_mode(&missing),
             Err(ClientError::Unsupported(
-                "-T/--no-pty requires -c/--command"
+                "-T/--no-pty requires a remote command"
             ))
         ));
         let present =
-            et_cli::client::ClientArgs::try_parse_from(["et", "-T", "-c", "true", "host"]).unwrap();
+            et_cli::client::ClientArgs::try_parse_from(["et", "-T", "host", "true"]).unwrap();
         assert!(validate_bootstrap_mode(&present).is_ok());
     }
 
@@ -823,17 +1175,17 @@ mod tests {
         let ambient = ClientArgs::try_parse_from(["et", "host"]).unwrap();
         assert_eq!(selected_ssh_config(&ambient).unwrap(), None);
 
-        let disabled = ClientArgs::try_parse_from(["et", "host", "--no-ssh-config"]).unwrap();
+        let disabled = ClientArgs::try_parse_from(["et", "--no-ssh-config", "host"]).unwrap();
         assert_eq!(
             selected_ssh_config(&disabled).unwrap().as_deref(),
             Some("none")
         );
 
-        let none = ClientArgs::try_parse_from(["et", "host", "--ssh-config", "none"]).unwrap();
+        let none = ClientArgs::try_parse_from(["et", "--ssh-config", "none", "host"]).unwrap();
         assert_eq!(selected_ssh_config(&none).unwrap().as_deref(), Some("none"));
 
         let relative =
-            ClientArgs::try_parse_from(["et", "host", "--ssh-config", "relative"]).unwrap();
+            ClientArgs::try_parse_from(["et", "--ssh-config", "relative", "host"]).unwrap();
         assert!(matches!(
             selected_ssh_config(&relative),
             Err(ClientError::InvalidSshConfig(
@@ -850,7 +1202,7 @@ mod tests {
                 Some("option".to_string()),
                 Some("config".to_string()),
             ),
-            Some("positional".to_string())
+            Some("option".to_string())
         );
         assert_eq!(
             effective_user(None, Some("option".to_string()), Some("config".to_string()),),
@@ -862,7 +1214,7 @@ mod tests {
                 Some("option".to_string()),
                 Some("config".to_string()),
             ),
-            Some("config".to_string())
+            Some("option".to_string())
         );
     }
 
@@ -931,10 +1283,10 @@ mod tests {
         );
         let explicit = ClientArgs::try_parse_from([
             "et",
-            "host",
             "--jumphost=cli-jump",
             "--ssh-socket=/tmp/cli-agent",
-            "-f",
+            "--forward-ssh-agent",
+            "host",
         ])
         .unwrap();
         config.proxy_jump = Some("invalid,multi-hop".into());
@@ -1012,7 +1364,7 @@ mod tests {
 
     #[test]
     fn remote_mode_refactor_preserves_explicit_windows_defaults() {
-        let args = ClientArgs::try_parse_from(["et", "host", "--winserver"]).unwrap();
+        let args = ClientArgs::try_parse_from(["et", "--winserver", "host"]).unwrap();
         assert_eq!(
             resolve_remote_mode(&args, Some(RemoteShell::Posix)),
             RemoteMode {
@@ -1026,7 +1378,7 @@ mod tests {
     #[test]
     fn explicit_powershell_preserves_terminal_override() {
         let args =
-            ClientArgs::try_parse_from(["et", "host", "--remote-shell", "powershell"]).unwrap();
+            ClientArgs::try_parse_from(["et", "--remote-shell", "powershell", "host"]).unwrap();
         assert_eq!(
             resolve_remote_mode(&args, Some(RemoteShell::Posix)),
             RemoteMode {

@@ -19,6 +19,7 @@ pub(crate) struct RuntimeCore {
     pub(crate) forward_resolver: Arc<dyn et_net::forward::ForwardResolver>,
     /// Process start, for the post-restart `RETRY_LATER` grace window.
     pub(crate) started: Instant,
+    pub(crate) disconnect_timeout_seconds: i32,
 }
 
 pub(crate) const MAX_PRE_AUTH_CONNECTIONS: usize = 128;
@@ -139,6 +140,27 @@ impl RawSockets {
             }
         }
         Ok(())
+    }
+
+    /// Call while holding the session-table lock during expiry. This check
+    /// observes authentication under the raw-socket lock, before removing the
+    /// session; an unproven challenge cannot extend the deadline. Authentication
+    /// publishes here before attempting to claim the session table.
+    pub(crate) fn has_authenticated_registration(
+        &self,
+        identity: &RegistrationIdentity,
+    ) -> Result<bool, RuntimeError> {
+        let streams = self
+            .streams
+            .lock()
+            .map_err(|_| RuntimeError::WorkerUnavailable)?;
+        Ok(streams.values().any(|tracked| {
+            tracked.authenticated
+                && tracked
+                    .registration
+                    .as_ref()
+                    .is_some_and(|current| current.same_generation(identity))
+        }))
     }
 }
 

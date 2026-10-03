@@ -29,6 +29,10 @@ pub enum ClientError {
     InvalidSessionId,
     InvalidPasskey,
     DnsTimeout(String),
+    DnsResolution {
+        endpoint: String,
+        source: io::Error,
+    },
     DnsWorker(io::Error),
     DnsWorkerPanicked,
     UnreachableEndpoint {
@@ -90,7 +94,7 @@ impl std::fmt::Display for ClientError {
                 write!(f, "could not terminate timed-out system ssh: {error}")
             }
             Self::SshTimeout(operation) => {
-                write!(f, "system ssh timed out while {operation}")
+                write!(f, "Operation timed out: system ssh while {operation}")
             }
             Self::SshNonZero(Some(code)) => write!(f, "system ssh exited with status {code}"),
             Self::SshNonZero(None) => write!(f, "system ssh terminated without an exit status"),
@@ -117,18 +121,24 @@ impl std::fmt::Display for ClientError {
                 write!(f, "IDPASSKEY passkey must be 32 ASCII alphanumeric bytes")
             }
             Self::DnsTimeout(endpoint) => {
-                write!(f, "DNS resolution timed out for ET endpoint {endpoint}")
+                write!(f, "Could not resolve hostname {endpoint}: Operation timed out")
+            }
+            Self::DnsResolution { endpoint, source } => {
+                write!(f, "Could not resolve hostname {endpoint}: ")?;
+                write_connect_reason(f, source)
             }
             Self::DnsWorker(error) => write!(f, "could not start DNS resolver: {error}"),
             Self::DnsWorkerPanicked => write!(f, "DNS resolver worker terminated unexpectedly"),
             Self::UnreachableEndpoint { endpoint, source } => {
-                write!(f, "could not reach the ET server at {endpoint}: {source}")
+                write!(f, "Could not reach the ET server: {endpoint}: ")?;
+                write_connect_reason(f, source)
             }
             Self::BootstrapTimeout(operation) => {
-                write!(f, "ET bootstrap timed out while {operation}")
+                write!(f, "Operation timed out: ET bootstrap while {operation}")
             }
             Self::ConnectIo { operation, source } => {
-                write!(f, "ET connection failed while {operation}: {source}")
+                write!(f, "ET connection failed while {operation}: ")?;
+                write_connect_reason(f, source)
             }
             Self::ServerInvalidKey(message) => {
                 write!(f, "ET server rejected the session key")?;
@@ -171,6 +181,29 @@ impl std::fmt::Display for ClientError {
     }
 }
 
+// Remote-SSH recognizes these OpenSSH/upstream ET phrases, not Rust's
+// platform-dependent descriptions (in particular Windows Winsock text).
+// Preserve the original diagnostic, including its OS error code.
+fn write_connect_reason(f: &mut std::fmt::Formatter<'_>, source: &io::Error) -> std::fmt::Result {
+    let reason = match source.kind() {
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => Some("Operation timed out"),
+        io::ErrorKind::NetworkUnreachable => Some("Network is unreachable"),
+        io::ErrorKind::HostUnreachable => Some("No route to host"),
+        io::ErrorKind::ConnectionRefused => Some("Connection refused"),
+        // Rust leaves WSAEHOSTDOWN unclassified; upstream maps it to
+        // EHOSTUNREACH along with WSAEHOSTUNREACH.
+        #[cfg(windows)]
+        _ if source.raw_os_error() == Some(10064) => Some("No route to host"),
+        _ => None,
+    };
+    if let Some(reason) = reason {
+        if !source.to_string().contains(reason) {
+            write!(f, "{reason}: ")?;
+        }
+    }
+    write!(f, "{source}")
+}
+
 fn write_message(f: &mut std::fmt::Formatter<'_>, message: &Option<String>) -> std::fmt::Result {
     if let Some(message) = message.as_deref().filter(|message| !message.is_empty()) {
         write!(f, ": {message}")?;
@@ -189,6 +222,7 @@ impl ClientError {
         matches!(
             self,
             Self::DnsTimeout(_)
+                | Self::DnsResolution { .. }
                 | Self::DnsWorker(_)
                 | Self::DnsWorkerPanicked
                 | Self::UnreachableEndpoint { .. }
@@ -202,6 +236,7 @@ impl ClientError {
         matches!(
             self,
             Self::DnsTimeout(_)
+                | Self::DnsResolution { .. }
                 | Self::DnsWorker(_)
                 | Self::DnsWorkerPanicked
                 | Self::UnreachableEndpoint { .. }
@@ -233,11 +268,100 @@ impl std::error::Error for ClientError {
             | Self::SshWait(error)
             | Self::SshTerminate(error)
             | Self::DnsWorker(error)
+            | Self::DnsResolution { source: error, .. }
             | Self::UnreachableEndpoint { source: error, .. }
             | Self::ConnectIo { source: error, .. } => Some(error),
             Self::Transport(error) => Some(error),
             Self::MalformedInitialResponse(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    #[test]
+    fn network_reasons_use_ssh_retry_phrases_and_keep_platform_details() {
+        for (kind, phrase) in [
+            (io::ErrorKind::TimedOut, "Operation timed out"),
+            (io::ErrorKind::WouldBlock, "Operation timed out"),
+            (io::ErrorKind::NetworkUnreachable, "Network is unreachable"),
+            (io::ErrorKind::HostUnreachable, "No route to host"),
+            (io::ErrorKind::ConnectionRefused, "Connection refused"),
+        ] {
+            // Deliberately unlike Unix strerror: Windows/localized messages
+            // still need the recognized English prefix without losing detail.
+            let detail = "platform-specific diagnostic (os error 12345)";
+            let error = ClientError::UnreachableEndpoint {
+                endpoint: "[::1]:2022".to_owned(),
+                source: io::Error::new(kind, detail),
+            };
+            assert_eq!(
+                error.to_string(),
+                format!("Could not reach the ET server: [::1]:2022: {phrase}: {detail}")
+            );
+            assert_eq!(error.source().unwrap().to_string(), detail);
+            assert!(error.is_retryable_initial_connect());
+            assert!(error.is_transient_reconnect());
+            let handshake = ClientError::ConnectIo {
+                operation: "completing the ET handshake",
+                source: io::Error::new(kind, detail),
+            };
+            assert!(handshake
+                .to_string()
+                .contains(&format!("{phrase}: {detail}")));
+        }
+    }
+
+    #[test]
+    fn unclassified_errors_are_not_mislabeled_as_network_outages() {
+        let error = ClientError::UnreachableEndpoint {
+            endpoint: "localhost:2022".to_owned(),
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "access denied"),
+        };
+        assert_eq!(
+            error.to_string(),
+            "Could not reach the ET server: localhost:2022: access denied"
+        );
+        let rejected = ClientError::ServerInvalidKey(None);
+        assert!(!rejected.is_retryable_initial_connect());
+        assert!(!rejected.is_transient_reconnect());
+    }
+
+    #[test]
+    fn deadline_errors_are_recognized_by_ssh_clients() {
+        for error in [
+            ClientError::DnsTimeout("dns.invalid:2022".to_owned()),
+            ClientError::BootstrapTimeout("connecting"),
+            ClientError::SshTimeout("bootstrapping"),
+        ] {
+            assert!(error.to_string().contains("Operation timed out"));
+        }
+        let resolution = ClientError::DnsResolution {
+            endpoint: "dns.invalid:2022".to_owned(),
+            source: io::Error::new(io::ErrorKind::TimedOut, "localized resolver timeout"),
+        };
+        assert_eq!(
+            resolution.to_string(),
+            "Could not resolve hostname dns.invalid:2022: Operation timed out: localized resolver timeout"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn winsock_host_down_uses_upstream_host_unreachable_wording() {
+        let source = io::Error::from_raw_os_error(10064);
+        let detail = source.to_string();
+        let error = ClientError::UnreachableEndpoint {
+            endpoint: "host:2022".to_owned(),
+            source,
+        };
+        assert_eq!(
+            error.to_string(),
+            format!("Could not reach the ET server: host:2022: No route to host: {detail}")
+        );
     }
 }

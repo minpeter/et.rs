@@ -783,6 +783,33 @@ fn remote_session_end_drains_every_partial_write_before_returning() {
 
 #[cfg(unix)]
 #[test]
+fn cancellable_stdout_accepts_null_output_but_still_honors_cancellation() {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .unwrap();
+    let (cancel, mut cancel_signal) = et_net::local::wake_pair().unwrap();
+    let mut writer = CancellableStdout {
+        file,
+        cancel,
+        discard_device: None,
+    };
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    std::thread::spawn(move || {
+        let written = writer.write_all(&vec![0xa7; 8193]);
+        cancel_signal.write_all(&[1]).unwrap();
+        let cancelled = writer.write(b"after cancellation");
+        done_tx.send((written, cancelled)).unwrap();
+    });
+    let (written, cancelled) = done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("null output or cancellation blocked");
+    written.unwrap();
+    assert_eq!(cancelled.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+}
+
+#[cfg(unix)]
+#[test]
 fn cancellable_stdout_fails_when_output_is_closed() {
     use std::os::unix::net::UnixStream;
 
@@ -791,7 +818,11 @@ fn cancellable_stdout_fails_when_output_is_closed() {
     drop(output);
     drop(peer);
     let (cancel, _cancel_signal) = et_net::local::wake_pair().unwrap();
-    let mut writer = CancellableStdout { file, cancel };
+    let mut writer = CancellableStdout {
+        file,
+        cancel,
+        discard_device: None,
+    };
 
     let (done_tx, done_rx) = mpsc::sync_channel(0);
     std::thread::spawn(move || done_tx.send(writer.write(b"closed")).unwrap());

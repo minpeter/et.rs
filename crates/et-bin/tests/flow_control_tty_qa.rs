@@ -42,7 +42,7 @@ fn flow_control_keeps_ctrl_c_and_prompt_responsive_on_a_slow_link() {
             stack.terminal.to_str().unwrap(),
             "--serverfifo",
             stack.router.to_str().unwrap(),
-            "-p",
+            "--port",
             &proxy.port.to_string(),
             "127.0.0.1",
         ]);

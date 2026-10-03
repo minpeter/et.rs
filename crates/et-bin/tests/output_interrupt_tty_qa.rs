@@ -60,7 +60,7 @@ fn default_output_flood_interrupt_allows_a_subsequent_command() {
         stack.terminal.to_str().unwrap(),
         "--serverfifo",
         stack.router.to_str().unwrap(),
-        "-p",
+        "--port",
         &proxy.port.to_string(),
         "127.0.0.1",
     ]);

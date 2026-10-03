@@ -19,11 +19,78 @@ use crate::resolver::EndpointResolver;
 
 const VERSION: &str = "1";
 
+#[cfg(unix)]
+pub fn load_for(
+    name: &str,
+    host: &str,
+    port: u16,
+    user: Option<&str>,
+) -> Result<Option<SavedSession>, ClientError> {
+    if !valid_name(name) {
+        return Err(ClientError::Terminal("invalid session name".to_owned()));
+    }
+    let directory = sessions_dir().map_err(ClientError::Terminal)?;
+    if !directory.exists() {
+        return Ok(None);
+    }
+    let _lock = crate::local_ipc::lock_directory(&directory)
+        .map_err(|e| ClientError::Terminal(e.to_string()))?;
+    let path = directory.join(name);
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            let saved = load(name).map_err(ClientError::Terminal)?;
+            if saved.host != host
+                || saved.port != port
+                || user.is_none()
+                || saved.user.as_deref() != user
+            {
+                return Err(ClientError::Terminal(format!(
+                    "session {name} belongs to a different destination; use --attach or a different --name"
+                )));
+            }
+            Ok(Some(saved))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ClientError::Terminal(error.to_string())),
+    }
+}
+
+#[cfg(unix)]
+pub fn remove_if_matches(name: &str, id: &str) -> Result<bool, ClientError> {
+    if !valid_name(name) {
+        return Err(ClientError::Terminal("invalid session name".to_owned()));
+    }
+    let directory = sessions_dir().map_err(ClientError::Terminal)?;
+    if !directory.exists() {
+        return Ok(false);
+    }
+    let _lock = crate::local_ipc::lock_directory(&directory)
+        .map_err(|e| ClientError::Terminal(e.to_string()))?;
+    let path = directory.join(name);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(ClientError::Terminal(error.to_string())),
+        Ok(_) => {}
+    }
+    // A different client may have saved a new session under this name while
+    // this transport was running. Never delete that replacement's credentials.
+    let saved = load(name).map_err(ClientError::Terminal)?;
+    if saved.id == id {
+        match fs::remove_file(path) {
+            Ok(()) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(ClientError::Terminal(error.to_string())),
+        }
+    }
+    Ok(false)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SavedSession {
     pub name: String,
     pub host: String,
     pub port: u16,
+    pub user: Option<String>,
     pub id: String,
     pub passkey: String,
     pub saved_at: i64,
@@ -45,6 +112,7 @@ pub fn save_direct(
     name: &str,
     host: &str,
     port: u16,
+    user: Option<&str>,
     id: &str,
     passkey: &str,
 ) -> Result<(), ClientError> {
@@ -62,6 +130,7 @@ pub fn save_direct(
         name: name.to_owned(),
         host: host.to_owned(),
         port,
+        user: user.map(str::to_owned),
         id: id.to_owned(),
         passkey: passkey.to_owned(),
         saved_at,
@@ -77,6 +146,31 @@ pub fn attach(
     deadline: Deadline,
 ) -> Result<i32, ClientError> {
     let saved = load(name).map_err(ClientError::Terminal)?;
+    attach_saved(saved, args, resolver, deadline)
+}
+
+pub fn attach_saved(
+    saved: SavedSession,
+    args: &ClientArgs,
+    resolver: &dyn EndpointResolver,
+    deadline: Deadline,
+) -> Result<i32, ClientError> {
+    #[cfg(unix)]
+    let local_session = crate::local_session::prepare(args)?;
+    let reconnect_timeout = {
+        #[cfg(unix)]
+        {
+            if local_session.is_some() {
+                2
+            } else {
+                10
+            }
+        }
+        #[cfg(windows)]
+        {
+            10
+        }
+    };
     let endpoint = Endpoint {
         host: saved.host.clone(),
         port: saved.port,
@@ -93,12 +187,41 @@ pub fn attach(
     payload.jumphost = Some(false);
     let connection =
         connect_initial_with_intent(&endpoint, &credentials, &payload, resolver, deadline, true)?;
+    #[cfg(unix)]
+    crate::local_daemon::detach().map_err(|e| ClientError::Terminal(e.to_string()))?;
+    let agent_forward = crate::agent_forward::AgentForward::attach(&credentials.id)?;
     let (forwarder, _) = et_net::forward::Forwarder::start_with_origins_deadline(
         Vec::new(),
         deadline.expires_at(),
         std::sync::Arc::new(et_net::forward::SystemForwardResolver),
     )
     .map_err(|error| ClientError::Terminal(error.to_string()))?;
+    let reconnect_session = |connection: &mut et_net::connection::Connection| {
+        let outcome = crate::initial_connect::reconnect(
+            connection,
+            &endpoint,
+            &credentials,
+            resolver,
+            crate::deadline::Deadline::after(std::time::Duration::from_secs(reconnect_timeout)),
+        )?;
+        agent_forward.reconnected(outcome)
+    };
+    #[cfg(unix)]
+    if let Some(prepared) = local_session {
+        let mut adopted = args.clone();
+        adopted.command = None;
+        adopted.host = Some(saved.host.clone());
+        return crate::local_session::run(
+            connection,
+            &adopted,
+            &credentials.id,
+            prepared,
+            forwarder,
+            reconnect_session,
+        );
+    }
+    #[cfg(unix)]
+    crate::local_daemon::ready().map_err(|e| ClientError::Terminal(e.to_string()))?;
     crate::client_terminal::run(
         connection,
         crate::client_terminal::TerminalOptions {
@@ -114,15 +237,7 @@ pub fn attach(
             stdio_forward: false,
         },
         forwarder,
-        |connection| {
-            crate::initial_connect::reconnect(
-                connection,
-                &endpoint,
-                &credentials,
-                resolver,
-                crate::deadline::Deadline::after(std::time::Duration::from_secs(10)),
-            )
-        },
+        reconnect_session,
     )
 }
 
@@ -221,9 +336,16 @@ fn save(session: &SavedSession) -> Result<(), String> {
             .ok_or_else(|| "session directory is invalid".to_owned())?,
     )?;
     ensure_private_dir(&directory)?;
+    #[cfg(unix)]
+    let _lock = crate::local_ipc::lock_directory(&directory)
+        .map_err(|_| "could not lock the session directory".to_owned())?;
     if !printable_field(&session.host)
         || !printable_field(&session.id)
         || !printable_field(&session.passkey)
+        || session
+            .user
+            .as_deref()
+            .is_some_and(|user| !printable_field(user))
         || session.title.contains(['\r', '\n'])
     {
         return Err("session file is invalid".to_owned());
@@ -238,14 +360,15 @@ fn save(session: &SavedSession) -> Result<(), String> {
         session.name, nonce[0], nonce[1], nonce[2], nonce[3]
     ));
     let body = format!(
-        "version={VERSION}\nname={}\nhost={}\nport={}\nid={}\npasskey={}\nsavedat={}\ntitle={}\n",
+        "version={VERSION}\nname={}\nhost={}\nport={}\nid={}\npasskey={}\nsavedat={}\ntitle={}\nuser={}\n",
         session.name,
         session.host,
         session.port,
         session.id,
         session.passkey,
         session.saved_at,
-        session.title
+        session.title,
+        session.user.as_deref().unwrap_or("")
     );
     if let Err(error) = write_private(&temporary, body.as_bytes()) {
         let _ = fs::remove_file(&temporary);
@@ -316,6 +439,7 @@ fn parse_session(name: &str, contents: &str) -> Result<SavedSession, String> {
         name: name.to_owned(),
         host,
         port,
+        user: fields.get("user").filter(|user| !user.is_empty()).cloned(),
         id,
         passkey,
         saved_at,
@@ -540,6 +664,7 @@ mod tests {
             name: "work".to_owned(),
             host: "example.test".to_owned(),
             port: 2022,
+            user: Some("alice".to_owned()),
             id: "abcdefghijklmnop".to_owned(),
             passkey: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef".to_owned(),
             saved_at: 10,
@@ -549,6 +674,20 @@ mod tests {
         let loaded = load("work").unwrap();
         assert_eq!(loaded.host, "example.test");
         assert_eq!(loaded.passkey, session.passkey);
+        #[cfg(unix)]
+        {
+            assert!(load_for("work", "example.test", 2022, Some("alice"))
+                .unwrap()
+                .is_some());
+            assert!(load_for("work", "example.test", 2022, Some("bob")).is_err());
+            let mut legacy = session.clone();
+            legacy.user = None;
+            save(&legacy).unwrap();
+            assert!(load("work").unwrap().user.is_none());
+            assert!(load_for("work", "example.test", 2022, Some("alice")).is_err());
+            assert!(!remove_if_matches("work", "replacement-id").unwrap());
+            assert_eq!(load("work").unwrap().id, session.id);
+        }
         let _ = fs::write(
             directory.join(".et").join("sessions").join("work"),
             b"not a session\nSECRETKEY",

@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
 use std::io::{Read, Write};
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::net::{IpAddr, Ipv6Addr};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
+#[cfg(unix)]
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,9 +16,9 @@ use et_core::proto::{
     PortForwardData, PortForwardDestinationRequest, PortForwardSourceRequest, SocketEndpoint,
     TerminalPacketType,
 };
-#[cfg(unix)]
-use et_net::forward::ForwardError;
 use et_net::forward::Forwarder;
+#[cfg(unix)]
+use et_net::forward::{ForwardError, ForwardResolver};
 #[cfg(unix)]
 use et_net::forward::{ForwardOrigin, ForwardSource};
 use prost::Message;
@@ -24,6 +26,145 @@ use prost::Message;
 const TIMEOUT: Duration = Duration::from_secs(3);
 const REFUSED_DESTINATION_TIMEOUT: Duration = Duration::from_secs(7);
 const HARD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[test]
+fn worker_failure_releases_locally_owned_listeners_without_forwarder_drop() {
+    let port = reserve_port();
+    let source = Forwarder::start(vec![request(port, 79)]).unwrap();
+    source
+        .receive(Packet::new(
+            TerminalPacketType::PortForwardData as u8,
+            vec![0xff],
+        ))
+        .unwrap();
+    assert!(source.wait_outbound(TIMEOUT).is_err());
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+            drop(listener);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "failed worker retained its listening port"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    drop(source);
+}
+
+#[test]
+fn cancelling_local_listener_preserves_accepted_streams_and_exact_identity() {
+    for preconfigured in [false, true] {
+        let remote = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let remote_port = remote.local_addr().unwrap().port();
+        let echo = thread::spawn(move || {
+            let (mut stream, _) = remote.accept().unwrap();
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            let mut bytes = [0; 17];
+            stream.read_exact(&mut bytes).unwrap();
+            assert_eq!(&bytes, b"after-cancel-data");
+            stream.write_all(b"survived").unwrap();
+        });
+        let port = reserve_port();
+        let wanted = request(port, remote_port);
+        let mut source = Forwarder::start(if preconfigured {
+            vec![wanted.clone()]
+        } else {
+            Vec::new()
+        })
+        .unwrap();
+        source.add_local_forward(wanted.clone()).unwrap();
+        // Repeated opens must not attempt a second bind.
+        source.add_local_forward(wanted.clone()).unwrap();
+        let destination = Forwarder::start(Vec::new()).unwrap();
+        let mut application = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        application.set_read_timeout(Some(TIMEOUT)).unwrap();
+        destination
+            .receive(source.wait_outbound(TIMEOUT).unwrap())
+            .unwrap();
+        source
+            .receive(wait_for_destination_response(&destination, &source))
+            .unwrap();
+
+        let mut different = wanted.clone();
+        different.destination.as_mut().unwrap().port = Some(1);
+        assert!(source.cancel_local_forward(&different).is_err());
+        source.cancel_local_forward(&wanted).unwrap();
+        assert!(source.cancel_local_forward(&wanted).is_err());
+        assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_err());
+        // A successful cancel releases the listening address before returning.
+        let rebound = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+
+        application.write_all(b"after-cancel-data").unwrap();
+        destination
+            .receive(source.wait_outbound(TIMEOUT).unwrap())
+            .unwrap();
+        let mut relayed = 0;
+        while relayed < 8 {
+            let packet = destination.wait_outbound(TIMEOUT).unwrap();
+            relayed += PortForwardData::decode(packet.payload())
+                .ok()
+                .and_then(|data| data.buffer)
+                .map_or(0, |bytes| bytes.len());
+            source.receive(packet).unwrap();
+        }
+        let mut reply = [0; 8];
+        application.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"survived");
+        drop(application);
+        source.shutdown().unwrap();
+        destination.shutdown().unwrap();
+        echo.join().unwrap();
+        drop(rebound);
+    }
+}
+
+#[test]
+fn added_and_preconfigured_listeners_share_client_id_allocation() {
+    let first_port = reserve_port();
+    let mut source = Forwarder::start(vec![request(first_port, 31)]).unwrap();
+    let second_port = reserve_port();
+    source.add_local_forward(request(second_port, 79)).unwrap();
+    let _first = TcpStream::connect((Ipv4Addr::LOCALHOST, first_port)).unwrap();
+    let first =
+        PortForwardDestinationRequest::decode(source.wait_outbound(TIMEOUT).unwrap().payload())
+            .unwrap();
+    let _second = TcpStream::connect((Ipv4Addr::LOCALHOST, second_port)).unwrap();
+    let second =
+        PortForwardDestinationRequest::decode(source.wait_outbound(TIMEOUT).unwrap().payload())
+            .unwrap();
+    assert_ne!(first.fd, second.fd);
+    assert_eq!(first.destination.unwrap().port, Some(31));
+    assert_eq!(second.destination.unwrap().port, Some(79));
+    source.shutdown_hard().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_unix_listener_can_be_cancelled_and_reopened() {
+    use std::os::unix::net::UnixStream;
+    let path = std::env::temp_dir().join(format!("et-mutable-forward-{}.sock", std::process::id()));
+    let mut wanted = request(1, 2);
+    wanted.source = Some(SocketEndpoint {
+        name: Some(path.to_string_lossy().into_owned()),
+        port: None,
+    });
+    let mut source = Forwarder::start(Vec::new()).unwrap();
+    for _ in 0..2 {
+        source.add_local_forward(wanted.clone()).unwrap();
+        let connection = UnixStream::connect(&path).unwrap();
+        let packet = source.wait_outbound(TIMEOUT).unwrap();
+        assert_eq!(
+            packet.header(),
+            TerminalPacketType::PortForwardDestinationRequest as u8
+        );
+        source.cancel_local_forward(&wanted).unwrap();
+        assert!(!path.exists());
+        drop(connection);
+    }
+    source.shutdown_hard().unwrap();
+}
 
 #[test]
 fn two_forwarders_relay_a_real_tcp_round_trip() {
@@ -683,7 +824,7 @@ fn imported_local_wildcard_is_externally_reachable_while_loopback_is_not() {
 
 #[cfg(unix)]
 #[test]
-fn local_forwarding_exceeds_reverse_cap_while_reverse_limit_is_transactional() {
+fn local_and_reverse_listener_limits_fail_before_binding() {
     struct RemoveDir(std::path::PathBuf);
     impl Drop for RemoveDir {
         fn drop(&mut self) {
@@ -712,12 +853,16 @@ fn local_forwarding_exceeds_reverse_cap_while_reverse_limit_is_transactional() {
         })
         .collect();
 
-    // When: client-local forwarding owns more than the server reverse cap.
-    let local = Forwarder::start(requests.clone()).unwrap();
-
-    // Then: every local listener is usable and cleanup is deterministic.
-    assert!(paths.iter().all(|path| path.exists()));
-    local.shutdown().unwrap();
+    // Both client-local and authenticated reverse limits are checked before
+    // any sibling address is bound.
+    let local_error = match Forwarder::start(requests.clone()) {
+        Ok(forwarder) => {
+            forwarder.shutdown().unwrap();
+            panic!("local listener cap was not enforced");
+        }
+        Err(error) => error,
+    };
+    assert!(local_error.to_string().contains("listener limit"));
     assert!(paths.iter().all(|path| !path.exists()));
 
     // When: the same multiset is requested as authenticated server reverse forwarding.
@@ -739,6 +884,59 @@ fn local_forwarding_exceeds_reverse_cap_while_reverse_limit_is_transactional() {
         "unexpected error: {error}"
     );
     assert!(paths.iter().all(|path| !path.exists()));
+}
+
+#[cfg(unix)]
+#[test]
+fn reverse_dns_fanout_reports_reverse_limit_before_binding() {
+    struct FanoutResolver;
+    impl ForwardResolver for FanoutResolver {
+        fn resolve(&self, _host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+            Ok((1..=33)
+                .map(|octet| SocketAddr::from((Ipv4Addr::new(127, 0, 0, octet), port)))
+                .collect())
+        }
+    }
+
+    let path = std::env::temp_dir().join(format!("et-reverse-fanout-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let unix_request = PortForwardSourceRequest {
+        source: Some(SocketEndpoint {
+            name: Some(path.to_string_lossy().into_owned()),
+            port: None,
+        }),
+        destination: Some(SocketEndpoint {
+            name: Some("/tmp/destination.sock".to_owned()),
+            port: None,
+        }),
+        environmentvariable: None,
+    };
+    let owner = (
+        rustix::process::geteuid().as_raw(),
+        rustix::process::getegid().as_raw(),
+    );
+
+    let error = match Forwarder::start_with_user_deadline(
+        vec![unix_request, request_on("fanout.test", 12345, 1)],
+        Some(owner),
+        Instant::now() + TIMEOUT,
+        Arc::new(FanoutResolver),
+    ) {
+        Ok((forwarder, _)) => {
+            forwarder.shutdown().unwrap();
+            panic!("reverse DNS fanout did not exceed the listener cap")
+        }
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        ForwardError::Protocol("reverse listener limit exceeded")
+    ));
+    assert!(
+        !path.exists(),
+        "cap must be checked before any source binds"
+    );
 }
 
 fn reserve_port() -> u16 {

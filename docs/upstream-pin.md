@@ -20,11 +20,11 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-10-02.
 | Baseline / latest release tag | [`et-v7.0.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.0.0) |
 | Baseline / release commit | [`7656a32a5bc15c6746726a27a5a4ba1e468fab6e`](https://github.com/MisterTea/EternalTerminal/commit/7656a32a5bc15c6746726a27a5a4ba1e468fab6e) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`bcc28abc`](https://github.com/MisterTea/EternalTerminal/commit/bcc28abc39d5445bd6f80efe518c8e5fdae125c4) (#878 tip, SSH auth banner skip, reviewed 2026-10-02) |
+| Pin tip (last classified) | [`5129342`](https://github.com/MisterTea/EternalTerminal/commit/5129342ef5ce3185125d907b95ad6d15a36b1cb6) (#876 tip, editor setup docs skip, reviewed 2026-10-02) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
 | ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.0.0` and `master`) |
 
-The reviewed baseline-to-tip range contains 76 classified commits. Unclassified commits would be drift. `#854` (raw pipe command channel) is `ported`. `#851` (remote exit status) and `#849` (`-D`/`-W` forwards) are `ported` for wire parity. `#858` (per-session disconnect timeout), `#864`/`#868` (catchup order and connect/recover), `#793` (named sessions and the authenticated handshake), and `#863` (TERM split) are `ported`. `#837` (`TERMINAL_CLOSE` / `--close-on-hangup`) is `ported`. Pin ≠ a claim that every product backlog item past the wire port is finished.
+The reviewed baseline-to-tip range contains 77 classified commits. Unclassified commits would be drift. The product-parity ports below passed combined Linux verification: 824 tests passed, none failed, and two existing tests were ignored. Formatting, workspace clippy, Windows GNU/macOS ARM binary cross-checks, and release/AUR packaging checks passed. Real OpenSSH mux clients exercised the Rust master; no live C++ peer, native Windows/macOS runtime, or actual VS Code sleep cycle was tested in this port. `ported` covers the behavior described in each row, including its explicit limitations, not unrestricted product parity. Protocol remains v6.
 
 ## Ledger (classified 2026-10-02)
 
@@ -40,7 +40,7 @@ The reviewed baseline-to-tip range contains 76 classified commits. Unclassified 
 | [`12889c5`](https://github.com/MisterTea/EternalTerminal/commit/12889c5bfbf1ece81d45b4834f9b05254e723e1e) | 2026-07-21 | ci | skip | #776 GCC-16 CI |
 | [`90711ad`](https://github.com/MisterTea/EternalTerminal/commit/90711ad421264db30dc5d05df4a37452b41a7667) | 2026-07-21 | ci | skip | #777 windows deploy |
 | [`69b3353`](https://github.com/MisterTea/EternalTerminal/commit/69b33537ab12f324cf619aca04dc483728dc30c3) | 2026-07-30 | security | **ported** | #784 handshake 4KiB, recover, unix-socket LPE. Landed in et.rs via #31 / 906a7ca. |
-| [`b74a12e`](https://github.com/MisterTea/EternalTerminal/commit/b74a12efc567dbc1360ac0846f889c945a2eba60) | 2026-08-07 | product | skip | #788 non-tty console keep-alive; not wire/security |
+| [`b74a12e`](https://github.com/MisterTea/EternalTerminal/commit/b74a12efc567dbc1360ac0846f889c945a2eba60) | 2026-08-07 | product | **ported** | #788 non-TTY input EOF survival; diagnostics and Windows raw input tracked under #874 |
 | [`fcce839`](https://github.com/MisterTea/EternalTerminal/commit/fcce83924326ab5743878f2d58a534bd8a6bc22c) | 2026-09-01 | other | skip | #801 HTM/Windows/coverage; not et.rs server accept/reconnect |
 | [`50b961d`](https://github.com/MisterTea/EternalTerminal/commit/50b961d9e9eb6daf57d8a5ce9cae8f9209bffe44) | 2026-09-01 | security | **ported** | #798 accept starvation / stuck reconnect. Landed in et.rs via #77. PROTOCOL_VERSION stays 6. |
 | [`3e8db00`](https://github.com/MisterTea/EternalTerminal/commit/3e8db00cdccba4906ca1b995d3fd7c0650a9fac9) | 2026-09-01 | product | skip | #803 TIOCGWINSZ; Unix terminal-size observation only |
@@ -77,35 +77,36 @@ The reviewed baseline-to-tip range contains 76 classified commits. Unclassified 
 | [`fcd4d95`](https://github.com/MisterTea/EternalTerminal/commit/fcd4d959c48082d465556a26400ab734bffdccc0) | 2026-09-22 | product | skip | #747/#840 nested SSH Include paths. C++ `ParseConfigFile.hpp` only; et.rs uses OpenSSH `ssh -G`, which already resolves relative Includes. Not wire/auth. |
 | [`9718366`](https://github.com/MisterTea/EternalTerminal/commit/9718366cc5059912791c2590972ec451a05eeb9a) | 2026-09-22 | product | skip | #570/#829 telemetry crash-signal handler (`signal`+`raise`). et.rs has no telemetry. Not wire/auth. |
 | [`34b1948`](https://github.com/MisterTea/EternalTerminal/commit/34b194813dc4a660370755c4306a19a489edf5d2) | 2026-09-23 | protocol | **ported** | #854 raw pipe command channel: `TerminalBuffer.is_stderr`, `InitialPayload`/`TermInit` `no_pty`+`command`, `et -T`. et.rs flow-control tags moved to fields 6 and 5 so they do not collide with `no_pty`. PROTOCOL_VERSION stays 6. |
-| [`7a0fe09`](https://github.com/MisterTea/EternalTerminal/commit/7a0fe09bc92eb80e7441c9d974daa9665c596113) | 2026-09-23 | product | skip | #850 ssh-style positional remote command. Product/CLI only; not wire. PROTOCOL_VERSION stays 6. |
-| [`bb4701d`](https://github.com/MisterTea/EternalTerminal/commit/bb4701d8a67be77496bd5926ca6a4fa2cc07e991) | 2026-09-23 | product | skip | #855 `etserver --disconnect-timeout`. Product/cfg; existing `TERMINAL_CLOSE` covers explicit close. Not a protocol bump. PROTOCOL_VERSION stays 6. |
-| [`2088bc4`](https://github.com/MisterTea/EternalTerminal/commit/2088bc4607e5239fe782b51a3b1f6f4bc375d9d6) | 2026-09-24 | product | skip | #852 local OpenSSH `-V`/`-G`. Client-local CLI only; et.rs already uses real `ssh -G`. Not wire/auth. |
+| [`7a0fe09`](https://github.com/MisterTea/EternalTerminal/commit/7a0fe09bc92eb80e7441c9d974daa9665c596113) | 2026-09-23 | product | **ported** | #850 strict host boundary and positional command |
+| [`bb4701d`](https://github.com/MisterTea/EternalTerminal/commit/bb4701d8a67be77496bd5926ca6a4fa2cc07e991) | 2026-09-23 | product | **ported** | #855 global server timeout, restart defaults and unclaimed expiry |
+| [`2088bc4`](https://github.com/MisterTea/EternalTerminal/commit/2088bc4607e5239fe782b51a3b1f6f4bc375d9d6) | 2026-09-24 | product | **ported** | #852 local `-V`/`-G`; `-G` uses the full system OpenSSH dump |
 | [`ce4963e`](https://github.com/MisterTea/EternalTerminal/commit/ce4963edfccf3ea38dbd320cc7751a2c8af4d882) | 2026-09-24 | protocol | **ported** | #851 `TERMINAL_EXIT_STATUS=12` and `supports_exit_status`. Forwarded only when the client opts in. PROTOCOL_VERSION stays 6. |
-| [`6f53869`](https://github.com/MisterTea/EternalTerminal/commit/6f53869473a16407b59f1f3382d291ab97b4f64f) | 2026-09-24 | protocol | **ported** | #849 `et -D` / `et -W`: `half_close`, `no_shell`. Existing `-t`/`-r` unchanged. PROTOCOL_VERSION stays 6. |
-| [`f90c6f4`](https://github.com/MisterTea/EternalTerminal/commit/f90c6f4715f8f7e72afaf8085248ed7305c8aa6a) | 2026-09-24 | product | skip | #857 journald wall text filter for tmux `-CC`. Product/HTM only. PROTOCOL_VERSION stays 6. |
+| [`6f53869`](https://github.com/MisterTea/EternalTerminal/commit/6f53869473a16407b59f1f3382d291ab97b4f64f) | 2026-09-24 | protocol | **ported** | #849 `et -D` / `et -W`: `half_close`, `no_shell`. PROTOCOL_VERSION stays 6. |
+| [`f90c6f4`](https://github.com/MisterTea/EternalTerminal/commit/f90c6f4715f8f7e72afaf8085248ed7305c8aa6a) | 2026-09-24 | product | **ported** | #857 bounded PTY-only tmux-CC wall filter |
 | [`b834d6e`](https://github.com/MisterTea/EternalTerminal/commit/b834d6ebbd0ba4742f5278cc562bba551800c0c0) | 2026-09-25 | ci | skip | #859 CI cache. Not protocol/wire/auth. |
-| [`9a2d230`](https://github.com/MisterTea/EternalTerminal/commit/9a2d23092584606f8d0c55b111ed7416ca71d5ea) | 2026-09-25 | product | skip | #853 local OpenSSH ControlMaster mux. Not ET wire. |
+| [`9a2d230`](https://github.com/MisterTea/EternalTerminal/commit/9a2d23092584606f8d0c55b111ed7416ca71d5ea) | 2026-09-25 | product | **ported** | #853 Unix mux v4 and local TCP/Unix mutation; unsupported requests rejected (see below) |
 | [`c5ddae7`](https://github.com/MisterTea/EternalTerminal/commit/c5ddae79be824944df0e423cb49c032c60cf3394) | 2026-09-25 | ci | skip | #865 HTM e2e harness. CI/product only. |
 | [`64fa900`](https://github.com/MisterTea/EternalTerminal/commit/64fa9006142cc63e936445fb908d07338ae9009e) | 2026-09-25 | product | **ported** | #863 split `id/passkey_TERM` at the first underscore. |
-| [`99ac197`](https://github.com/MisterTea/EternalTerminal/commit/99ac1972c21f68c141d66f967ded231fc2903c7b) | 2026-09-25 | product | skip | #843/#769 SSH banner stderr UX. Product only. |
+| [`99ac197`](https://github.com/MisterTea/EternalTerminal/commit/99ac1972c21f68c141d66f967ded231fc2903c7b) | 2026-09-25 | product | skip | #843/#769 equivalent foreground behavior: SSH inherits stderr; file logging does not redirect it |
 | [`fe0795c`](https://github.com/MisterTea/EternalTerminal/commit/fe0795c1dc6c42d13b50445681bf6a5b341ca64e) | 2026-09-25 | protocol | **ported** | #858 `disconnect_timeout_seconds` field 8. et.rs `flowcontrol` moved to field 9. |
 | [`a4bed0c`](https://github.com/MisterTea/EternalTerminal/commit/a4bed0cfabe64cc307bc0afb63c6512e4e85d4e8) | 2026-09-25 | protocol | **ported** | #864 client reads peer catchup before writing its own. |
-| [`f3137ce`](https://github.com/MisterTea/EternalTerminal/commit/f3137cee7b805284d7c76a7a5538884946576fd1) | 2026-09-26 | product | skip | #867 OpenSSH short-flag remap. et.rs short flags unchanged. |
+| [`f3137ce`](https://github.com/MisterTea/EternalTerminal/commit/f3137cee7b805284d7c76a7a5538884946576fd1) | 2026-09-26 | product | **ported** | #867 OpenSSH short-flag remap; README migration required |
 | [`540367a`](https://github.com/MisterTea/EternalTerminal/commit/540367ac4509be41714769cf511d8c0aa90cde7a) | 2026-09-26 | security | **ported** | #793 named sessions, challenge handshake, restart survival. |
-| [`da977ba`](https://github.com/MisterTea/EternalTerminal/commit/da977ba0fa212b775774c7e58a0f6d8f4c6ea175) | 2026-09-27 | product | skip | #870 ssh_config forwards and SendEnv. Product only. |
+| [`da977ba`](https://github.com/MisterTea/EternalTerminal/commit/da977ba0fa212b775774c7e58a0f6d8f4c6ea175) | 2026-09-27 | product | **ported** | #870 forwards, SendEnv and RemoteCommand; unsupported forward forms remain explicit |
 | [`ca91fb5`](https://github.com/MisterTea/EternalTerminal/commit/ca91fb5d5eaccaa464f1106cb946586ebc7789f9) | 2026-09-27 | protocol | **ported** | #868 failed connect exits, second connect recovers, catchup read-first. |
 | [`044bcb5`](https://github.com/MisterTea/EternalTerminal/commit/044bcb5ae7960445a8bffb6fed4d3589f1aa8fc4) | 2026-09-27 | product | skip | #827 PTY teardown when a background process holds the slave. |
-| [`16aec0c`](https://github.com/MisterTea/EternalTerminal/commit/16aec0c1d49b24027057541c7bb0f967b077bc2f) | 2026-09-28 | product | skip | #828/#506 client-local SSH agent proxy symlink retarget on reconnect/reattach. Not ET wire/auth. PROTOCOL_VERSION stays 6. |
+| [`16aec0c`](https://github.com/MisterTea/EternalTerminal/commit/16aec0c1d49b24027057541c7bb0f967b077bc2f) | 2026-09-28 | product | **ported** | #828 secure agent symlink retarget; absent agent clears stale link |
 | [`568b7cc`](https://github.com/MisterTea/EternalTerminal/commit/568b7ccc043eb632462d6f51f8219f188c5a25a3) | 2026-09-28 | product | skip | #832/#660 empty no-op close after #833 already fixed partial listen. Same skip as #669/#833 (et.rs already probes IPv6). PROTOCOL_VERSION stays 6. |
-| [`662c332`](https://github.com/MisterTea/EternalTerminal/commit/662c332ba572364265ea84d350c4065b3dc3d52e) | 2026-09-28 | product | skip | #825/#425 export SSH_TTY for remote PTY sessions. Product env only; not wire/auth. PROTOCOL_VERSION stays 6. |
+| [`662c332`](https://github.com/MisterTea/EternalTerminal/commit/662c332ba572364265ea84d350c4065b3dc3d52e) | 2026-09-28 | product | **ported** | #825 actual Unix PTY path in SSH_TTY |
 | [`f50f878`](https://github.com/MisterTea/EternalTerminal/commit/f50f878d21355e986a07582b4183f47a2ca309b7) | 2026-09-28 | product | skip | #823/#298 C++ per-connection port-forward 64KiB event-loop budget. Product/fairness; no wire change. PROTOCOL_VERSION stays 6. |
-| [`5b0f17a`](https://github.com/MisterTea/EternalTerminal/commit/5b0f17a56e2a664ce506f3266d7cf770561e55b6) | 2026-09-28 | product | skip | #819 et --ctl local Unix control socket (ControlProtocol local IPC, not ET wire). Product/CLI; POSIX-only. PROTOCOL_VERSION stays 6. |
-| [`eb518af`](https://github.com/MisterTea/EternalTerminal/commit/eb518af9f06dc338660c020cdc11fc7bede7c35e) | 2026-09-29 | product | skip | #872 C++ per-OS platform split (Unix/Windows source files), Windows console/PollSet fixes, 64-packet server fairness bound, FdPoller descriptor lifetime. No .proto/wire change; PROTOCOL_VERSION stays 6. et.rs already has ConPTY + forbid(unsafe) and no C++ FdPoller path. Same skip family as #823/#817. |
-| [`b5b009b`](https://github.com/MisterTea/EternalTerminal/commit/b5b009bf9ad91fda30eb2b394c6936c69e2b9806) | 2026-09-30 | product | skip | #874 VS Code Remote-SSH keep-alive: console EOF checks the fd actually read; OpenSSH-style connect error text via getLastConnectError. Client UX/interop only; no .proto/wire/auth. PROTOCOL_VERSION stays 6. |
+| [`5b0f17a`](https://github.com/MisterTea/EternalTerminal/commit/5b0f17a56e2a664ce506f3266d7cf770561e55b6) | 2026-09-28 | product | **ported** | #819 Unix ctl, cursors, transcript and lifecycle; raw -T/-W and Windows unsupported |
+| [`eb518af`](https://github.com/MisterTea/EternalTerminal/commit/eb518af9f06dc338660c020cdc11fc7bede7c35e) | 2026-09-29 | product | skip | #872 C++ platform split N/A; equivalent `CLIENT_READ_BATCH=64`, bounded per-stream queues, and async pending writes |
+| [`b5b009b`](https://github.com/MisterTea/EternalTerminal/commit/b5b009bf9ad91fda30eb2b394c6936c69e2b9806) | 2026-09-30 | product | **ported** | #874 EOF survival and SSH diagnostics; no actual VS Code sleep-cycle test. |
 | [`ea2542f`](https://github.com/MisterTea/EternalTerminal/commit/ea2542fade29191703356e0abf00b78e72bb58e2) | 2026-09-30 | ci | skip | #875 C++ mains testable (MainEntry split) + setup-failure CI coverage. C++ harness only; not et.rs wire. PROTOCOL_VERSION stays 6. |
 | [`a5e29af`](https://github.com/MisterTea/EternalTerminal/commit/a5e29afdf97b163cdc74331a58fbdb0514a466c5) | 2026-09-30 | product | skip | #873 client setup failures throw instead of exit(1); Connection drops writes when no handshake writer (hang fix). Product/reliability; et.rs already uses Result paths. No wire/auth change. PROTOCOL_VERSION stays 6. |
 | [`dc1dc63`](https://github.com/MisterTea/EternalTerminal/commit/dc1dc63dc6b6175168d4dbc52227608ed3cbc6d0) | 2026-09-30 | ci | skip | #877 OpenWrt package installs et1. Packaging/CI only. PROTOCOL_VERSION stays 6. |
-| [`bcc28abc`](https://github.com/MisterTea/EternalTerminal/commit/bcc28abc39d5445bd6f80efe518c8e5fdae125c4) | 2026-10-01 | product | skip | #878/#769 SSH auth banners on terminal after stderr→log redirect (preserve original stderr). Same product/UX family as #843/#769 skip; not wire/auth. PROTOCOL_VERSION stays 6. Pin tip. |
+| [`bcc28abc`](https://github.com/MisterTea/EternalTerminal/commit/bcc28abc39d5445bd6f80efe518c8e5fdae125c4) | 2026-10-01 | product | skip | #878/#769 logging never redirects process stderr; foreground SSH already inherits it; background -f intentionally detaches stdio |
+| [`5129342`](https://github.com/MisterTea/EternalTerminal/commit/5129342ef5ce3185125d907b95ad6d15a36b1cb6) | 2026-10-02 | docs | skip | #876 README-only editor setup for upstream et1; et.rs does not package that wrapper or claim editor sleep-cycle verification. Pin tip. |
 
 
 ## Ported and residual
@@ -157,8 +158,10 @@ Upstream left reconnect passkey-before-recover for a future
 `PROTOCOL_VERSION` bump; that residual is still unported. Do **not** treat
 this pin as a green light to bump `PROTOCOL_VERSION` or land a v7 port.
 
-[`b74a12e`](https://github.com/MisterTea/EternalTerminal/commit/b74a12efc567dbc1360ac0846f889c945a2eba60) (`#788`) stays `status: skip`
-(product, not wire/security).
+[`b74a12e`](https://github.com/MisterTea/EternalTerminal/commit/b74a12efc567dbc1360ac0846f889c945a2eba60) (`#788`) is `status: ported`:
+non-TTY input EOF no longer ends the session. SSH diagnostic phrasing and the
+Windows redirected-byte input path are tracked under `#874`. Linux heredoc and
+input tests pass; redirected Windows input lacks native runtime coverage.
 [`fcce839`](https://github.com/MisterTea/EternalTerminal/commit/fcce83924326ab5743878f2d58a534bd8a6bc22c) (`#801`),
 [`3e8db00`](https://github.com/MisterTea/EternalTerminal/commit/3e8db00cdccba4906ca1b995d3fd7c0650a9fac9) (`#803`), and
 [`342c0df`](https://github.com/MisterTea/EternalTerminal/commit/342c0dfb32882c94df6aa18092fc897015222c0b) (`#802`) stay `status: skip`
@@ -274,26 +277,27 @@ fields on `TermInit`. et.rs previously used those field numbers for
 not `half_close`. `PROTOCOL_VERSION` stays 6.
 
 [`7a0fe09`](https://github.com/MisterTea/EternalTerminal/commit/7a0fe09bc92eb80e7441c9d974daa9665c596113)
-(`#850`) stays `status: skip`. SSH-style positional remote command
-(`et user@host cmd...`) is client argument parsing only. Not wire.
+(`#850`) is `status: ported`. SSH-style positional commands use a strict host
+boundary, together with the #867 short-flag remap. CLI and integration tests pass.
 `PROTOCOL_VERSION` stays 6.
 
 [`bb4701d`](https://github.com/MisterTea/EternalTerminal/commit/bb4701d8a67be77496bd5926ca6a4fa2cc07e991)
-(`#855`) stays `status: skip`. Optional
-`etserver --disconnect-timeout` closes disconnected `etterminal` sessions.
-Product/config only; explicit close already uses `TERMINAL_CLOSE`. Not a
-protocol bump. `PROTOCOL_VERSION` stays 6.
+(`#855`) is `status: ported`. The global server timeout is minutes in CLI and
+INI `[Networking] disconnect_timeout`; explicit 0 disables it. Restart resolves
+the current default, while unclaimed resumes receive `max(timeout, 60s grace)`.
+Restart, claim-race and real-time expiry tests pass; `PROTOCOL_VERSION` stays 6.
 
 [`2088bc4`](https://github.com/MisterTea/EternalTerminal/commit/2088bc4607e5239fe782b51a3b1f6f4bc375d9d6)
-(`#852`) stays `status: skip`. Local OpenSSH `-V` and `-G` queries never
-connect. et.rs already resolves SSH config with real `ssh -G`. Not wire or auth.
+(`#852`) is `status: ported`: local `-V` and `-G` bypass daemon/mux dispatch.
+`-G` prints the full resolved system OpenSSH dump, not upstream's smaller subset.
+Bootstrap and CLI tests pass.
 
 [`ce4963e`](https://github.com/MisterTea/EternalTerminal/commit/ce4963edfccf3ea38dbd320cc7751a2c8af4d882)
 (`#851`) is `status: ported` for wire parity. `TERMINAL_EXIT_STATUS = 12` and
 `TerminalExitStatus.exitcode` report `WEXITSTATUS` or `128+signal`.
 `InitialPayload.supports_exit_status` is field 6 (default unset). etserver
 forwards packet 12 only when the client set it, because et-v7.0.0 aborts on
-unknown type 12. `et -c` / command sessions exit with that status; interactive
+unknown type 12. `et --command` / command sessions exit with that status; interactive
 sessions and `et -W` stay 0. et.rs `flowcontrol` left field 6 and now lives at field 9.
 `PROTOCOL_VERSION` stays 6. This pin does not claim every product follow-up
 beyond that wire behavior is finished.
@@ -305,18 +309,24 @@ ties stdio to the remote destination with `no_shell` and no pty. `half_close`
 keeps the destination open for the reply after the source finishes writing.
 `TermInit.no_shell` is field 5. et.rs `flowcontrol` left that tag and now lives at field 8.
 `PortForwardData.half_close` is field 6, so et.rs `window` moved to field 7.
-Existing `-t`/`-r` still fully close. Windows rejects `-W`. `PROTOCOL_VERSION` stays 6.
+Windows rejects `-W`. `PROTOCOL_VERSION` stays 6.
 
 [`f90c6f4`](https://github.com/MisterTea/EternalTerminal/commit/f90c6f4715f8f7e72afaf8085248ed7305c8aa6a)
-(`#857`) stays `status: skip`. It drops journald wall text
-from tmux `-CC` streams. Product/HTM only; et.rs has its own HTM path. Not
-protocol, wire, or auth. `PROTOCOL_VERSION` stays 6.
+(`#857`) is `status: ported`. A PTY-only tmux-CC filter removes journald wall
+text while retaining response bodies and binary bytes. It buffers at most seven
+undecided prefix bytes; megabyte streams, one-byte chunks, keyword lookalikes and
+split terminators are tested. `PROTOCOL_VERSION` stays 6.
 
 [`b834d6e`](https://github.com/MisterTea/EternalTerminal/commit/b834d6ebbd0ba4742f5278cc562bba551800c0c0)
 (`#859`) stays `status: skip`. CI cache only.
 
 [`9a2d230`](https://github.com/MisterTea/EternalTerminal/commit/9a2d23092584606f8d0c55b111ed7416ca71d5ea)
-(`#853`) stays `status: skip`. Local OpenSSH ControlMaster mux. Not ET wire.
+(`#853`) is `status: ported`. Unix mux v4 supports command/interactive passengers,
+background/persistence, and local TCP/Unix forward open/cancel. Cancellation
+leaves accepted streams alive. Real system OpenSSH clients test framing,
+descriptor passing and command status. Remote, dynamic, stdio, X11, subsystem
+and agent mux requests, raw `-T` masters (except `-NT`), and Windows local mux
+are explicitly unsupported. ControlPath tokens are literal, not expanded.
 
 [`c5ddae7`](https://github.com/MisterTea/EternalTerminal/commit/c5ddae79be824944df0e423cb49c032c60cf3394)
 (`#865`) stays `status: skip`. HTM end-to-end harness. CI/product only.
@@ -326,7 +336,9 @@ protocol, wire, or auth. `PROTOCOL_VERSION` stays 6.
 underscore, so a TERM such as `xterm_256color` does not abort session start.
 
 [`99ac197`](https://github.com/MisterTea/EternalTerminal/commit/99ac1972c21f68c141d66f967ded231fc2903c7b)
-(`#843` / `#769`) stays `status: skip`. SSH banner stderr UX. Product only.
+(`#843` / `#769`) stays `status: skip`: foreground `SystemSsh` already inherits
+stderr, and file logging never redirects that descriptor. Background `-f`
+intentionally detaches stdio rather than displaying interactive auth banners.
 
 [`fe0795c`](https://github.com/MisterTea/EternalTerminal/commit/fe0795c1dc6c42d13b50445681bf6a5b341ca64e)
 (`#858`) is `status: ported` for the wire field and the etserver/etterminal
@@ -341,9 +353,9 @@ writing its own. The server still writes first, so a patched client recovers
 against an old or new server.
 
 [`f3137ce`](https://github.com/MisterTea/EternalTerminal/commit/f3137cee7b805284d7c76a7a5538884946576fd1)
-(`#867`) stays `status: skip`. OpenSSH short-flag remap is a breaking product
-CLI. et.rs keeps its existing short flags; `-x` remains `--kill-other-sessions`.
-Named-session kill is the long flag `--kill` only.
+(`#867`) is `status: ported` with the OpenSSH short-flag remap and strict host
+boundary. Existing scripts must follow the README migration table. The migrated
+integration suite and CLI boundary tests pass.
 
 [`540367a`](https://github.com/MisterTea/EternalTerminal/commit/540367ac4509be41714769cf511d8c0aa90cde7a)
 (`#793`) is `status: ported` for the wire, auth, and named-session behavior.
@@ -357,7 +369,11 @@ are the upstream resume tags, so et.rs `flowcontrol` on `TermInit` lives at
 field 8. `PROTOCOL_VERSION` stays 6.
 
 [`da977ba`](https://github.com/MisterTea/EternalTerminal/commit/da977ba0fa212b775774c7e58a0f6d8f4c6ea175)
-(`#870`) stays `status: skip`. ssh_config forwards and SendEnv. Product only.
+(`#870`) is `status: ported`: ordinary `RemoteForward`, `DynamicForward`,
+`SendEnv`, `RemoteCommand`, and related ssh_config behavior pass configuration
+and real forwarding tests. Remote bind errors remain fatal; reverse SOCKS,
+allocated remote port 0 and unsupported streamlocal bind policies are skipped
+with warnings. See the README for environment and bootstrap isolation rules.
 
 [`ca91fb5`](https://github.com/MisterTea/EternalTerminal/commit/ca91fb5d5eaccaa464f1106cb946586ebc7789f9)
 (`#868`, including `#866` / `#862` / `#861`) is `status: ported`. A failed
@@ -366,13 +382,18 @@ connection runs recover instead of installing sequence 0. The client still
 reads catchup first.
 
 [`044bcb5`](https://github.com/MisterTea/EternalTerminal/commit/044bcb5ae7960445a8bffb6fed4d3589f1aa8fc4)
-(`#827` / `#448`) stays `status: skip`. It tears down a PTY
-session when a background process still holds the slave, using the
-already-ported type 12 exit status. Product/lifecycle only. `PROTOCOL_VERSION` stays 6.
+(`#827` / `#448`) stays `status: skip` because et.rs already has equivalent
+behavior: `terminal_pty` waits for the foreground child independently of PTY
+EOF, bounds output draining, reports type 12 exit status, and kills the remaining
+process group. A background descendant retaining the slave therefore does not
+keep the session alive indefinitely. `PROTOCOL_VERSION` stays 6.
 
 [`16aec0c`](https://github.com/MisterTea/EternalTerminal/commit/16aec0c1d49b24027057541c7bb0f967b077bc2f)
-(`#828` / `#506`) stays `status: skip`. Client-local SSH agent proxy symlink
-retarget on reconnect/reattach. Not ET wire/auth. `PROTOCOL_VERSION` stays 6.
+(`#828` / `#506`) is `status: ported`. The stable, secure agent proxy symlink
+retargets on reconnect/reattach. Tests exercise different agents through the
+same remote socket, rejected authentication and missing-directory recovery.
+Saved attach uses current `SSH_AUTH_SOCK` and consistent `TMPDIR`; an absent
+agent clears the stale link rather than upstream's old-link fallback.
 
 [`568b7cc`](https://github.com/MisterTea/EternalTerminal/commit/568b7ccc043eb632462d6f51f8219f188c5a25a3)
 (`#832` / `#660`) stays `status: skip`. Empty no-op close after `#833` already
@@ -380,34 +401,35 @@ fixed partial listen. Same skip as `#669`/`#833` (et.rs already probes IPv6).
 `PROTOCOL_VERSION` stays 6.
 
 [`662c332`](https://github.com/MisterTea/EternalTerminal/commit/662c332ba572364265ea84d350c4065b3dc3d52e)
-(`#825` / `#425`) stays `status: skip`. Export `SSH_TTY` for remote PTY
-sessions. Product env only; not wire/auth. `PROTOCOL_VERSION` stays 6.
+(`#825` / `#425`) is `status: ported`. Remote Unix PTY sessions export their
+actual PTY path as `SSH_TTY`; PTY and no-PTY tests pass.
 
 [`f50f878`](https://github.com/MisterTea/EternalTerminal/commit/f50f878d21355e986a07582b4183f47a2ca309b7)
-(`#823` / `#298`) stays `status: skip`. C++ per-connection port-forward 64KiB
-event-loop budget. Product/fairness; no wire change. `PROTOCOL_VERSION` stays 6.
+(`#823` / `#298`) stays `status: skip` with equivalent Rust evidence: per-stream
+readers feed bounded queues and pending connection writes are asynchronous.
+`PROTOCOL_VERSION` stays 6.
 
 [`5b0f17a`](https://github.com/MisterTea/EternalTerminal/commit/5b0f17a56e2a664ce506f3266d7cf770561e55b6)
-(`#819`) stays `status: skip`. `et --ctl` is a local Unix
-control socket (`ControlProtocol` local IPC, not ET wire). Product/CLI;
-POSIX-only. `PROTOCOL_VERSION` stays 6.
+(`#819`) is `status: ported`. Unix `et --ctl` supports input, resize, output
+cursors, status, redacted transcripts, tombstones and saved-session adoption.
+Local kill retains an attachable remote shell; definite remote end removes
+matching saved credentials, so the same name can bootstrap afresh. Tests cover
+both paths, startup-command non-replay and replacement-ID preservation.
+Raw `-T`/`-W` control and Windows local control are unsupported.
 
 [`eb518af`](https://github.com/MisterTea/EternalTerminal/commit/eb518af9f06dc338660c020cdc11fc7bede7c35e)
-(`#872`) stays `status: skip`. It splits C++ `#ifdef WIN32`
-code into CMake-selected `*Unix.cpp` / `*Windows.cpp` files, adds Windows
-console UTF-8 / `PollSet` so keystrokes and `-T` do not starve the client
-socket, bounds client-packet work per server iteration (64, same fairness
-family as `#823`), and fixes `FdPoller` descriptor lifetime during reconnect.
-FreeBSD CI ccache PCH timestamps are CI-only. No `.proto` or wire fixture
-change. et.rs already has its own ConPTY Windows path, `#![forbid(unsafe_code)]`,
-and socket2/nix I/O, with no C `FdPoller`/`select` path to mirror (same skip
-family as `#823` / `#817`). `PROTOCOL_VERSION` stays 6.
+(`#872`) stays `status: skip` with equivalent evidence where applicable:
+`CLIENT_READ_BATCH=64` bounds server client reads, and forwarding uses bounded
+per-stream reader queues plus asynchronous pending connection writes. The C++
+platform split and `FdPoller` lifetime do not map to Rust. This does not claim
+native macOS/Windows runtime or C++ live-peer testing. `PROTOCOL_VERSION` stays 6.
 
 [`b5b009b`](https://github.com/MisterTea/EternalTerminal/commit/b5b009bf9ad91fda30eb2b394c6936c69e2b9806)
-(`#874`) stays `status: skip`. VS Code Remote-SSH keep-alive: console EOF
-checks the fd actually read; OpenSSH-style connect error text via
-`getLastConnectError`. Client UX/interop only; no `.proto`/wire/auth.
-`PROTOCOL_VERSION` stays 6.
+(`#874`, “keep VS Code Remote-SSH sessions alive over et across sleep”) is
+`status: ported`. It shares #788's non-TTY EOF survival and SSH
+diagnostic handling, including redirected Windows raw bytes. Linux heredoc and
+reconnect tests pass; no actual VS Code sleep cycle, native Windows/macOS runtime
+or live C++ peer was exercised in this port. `PROTOCOL_VERSION` stays 6.
 
 [`ea2542f`](https://github.com/MisterTea/EternalTerminal/commit/ea2542fade29191703356e0abf00b78e72bb58e2)
 (`#875`) stays `status: skip`. C++ mains testable (`MainEntry` split) plus
@@ -425,13 +447,20 @@ Product/reliability; et.rs already uses `Result` paths. No wire/auth change.
 `et1`. Packaging/CI only. `PROTOCOL_VERSION` stays 6.
 
 [`bcc28abc`](https://github.com/MisterTea/EternalTerminal/commit/bcc28abc39d5445bd6f80efe518c8e5fdae125c4)
-(`#878` / `#769`) is the pin tip and stays `status: skip`. SSH auth banners
-show on the terminal after the stderr→log redirect (preserve original stderr).
-Same product/UX family as `#843`/`#769`. Not wire/auth. Pin ≠ a claim that
-every product backlog item is finished. `PROTOCOL_VERSION` stays 6.
+(`#878` / `#769`) stays `status: skip`: et.rs logging never redirects process
+stderr, so preserving a pre-redirect descriptor is unnecessary. Foreground SSH
+inherits stderr; background `-f` intentionally detaches it. `PROTOCOL_VERSION`
+stays 6.
+
+[`5129342`](https://github.com/MisterTea/EternalTerminal/commit/5129342ef5ce3185125d907b95ad6d15a36b1cb6)
+(`#876`) is the pin tip and `status: skip`. This README-only change documents
+VS Code/Cursor Remote-SSH settings using upstream's installed `et1` wrapper.
+et.rs does not package `et1`; copying that installation claim would be incorrect.
+No runtime or wire change is required, and actual editor sleep-cycle verification
+remains unclaimed.
 
 et.rs still claims **protocol v6**. EternalTerminal’s latest product release is
-**v7.0.0**, and the reviewed tip is seventy-six classified commits past that tag.
+**v7.0.0**, and the reviewed tip is seventy-seven classified commits past that tag.
 
 Review ports against the conflict policy in
 [`docs/upstream-factory.md`](upstream-factory.md). Gate any later port with

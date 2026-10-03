@@ -1,6 +1,41 @@
 use super::*;
 
 #[test]
+fn three_part_openssh_forwards_default_only_the_bind_address() {
+    let requests = parse_tunnels(&["8080:db.internal:5432,9090:[2001:db8::7]:443".into()]).unwrap();
+    assert_eq!(
+        requests[0].source,
+        Some(SocketEndpoint {
+            name: Some("localhost".into()),
+            port: Some(8080)
+        })
+    );
+    assert_eq!(
+        requests[0].destination,
+        Some(SocketEndpoint {
+            name: Some("db.internal".into()),
+            port: Some(5432)
+        })
+    );
+    assert_eq!(
+        requests[1].source,
+        Some(SocketEndpoint {
+            name: Some("localhost".into()),
+            port: Some(9090)
+        })
+    );
+    assert_eq!(
+        requests[1].destination,
+        Some(SocketEndpoint {
+            name: Some("2001:db8::7".into()),
+            port: Some(443)
+        })
+    );
+    assert!(parse_tunnels(&["/tmp/source:db.internal:5432".into()]).is_err());
+    assert!(parse_tunnels(&["8080::5432".into()]).is_err());
+}
+
+#[test]
 fn parses_upstream_two_port_and_range_syntax() {
     let requests = parse_tunnels(&["1000:2000,8000-8002:9000-9002".to_owned()]).unwrap();
     assert_eq!(requests.len(), 4);

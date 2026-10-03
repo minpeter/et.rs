@@ -6,7 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use et_core::keys::passkey_to_key;
 use et_core::packet::Packet;
@@ -200,6 +200,15 @@ fn register(
     path: &Path,
     handle: &crate::runtime_handle::RuntimeHandle,
 ) -> et_net::local::LocalStream {
+    register_resume(path, handle, false, None)
+}
+
+fn register_resume(
+    path: &Path,
+    handle: &crate::runtime_handle::RuntimeHandle,
+    resumed: bool,
+    timeout: Option<i32>,
+) -> et_net::local::LocalStream {
     let mut stream = et_net::local::connect(path).unwrap();
     let packet = Packet::new(
         TerminalPacketType::TerminalUserInfo as u8,
@@ -209,9 +218,9 @@ fn register(
             uid: Some(i64::from(rustix::process::getuid().as_raw())),
             gid: Some(i64::from(rustix::process::getgid().as_raw())),
             fd: None,
-            ptyactive: None,
+            ptyactive: resumed.then_some(true),
             hadreversetunnels: None,
-            disconnect_timeout_seconds: None,
+            disconnect_timeout_seconds: timeout,
         }
         .encode_to_vec(),
     );
@@ -227,4 +236,192 @@ fn handshake(address: SocketAddr) -> (TcpStream, ConnectResponse) {
     write_proto(&mut stream, &client_request(ID)).unwrap();
     let response = read_proto_limited(&mut stream, 64 * 1024).unwrap();
     (stream, response)
+}
+
+#[test]
+fn unclaimed_resumes_obey_grace_override_and_exact_expiry_boundary() {
+    for (global, session, expires_after) in [
+        (1, None, Some(60)),
+        (90, None, Some(90)),
+        (90, Some(1), Some(60)),
+        (1, Some(120), Some(120)),
+        (1, Some(0), None),
+        (0, None, None),
+        (0, Some(1), Some(60)),
+    ] {
+        let directory = TestDirectory::new();
+        let router_path = select_router_path_for(
+            rustix::process::getuid().as_raw(),
+            Some(&directory.socket()),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut runtime = Runtime::start_with_settings(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            0,
+            router_path,
+            128,
+            global,
+        )
+        .unwrap();
+        let mut terminal = register_resume(&directory.socket(), &runtime.handle(), true, session);
+        terminal.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let (registration, registered_at) = runtime.core.registry.resumed().unwrap().pop().unwrap();
+        let before = registered_at + Duration::from_secs(expires_after.unwrap_or(1000))
+            - Duration::from_nanos(1);
+        crate::runtime_lifecycle::expire_unclaimed_resumes(&runtime.core, before).unwrap();
+        assert!(runtime
+            .core
+            .registry
+            .contains(&registration.identity())
+            .unwrap());
+        crate::runtime_lifecycle::expire_unclaimed_resumes(
+            &runtime.core,
+            before + Duration::from_nanos(1),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime
+                .core
+                .registry
+                .contains(&registration.identity())
+                .unwrap(),
+            expires_after.is_none()
+        );
+        if expires_after.is_some() {
+            assert!(runtime.core.registry.was_removed(ID).unwrap());
+            assert_eq!(
+                read_local_packet(&mut terminal).unwrap().header(),
+                TerminalPacketType::TerminalClose as u8
+            );
+        }
+        runtime.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn authenticated_reconnect_blocks_expiry_only_while_claim_is_pending() {
+    let directory = TestDirectory::new();
+    let router_path = select_router_path_for(
+        rustix::process::getuid().as_raw(),
+        Some(&directory.socket()),
+        None,
+        None,
+    )
+    .unwrap();
+    let mut runtime =
+        Runtime::start_with_settings(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, router_path, 128, 1)
+            .unwrap();
+    let mut terminal = register_resume(&directory.socket(), &runtime.handle(), true, None);
+    terminal.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let registration = runtime.core.registry.get(ID).unwrap().unwrap();
+
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (stream, _) = listener.accept().unwrap();
+    let mut reconnect = runtime.core.raw_sockets.track(&stream).unwrap();
+    reconnect.assign(registration.identity()).unwrap();
+    reconnect.authenticate().unwrap();
+
+    let expired = Instant::now() + et_core::RECOVERY_GRACE + Duration::from_secs(1);
+    crate::runtime_lifecycle::expire_unclaimed_resumes(&runtime.core, expired).unwrap();
+    assert!(runtime
+        .core
+        .registry
+        .contains(&registration.identity())
+        .unwrap());
+
+    drop(reconnect);
+    crate::runtime_lifecycle::expire_unclaimed_resumes(&runtime.core, expired).unwrap();
+    assert!(!runtime
+        .core
+        .registry
+        .contains(&registration.identity())
+        .unwrap());
+    assert_eq!(
+        read_local_packet(&mut terminal).unwrap().header(),
+        TerminalPacketType::TerminalClose as u8
+    );
+    drop(peer);
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn unclaimed_sweep_does_not_close_starting_active_or_fresh_terminals() {
+    for activate in [false, true] {
+        let directory = TestDirectory::new();
+        let router_path = select_router_path_for(
+            rustix::process::getuid().as_raw(),
+            Some(&directory.socket()),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut runtime =
+            Runtime::start_with_settings(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, router_path, 128, 1)
+                .unwrap();
+        let mut terminal = register_resume(&directory.socket(), &runtime.handle(), true, None);
+        terminal.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let registration = runtime.core.registry.get(ID).unwrap().unwrap();
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let crate::session_table::SessionClaim::New { start, .. } = runtime
+            .core
+            .sessions
+            .claim(registration.clone(), &stream, &runtime.core.registry)
+            .unwrap()
+        else {
+            panic!("new claim expected")
+        };
+        let later = std::time::Instant::now() + Duration::from_secs(1000);
+        crate::runtime_lifecycle::expire_unclaimed_resumes(&runtime.core, later).unwrap();
+        assert!(runtime
+            .core
+            .registry
+            .contains(&registration.identity())
+            .unwrap());
+        if activate {
+            let router = runtime.core.registry.clone_stream(&registration).unwrap();
+            let active = crate::session::ActiveSession::new(
+                Connection::new_server(stream, &registration.key),
+                &router,
+                None,
+            )
+            .unwrap();
+            start.activate(std::sync::Arc::new(active)).unwrap();
+            crate::runtime_lifecycle::expire_unclaimed_resumes(&runtime.core, later).unwrap();
+            assert!(runtime
+                .core
+                .registry
+                .contains(&registration.identity())
+                .unwrap());
+        } else {
+            drop(start); // Failed initialization rolls back to Registered.
+            crate::runtime_lifecycle::expire_unclaimed_resumes(&runtime.core, later).unwrap();
+            assert!(!runtime
+                .core
+                .registry
+                .contains(&registration.identity())
+                .unwrap());
+            assert_eq!(
+                read_local_packet(&mut terminal).unwrap().header(),
+                TerminalPacketType::TerminalClose as u8
+            );
+            assert!(matches!(
+                runtime
+                    .core
+                    .sessions
+                    .claim(registration, &stream, &runtime.core.registry),
+                Err(crate::session_table::SessionTableError::ObsoleteRegistration)
+            ));
+            drop(terminal);
+            let _fresh_terminal = register(&directory.socket(), &runtime.handle());
+            crate::runtime_lifecycle::expire_unclaimed_resumes(&runtime.core, later).unwrap();
+            assert!(runtime.core.registry.get(ID).unwrap().is_some());
+        }
+        drop(peer);
+        runtime.shutdown().unwrap();
+    }
 }

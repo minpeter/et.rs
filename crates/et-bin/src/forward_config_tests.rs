@@ -1,4 +1,3 @@
-use clap::Parser;
 use et_cli::client::ClientArgs;
 
 use crate::ssh_config::ResolvedSshConfig;
@@ -6,17 +5,85 @@ use crate::ssh_config::ResolvedSshConfig;
 use super::*;
 
 #[test]
+fn configured_remote_and_dynamic_forwards_merge_and_clear_without_disabling_agent() {
+    let args = ClientArgs::try_parse_from([
+        "et",
+        "-L8000:80",
+        "-R9000:90",
+        "-D1080",
+        "--forward-ssh-agent",
+        "host",
+    ])
+    .unwrap();
+    let remote = PortForwardSourceRequest {
+        source: Some(SocketEndpoint {
+            name: Some("localhost".into()),
+            port: Some(9001),
+        }),
+        destination: Some(SocketEndpoint {
+            name: Some("database".into()),
+            port: Some(5432),
+        }),
+        environmentvariable: None,
+    };
+    let mut resolved = ResolvedSshConfig {
+        remote_forwards: vec![remote.clone(), remote.clone()],
+        dynamic_forwards: vec![SocketEndpoint {
+            name: Some("127.0.0.1".into()),
+            port: Some(1081),
+        }],
+        exit_on_forward_failure: true,
+        ..Default::default()
+    };
+    let mut config = build(&args, Some("/tmp/agent")).unwrap();
+    config.apply_ssh_config(&resolved).unwrap();
+    assert_eq!(config.local_sources.len(), 3);
+    assert!(config.local_sources[2].socks);
+    assert_eq!(
+        config.local_sources[2].origin,
+        et_net::forward::ForwardOrigin::SshConfig { strict: true }
+    );
+    assert_eq!(config.initial_payload.reversetunnels.len(), 3);
+    assert_eq!(config.initial_payload.reversetunnels[1], remote);
+    assert_eq!(
+        config.initial_payload.reversetunnels[2]
+            .destination
+            .as_ref()
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("/tmp/agent")
+    );
+    assert_eq!(
+        config.initial_payload.reversetunnels[2]
+            .environmentvariable
+            .as_deref(),
+        Some("SSH_AUTH_SOCK")
+    );
+    resolved.clear_all_forwardings = true;
+    config.apply_ssh_config(&resolved).unwrap();
+    assert!(config.local_sources.is_empty());
+    assert_eq!(config.initial_payload.reversetunnels.len(), 1);
+    assert_eq!(
+        config.initial_payload.reversetunnels[0]
+            .environmentvariable
+            .as_deref(),
+        Some("SSH_AUTH_SOCK")
+    );
+}
+
+#[test]
 fn builds_local_reverse_and_agent_forwarding_configuration() {
     let args = ClientArgs::try_parse_from([
         "et",
-        "host",
-        "-t",
+        "--tunnel",
         "1000:2000",
         "-r",
         "3000:4000",
         "--forward-ssh-agent",
         "--ssh-socket",
         "/tmp/local-agent.sock",
+        "host",
     ])
     .unwrap();
     let config = build(&args, None).unwrap();
@@ -36,7 +103,7 @@ fn builds_local_reverse_and_agent_forwarding_configuration() {
 
 #[test]
 fn agent_forwarding_falls_back_to_environment_and_requires_a_socket() {
-    let args = ClientArgs::try_parse_from(["et", "host", "--forward-ssh-agent"]).unwrap();
+    let args = ClientArgs::try_parse_from(["et", "--forward-ssh-agent", "host"]).unwrap();
     let config = build(&args, Some("/run/agent.sock")).unwrap();
     assert_eq!(
         config.initial_payload.reversetunnels[0]
@@ -55,7 +122,7 @@ fn agent_forwarding_falls_back_to_environment_and_requires_a_socket() {
 
 #[test]
 fn applying_ssh_config_preserves_agent_forwarding() {
-    let args = ClientArgs::try_parse_from(["et", "host", "--forward-ssh-agent"]).unwrap();
+    let args = ClientArgs::try_parse_from(["et", "--forward-ssh-agent", "host"]).unwrap();
     let mut config = build(&args, Some("/run/agent.sock")).unwrap();
     let resolved = ResolvedSshConfig {
         hostname: "host".to_owned(),
@@ -124,17 +191,17 @@ fn ssh_config_forwards_are_cumulative_stable_and_exactly_deduplicated() {
     // Given
     let args = ClientArgs::try_parse_from([
         "et",
-        "host",
-        "-t",
+        "--tunnel",
         "localhost:1000:127.0.0.1:2000",
-        "-t",
+        "--tunnel",
         "localhost:1000:127.0.0.1:2000",
-        "-t",
+        "--tunnel",
         "localhost:1000:127.0.0.1:2001",
         "-r",
         "localhost:3000:127.0.0.1:4000",
         "-r",
         "localhost:3000:127.0.0.1:4000",
+        "host",
     ])
     .unwrap();
     let mut config = build(&args, None).unwrap();

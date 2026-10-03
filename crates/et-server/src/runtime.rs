@@ -64,6 +64,26 @@ impl Runtime {
             router_path,
             Arc::new(et_net::forward::SystemForwardResolver),
             listen_backlog,
+            0,
+        )
+    }
+
+    /// Start with a server-wide disconnect timeout in seconds. Explicit
+    /// per-session values (including zero) override this default.
+    pub fn start_with_settings(
+        bind_ip: IpAddr,
+        port: u16,
+        router_path: RouterPath,
+        listen_backlog: i32,
+        disconnect_timeout_seconds: i32,
+    ) -> Result<Self, RuntimeError> {
+        Self::start_configured(
+            bind_ip,
+            port,
+            router_path,
+            Arc::new(et_net::forward::SystemForwardResolver),
+            listen_backlog,
+            disconnect_timeout_seconds,
         )
     }
 
@@ -80,6 +100,7 @@ impl Runtime {
             router_path,
             forward_resolver,
             DEFAULT_LISTEN_BACKLOG,
+            0,
         )
     }
 
@@ -89,6 +110,7 @@ impl Runtime {
         router_path: RouterPath,
         forward_resolver: Arc<dyn et_net::forward::ForwardResolver>,
         listen_backlog: i32,
+        disconnect_timeout_seconds: i32,
     ) -> Result<Self, RuntimeError> {
         let bound = bind_tcp_with_backlog(bind_ip, port, listen_backlog)?;
         let mut tcp_addresses = Vec::new();
@@ -108,6 +130,7 @@ impl Runtime {
             shutdown: AtomicBool::new(false),
             forward_resolver,
             started: Instant::now(),
+            disconnect_timeout_seconds,
         });
         let router_name = router_path.path().to_path_buf();
         let (lifecycle_sender, lifecycle_events) = mpsc::channel();

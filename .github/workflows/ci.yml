@@ -116,14 +116,20 @@ jobs:
       - name: Exercise native Windows transport backpressure and replay
         shell: pwsh
         run: |
-          cargo test --locked -p et-net --lib connection:: -- --test-threads=1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p et-server --lib session:: -- --test-threads=1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p et --bin et client_terminal_windows:: -- --test-threads=1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p et --bin et client_hangup:: -- --test-threads=1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          function Test-Module($package, $target, $filter) {
+            $output = cargo test --locked -p $package $target $filter -- --test-threads=1 2>&1
+            $code = $LASTEXITCODE
+            $output | Write-Output
+            if ($code -ne 0) { exit $code }
+            if (-not ($output -match '^test result: ok\. [1-9][0-9]* passed;')) {
+              throw "No passing tests matched $package $filter"
+            }
+          }
+          Test-Module et-net --lib connection::
+          Test-Module et-server --lib session::
+          Test-Module et --bin=et client_terminal_windows::
+          Test-Module et --bin=et client_hangup::
+          Test-Module et --bin=et server_daemon::
 
       - name: Build relocatable native runtime QA artifacts
         shell: pwsh

@@ -431,7 +431,7 @@ per-stream reader queues plus asynchronous pending connection writes. The C++
 platform split and `FdPoller` lifetime do not map to Rust. This does not claim
 native macOS/Windows runtime or C++ live-peer testing. `PROTOCOL_VERSION` stays 6.
 
-### Windows transport follow-up (#134)
+### Windows transport follow-up (et.rs #134)
 
 The original #823/#872 equivalence claim omitted Windows live writes. Reviewed
 [#823](https://github.com/MisterTea/EternalTerminal/pull/823) and
@@ -451,6 +451,11 @@ so recovery installation cannot race the old writer. A safe `winapi-wsapoll`
 wrapper preserves `unsafe_code = "forbid"`; bootstrap/recovery synchronous I/O
 waits for readiness without toggling another socket clone back to blocking.
 These are deliberate Rust adaptations, not a copy of the C++ locking loop.
+
+Review follow-up: capped `WSAPoll` intervals retain the caller's absolute
+deadline. The PID-path test now checks each platform's existing default;
+upstream Windows uses its temporary directory while Rust keeps the existing
+relative `etserver.pid`. This follow-up changes no PID-path runtime behavior.
 
 Replay accepts each frame once before live transmission, with unchanged nonce
 and sequence ordering. A failed partial frame shuts down its old transport;

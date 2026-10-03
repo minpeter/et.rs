@@ -297,7 +297,10 @@ mod tests {
 
     #[test]
     fn pid_file_defaults_to_the_upstream_location() {
+        #[cfg(unix)]
         assert_eq!(pid_file_path(None), PathBuf::from("/var/run/etserver.pid"));
+        #[cfg(windows)]
+        assert_eq!(pid_file_path(None), PathBuf::from("etserver.pid"));
         assert_eq!(
             pid_file_path(Some(Path::new("/tmp/custom.pid"))),
             PathBuf::from("/tmp/custom.pid")

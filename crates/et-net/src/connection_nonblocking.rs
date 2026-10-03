@@ -89,6 +89,8 @@ fn wait_ready(
             }
         };
         match winapi_wsapoll::wsa_poll(&mut descriptors, timeout) {
+            // A capped poll interval is not the caller's absolute deadline.
+            Ok(0) if deadline.is_some_and(|deadline| Instant::now() < deadline) => continue,
             Ok(0) => return Err(io::ErrorKind::TimedOut.into()),
             Ok(_) => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}

@@ -10,7 +10,7 @@ Canonical machine files:
 - Ledger (every `master` commit after baseline):
   [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml)
 
-Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-10-02.
+Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-10-06.
 `#784` marked `ported` after et.rs [#31](https://github.com/minpeter/et.rs/pull/31) / `906a7ca86691f00a82f88b99b21d7afceb07bf97`.
 `#798` marked `ported` after et.rs [#77](https://github.com/minpeter/et.rs/pull/77).
 
@@ -20,13 +20,13 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-10-02.
 | Baseline / latest release tag | [`et-v7.0.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.0.0) |
 | Baseline / release commit | [`7656a32a5bc15c6746726a27a5a4ba1e468fab6e`](https://github.com/MisterTea/EternalTerminal/commit/7656a32a5bc15c6746726a27a5a4ba1e468fab6e) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`5129342`](https://github.com/MisterTea/EternalTerminal/commit/5129342ef5ce3185125d907b95ad6d15a36b1cb6) (#876 tip, editor setup docs skip, reviewed 2026-10-02) |
+| Pin tip (last classified) | [`b2adbfd`](https://github.com/MisterTea/EternalTerminal/commit/b2adbfd1846ddf0448a73a37f14d65b3a1a8ec3e) (#820 tip, etctl local control skip, reviewed 2026-10-06) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
 | ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.0.0` and `master`) |
 
-The reviewed baseline-to-tip range contains 77 classified commits. Unclassified commits would be drift. The product-parity ports below passed combined Linux verification: 824 tests passed, none failed, and two existing tests were ignored. Formatting, workspace clippy, Windows GNU/macOS ARM binary cross-checks, and release/AUR packaging checks passed. Real OpenSSH mux clients exercised the Rust master; no live C++ peer, native Windows/macOS runtime, or actual VS Code sleep cycle was tested in this port. `ported` covers the behavior described in each row, including its explicit limitations, not unrestricted product parity. Protocol remains v6.
+The reviewed baseline-to-tip range contains 78 classified commits. Unclassified commits would be drift. The product-parity ports below passed combined Linux verification: 824 tests passed, none failed, and two existing tests were ignored. Formatting, workspace clippy, Windows GNU/macOS ARM binary cross-checks, and release/AUR packaging checks passed. Real OpenSSH mux clients exercised the Rust master; no live C++ peer, native Windows/macOS runtime, or actual VS Code sleep cycle was tested in this port. `ported` covers the behavior described in each row, including its explicit limitations, not unrestricted product parity. Protocol remains v6.
 
-## Ledger (classified 2026-10-02)
+## Ledger (classified 2026-10-06)
 
 | sha | date | kind | status | note |
 | --- | --- | --- | --- | --- |
@@ -106,7 +106,8 @@ The reviewed baseline-to-tip range contains 77 classified commits. Unclassified 
 | [`a5e29af`](https://github.com/MisterTea/EternalTerminal/commit/a5e29afdf97b163cdc74331a58fbdb0514a466c5) | 2026-09-30 | product | skip | #873 client setup failures throw instead of exit(1); Connection drops writes when no handshake writer (hang fix). Product/reliability; et.rs already uses Result paths. No wire/auth change. PROTOCOL_VERSION stays 6. |
 | [`dc1dc63`](https://github.com/MisterTea/EternalTerminal/commit/dc1dc63dc6b6175168d4dbc52227608ed3cbc6d0) | 2026-09-30 | ci | skip | #877 OpenWrt package installs et1. Packaging/CI only. PROTOCOL_VERSION stays 6. |
 | [`bcc28abc`](https://github.com/MisterTea/EternalTerminal/commit/bcc28abc39d5445bd6f80efe518c8e5fdae125c4) | 2026-10-01 | product | skip | #878/#769 logging never redirects process stderr; foreground SSH already inherits it; background -f intentionally detaches stdio |
-| [`5129342`](https://github.com/MisterTea/EternalTerminal/commit/5129342ef5ce3185125d907b95ad6d15a36b1cb6) | 2026-10-02 | docs | skip | #876 README-only editor setup for upstream et1; et.rs does not package that wrapper or claim editor sleep-cycle verification. Pin tip. |
+| [`5129342`](https://github.com/MisterTea/EternalTerminal/commit/5129342ef5ce3185125d907b95ad6d15a36b1cb6) | 2026-10-02 | docs | skip | #876 README-only editor setup for upstream et1; et.rs does not package that wrapper or claim editor sleep-cycle verification. |
+| [`b2adbfd`](https://github.com/MisterTea/EternalTerminal/commit/b2adbfd1846ddf0448a73a37f14d65b3a1a8ec3e) | 2026-10-05 | product | skip | #820 etctl client CLI drives local `et --ctl` Unix sockets (ControlProtocol IPC, same class as #819). et.rs already has that control surface. Help-text-only `--ctl-socket` path. Not wire/auth/server. Pin tip. |
 
 
 ## Ported and residual
@@ -516,14 +517,22 @@ inherits stderr; background `-f` intentionally detaches it. `PROTOCOL_VERSION`
 stays 6.
 
 [`5129342`](https://github.com/MisterTea/EternalTerminal/commit/5129342ef5ce3185125d907b95ad6d15a36b1cb6)
-(`#876`) is the pin tip and `status: skip`. This README-only change documents
+(`#876`) stays `status: skip`. This README-only change documents
 VS Code/Cursor Remote-SSH settings using upstream's installed `et1` wrapper.
 et.rs does not package `et1`; copying that installation claim would be incorrect.
 No runtime or wire change is required, and actual editor sleep-cycle verification
 remains unclaimed.
 
+[`b2adbfd`](https://github.com/MisterTea/EternalTerminal/commit/b2adbfd1846ddf0448a73a37f14d65b3a1a8ec3e)
+(`#820`) is the pin tip and `status: skip`. It adds a client-side `etctl`
+CLI that drives local `et --ctl` sessions over the Unix control socket
+(`ControlProtocol` IPC, same class as `#819`). et.rs already has that local
+control surface. The only `et` change is help text for the default
+`--ctl-socket` path (`~/.et/control/<name>.sock`). No wire, handshake, auth,
+crypto, server, or `PROTOCOL_VERSION` change.
+
 et.rs still claims **protocol v6**. EternalTerminal’s latest product release is
-**v7.0.0**, and the reviewed tip is seventy-seven classified commits past that tag.
+**v7.0.0**, and the reviewed tip is seventy-eight classified commits past that tag.
 
 Review ports against the conflict policy in
 [`docs/upstream-factory.md`](upstream-factory.md). Gate any later port with

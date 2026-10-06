@@ -13,7 +13,7 @@
 # Classified 2026-09-21. #804 passed independent review in et.rs #100.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-10-02"
+classified: "2026-10-06"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -466,5 +466,11 @@ commits:
     date: "2026-10-02"
     kind: docs
     status: skip
-    note: "#876 README-only VS Code/Cursor Remote-SSH setup for upstream et1. et.rs does not package et1 and does not claim an actual editor sleep-cycle test; do not copy upstream's installed-wrapper claim. No runtime or wire change. Pin tip."
+    note: "#876 README-only VS Code/Cursor Remote-SSH setup for upstream et1. et.rs does not package et1 and does not claim an actual editor sleep-cycle test; do not copy upstream's installed-wrapper claim. No runtime or wire change."
     et_pr: 876
+  - sha: b2adbfd1846ddf0448a73a37f14d65b3a1a8ec3e
+    date: "2026-10-05"
+    kind: product
+    status: skip
+    note: "#820 etctl client CLI drives local et --ctl Unix sockets (ControlProtocol IPC, same class as #819). et.rs already has that control surface; no wire, auth, crypto, or server change. TerminalClientMain.cpp is help-text only. PROTOCOL_VERSION stays 6. Pin tip."
+    et_pr: 820

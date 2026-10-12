@@ -74,6 +74,10 @@ impl From<et_cli::tunnel::TunnelError> for ForwardConfigError {
 pub struct ForwardConfig {
     pub local_sources: Vec<ForwardSource>,
     pub initial_payload: InitialPayload,
+    /// OpenSSH `session-bind@openssh.com` request bodies replayed on each
+    /// forwarded agent connection. Empty until upstream #881 records them and
+    /// #879 binds them to the bootstrap host key. Not part of the ET wire.
+    pub ssh_agent_session_binds: Vec<Vec<u8>>,
 }
 
 impl ForwardConfig {
@@ -183,10 +187,13 @@ pub fn build(
             }),
             environmentvariable: Some("SSH_AUTH_SOCK".to_owned()),
         });
+        // Session binds are replayed locally on the stable proxy. They are
+        // not a tunnel field. Nothing records them until upstream #881/#879.
     }
     validate_environment_names(&reverse_tunnels)?;
     Ok(ForwardConfig {
         local_sources,
+        ssh_agent_session_binds: Vec::new(),
         initial_payload: InitialPayload {
             jumphost: Some(false),
             reversetunnels: reverse_tunnels,

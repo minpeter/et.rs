@@ -196,6 +196,7 @@ pub fn attach_saved(
         std::sync::Arc::new(et_net::forward::SystemForwardResolver),
     )
     .map_err(|error| ClientError::Terminal(error.to_string()))?;
+    agent_forward.replay(&forwarder)?;
     let reconnect_session = |connection: &mut et_net::connection::Connection| {
         let outcome = crate::initial_connect::reconnect(
             connection,

@@ -11,6 +11,9 @@ use et_core::proto::{
 use prost::Message;
 
 use crate::forward_endpoint::Endpoint;
+use crate::ssh_agent_session_bind::{
+    binds_for_destination, write_session_binds, AgentSessionBindReplies,
+};
 
 use super::{
     close_write, spawn_connector, spawn_io, subtract_saturating, ActiveIo, FlowWindow,
@@ -96,11 +99,37 @@ impl Worker {
         peer_advertised: Option<FlowWindow>,
     ) -> Result<(), ForwardError> {
         self.connecting.remove(&socket_id);
+        let pending_binds = self.pending_agent_binds.remove(&socket_id);
         let error = match result {
-            Ok(stream) => {
-                self.activate(Role::Destination, socket_id, stream, peer_advertised)?;
-                None
-            }
+            Ok(mut stream) => match pending_binds {
+                Some(pending) => {
+                    match write_session_binds(&mut stream, &pending.path, &pending.binds) {
+                        Ok(()) => {
+                            let replies = AgentSessionBindReplies::new(
+                                pending.binds.len(),
+                                pending.path.clone(),
+                            );
+                            self.activate(
+                                Role::Destination,
+                                socket_id,
+                                stream,
+                                peer_advertised,
+                                Some(replies),
+                            )?;
+                            None
+                        }
+                        Err(_) => {
+                            // The warning is already logged. Drop closes the socket.
+                            drop(stream);
+                            Some("could not send ssh agent session binding".to_owned())
+                        }
+                    }
+                }
+                None => {
+                    self.activate(Role::Destination, socket_id, stream, peer_advertised, None)?;
+                    None
+                }
+            },
             Err(error) => Some(error.to_string()),
         };
         self.emit(
@@ -168,6 +197,9 @@ impl Worker {
         let socket_id = self.allocate_socket_id()?;
         self.connecting.insert(socket_id);
         self.pending_windows.insert(socket_id, peer_advertised);
+        if let Some(pending) = self.recorded_binds_for(&destination) {
+            self.pending_agent_binds.insert(socket_id, pending);
+        }
         self.threads.push(spawn_connector(
             client_fd,
             socket_id,
@@ -219,7 +251,7 @@ impl Worker {
             stdio,
             ..
         } = pending;
-        self.activate(Role::Source, socket_id, stream, peer_advertised)?;
+        self.activate(Role::Source, socket_id, stream, peer_advertised, None)?;
         if let Some(active) = self.sources.get_mut(&socket_id) {
             active.half_close_on_eof = half_close_on_eof;
         }
@@ -453,12 +485,30 @@ impl Worker {
         }
     }
 
+    fn recorded_binds_for(
+        &self,
+        destination: &Endpoint,
+    ) -> Option<crate::ssh_agent_session_bind::PendingSessionBinds> {
+        let (is_tcp, name) = match destination {
+            Endpoint::Tcp { .. } => (true, None),
+            #[cfg(unix)]
+            Endpoint::Unix(path) => (false, path.to_str()),
+        };
+        binds_for_destination(
+            &self.ssh_agent_socket_path,
+            &self.ssh_agent_session_binds,
+            is_tcp,
+            name,
+        )
+    }
+
     fn activate(
         &mut self,
         role: Role,
         socket_id: i32,
         stream: ForwardStream,
         peer_window: Option<FlowWindow>,
+        bind_replies: Option<AgentSessionBindReplies>,
     ) -> Result<(), ForwardError> {
         let (active, handles) = spawn_io(
             role,
@@ -468,6 +518,7 @@ impl Worker {
             self.commands.clone(),
             self.cancel.clone(),
             self.abandoned.clone(),
+            bind_replies,
         )
         .map_err(ForwardError::Io)?;
         self.map(role).insert(socket_id, active);

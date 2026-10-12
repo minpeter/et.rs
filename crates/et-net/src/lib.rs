@@ -16,5 +16,6 @@ pub mod listener;
 pub mod local;
 pub mod local_packet;
 pub(crate) mod socks;
+pub mod ssh_agent_session_bind;
 #[cfg(unix)]
 pub mod user_socket_ops;

@@ -13,6 +13,14 @@ use crate::initial_connect::ReconnectOutcome;
 pub struct AgentForward {
     #[cfg(unix)]
     proxy: Option<unix::Proxy>,
+    /// UTF-8 path of the stable `et-agent-<id>` proxy. Session binds are
+    /// replayed only on connections to this path.
+    #[cfg(unix)]
+    socket_path: Option<String>,
+    /// OpenSSH session-bind request bodies. Empty until upstream #881 records
+    /// them and #879 binds them to the bootstrap host key.
+    #[cfg(unix)]
+    session_binds: Vec<Vec<u8>>,
 }
 
 impl AgentForward {
@@ -20,10 +28,11 @@ impl AgentForward {
         args: &ClientArgs,
         id: &str,
         payload: &mut InitialPayload,
+        session_binds: Vec<Vec<u8>>,
     ) -> Result<Self, ClientError> {
         #[cfg(unix)]
         {
-            let proxy = if args.forward_ssh_agent {
+            let (proxy, socket_path) = if args.forward_ssh_agent {
                 let proxy = unix::Proxy::open(
                     id,
                     args.ssh_socket.clone().map(OsString::from),
@@ -34,30 +43,33 @@ impl AgentForward {
                 .expect("created agent proxy directory");
                 let environment = std::env::var_os("SSH_AUTH_SOCK");
                 proxy.refresh(environment.as_deref()).map_err(agent_error)?;
+                let socket_path = proxy
+                    .path()
+                    .to_str()
+                    .ok_or_else(|| {
+                        agent_error(std::io::Error::other("agent proxy path is not UTF-8"))
+                    })?
+                    .to_owned();
                 // build() appends the generated agent request after user tunnels.
                 let request = payload.reversetunnels.last_mut().expect("agent request");
                 request
                     .destination
                     .as_mut()
                     .expect("agent destination")
-                    .name = Some(
-                    proxy
-                        .path()
-                        .to_str()
-                        .ok_or_else(|| {
-                            agent_error(std::io::Error::other("agent proxy path is not UTF-8"))
-                        })?
-                        .to_owned(),
-                );
-                Some(proxy)
+                    .name = Some(socket_path.clone());
+                (Some(proxy), Some(socket_path))
             } else {
-                None
+                (None, None)
             };
-            Ok(Self { proxy })
+            Ok(Self {
+                proxy,
+                socket_path,
+                session_binds,
+            })
         }
         #[cfg(windows)]
         {
-            let _ = (id, payload);
+            let _ = (id, payload, session_binds);
             if args.forward_ssh_agent {
                 return Err(ClientError::Unsupported(
                     "SSH agent forwarding is not supported on Windows",
@@ -76,7 +88,23 @@ impl AgentForward {
             let environment = std::env::var_os("SSH_AUTH_SOCK");
             let proxy = unix::Proxy::open(id, None, unix::Policy::Attach, environment.is_some())
                 .map_err(agent_error)?;
-            let mut forward = Self { proxy };
+            let socket_path = match &proxy {
+                Some(proxy) => Some(
+                    proxy
+                        .path()
+                        .to_str()
+                        .ok_or_else(|| {
+                            agent_error(std::io::Error::other("agent proxy path is not UTF-8"))
+                        })?
+                        .to_owned(),
+                ),
+                None => None,
+            };
+            let mut forward = Self {
+                proxy,
+                socket_path,
+                session_binds: Vec::new(),
+            };
             forward.established();
             if let Some(proxy) = &forward.proxy {
                 proxy.refresh(environment.as_deref()).map_err(agent_error)?;
@@ -97,6 +125,24 @@ impl AgentForward {
         if let Some(proxy) = &mut self.proxy {
             proxy.established = true;
         }
+    }
+
+    /// Tell the local forwarder which socket receives recorded session binds.
+    /// Empty binds register the path and do not change forwarding.
+    pub fn replay(&self, forwarder: &et_net::forward::Forwarder) -> Result<(), ClientError> {
+        #[cfg(unix)]
+        if let Some(path) = &self.socket_path {
+            forwarder
+                .set_ssh_agent_session_binds(path.clone(), self.session_binds.clone())
+                .map_err(|error| {
+                    ClientError::Terminal(format!(
+                        "could not record ssh agent session bindings: {error}"
+                    ))
+                })?;
+        }
+        #[cfg(windows)]
+        let _ = forwarder;
+        Ok(())
     }
 
     pub fn reconnected(&self, outcome: ReconnectOutcome) -> Result<ReconnectOutcome, ClientError> {

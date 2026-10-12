@@ -13,7 +13,7 @@
 # Classified 2026-09-21. #804 passed independent review in et.rs #100.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-10-08"
+classified: "2026-10-12"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -478,5 +478,11 @@ commits:
     date: "2026-10-07"
     kind: ci
     status: skip
-    note: "#884 C++ -Werror build hygiene: version from vcpkg.json, replace deprecated daemon(), check ignored chdir/read/write/system and nodiscard SerializeToString. et.rs uses Rust Result paths and its own daemonize; nothing to port. PROTOCOL_VERSION stays 6. Pin tip."
+    note: "#884 C++ -Werror build hygiene: version from vcpkg.json, replace deprecated daemon(), check ignored chdir/read/write/system and nodiscard SerializeToString. et.rs uses Rust Result paths and its own daemonize; nothing to port. PROTOCOL_VERSION stays 6."
     et_pr: 884
+  - sha: 8a92ea76fc7b29c8316b924398b2c505d77177b1
+    date: "2026-10-12"
+    kind: security
+    status: backlog
+    note: "#880 part 1/3 of OpenSSH session-bind@openssh.com replay on forwarded agent connections. TerminalClient's new bind list defaults to empty and TerminalClientMain does not pass one, so createDestination writes no bind frames and ForwardDestinationHandler forwards agent bytes unchanged. No protobuf, handshake, or PROTOCOL_VERSION change (stays 6). Windows backslash path compare is WIN32-only; et.rs does not forward agents on Windows. Destination-constrained keys stay unenforced until unmerged #881 (record) and #879 (capture and pass binds). Backlog the replay until those land; porting the inert plumbing now would not change wire, auth, or security behavior. Pin tip."
+    et_pr: 880

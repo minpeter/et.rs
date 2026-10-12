@@ -1058,12 +1058,11 @@ mod tests {
                 binds: vec![bind],
             },
         );
-        let (stream, peer) = UnixStream::pair().unwrap();
-        peer.shutdown(std::net::Shutdown::Both).unwrap();
-        drop(peer);
-        stream
-            .set_write_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
+        // A connected pair with its own write side shut down. The bind send
+        // then fails with EPIPE. macOS returns EINVAL from SO_SNDTIMEO once a
+        // unix socket's peer is already gone, so this does not use a timeout.
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
         worker
             .connected(3, 7, Ok(ForwardStream::Unix(stream)), None)
             .unwrap();

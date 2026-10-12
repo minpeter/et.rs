@@ -72,6 +72,12 @@ pub(crate) enum Command {
         socket_id: i32,
         error: io::Error,
     },
+    /// Replace the recorded OpenSSH session binds replayed on new connections
+    /// to `agent_socket_path`. An empty list leaves forwarding unchanged.
+    SetSshAgentSessionBinds {
+        agent_socket_path: String,
+        binds: Vec<Vec<u8>>,
+    },
 }
 
 struct CommandQueueState {
@@ -350,6 +356,12 @@ struct Worker {
     session_user: Option<(u32, u32)>,
     stdio_open: Option<Arc<AtomicBool>>,
     stdio_socket: Option<i32>,
+    /// Forwarded ssh-agent socket that receives session bindings.
+    ssh_agent_socket_path: String,
+    /// Session-bind request bodies replayed on new agent connections.
+    ssh_agent_session_binds: Vec<Vec<u8>>,
+    /// Binds snapshotted for a destination connect that has not finished.
+    pending_agent_binds: HashMap<i32, crate::ssh_agent_session_bind::PendingSessionBinds>,
 }
 
 struct PendingAccept {
@@ -393,6 +405,9 @@ impl Worker {
             session_user: None,
             stdio_open: None,
             stdio_socket: None,
+            ssh_agent_socket_path: String::new(),
+            ssh_agent_session_binds: Vec::new(),
+            pending_agent_binds: HashMap::new(),
         })
     }
 
@@ -516,6 +531,14 @@ impl Worker {
                 } => {
                     self.remove(role, socket_id);
                     self.send_data(role, socket_id, Vec::new(), true, Some(error.to_string()))
+                }
+                Command::SetSshAgentSessionBinds {
+                    agent_socket_path,
+                    binds,
+                } => {
+                    self.ssh_agent_socket_path = agent_socket_path;
+                    self.ssh_agent_session_binds = binds;
+                    Ok(())
                 }
             };
             if let Err(error) = step {
@@ -1016,5 +1039,43 @@ mod tests {
         for thread in worker.threads.drain(..) {
             thread.join().unwrap();
         }
+    }
+
+    #[test]
+    fn a_failed_session_bind_write_fails_the_forwarded_connection() {
+        let (mut worker, _commands, outbound, _cancel) = worker();
+        let bind = crate::ssh_agent_session_bind::encode_session_bind(
+            b"dest-key",
+            b"session-id",
+            b"signature",
+            true,
+        )
+        .unwrap();
+        worker.pending_agent_binds.insert(
+            7,
+            crate::ssh_agent_session_bind::PendingSessionBinds {
+                path: "/tmp/agent.sock".to_owned(),
+                binds: vec![bind],
+            },
+        );
+        // A connected pair with its own write side shut down. The bind send
+        // then fails with EPIPE. macOS returns EINVAL from SO_SNDTIMEO once a
+        // unix socket's peer is already gone, so this does not use a timeout.
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        worker
+            .connected(3, 7, Ok(ForwardStream::Unix(stream)), None)
+            .unwrap();
+
+        let packet = outbound.recv_timeout(EVENT_TIMEOUT).unwrap().unwrap();
+        let response = response(packet);
+        assert_eq!(
+            response.error.as_deref(),
+            Some("could not send ssh agent session binding")
+        );
+        assert!(response.socketid.is_none());
+        assert_eq!(response.clientfd, Some(3));
+        assert!(worker.destinations.is_empty());
+        assert!(!worker.pending_agent_binds.contains_key(&7));
     }
 }

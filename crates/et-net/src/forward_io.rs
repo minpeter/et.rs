@@ -10,6 +10,7 @@ use crossbeam_channel as channel;
 use rustix::event::{poll, PollFd, PollFlags};
 
 use crate::forward_endpoint::{Endpoint, ForwardListener, ForwardStream};
+use crate::ssh_agent_session_bind::AgentSessionBindReplies;
 use et_core::proto::SocketEndpoint;
 
 use super::forward_worker::{Command, CommandSender, Role, TryCommandError};
@@ -494,6 +495,7 @@ pub(crate) fn spawn_connector(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_io(
     role: Role,
     socket_id: i32,
@@ -502,6 +504,7 @@ pub(crate) fn spawn_io(
     commands: CommandSender,
     cancel: channel::Receiver<()>,
     abandoned: Arc<AtomicBool>,
+    bind_replies: Option<AgentSessionBindReplies>,
 ) -> io::Result<(ActiveIo, [JoinHandle<()>; 2])> {
     spawn_io_inner(
         ReaderSetup {
@@ -509,6 +512,7 @@ pub(crate) fn spawn_io(
             socket_id,
             peer_window,
             read_limit: READ_CHUNK,
+            bind_replies,
         },
         stream,
         commands,
@@ -533,6 +537,7 @@ fn spawn_io_with_read_limit(
             socket_id: socket.1,
             peer_window,
             read_limit,
+            bind_replies: None,
         },
         stream,
         commands,
@@ -546,6 +551,7 @@ struct ReaderSetup {
     socket_id: i32,
     peer_window: Option<FlowWindow>,
     read_limit: usize,
+    bind_replies: Option<AgentSessionBindReplies>,
 }
 
 fn spawn_io_inner(
@@ -560,6 +566,7 @@ fn spawn_io_inner(
         socket_id,
         peer_window,
         read_limit,
+        bind_replies,
     } = setup;
     #[cfg(windows)]
     {
@@ -599,6 +606,7 @@ fn spawn_io_inner(
     let reader_reserved_packets = reserved_packets.clone();
     let reader_window = window.clone();
     let reader_packet_window = packet_window.clone();
+    let mut bind_replies = bind_replies;
     let reader_handle = thread::spawn(move || {
         let mut buffer = [0u8; READ_CHUNK];
         loop {
@@ -658,11 +666,43 @@ fn spawn_io_inner(
                     return;
                 }
                 Ok(count) => {
-                    let actual = i64::try_from(count).unwrap_or(i64::MAX);
+                    let forwarded = if let Some(replies) = bind_replies.as_mut() {
+                        match replies.consume(&buffer[..count]) {
+                            Ok(forwarded) => forwarded,
+                            Err(()) => {
+                                // Already logged. The stream cannot be resynchronized.
+                                release_reservation(i64::try_from(read_len).unwrap_or(i64::MAX));
+                                if !cancellation_requested(&reader_cancel) {
+                                    let _ = reader_commands.send(Command::IoFailed {
+                                        role,
+                                        socket_id,
+                                        error: io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            "invalid ssh agent reply to session binding",
+                                        ),
+                                    });
+                                }
+                                return;
+                            }
+                        }
+                    } else {
+                        buffer[..count].to_vec()
+                    };
+                    if forwarded.is_empty() {
+                        // Only session-bind replies so far. Do not charge the
+                        // window or present an empty read as EOF.
+                        release_reservation(i64::try_from(read_len).unwrap_or(i64::MAX));
+                        if cancellation_requested(&reader_cancel) {
+                            return;
+                        }
+                        continue;
+                    }
+                    let actual = i64::try_from(forwarded.len()).unwrap_or(i64::MAX);
                     if windowed {
+                        let reserved = i64::try_from(read_len).unwrap_or(i64::MAX);
                         subtract_saturating(
                             &reader_reserved_bytes,
-                            i64::try_from(read_len - count).unwrap_or(i64::MAX),
+                            reserved.saturating_sub(actual.min(reserved)),
                         );
                     }
                     if cancellation_requested(&reader_cancel) {
@@ -674,7 +714,7 @@ fn spawn_io_inner(
                         .send(Command::Read {
                             role,
                             socket_id,
-                            buffer: buffer[..count].to_vec(),
+                            buffer: forwarded,
                             committed,
                         })
                         .is_err()
@@ -1002,6 +1042,7 @@ mod tests {
             commands,
             cancel_receiver,
             abandoned,
+            None,
         )
         .unwrap();
         let started = active
@@ -1164,6 +1205,7 @@ mod tests {
             commands,
             cancel_receiver,
             abandoned,
+            None,
         )
         .unwrap();
         for _ in 0..64 {

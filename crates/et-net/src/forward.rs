@@ -771,6 +771,23 @@ impl Forwarder {
         wait_outbound_from(&self.priority, &self.outbound, timeout)
     }
 
+    /// Replay `binds` (OpenSSH `session-bind@openssh.com` request bodies) on
+    /// every new destination connection to `agent_socket_path`, ahead of
+    /// forwarded data. An empty list records nothing and leaves forwarding
+    /// unchanged. Upstream #881 / #879 are what will supply the bodies.
+    pub fn set_ssh_agent_session_binds(
+        &self,
+        agent_socket_path: impl Into<String>,
+        binds: Vec<Vec<u8>>,
+    ) -> Result<(), ForwardError> {
+        self.commands
+            .send(Command::SetSshAgentSessionBinds {
+                agent_socket_path: agent_socket_path.into(),
+                binds,
+            })
+            .map_err(|_| ForwardError::Unavailable)
+    }
+
     pub fn shutdown(mut self) -> Result<(), ForwardError> {
         self.stop()
     }

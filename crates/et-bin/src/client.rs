@@ -473,8 +473,12 @@ fn run_client(
                 .insert("COLORTERM".to_owned(), value.to_owned());
         }
     }
-    let mut agent_forward =
-        crate::agent_forward::AgentForward::prepare(args, &credentials.id, &mut initial_payload)?;
+    let mut agent_forward = crate::agent_forward::AgentForward::prepare(
+        args,
+        &credentials.id,
+        &mut initial_payload,
+        forward_config.ssh_agent_session_binds,
+    )?;
     et_cli::logging::info(format!("Connecting to {endpoint}"));
     let connection = connect_initial(
         &endpoint,
@@ -528,6 +532,7 @@ fn run_client(
             skipped.error
         ));
     }
+    agent_forward.replay(&forwarder)?;
     let local_mode = {
         #[cfg(unix)]
         {
@@ -709,7 +714,22 @@ fn init_logging(args: &ClientArgs) -> std::io::Result<()> {
         append_pid: true,
         verbose: args.verbose,
         max_size: et_cli::logging::DEFAULT_MAX_LOG_SIZE,
-    })
+    })?;
+    et_net::ssh_agent_session_bind::install_logger(log_ssh_agent_session_bind);
+    Ok(())
+}
+
+fn log_ssh_agent_session_bind(
+    level: et_net::ssh_agent_session_bind::SessionBindLog,
+    message: &str,
+) {
+    match level {
+        et_net::ssh_agent_session_bind::SessionBindLog::Warning => et_cli::logging::warn(message),
+        et_net::ssh_agent_session_bind::SessionBindLog::Info => et_cli::logging::info(message),
+        et_net::ssh_agent_session_bind::SessionBindLog::Verbose => {
+            et_cli::logging::verbose(1, message)
+        }
+    }
 }
 
 fn bootstrap_log_message(request: &BootstrapRequest) -> String {

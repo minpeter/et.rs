@@ -10,10 +10,10 @@
 #   note: short string
 #   et_pr: optional upstream PR number
 #
-# Classified 2026-09-21. #804 passed independent review in et.rs #100.
+# Classified 2026-10-12. #804 passed independent review in et.rs #100.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-10-08"
+classified: "2026-10-12"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -478,5 +478,11 @@ commits:
     date: "2026-10-07"
     kind: ci
     status: skip
-    note: "#884 C++ -Werror build hygiene: version from vcpkg.json, replace deprecated daemon(), check ignored chdir/read/write/system and nodiscard SerializeToString. et.rs uses Rust Result paths and its own daemonize; nothing to port. PROTOCOL_VERSION stays 6. Pin tip."
+    note: "#884 C++ -Werror build hygiene: version from vcpkg.json, replace deprecated daemon(), check ignored chdir/read/write/system and nodiscard SerializeToString. et.rs uses Rust Result paths and its own daemonize; nothing to port. PROTOCOL_VERSION stays 6."
     et_pr: 884
+  - sha: 8a92ea76fc7b29c8316b924398b2c505d77177b1
+    date: "2026-10-12"
+    kind: product
+    status: ported
+    note: "#880 replay recorded ssh-agent session-bind requests on each forwarded agent connection and strip the agent's replies. SSH_AGENT_FAILURE and SSH_AGENT_EXTENSION_FAILURE are logged and tolerated. Parts 2/3 #881 (record) and #879 (bootstrap host key) are still open upstream, so nothing supplies bindings yet and behavior is unchanged. PROTOCOL_VERSION stays 6."
+    et_pr: 880

@@ -246,13 +246,6 @@ impl CommandReceiver {
         }
     }
 
-    fn recv(&self) -> Option<Command> {
-        match self.recv_until(None) {
-            RecvStatus::Command(command) => Some(command),
-            RecvStatus::Timeout | RecvStatus::Disconnected => None,
-        }
-    }
-
     #[cfg(all(test, unix))]
     pub(crate) fn recv_timeout(
         &self,
@@ -1135,7 +1128,7 @@ mod tests {
 mod parked_forward_limits {
     use std::io::Read;
     use std::net::{TcpListener, TcpStream};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1247,7 +1240,7 @@ mod parked_forward_limits {
         let _request = harness.outbound.recv_timeout(Duration::from_secs(2)).unwrap();
         harness.worker.expire_for_test(1);
         harness.worker.expire_parked();
-        let (_next_peer, next) = pair();
+        let (next_peer, next) = pair();
         park(&mut harness.worker, 2, next);
         let _next_request = harness.outbound.recv_timeout(Duration::from_secs(2)).unwrap();
 
@@ -1288,6 +1281,8 @@ mod parked_forward_limits {
             .unwrap();
         assert!(harness.worker.sources.contains_key(&45));
         assert!(!harness.worker.pending.contains_key(&2));
+        drop(next_peer);
+        harness.worker.remove(super::Role::Source, 45);
         for thread in harness.worker.threads.drain(..) {
             thread.join().unwrap();
         }

@@ -1370,7 +1370,7 @@ mod socks_limits {
 
     use crossbeam_channel as channel;
 
-    use super::forward_worker::Command;
+    use crate::forward_worker::Command;
     use super::{finish_socks_handshake, try_admit_socks, MAX_PENDING_SOCKS};
     use crate::forward_endpoint::ForwardStream;
 

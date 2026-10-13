@@ -113,7 +113,7 @@ fn frame(body: &[u8]) -> Vec<u8> {
 }
 
 fn random_token() -> io::Result<String> {
-    let mut bytes = [0u8; 16];
+    let mut bytes = [0u8; 8];
     getrandom::getrandom(&mut bytes).map_err(io::Error::other)?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
@@ -206,7 +206,19 @@ mod unix {
     }
 
     fn private_directory() -> io::Result<PathBuf> {
-        let directory = std::env::temp_dir().join(format!("et-ssh-bind-{}", random_token()?));
+        // macOS sockaddr_un is 104 bytes and GitHub's TMPDIR is already long.
+        // Fall back to /tmp so `directory/agent.sock` still fits.
+        let name = format!("etb-{}", random_token()?);
+        let mut directory = std::env::temp_dir().join(&name);
+        let socket = directory.join("agent.sock");
+        let limit = if cfg!(any(target_os = "linux", target_os = "android")) {
+            108
+        } else {
+            104
+        };
+        if socket.as_os_str().len() >= limit {
+            directory = PathBuf::from("/tmp").join(name);
+        }
         let mut builder = std::fs::DirBuilder::new();
         builder.mode(0o700);
         builder.create(&directory)?;
@@ -816,8 +828,8 @@ mod tests {
 
     impl FakeAgent {
         fn new(reply: impl Fn(Vec<u8>) -> Vec<u8> + Send + 'static) -> Self {
-            let directory = std::env::temp_dir().join(format!(
-                "et-fake-agent-{}-{}",
+            let directory = PathBuf::from(format!(
+                "/tmp/etfa-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1056,13 +1068,13 @@ mod tests {
 
     #[test]
     fn recorder_shuts_down_while_a_request_is_pending() {
-        let directory = std::env::temp_dir().join(format!(
-            "et-hang-agent-{}-{}",
+        let directory = PathBuf::from(format!(
+            "/tmp/ethang-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_nanos()
+                .subsec_nanos()
         ));
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("agent.sock");

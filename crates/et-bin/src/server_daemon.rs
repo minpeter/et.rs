@@ -7,6 +7,7 @@
 //! and the child becomes a session leader before serving.
 
 use crate::detach::{ChildStderr, Stdio};
+#[cfg(any(windows, test))]
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -274,12 +275,12 @@ fn write_pid_file(path: &Path) -> Result<(), String> {
         // whose ancestors another user can replace. Truncate only after the
         // inode checks, so a stale pid cannot survive and a victim cannot be
         // overwritten through a planted link.
-        return et_server::private_storage::replace_file(path, &contents).map_err(|error| {
+        et_server::private_storage::replace_file(path, &contents).map_err(|error| {
             format!(
                 "Error opening pidfile for writing: {}: {error}",
                 path.display()
             )
-        });
+        })
     }
     #[cfg(not(unix))]
     {

@@ -239,7 +239,10 @@ impl CommandReceiver {
                 .wait_timeout(state, deadline.saturating_duration_since(now))
                 .unwrap();
             state = next;
-            if wait.timed_out() && state.commands.is_empty() && !state.shutdown && state.senders != 0
+            if wait.timed_out()
+                && state.commands.is_empty()
+                && !state.shutdown
+                && state.senders != 0
             {
                 return RecvStatus::Timeout;
             }
@@ -1139,9 +1142,7 @@ mod parked_forward_limits {
     };
     use prost::Message;
 
-    use super::{
-        command_channel, PendingAccept, Worker, MAX_UNASSIGNED_FDS,
-    };
+    use super::{command_channel, PendingAccept, Worker, MAX_UNASSIGNED_FDS};
     use crate::forward_endpoint::ForwardStream;
 
     struct Harness {
@@ -1210,15 +1211,14 @@ mod parked_forward_limits {
             let (peer, accepted) = pair();
             park(&mut harness.worker, client_fd, accepted);
             peers.push(peer);
-            assert!(harness.outbound.recv_timeout(Duration::from_secs(2)).is_ok());
+            assert!(harness
+                .outbound
+                .recv_timeout(Duration::from_secs(2))
+                .is_ok());
         }
         assert_eq!(harness.worker.pending.len(), MAX_UNASSIGNED_FDS);
         let (mut overflow_peer, overflow) = pair();
-        park(
-            &mut harness.worker,
-            MAX_UNASSIGNED_FDS as i32 + 1,
-            overflow,
-        );
+        park(&mut harness.worker, MAX_UNASSIGNED_FDS as i32 + 1, overflow);
         assert_eq!(harness.worker.pending.len(), MAX_UNASSIGNED_FDS);
         let mut byte = [0u8; 1];
         assert_eq!(overflow_peer.read(&mut byte).unwrap(), 0);
@@ -1237,12 +1237,18 @@ mod parked_forward_limits {
         let mut harness = harness();
         let (_peer, accepted) = pair();
         park(&mut harness.worker, 1, accepted);
-        let _request = harness.outbound.recv_timeout(Duration::from_secs(2)).unwrap();
+        let _request = harness
+            .outbound
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
         harness.worker.expire_for_test(1);
         harness.worker.expire_parked();
         let (next_peer, next) = pair();
         park(&mut harness.worker, 2, next);
-        let _next_request = harness.outbound.recv_timeout(Duration::from_secs(2)).unwrap();
+        let _next_request = harness
+            .outbound
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
 
         harness
             .worker
@@ -1257,7 +1263,11 @@ mod parked_forward_limits {
                 .encode_to_vec(),
             ))
             .unwrap();
-        let stale = harness.outbound.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        let stale = harness
+            .outbound
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
         assert_eq!(stale.header(), TerminalPacketType::PortForwardData as u8);
         let closed = PortForwardData::decode(stale.payload()).unwrap();
         assert_eq!(closed.socketid, Some(44));

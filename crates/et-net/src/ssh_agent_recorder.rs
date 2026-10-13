@@ -5,7 +5,9 @@
 //! ProxyJump helpers bind before the destination, so the last binding belongs
 //! to the final host. Bootstrap wiring is upstream #879 and is not done here.
 
-use std::io::{self, Write};
+#[cfg(unix)]
+use std::io::Write;
+use std::io::{self};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -344,10 +346,7 @@ mod unix {
         if write_all_cancellable(upstream, &frame(request), stop).is_err() {
             return None;
         }
-        match read_frame(upstream, stop, socket_path) {
-            Ok(body) => Some(body),
-            Err(_) => None,
-        }
+        read_frame(upstream, stop, socket_path).ok()
     }
 
     fn connect_upstream(path: &Path, stop: &AtomicBool) -> Option<UnixStream> {
@@ -362,17 +361,18 @@ mod unix {
             Err(error) => {
                 log(
                     SessionBindLog::Warning,
-                    &format!(
-                        "Could not connect to ssh agent {}: {error}",
-                        path.display()
-                    ),
+                    &format!("Could not connect to ssh agent {}: {error}", path.display()),
                 );
                 None
             }
         }
     }
 
-    fn read_frame(stream: &mut UnixStream, stop: &AtomicBool, socket_path: &Path) -> io::Result<Vec<u8>> {
+    fn read_frame(
+        stream: &mut UnixStream,
+        stop: &AtomicBool,
+        socket_path: &Path,
+    ) -> io::Result<Vec<u8>> {
         let mut length_bytes = [0u8; 4];
         read_exact_cancellable(stream, &mut length_bytes, stop, socket_path)?;
         let length = u32::from_be_bytes(length_bytes);
@@ -444,7 +444,11 @@ mod unix {
         Ok(())
     }
 
-    fn write_all_cancellable(stream: &mut UnixStream, bytes: &[u8], stop: &AtomicBool) -> io::Result<()> {
+    fn write_all_cancellable(
+        stream: &mut UnixStream,
+        bytes: &[u8],
+        stop: &AtomicBool,
+    ) -> io::Result<()> {
         let mut written = 0;
         while written < bytes.len() {
             if stop.load(Ordering::Acquire) {
@@ -464,7 +468,13 @@ mod unix {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     let mut polls = [PollFd::new(stream, PollFlags::OUT)];
-                    match poll(&mut polls, Some(&rustix::event::Timespec { tv_sec: 0, tv_nsec: 50_000_000 })) {
+                    match poll(
+                        &mut polls,
+                        Some(&rustix::event::Timespec {
+                            tv_sec: 0,
+                            tv_nsec: 50_000_000,
+                        }),
+                    ) {
                         Ok(_) => {}
                         Err(Errno::INTR) => {}
                         Err(error) => return Err(io::Error::from(error)),
@@ -510,7 +520,9 @@ mod windows {
     use super::{
         frame, note_bind, pop_frame, random_token, SshAgentSessionBindRecorder, SLOW_AGENT_WARNING,
     };
-    use crate::ssh_agent_session_bind::{log, SessionBindLog, SSH_AGENT_FAILURE, SSH_AGENT_MAX_MESSAGE_LENGTH};
+    use crate::ssh_agent_session_bind::{
+        log, SessionBindLog, SSH_AGENT_FAILURE, SSH_AGENT_MAX_MESSAGE_LENGTH,
+    };
 
     pub(super) fn start(upstream: &Path) -> io::Result<SshAgentSessionBindRecorder> {
         let socket_path = format!(r"\\.\pipe\et-ssh-bind-{}", random_token()?);
@@ -526,15 +538,19 @@ mod windows {
         let listener = options.create_duplex::<pipe_mode::Bytes>()?;
         let stop = Arc::new(AtomicBool::new(false));
         let last = Arc::new(Mutex::new(None));
-        let upstream = upstream.to_path_buf();
+        let upstream_path = upstream.to_path_buf();
         let worker_stop = Arc::clone(&stop);
         let worker_last = Arc::clone(&last);
+        let worker_upstream = upstream_path.clone();
         let worker = thread::Builder::new()
             .name("et-ssh-bind".to_owned())
-            .spawn(move || run(listener, worker_stop, worker_last, upstream))?;
+            .spawn(move || run(listener, worker_stop, worker_last, worker_upstream))?;
         log(
             SessionBindLog::Info,
-            &format!("Agent proxy {socket_path} relays to ssh agent {}", upstream.display()),
+            &format!(
+                "Agent proxy {socket_path} relays to ssh agent {}",
+                upstream_path.display()
+            ),
         );
         Ok(SshAgentSessionBindRecorder {
             socket_path: socket_path.into(),
@@ -564,7 +580,10 @@ mod windows {
     }
 
     fn run(
-        listener: interprocess::os::windows::named_pipe::PipeListener<pipe_mode::Bytes, pipe_mode::Bytes>,
+        listener: interprocess::os::windows::named_pipe::PipeListener<
+            pipe_mode::Bytes,
+            pipe_mode::Bytes,
+        >,
         stop: Arc<AtomicBool>,
         last: Arc<Mutex<Option<Vec<u8>>>>,
         upstream: std::path::PathBuf,
@@ -642,7 +661,10 @@ mod windows {
         read_frame(stream, stop, path)
     }
 
-    fn connect_upstream(path: &Path, stop: &AtomicBool) -> Option<DuplexPipeStream<pipe_mode::Bytes>> {
+    fn connect_upstream(
+        path: &Path,
+        stop: &AtomicBool,
+    ) -> Option<DuplexPipeStream<pipe_mode::Bytes>> {
         if path.as_os_str().is_empty() {
             return None;
         }
@@ -704,7 +726,10 @@ mod windows {
         let mut filled = 0;
         while filled < buf.len() {
             if stop.load(Ordering::Acquire) {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "agent proxy stopped"));
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "agent proxy stopped",
+                ));
             }
             if !warned && started.elapsed() >= SLOW_AGENT_WARNING {
                 warned = true;
@@ -743,11 +768,17 @@ mod windows {
         let mut written = 0;
         while written < bytes.len() {
             if stop.load(Ordering::Acquire) {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "agent proxy stopped"));
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "agent proxy stopped",
+                ));
             }
             match stream.write(&bytes[written..]) {
                 Ok(0) => {
-                    return Err(io::Error::new(io::ErrorKind::WriteZero, "ssh agent write blocked"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "ssh agent write blocked",
+                    ));
                 }
                 Ok(count) => written += count,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -819,7 +850,9 @@ mod tests {
                                             if response.is_empty() {
                                                 return;
                                             }
-                                            let _ = stream.write_all(&frame_agent_message(&response).unwrap());
+                                            let _ = stream.write_all(
+                                                &frame_agent_message(&response).unwrap(),
+                                            );
                                         }
                                     }
                                 }
@@ -877,8 +910,12 @@ mod tests {
 
     fn connect(path: &std::path::Path) -> UnixStream {
         let stream = UnixStream::connect(path).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(8))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(8)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(8)))
+            .unwrap();
         stream
     }
 
@@ -918,7 +955,11 @@ mod tests {
         drop(destination);
         assert_eq!(
             recorder.last_forwarded_bind().as_deref(),
-            Some(encode_session_bind(b"dest-key", b"sid", b"sig", true).unwrap().as_slice())
+            Some(
+                encode_session_bind(b"dest-key", b"sid", b"sig", true)
+                    .unwrap()
+                    .as_slice()
+            )
         );
         let received = agent.received.lock().unwrap();
         assert_eq!(received.len(), 3);
@@ -938,10 +979,7 @@ mod tests {
             let recorder = SshAgentSessionBindRecorder::start(&upstream).unwrap();
             let path = recorder.socket_path().to_path_buf();
             let mut client = connect(&path);
-            assert_eq!(
-                round_trip(&mut client, &[11]),
-                vec![SSH_AGENT_FAILURE]
-            );
+            assert_eq!(round_trip(&mut client, &[11]), vec![SSH_AGENT_FAILURE]);
             assert_eq!(
                 round_trip(
                     &mut client,
@@ -951,7 +989,11 @@ mod tests {
             );
             assert_eq!(
                 recorder.last_forwarded_bind().as_deref(),
-                Some(encode_session_bind(b"dest-key", b"sid", b"sig", true).unwrap().as_slice())
+                Some(
+                    encode_session_bind(b"dest-key", b"sid", b"sig", true)
+                        .unwrap()
+                        .as_slice()
+                )
             );
             drop(client);
             drop(recorder);
@@ -968,10 +1010,9 @@ mod tests {
         });
         let recorder = SshAgentSessionBindRecorder::start(&agent.path).unwrap();
         let mut client = connect(recorder.socket_path());
-        let bind = frame_agent_message(
-            &encode_session_bind(b"dest-key", b"sid", b"sig", false).unwrap(),
-        )
-        .unwrap();
+        let bind =
+            frame_agent_message(&encode_session_bind(b"dest-key", b"sid", b"sig", false).unwrap())
+                .unwrap();
         let identities = frame_agent_message(&[SSH_AGENTC_EXTENSION]).unwrap();
         client.write_all(&bind[..6]).unwrap();
         thread::sleep(Duration::from_millis(50));
@@ -996,7 +1037,11 @@ mod tests {
         );
         assert_eq!(
             recorder.last_forwarded_bind().as_deref(),
-            Some(encode_session_bind(b"dest-key", b"sid", b"sig", true).unwrap().as_slice())
+            Some(
+                encode_session_bind(b"dest-key", b"sid", b"sig", true)
+                    .unwrap()
+                    .as_slice()
+            )
         );
     }
 

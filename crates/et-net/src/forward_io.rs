@@ -1370,9 +1370,9 @@ mod socks_limits {
 
     use crossbeam_channel as channel;
 
-    use crate::forward_worker::Command;
     use super::{finish_socks_handshake, try_admit_socks, MAX_PENDING_SOCKS};
     use crate::forward_endpoint::ForwardStream;
+    use crate::forward_worker::Command;
 
     fn pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

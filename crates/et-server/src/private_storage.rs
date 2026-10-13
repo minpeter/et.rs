@@ -149,9 +149,9 @@ fn open_directory(
             }
             Err(errno) => {
                 let link = statat(&current, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW).ok();
-                let is_link = link.as_ref().is_some_and(|stat| {
-                    FileType::from_raw_mode(stat.st_mode).is_symlink()
-                });
+                let is_link = link
+                    .as_ref()
+                    .is_some_and(|stat| FileType::from_raw_mode(stat.st_mode).is_symlink());
                 let follow = link.as_ref().is_some_and(|stat| {
                     FileType::from_raw_mode(stat.st_mode).is_symlink()
                         && stat.st_uid == 0

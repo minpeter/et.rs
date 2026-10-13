@@ -354,7 +354,11 @@ mod tests {
         let bind = encode_session_bind(b"host-key", b"session", b"signature", false).unwrap();
         assert_eq!(
             forwarded_session_bind(&bind).as_deref(),
-            Some(encode_session_bind(b"host-key", b"session", b"signature", true).unwrap().as_slice())
+            Some(
+                encode_session_bind(b"host-key", b"session", b"signature", true)
+                    .unwrap()
+                    .as_slice()
+            )
         );
         let already = encode_session_bind(b"host-key", b"session", b"signature", true).unwrap();
         assert!(forwarded_session_bind(&already).is_none());
@@ -362,7 +366,10 @@ mod tests {
         assert!(forwarded_session_bind(&[]).is_none());
         assert!(forwarded_session_bind(&bind[..bind.len() - 1]).is_none());
         assert!(forwarded_session_bind(&[bind.as_slice(), b"x"].concat()).is_none());
-        assert!(forwarded_session_bind(&encode_session_bind(b"", b"session", b"signature", false).unwrap()).is_none());
+        assert!(forwarded_session_bind(
+            &encode_session_bind(b"", b"session", b"signature", false).unwrap()
+        )
+        .is_none());
         let host_key = base64::engine::general_purpose::STANDARD
             .decode("AAAAC3NzaC1lZDI1NTE5AAAAID4NdJ9B1LOS7+li7shEB10b9lQEjdsbe2oNQEW8fZP7")
             .unwrap();

@@ -10,7 +10,7 @@ Canonical machine files:
 - Ledger (every `master` commit after baseline):
   [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml)
 
-Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-10-12.
+Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-10-13.
 `#784` marked `ported` after et.rs [#31](https://github.com/minpeter/et.rs/pull/31) / `906a7ca86691f00a82f88b99b21d7afceb07bf97`.
 `#798` marked `ported` after et.rs [#77](https://github.com/minpeter/et.rs/pull/77).
 
@@ -20,11 +20,11 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-10-12.
 | Baseline / latest release tag | [`et-v7.0.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.0.0) |
 | Baseline / release commit | [`7656a32a5bc15c6746726a27a5a4ba1e468fab6e`](https://github.com/MisterTea/EternalTerminal/commit/7656a32a5bc15c6746726a27a5a4ba1e468fab6e) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`8a92ea7`](https://github.com/MisterTea/EternalTerminal/commit/8a92ea76fc7b29c8316b924398b2c505d77177b1) (#880 ssh-agent session-bind replay, part 1/3, reviewed 2026-10-12) |
+| Pin tip (last classified) | [`e02aefa`](https://github.com/MisterTea/EternalTerminal/commit/e02aefa2301a9544fe7a40564e612dcf122291e1) (#881 ssh-agent session-bind recorder, part 2/3, reviewed 2026-10-13) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
 | ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.0.0` and `master`) |
 
-The reviewed baseline-to-tip range contains 80 classified commits. Unclassified commits would be drift. The product-parity ports below passed combined Linux verification: 824 tests passed, none failed, and two existing tests were ignored. Formatting, workspace clippy, Windows GNU/macOS ARM binary cross-checks, and release/AUR packaging checks passed. Real OpenSSH mux clients exercised the Rust master; no live C++ peer, native Windows/macOS runtime, or actual VS Code sleep cycle was tested in this port. `ported` covers the behavior described in each row, including its explicit limitations, not unrestricted product parity. Protocol remains v6.
+The reviewed baseline-to-tip range contains 109 classified commits. Unclassified commits would be drift. The product-parity ports below passed combined Linux verification: 824 tests passed, none failed, and two existing tests were ignored. Formatting, workspace clippy, Windows GNU/macOS ARM binary cross-checks, and release/AUR packaging checks passed. Real OpenSSH mux clients exercised the Rust master; no live C++ peer, native Windows/macOS runtime, or actual VS Code sleep cycle was tested in this port. `ported` covers the behavior described in each row, including its explicit limitations, not unrestricted product parity. Protocol remains v6.
 
 ## Ledger (classified 2026-10-12)
 
@@ -109,7 +109,36 @@ The reviewed baseline-to-tip range contains 80 classified commits. Unclassified 
 | [`5129342`](https://github.com/MisterTea/EternalTerminal/commit/5129342ef5ce3185125d907b95ad6d15a36b1cb6) | 2026-10-02 | docs | skip | #876 README-only editor setup for upstream et1; et.rs does not package that wrapper or claim editor sleep-cycle verification. |
 | [`b2adbfd`](https://github.com/MisterTea/EternalTerminal/commit/b2adbfd1846ddf0448a73a37f14d65b3a1a8ec3e) | 2026-10-05 | product | skip | #820 etctl client CLI drives local `et --ctl` Unix sockets (ControlProtocol IPC, same class as #819). et.rs already has that control surface. Help-text-only `--ctl-socket` path. Not wire/auth/server. |
 | [`8f66739`](https://github.com/MisterTea/EternalTerminal/commit/8f667391875832fb5f7035936eb51e08da679bc0) | 2026-10-07 | ci | skip | #884 C++ build hygiene / `-Werror`. et.rs uses Rust Result paths and its own daemonize; nothing to port. PROTOCOL_VERSION stays 6. |
-| [`8a92ea7`](https://github.com/MisterTea/EternalTerminal/commit/8a92ea76fc7b29c8316b924398b2c505d77177b1) | 2026-10-12 | product | **ported** | #880 replay recorded `session-bind@openssh.com` requests on forwarded agent connections and strip the agent's replies. Refusals are logged and tolerated. Parts 2/3 #881 and #879 are still open upstream, so nothing supplies bindings yet. PROTOCOL_VERSION stays 6. |
+| [`8a92ea7`](https://github.com/MisterTea/EternalTerminal/commit/8a92ea76fc7b29c8316b924398b2c505d77177b1) | 2026-10-12 | product | **ported** | #880 replay recorded `session-bind@openssh.com` requests on forwarded agent connections and strip the agent's replies. Refusals are logged and tolerated. The recorder landed with #881; #879 still does not wire it into bootstrap ssh. PROTOCOL_VERSION stays 6. |
+| [`f830e25`](https://github.com/MisterTea/EternalTerminal/commit/f830e25fc20b6d66de6fcb91e08dd6743808a29c) | 2026-10-09 | product | skip | #886 Windows console NUL modifier keys. No raw KEY_EVENT_RECORD path. |
+| [`628ca71`](https://github.com/MisterTea/EternalTerminal/commit/628ca7111d6c2eb4a5c55daae269b4e383d84f36) | 2026-10-09 | product | skip | #886 layout follow-up for the same console records. |
+| [`f6ed9fe`](https://github.com/MisterTea/EternalTerminal/commit/f6ed9fedef7d54242c18587649075e331d67e5b5) | 2026-10-09 | product | skip | #888 sorted Include globs. et.rs uses OpenSSH `ssh -G`. |
+| [`e49d71f`](https://github.com/MisterTea/EternalTerminal/commit/e49d71f1089cec5c10f36b2bb96ac0a990798347) | 2026-10-10 | product | **ported** | #892 bound parked forwarding sockets and reject stale destination replies. |
+| [`e6c3558`](https://github.com/MisterTea/EternalTerminal/commit/e6c355897b618a8c295b401e7e21c5c31b8799a4) | 2026-10-11 | docs | skip | #896 telemetry README. et.rs never collects telemetry. |
+| [`f49c1bb`](https://github.com/MisterTea/EternalTerminal/commit/f49c1bb8f4b73b9534bdc90e7b51d9539aae54ef) | 2026-10-10 | product | **ported** | #892 bound incomplete SOCKS handshakes on dynamic forwards. |
+| [`c758c95`](https://github.com/MisterTea/EternalTerminal/commit/c758c953e66a5e182d1ccb2f9982e81392a12918) | 2026-10-10 | product | **ported** | #893 preserve log-file identity during rotation. |
+| [`1928401`](https://github.com/MisterTea/EternalTerminal/commit/19284011f415c67e15cbb5c590d33f4cd3075f66) | 2026-10-11 | product | skip | #893 telemetry storage out of shared tmp. No telemetry store. |
+| [`fe377a4`](https://github.com/MisterTea/EternalTerminal/commit/fe377a419acead6d41759086677f92420bfef893) | 2026-10-11 | product | **ported** | #893 refuse unsafe daemon pid files and truncate stale contents. |
+| [`c98e3f5`](https://github.com/MisterTea/EternalTerminal/commit/c98e3f5660680bed8f7eacc4b7b518d67add4ff3) | 2026-10-11 | product | **ported** | #893 check every ancestor of the etserver fifo directory. |
+| [`63e7be9`](https://github.com/MisterTea/EternalTerminal/commit/63e7be9e50630a034cf20ca948f75e27dda13fa6) | 2026-10-01 | product | **ported** | #881 record the bootstrap ssh session-bind. #879 wiring is still open. |
+| [`56d2e98`](https://github.com/MisterTea/EternalTerminal/commit/56d2e9804106e96e0543838e92eebab7e2c37adb) | 2026-10-12 | product | **ported** | #881 Windows named-pipe recorder. Not executed on Windows in this port. |
+| [`e22996b`](https://github.com/MisterTea/EternalTerminal/commit/e22996bbc194e0c2a987d48cf41300c2c7fcacbc) | 2026-10-12 | product | skip | Disabled-telemetry identifier init. et.rs has no telemetry. |
+| [`b0c72ed`](https://github.com/MisterTea/EternalTerminal/commit/b0c72ed5b418de14f0df2181e78232a30ce41d6b) | 2026-10-12 | ci | skip | #897 MSan coverage. |
+| [`3130b52`](https://github.com/MisterTea/EternalTerminal/commit/3130b5256530c5c864585d2e64fb69289707072c) | 2026-10-12 | ci | skip | #897 git bootstrap in distro containers. |
+| [`ad065d2`](https://github.com/MisterTea/EternalTerminal/commit/ad065d2d1d6383d225e0038dc153319ab38faeac) | 2026-10-12 | ci | skip | Merge #897. |
+| [`4583d9d`](https://github.com/MisterTea/EternalTerminal/commit/4583d9d05881dc9a7089825e54cf80725c5fa5a0) | 2026-10-12 | docs | skip | Merge #896 telemetry docs. |
+| [`0368025`](https://github.com/MisterTea/EternalTerminal/commit/03680253921a9c9444ebb5d6ce4542e0cfa2354a) | 2026-10-12 | product | **ported** | Merge #893. Telemetry storage skipped. |
+| [`4c5508b`](https://github.com/MisterTea/EternalTerminal/commit/4c5508b6136d2037541624ffb28b2f2d7f74b854) | 2026-10-12 | product | skip | Merge #888. |
+| [`3142f87`](https://github.com/MisterTea/EternalTerminal/commit/3142f879eb4b06bb1d30ed407e25bff4f5402a7c) | 2026-10-12 | product | skip | Merge #886. |
+| [`c8116ac`](https://github.com/MisterTea/EternalTerminal/commit/c8116ac75aedebf9f6d4eac69248b24fab0301db) | 2026-10-12 | product | **ported** | Merge #892. |
+| [`026b451`](https://github.com/MisterTea/EternalTerminal/commit/026b45162fe60a6c704528b32360d18dea332333) | 2026-10-10 | ci | skip | #894 QEMU interpreter registration. |
+| [`64173c4`](https://github.com/MisterTea/EternalTerminal/commit/64173c449c728e03366b27172f2f9b0be1934107) | 2026-10-10 | ci | skip | #894 pin third-party actions. |
+| [`9a82ff4`](https://github.com/MisterTea/EternalTerminal/commit/9a82ff470a9af83e8db5a12318df8ba286a347b5) | 2026-10-12 | ci | skip | #894 FreeBSD ccache 4. |
+| [`ade24de`](https://github.com/MisterTea/EternalTerminal/commit/ade24de1df69b9bd1cad8bafe51f928556f40bfa) | 2026-10-10 | product | **ported** | #895 iterative tmux control prelude. |
+| [`ed6067e`](https://github.com/MisterTea/EternalTerminal/commit/ed6067e5a39c66fdce61f302ba15bf429957581d) | 2026-10-10 | product | skip | #895 linear OSC 133 scan. No OSC parser in et.rs. |
+| [`d5025c2`](https://github.com/MisterTea/EternalTerminal/commit/d5025c2df0176981e5eb6a69603378970a218a9e) | 2026-10-12 | ci | skip | Merge #894. |
+| [`dd15b2b`](https://github.com/MisterTea/EternalTerminal/commit/dd15b2b119a2e29f070c73491e9afd7ce19a2359) | 2026-10-12 | product | **ported** | Merge #895. OSC scan skipped. |
+| [`e02aefa`](https://github.com/MisterTea/EternalTerminal/commit/e02aefa2301a9544fe7a40564e612dcf122291e1) | 2026-10-12 | product | **ported** | Merge #881 recorder. #879 wiring not ported. |
 
 
 ## Ported and residual
@@ -544,19 +573,35 @@ Rust `Result` paths and its own daemonize; nothing to port. No `.proto`,
 stays 6.
 
 [`8a92ea7`](https://github.com/MisterTea/EternalTerminal/commit/8a92ea76fc7b29c8316b924398b2c505d77177b1)
-(`#880`, part 1/3 of OpenSSH agent session binding) is `status: ported` and the
-pin tip. The client replays recorded `session-bind@openssh.com` requests
-(`SSH_AGENTC_EXTENSION`: host key, session identifier, signature,
-`is_forwarding`) on each new connection to the stable `et-agent-<id>` proxy,
-ahead of forwarded data, and strips exactly one agent reply per bind as those
-replies arrive. `SSH_AGENT_SUCCESS` is accepted; `SSH_AGENT_FAILURE` and
-`SSH_AGENT_EXTENSION_FAILURE` are logged and tolerated, as ssh does. Nothing
-records bindings yet (`#881` and `#879` are still open upstream), so the path
-stays dormant and agent forwarding is unchanged. No `.proto`, `Headers.hpp`,
-or wire change. `PROTOCOL_VERSION` stays 6. No live C++ peer was tested.
+(`#880`, part 1/3 of OpenSSH agent session binding) is `status: ported`. The
+client replays recorded `session-bind@openssh.com` requests on each new
+connection to the stable `et-agent-<id>` proxy and strips exactly one agent
+reply per bind. `SSH_AGENT_FAILURE` and `SSH_AGENT_EXTENSION_FAILURE` are
+logged and tolerated.
+
+[`e02aefa`](https://github.com/MisterTea/EternalTerminal/commit/e02aefa2301a9544fe7a40564e612dcf122291e1)
+is the pin tip, reviewed 2026-10-13. Twenty-nine commits after `#880` are
+classified. Ported behavior:
+
+- `#892` parks at most 128 forwarding sockets for 30 seconds and closes a
+  destination whose reply names a token that is no longer parked. Incomplete
+  dynamic-forward SOCKS handshakes are capped at 64 and closed after 30
+  seconds.
+- `#893` truncates the open log inode on rotation, refuses unsafe daemon pid
+  files, and checks every ancestor of the etserver directory. Telemetry
+  storage is skipped because et.rs has no telemetry.
+- `#895` keeps a mid-line tmux control prelude in one loop, including a large
+  backlog. The OSC 133 scanner is skipped because et.rs has no OSC parser.
+- `#881` records the last non-forwarded bootstrap session-bind on a private
+  proxy, including a Windows named pipe. `#879`, which would hand that proxy
+  to bootstrap ssh, is still open and is not ported, so replay stays empty
+  until something calls the recorder.
+
+`#886`, `#888`, `#894`, `#896`, `#897`, and `e22996b` are ledger skips.
+`PROTOCOL_VERSION` stays 6. No live C++ peer was tested.
 
 et.rs still claims **protocol v6**. EternalTerminal’s latest product release is
-**v7.0.0**, and the reviewed tip is eighty classified commits past that tag.
+**v7.0.0**, and the reviewed tip is one hundred nine classified commits past that tag.
 
 Review ports against the conflict policy in
 [`docs/upstream-factory.md`](upstream-factory.md). Gate any later port with

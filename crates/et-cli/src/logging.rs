@@ -537,7 +537,10 @@ mod tests {
         assert!(logger.file.is_none());
         logger.write(0, "no retry").unwrap();
         #[cfg(unix)]
-        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         #[cfg(not(unix))]
         assert!(path.is_dir());
     }

@@ -13,7 +13,7 @@
 # Classified 2026-10-12. #804 passed independent review in et.rs #100.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-10-12"
+classified: "2026-10-13"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -486,3 +486,176 @@ commits:
     status: ported
     note: "#880 replay recorded ssh-agent session-bind requests on each forwarded agent connection and strip the agent's replies. SSH_AGENT_FAILURE and SSH_AGENT_EXTENSION_FAILURE are logged and tolerated. Parts 2/3 #881 (record) and #879 (bootstrap host key) are still open upstream, so nothing supplies bindings yet and behavior is unchanged. PROTOCOL_VERSION stays 6."
     et_pr: 880
+  - sha: f830e25fc20b6d66de6fcb91e08dd6743808a29c
+    date: "2026-10-09"
+    kind: product
+    status: skip
+    note: "#886 Windows console NUL for bare modifier keys. et.rs reads crossterm KeyEvent, not raw KEY_EVENT_RECORD UnicodeChar, so that NUL leak has no equivalent path. PROTOCOL_VERSION stays 6."
+    et_pr: 886
+  - sha: 628ca7111d6c2eb4a5c55daae269b4e383d84f36
+    date: "2026-10-09"
+    kind: product
+    status: skip
+    note: "#886 follow-up: match NUL chords by layout in PlatformUtils. Same skip as f830e25; no raw Windows console record path. PROTOCOL_VERSION stays 6."
+    et_pr: 886
+  - sha: f6ed9fedef7d54242c18587649075e331d67e5b5
+    date: "2026-10-09"
+    kind: product
+    status: skip
+    note: "#888 sorted wildcard Include. et.rs resolves ssh_config through OpenSSH ssh -G and does not parse Include globs itself. PROTOCOL_VERSION stays 6."
+    et_pr: 888
+  - sha: e49d71f1089cec5c10f36b2bb96ac0a990798347
+    date: "2026-10-10"
+    kind: product
+    status: ported
+    note: "#892 cap parked forwarding sockets at 128, expire them after 30s, and close a destination whose reply names a token that is no longer parked. et.rs tokens are logical ids, not OS descriptors. PROTOCOL_VERSION stays 6."
+    et_pr: 892
+  - sha: e6c355897b618a8c295b401e7e21c5c31b8799a4
+    date: "2026-10-11"
+    kind: docs
+    status: skip
+    note: "#896 telemetry README. et.rs accepts --telemetry and never collects it; no telemetry docs to copy. PROTOCOL_VERSION stays 6."
+    et_pr: 896
+  - sha: f49c1bb8f4b73b9534bdc90e7b51d9539aae54ef
+    date: "2026-10-10"
+    kind: product
+    status: ported
+    note: "#892 cap incomplete dynamic-forward SOCKS handshakes at 64 and close them after 30s. PROTOCOL_VERSION stays 6."
+    et_pr: 892
+  - sha: c758c953e66a5e182d1ccb2f9982e81392a12918
+    date: "2026-10-10"
+    kind: product
+    status: ported
+    note: "#893 log rotation truncates the open file so the inode stays put. Unlinking the name would let another user plant a symlink before reopen. PROTOCOL_VERSION stays 6."
+    et_pr: 893
+  - sha: 19284011f415c67e15cbb5c590d33f4cd3075f66
+    date: "2026-10-11"
+    kind: product
+    status: skip
+    note: "#893 telemetry storage out of shared tmp. et.rs has no telemetry store, same as #778. PROTOCOL_VERSION stays 6."
+    et_pr: 893
+  - sha: fe377a419acead6d41759086677f92420bfef893
+    date: "2026-10-11"
+    kind: product
+    status: ported
+    note: "#893 refuse unsafe daemon pid files (symlink, extra hard link, fifo, writable ancestor or mode) and truncate stale contents only after those checks. PROTOCOL_VERSION stays 6."
+    et_pr: 893
+  - sha: c98e3f5660680bed8f7eacc4b7b518d67add4ff3
+    date: "2026-10-11"
+    kind: product
+    status: ported
+    note: "#893 check every ancestor of the etserver fifo directory. Root-owned sticky directories such as /tmp stay allowed; a user-writable parent or planted symlink is refused. PROTOCOL_VERSION stays 6."
+    et_pr: 893
+  - sha: 63e7be9e50630a034cf20ca948f75e27dda13fa6
+    date: "2026-10-01"
+    kind: product
+    status: ported
+    note: "#881 record the bootstrap ssh session-bind on a private agent proxy and keep the last non-forwarded bind. #879, which wires the recorder into bootstrap ssh, is still open and is not ported. PROTOCOL_VERSION stays 6."
+    et_pr: 881
+  - sha: 56d2e9804106e96e0543838e92eebab7e2c37adb
+    date: "2026-10-12"
+    kind: product
+    status: ported
+    note: "#881 Windows named-pipe recorder: remote clients rejected, current-user SDDL when whoami can supply the SID. Not executed on a Windows host in this port. PROTOCOL_VERSION stays 6."
+    et_pr: 881
+  - sha: e22996bbc194e0c2a987d48cf41300c2c7fcacbc
+    date: "2026-10-12"
+    kind: product
+    status: skip
+    note: "Initialize the identifier used by disabled telemetry. et.rs has no telemetry. PROTOCOL_VERSION stays 6."
+  - sha: b0c72ed5b418de14f0df2181e78232a30ce41d6b
+    date: "2026-10-12"
+    kind: ci
+    status: skip
+    note: "#897 restore MSan coverage and reduce rebuilds. C++ CI only. PROTOCOL_VERSION stays 6."
+    et_pr: 897
+  - sha: 3130b5256530c5c864585d2e64fb69289707072c
+    date: "2026-10-12"
+    kind: ci
+    status: skip
+    note: "#897 bootstrap Git before checkout in distro containers. CI only. PROTOCOL_VERSION stays 6."
+    et_pr: 897
+  - sha: ad065d2d1d6383d225e0038dc153319ab38faeac
+    date: "2026-10-12"
+    kind: ci
+    status: skip
+    note: "Merge #897 MSan and git-bootstrap CI. Not an et.rs change. PROTOCOL_VERSION stays 6."
+    et_pr: 897
+  - sha: 4583d9d05881dc9a7089825e54cf80725c5fa5a0
+    date: "2026-10-12"
+    kind: docs
+    status: skip
+    note: "Merge #896 telemetry README. et.rs has no telemetry to document. PROTOCOL_VERSION stays 6."
+    et_pr: 896
+  - sha: 03680253921a9c9444ebb5d6ce4542e0cfa2354a
+    date: "2026-10-12"
+    kind: product
+    status: ported
+    note: "Merge #893. Log identity, pid-file checks, and fifo ancestors are ported. Telemetry storage is skipped because et.rs has no telemetry. PROTOCOL_VERSION stays 6."
+    et_pr: 893
+  - sha: 4c5508b6136d2037541624ffb28b2f2d7f74b854
+    date: "2026-10-12"
+    kind: product
+    status: skip
+    note: "Merge #888 sorted Include globs. et.rs does not parse Include. PROTOCOL_VERSION stays 6."
+    et_pr: 888
+  - sha: 3142f879eb4b06bb1d30ed407e25bff4f5402a7c
+    date: "2026-10-12"
+    kind: product
+    status: skip
+    note: "Merge #886 Windows console NUL modifier keys. No raw console-record path in et.rs. PROTOCOL_VERSION stays 6."
+    et_pr: 886
+  - sha: c8116ac75aedebf9f6d4eac69248b24fab0301db
+    date: "2026-10-12"
+    kind: product
+    status: ported
+    note: "Merge #892 parked-forward and incomplete SOCKS limits. PROTOCOL_VERSION stays 6."
+    et_pr: 892
+  - sha: 026b45162fe60a6c704528b32360d18dea332333
+    date: "2026-10-10"
+    kind: ci
+    status: skip
+    note: "#894 register QEMU interpreters without executing a fetched script. CI only. PROTOCOL_VERSION stays 6."
+    et_pr: 894
+  - sha: 64173c449c728e03366b27172f2f9b0be1934107
+    date: "2026-10-10"
+    kind: ci
+    status: skip
+    note: "#894 pin third-party actions used by builds and releases. CI only. PROTOCOL_VERSION stays 6."
+    et_pr: 894
+  - sha: 9a82ff470a9af83e8db5a12318df8ba286a347b5
+    date: "2026-10-12"
+    kind: ci
+    status: skip
+    note: "#894 use ccache 4 on FreeBSD. CI only. PROTOCOL_VERSION stays 6."
+    et_pr: 894
+  - sha: ade24de1df69b9bd1cad8bafe51f928556f40bfa
+    date: "2026-10-10"
+    kind: product
+    status: ported
+    note: "#895 keep a mid-line tmux control prelude iteratively, including a large backlog, instead of recursing once per line. PROTOCOL_VERSION stays 6."
+    et_pr: 895
+  - sha: ed6067e5a39c66fdce61f302ba15bf429957581d
+    date: "2026-10-10"
+    kind: product
+    status: skip
+    note: "#895 linear OSC 133 prompt-mark scan. et.rs has no OSC 133 / etctl prompt parser. PROTOCOL_VERSION stays 6."
+    et_pr: 895
+  - sha: d5025c2df0176981e5eb6a69603378970a218a9e
+    date: "2026-10-12"
+    kind: ci
+    status: skip
+    note: "Merge #894 QEMU, action pinning, and ccache CI. Not an et.rs change. PROTOCOL_VERSION stays 6."
+    et_pr: 894
+  - sha: dd15b2b119a2e29f070c73491e9afd7ce19a2359
+    date: "2026-10-12"
+    kind: product
+    status: ported
+    note: "Merge #895. The tmux control prelude is ported. OSC scanning is skipped because et.rs has no OSC 133 parser. PROTOCOL_VERSION stays 6."
+    et_pr: 895
+  - sha: e02aefa2301a9544fe7a40564e612dcf122291e1
+    date: "2026-10-12"
+    kind: product
+    status: ported
+    note: "Merge #881 ssh-agent session-bind recorder, including the Windows named-pipe proxy. Bootstrap wiring remains open upstream #879 and is not ported. PROTOCOL_VERSION stays 6."
+    et_pr: 881

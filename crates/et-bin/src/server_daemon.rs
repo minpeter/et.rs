@@ -405,14 +405,12 @@ mod tests {
         );
         fs::remove_file(&link).unwrap();
 
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &link,
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::from_raw_mode(0o600),
-            0,
-        )
-        .unwrap();
+        // rustix::fs::mknodat is unavailable on macOS. mkfifo is on Linux and macOS.
+        let created = std::process::Command::new("mkfifo")
+            .arg(&link)
+            .status()
+            .expect("mkfifo");
+        assert!(created.success(), "mkfifo failed: {created}");
         let path = link.clone();
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {

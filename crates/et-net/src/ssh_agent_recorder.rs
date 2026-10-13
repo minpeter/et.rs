@@ -5,16 +5,16 @@
 //! ProxyJump helpers bind before the destination, so the last binding belongs
 //! to the final host. Bootstrap wiring is upstream #879 and is not done here.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use super::{
     forwarded_session_bind, log, session_bind_host_key_fingerprint, SessionBindLog,
-    SSH_AGENT_FAILURE, SSH_AGENT_MAX_MESSAGE_LENGTH,
+    SSH_AGENT_MAX_MESSAGE_LENGTH,
 };
 
 const SLOW_AGENT_WARNING: Duration = Duration::from_secs(5);
@@ -119,14 +119,13 @@ fn random_token() -> io::Result<String> {
 #[cfg(unix)]
 mod unix {
     use std::io::{self, Read, Write};
-    use std::os::fd::AsFd;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::thread::{self, JoinHandle};
-    use std::time::{Duration, Instant};
+    use std::thread;
+    use std::time::Instant;
 
     use rustix::event::{poll, PollFd, PollFlags};
     use rustix::io::Errno;

@@ -75,7 +75,7 @@ fn xdg_etserver_refuses_a_replaceable_parent_and_a_planted_symlink() {
 
 #[test]
 fn home_etserver_checks_ancestors_and_stays_private() {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::MetadataExt;
 
     let home = TestRoot::new();
     let selected = select_router_path_for(1000, None, None, Some(&home.0)).unwrap();

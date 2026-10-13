@@ -523,7 +523,7 @@ impl Worker {
         }
     }
 
-    fn next_park_deadline(&self) -> Option<Instant> {
+    pub(super) fn next_park_deadline(&self) -> Option<Instant> {
         self.pending.values().map(|pending| pending.deadline).min()
     }
 

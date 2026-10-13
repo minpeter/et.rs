@@ -309,7 +309,7 @@ impl Logger {
         if let Some(file) = self.file.as_mut() {
             file.write_all(line.as_bytes())
                 .and_then(|()| file.flush())
-                .map_err(|error| log_error("write", path, error))?;
+                .map_err(|error| log_error("write", &path, error))?;
             self.written += line.len() as u64;
         }
         Ok(())
@@ -491,7 +491,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn every_rollover_generation_keeps_the_same_private_inode() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::fs::MetadataExt;
 
         let directory = TestDirectory::new();
         let mut logger = Logger::open(directory.options()).unwrap();

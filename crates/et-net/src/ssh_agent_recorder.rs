@@ -23,7 +23,7 @@ pub struct SshAgentSessionBindRecorder {
     socket_path: PathBuf,
     #[cfg(unix)]
     directory: PathBuf,
-    last: Arc<Mutex<Option<Vec<u8>>>>
+    last: Arc<Mutex<Option<Vec<u8>>>>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     #[cfg(unix)]

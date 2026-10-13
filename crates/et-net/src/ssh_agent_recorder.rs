@@ -847,13 +847,24 @@ mod tests {
                 while std::time::Instant::now() < deadline {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            // The accepted fd inherits O_NONBLOCK. Clear it so a
+                            // split request blocks for the rest instead of
+                            // looking like EOF. macOS also returns EINVAL from
+                            // SO_RCVTIMEO on a socket that is still nonblocking.
+                            let _ = stream.set_nonblocking(false);
                             let _ = stream.set_read_timeout(Some(Duration::from_secs(8)));
                             let _ = stream.set_write_timeout(Some(Duration::from_secs(8)));
                             let mut buffer = Vec::new();
                             let mut chunk = [0u8; 1024];
                             loop {
                                 match stream.read(&mut chunk) {
-                                    Ok(0) | Err(_) => break,
+                                    Ok(0) => break,
+                                    Err(error)
+                                        if error.kind() == std::io::ErrorKind::Interrupted =>
+                                    {
+                                        continue;
+                                    }
+                                    Err(_) => break,
                                     Ok(count) => {
                                         buffer.extend_from_slice(&chunk[..count]);
                                         while let Some(body) = take_frame(&mut buffer) {

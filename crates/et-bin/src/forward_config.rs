@@ -188,7 +188,8 @@ pub fn build(
             environmentvariable: Some("SSH_AUTH_SOCK".to_owned()),
         });
         // Session binds are replayed locally on the stable proxy. They are
-        // not a tunnel field. Nothing records them until upstream #881/#879.
+        // not a tunnel field. #881 can record them; #879 (still open) wires
+        // the recorder into bootstrap ssh.
     }
     validate_environment_names(&reverse_tunnels)?;
     Ok(ForwardConfig {

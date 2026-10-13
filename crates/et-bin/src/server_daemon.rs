@@ -267,22 +267,34 @@ fn root_directory() -> PathBuf {
 }
 
 fn write_pid_file(path: &Path) -> Result<(), String> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    let contents = format!("{}\n", std::process::id());
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        // Refuse symlinks, extra hard links, special files, and directories
+        // whose ancestors another user can replace. Truncate only after the
+        // inode checks, so a stale pid cannot survive and a victim cannot be
+        // overwritten through a planted link.
+        return et_server::private_storage::replace_file(path, &contents).map_err(|error| {
+            format!(
+                "Error opening pidfile for writing: {}: {error}",
+                path.display()
+            )
+        });
     }
-    let mut file = options.open(path).map_err(|error| {
-        format!(
-            "Error opening pidfile for writing: {}: {error}",
-            path.display()
-        )
-    })?;
-    writeln!(file, "{}", std::process::id())
-        .and_then(|()| file.flush())
-        .map_err(|error| format!("Error writing pidfile: {}: {error}", path.display()))
+    #[cfg(not(unix))]
+    {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        let mut file = options.open(path).map_err(|error| {
+            format!(
+                "Error opening pidfile for writing: {}: {error}",
+                path.display()
+            )
+        })?;
+        file.write_all(contents.as_bytes())
+            .and_then(|()| file.flush())
+            .map_err(|error| format!("Error writing pidfile: {}: {error}", path.display()))
+    }
 }
 
 /// Resolve the pid-file path with the upstream default.
@@ -326,6 +338,103 @@ mod tests {
     fn pid_file_errors_are_reported_with_the_path() {
         let error = write_pid_file(Path::new("/nonexistent-dir/etserver.pid")).unwrap_err();
         assert!(error.contains("/nonexistent-dir/etserver.pid"));
+    }
+
+    #[test]
+    fn pid_file_truncates_stale_contents() {
+        let directory = std::env::temp_dir().join(format!(
+            "et-pid-truncate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = directory.join("daemon.pid");
+        fs::write(&path, "123456789\nstale trailing bytes\n").unwrap();
+        write_pid_file(&path).unwrap();
+        write_pid_file(&path).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("{}\n", std::process::id())
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_file_refuses_links_special_files_and_writable_parents() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::time::Duration;
+
+        let directory = std::env::temp_dir().join(format!(
+            "et-pid-secure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let victim = directory.join("victim");
+        fs::write(&victim, "DO NOT OVERWRITE THIS FILE\n").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let link = directory.join("daemon.pid");
+        symlink(&victim, &link).unwrap();
+        assert!(write_pid_file(&link).is_err());
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "DO NOT OVERWRITE THIS FILE\n"
+        );
+        fs::remove_file(&link).unwrap();
+
+        std::fs::hard_link(&victim, &link).unwrap();
+        assert!(write_pid_file(&link).is_err());
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "DO NOT OVERWRITE THIS FILE\n"
+        );
+        fs::remove_file(&link).unwrap();
+
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &link,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        let path = link.clone();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(write_pid_file(&path));
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(2));
+        assert!(
+            result.is_ok(),
+            "pid write blocked on a FIFO instead of refusing it"
+        );
+        assert!(result.unwrap().is_err());
+        fs::remove_file(&link).unwrap();
+
+        fs::write(&link, "UNCHANGED\n").unwrap();
+        fs::set_permissions(&link, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(write_pid_file(&link).is_err());
+        assert_eq!(fs::read_to_string(&link).unwrap(), "UNCHANGED\n");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&link, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(write_pid_file(&link).is_err());
+        assert_eq!(fs::read_to_string(&link).unwrap(), "UNCHANGED\n");
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[cfg(unix)]

@@ -3,11 +3,13 @@
 //!
 //! Log files are named exactly like upstream:
 //! `<prefix>-<YYYY-MM-DD_HH-MM-SS>.<micros>[_<pid>].log`, created inside
-//! `logdir` (which is created if missing), and rolled over (deleted and
-//! restarted) once they exceed the configured maximum size.
+//! `logdir` (which is created if missing), and rolled over in place once they
+//! exceed the configured maximum size. Rotation truncates the open file so the
+//! inode stays put; unlinking the name would let another user plant a symlink
+//! before the next create.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -285,18 +287,23 @@ impl Logger {
     }
 
     fn write_file(&mut self, line: &str) -> io::Result<()> {
-        let Some(path) = self.path.as_ref() else {
+        let Some(path) = self.path.clone() else {
             return Ok(());
         };
-        // Keep upstream's single-path rollout, but every generation must be
-        // exclusively created, including after unlink. Never reopen by append.
+        // Truncate the already-open inode. Reopening the path would follow a
+        // symlink planted in a shared directory after an unlink.
         if self.written.saturating_add(line.len() as u64) > self.options.max_size {
-            self.file = None;
-            fs::remove_file(path)
-                .map_err(|error| log_error("remove during rollover", path, error))?;
-            self.file = Some(
-                create(path).map_err(|error| log_error("create during rollover", path, error))?,
-            );
+            let Some(file) = self.file.as_mut() else {
+                self.path = None;
+                return Err(log_error(
+                    "truncate during rollover",
+                    &path,
+                    io::Error::other("log file identity was lost"),
+                ));
+            };
+            file.set_len(0)
+                .and_then(|()| file.seek(SeekFrom::Start(0)))
+                .map_err(|error| log_error("truncate during rollover", &path, error))?;
             self.written = 0;
         }
         if let Some(file) = self.file.as_mut() {
@@ -483,25 +490,20 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn every_rollover_generation_is_private_and_replaces_the_inode() {
+    fn every_rollover_generation_keeps_the_same_private_inode() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let directory = TestDirectory::new();
         let mut logger = Logger::open(directory.options()).unwrap();
         let path = logger.path.clone().unwrap();
+        let original = fs::metadata(&path).unwrap().ino();
         for generation in 0..3 {
-            let old = fs::File::open(&path).unwrap();
-            assert_eq!(old.metadata().unwrap().mode() & 0o777, 0o600);
-            // A changed mode must not survive recreation.
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
             logger.options.max_size = 1;
             logger
                 .write(0, &format!("generation {generation}"))
                 .unwrap();
-            assert_ne!(
-                old.metadata().unwrap().ino(),
-                fs::metadata(&path).unwrap().ino()
-            );
+            assert_eq!(fs::metadata(&path).unwrap().ino(), original);
             assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
             let contents = fs::read_to_string(&path).unwrap();
             assert!(contents.ends_with(&format!("generation {generation}\n")));
@@ -510,22 +512,33 @@ mod tests {
     }
 
     #[test]
-    fn rollover_failure_disables_file_sink_without_retrying() {
+    fn rollover_failure_disables_file_sink_without_reopening_the_path() {
         let directory = TestDirectory::new();
         let mut logger = Logger::open(directory.options()).unwrap();
         let path = logger.path.clone().unwrap();
         logger.write(0, "original").unwrap();
-        // A directory at the active pathname makes unlink fail deterministically,
-        // including when tests run as root or on Windows.
+        // Losing the open inode must not recreate the path: a shared directory
+        // could now contain a symlink to another user's file.
         logger.file = None;
         fs::remove_file(&path).unwrap();
-        fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("victim", &path).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            fs::create_dir(&path).unwrap();
+        }
         logger.options.max_size = 1;
         let error = logger.write(0, "rollover").unwrap_err();
-        assert!(error.to_string().contains("remove during rollover"));
+        assert!(error.to_string().contains("truncate during rollover"));
+        assert!(error.to_string().contains("log file identity was lost"));
         assert!(logger.path.is_none());
         assert!(logger.file.is_none());
         logger.write(0, "no retry").unwrap();
+        #[cfg(unix)]
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        #[cfg(not(unix))]
         assert!(path.is_dir());
     }
 
@@ -553,7 +566,6 @@ mod tests {
         assert_eq!(log_path().unwrap(), original);
         LOGGER.lock().unwrap().as_mut().unwrap().file = None;
         fs::remove_file(&original).unwrap();
-        fs::create_dir(&original).unwrap();
         info("first mirrored line");
         info("second mirrored line");
         assert!(log_path().is_none());
@@ -575,7 +587,7 @@ mod tests {
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert_eq!(
             stderr
-                .matches("could not remove during rollover log")
+                .matches("could not truncate during rollover log")
                 .count(),
             1
         );

@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel as channel;
 
@@ -24,6 +25,10 @@ use et_core::proto::SocketEndpoint;
 
 const MAX_ACTIVE_SOCKETS: usize = 256;
 const MAX_DATA_PACKET: usize = 64 * 1024;
+/// Accepted forwards parked until a destination response. A withholding peer
+/// must not exhaust the process by leaving this set unbounded.
+pub(crate) const MAX_UNASSIGNED_FDS: usize = 128;
+pub(crate) const UNASSIGNED_FD_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Role {
@@ -203,21 +208,48 @@ impl CommandSender {
     }
 }
 
+enum RecvStatus {
+    Command(Command),
+    Timeout,
+    Disconnected,
+}
+
 impl CommandReceiver {
-    fn recv(&self) -> Option<Command> {
+    fn recv_until(&self, deadline: Option<Instant>) -> RecvStatus {
         let mut state = self.queue.state.lock().unwrap();
         loop {
-            if state.shutdown {
-                return None;
+            if state.shutdown || state.senders == 0 {
+                return RecvStatus::Disconnected;
             }
             if let Some(command) = state.commands.pop_front() {
                 self.queue.changed.notify_all();
-                return Some(command);
+                return RecvStatus::Command(command);
             }
-            if state.senders == 0 {
-                return None;
+            let Some(deadline) = deadline else {
+                state = self.queue.changed.wait(state).unwrap();
+                continue;
+            };
+            let now = Instant::now();
+            if now >= deadline {
+                return RecvStatus::Timeout;
             }
-            state = self.queue.changed.wait(state).unwrap();
+            let (next, wait) = self
+                .queue
+                .changed
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap();
+            state = next;
+            if wait.timed_out() && state.commands.is_empty() && !state.shutdown && state.senders != 0
+            {
+                return RecvStatus::Timeout;
+            }
+        }
+    }
+
+    fn recv(&self) -> Option<Command> {
+        match self.recv_until(None) {
+            RecvStatus::Command(command) => Some(command),
+            RecvStatus::Timeout | RecvStatus::Disconnected => None,
         }
     }
 
@@ -370,6 +402,28 @@ struct PendingAccept {
     socks_version: Option<u8>,
     half_close_on_eof: bool,
     stdio: bool,
+    /// When the destination response must have arrived. After this the parked
+    /// socket is closed so a late reply cannot attach to a recycled token.
+    deadline: Instant,
+}
+
+impl PendingAccept {
+    fn park(
+        stream: ForwardStream,
+        early: Vec<u8>,
+        socks_version: Option<u8>,
+        half_close_on_eof: bool,
+        stdio: bool,
+    ) -> Self {
+        Self {
+            stream,
+            early,
+            socks_version,
+            half_close_on_eof,
+            stdio,
+            deadline: Instant::now() + UNASSIGNED_FD_TIMEOUT,
+        }
+    }
 }
 
 impl Worker {
@@ -472,8 +526,11 @@ impl Worker {
             self.threads.push(thread);
         }
         let result = loop {
-            let Some(command) = commands.recv() else {
-                break Ok(());
+            self.expire_parked();
+            let command = match commands.recv_until(self.next_park_deadline()) {
+                RecvStatus::Command(command) => command,
+                RecvStatus::Timeout => continue,
+                RecvStatus::Disconnected => break Ok(()),
             };
             let step = match command {
                 Command::Packet(packet) => self.handle_packet(packet),
@@ -488,13 +545,7 @@ impl Worker {
                 } => self.accepted(
                     client_fd,
                     destination,
-                    PendingAccept {
-                        stream,
-                        early,
-                        socks_version,
-                        half_close_on_eof,
-                        stdio,
-                    },
+                    PendingAccept::park(stream, early, socks_version, half_close_on_eof, stdio),
                 ),
                 Command::Connected {
                     client_fd,
@@ -691,13 +742,13 @@ mod tests {
             .accepted(
                 1,
                 SocketEndpoint::default(),
-                PendingAccept {
-                    stream: ForwardStream::Unix(worker_end),
-                    early: Vec::new(),
-                    socks_version: None,
-                    half_close_on_eof: true,
-                    stdio: true,
-                },
+                PendingAccept::park(
+                    ForwardStream::Unix(worker_end),
+                    Vec::new(),
+                    None,
+                    true,
+                    true,
+                ),
             )
             .unwrap();
         let _request = outbound.recv_timeout(EVENT_TIMEOUT).unwrap().unwrap();
@@ -1077,5 +1128,168 @@ mod tests {
         assert_eq!(response.clientfd, Some(3));
         assert!(worker.destinations.is_empty());
         assert!(!worker.pending_agent_binds.contains_key(&7));
+    }
+}
+
+#[cfg(test)]
+mod parked_forward_limits {
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crossbeam_channel as channel;
+    use et_core::packet::Packet;
+    use et_core::proto::{
+        PortForwardData, PortForwardDestinationResponse, SocketEndpoint, TerminalPacketType,
+    };
+    use prost::Message;
+
+    use super::{
+        command_channel, PendingAccept, Worker, MAX_UNASSIGNED_FDS,
+    };
+    use crate::forward_endpoint::ForwardStream;
+
+    struct Harness {
+        worker: Worker,
+        outbound: channel::Receiver<crate::forward::Outbound>,
+        _cancel: channel::Sender<()>,
+    }
+
+    fn harness() -> Harness {
+        let (commands, _receiver) = command_channel(MAX_UNASSIGNED_FDS + 8);
+        let (outbound, outbound_receiver) = channel::bounded(MAX_UNASSIGNED_FDS + 8);
+        let (cancel, cancel_receiver) = channel::bounded(1);
+        #[cfg(unix)]
+        let worker = {
+            let (_read, write) = std::os::unix::net::UnixStream::pair().unwrap();
+            Worker::new(
+                commands,
+                outbound.clone(),
+                outbound,
+                Some(write),
+                cancel_receiver,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap()
+        };
+        #[cfg(windows)]
+        let worker = Worker::new(
+            commands,
+            outbound.clone(),
+            outbound,
+            cancel_receiver,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        Harness {
+            worker,
+            outbound: outbound_receiver,
+            _cancel: cancel,
+        }
+    }
+
+    fn pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        let _ = client.set_read_timeout(Some(Duration::from_secs(2)));
+        (client, accepted)
+    }
+
+    fn park(worker: &mut Worker, client_fd: i32, accepted: TcpStream) {
+        worker
+            .accepted(
+                client_fd,
+                SocketEndpoint::default(),
+                PendingAccept::park(ForwardStream::Tcp(accepted), Vec::new(), None, false, false),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn parked_forwards_are_capped_and_expired() {
+        let mut harness = harness();
+        let mut peers = Vec::new();
+        for client_fd in 1..=MAX_UNASSIGNED_FDS as i32 {
+            let (peer, accepted) = pair();
+            park(&mut harness.worker, client_fd, accepted);
+            peers.push(peer);
+            assert!(harness.outbound.recv_timeout(Duration::from_secs(2)).is_ok());
+        }
+        assert_eq!(harness.worker.pending.len(), MAX_UNASSIGNED_FDS);
+        let (mut overflow_peer, overflow) = pair();
+        park(
+            &mut harness.worker,
+            MAX_UNASSIGNED_FDS as i32 + 1,
+            overflow,
+        );
+        assert_eq!(harness.worker.pending.len(), MAX_UNASSIGNED_FDS);
+        let mut byte = [0u8; 1];
+        assert_eq!(overflow_peer.read(&mut byte).unwrap(), 0);
+
+        harness.worker.expire_parked();
+        assert_eq!(harness.worker.pending.len(), MAX_UNASSIGNED_FDS);
+        harness.worker.expire_for_test(1);
+        harness.worker.expire_parked();
+        assert!(!harness.worker.pending.contains_key(&1));
+        assert_eq!(peers[0].read(&mut byte).unwrap(), 0);
+        assert!(harness.worker.pending.contains_key(&2));
+    }
+
+    #[test]
+    fn a_late_destination_response_closes_the_peer_socket() {
+        let mut harness = harness();
+        let (_peer, accepted) = pair();
+        park(&mut harness.worker, 1, accepted);
+        let _request = harness.outbound.recv_timeout(Duration::from_secs(2)).unwrap();
+        harness.worker.expire_for_test(1);
+        harness.worker.expire_parked();
+        let (_next_peer, next) = pair();
+        park(&mut harness.worker, 2, next);
+        let _next_request = harness.outbound.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        harness
+            .worker
+            .handle_packet(Packet::new(
+                TerminalPacketType::PortForwardDestinationResponse as u8,
+                PortForwardDestinationResponse {
+                    clientfd: Some(1),
+                    socketid: Some(44),
+                    error: None,
+                    window: None,
+                }
+                .encode_to_vec(),
+            ))
+            .unwrap();
+        let stale = harness.outbound.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(stale.header(), TerminalPacketType::PortForwardData as u8);
+        let closed = PortForwardData::decode(stale.payload()).unwrap();
+        assert_eq!(closed.socketid, Some(44));
+        assert_eq!(closed.sourcetodestination, Some(true));
+        assert_eq!(closed.closed, Some(true));
+        assert!(harness.worker.pending.contains_key(&2));
+        assert!(!harness.worker.sources.contains_key(&44));
+
+        harness
+            .worker
+            .handle_packet(Packet::new(
+                TerminalPacketType::PortForwardDestinationResponse as u8,
+                PortForwardDestinationResponse {
+                    clientfd: Some(2),
+                    socketid: Some(45),
+                    error: None,
+                    window: None,
+                }
+                .encode_to_vec(),
+            ))
+            .unwrap();
+        assert!(harness.worker.sources.contains_key(&45));
+        assert!(!harness.worker.pending.contains_key(&2));
+        for thread in harness.worker.threads.drain(..) {
+            thread.join().unwrap();
+        }
     }
 }

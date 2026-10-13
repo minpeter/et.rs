@@ -4,6 +4,8 @@
 
 pub mod diag;
 pub mod path;
+#[cfg(unix)]
+pub mod private_storage;
 mod registry;
 mod registry_validation;
 mod router;

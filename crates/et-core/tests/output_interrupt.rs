@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use et_core::flow_control::{FlowControlMode, OutputQueue};
-use et_core::output_interrupt::InterruptInput;
+use et_core::output_interrupt::{InterruptInput, TerminalStream};
 use et_core::packet::Packet;
 use et_core::proto::{TerminalBuffer, TerminalExitStatus, TerminalPacketType};
 use prost::Message;
@@ -252,4 +252,34 @@ fn incomplete_tmux_records_remain_ordering_barriers_during_promotion() {
         // Then earlier pane bytes never become part of the incomplete record.
         assert_eq!(actual, [pane.as_bytes(), fragment, ending].concat());
     }
+}
+
+fn mid_line_control() -> TerminalStream {
+    let mut stream = TerminalStream::default();
+    stream.observe(b"%output %0 partial");
+    stream
+}
+
+#[test]
+fn mid_line_tmux_backlog_is_kept_without_recursion() {
+    let stream = mid_line_control();
+    let mut backlog = Vec::with_capacity(1 + 200_000 * 2);
+    backlog.push(b'x');
+    for _ in 0..200_000 {
+        backlog.extend_from_slice(b"y\n");
+    }
+    let filtered = stream.filter(&backlog);
+    assert_eq!(filtered.kept.len(), backlog.len());
+    assert_eq!(filtered.dropped, 0);
+}
+
+#[test]
+fn mid_line_prelude_keeps_lines_until_the_next_command() {
+    let stream = mid_line_control();
+    let data = b"aa\nbb\n%exit\n";
+    assert_eq!(stream.filter(data).kept, data);
+    assert_eq!(stream.filter(data).dropped, 0);
+    let data = b"aa\nbb\n\n%foo\n";
+    assert_eq!(stream.filter(data).kept, data);
+    assert_eq!(stream.filter(data).dropped, 0);
 }

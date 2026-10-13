@@ -1,6 +1,7 @@
 #[cfg(unix)]
 use std::io::Write;
 use std::io::{self};
+use std::time::Instant;
 
 use crossbeam_channel as channel;
 use et_core::packet::Packet;
@@ -18,6 +19,7 @@ use crate::ssh_agent_session_bind::{
 use super::{
     close_write, spawn_connector, spawn_io, subtract_saturating, ActiveIo, FlowWindow,
     ForwardError, ForwardStream, Role, Worker, MAX_ACTIVE_SOCKETS, MAX_DATA_PACKET,
+    MAX_UNASSIGNED_FDS,
 };
 
 /// Per-socket receive window.
@@ -73,7 +75,7 @@ impl Worker {
         destination: SocketEndpoint,
         pending: super::PendingAccept,
     ) -> Result<(), ForwardError> {
-        if self.total_sockets() >= MAX_ACTIVE_SOCKETS {
+        if self.total_sockets() >= MAX_ACTIVE_SOCKETS || self.pending.len() >= MAX_UNASSIGNED_FDS {
             pending.stream.shutdown();
             if pending.stdio {
                 self.clear_stdio();
@@ -215,13 +217,14 @@ impl Worker {
         &mut self,
         response: PortForwardDestinationResponse,
     ) -> Result<(), ForwardError> {
-        // A response for an fd we no longer track is logged-and-ignored
-        // upstream (`closeSourceFd`), not treated as a fatal protocol error.
-        let Some(pending) = response
-            .clientfd
-            .and_then(|client_fd| self.pending.remove(&client_fd))
-        else {
+        // A response for a token we no longer track must not attach to a later
+        // accept that reused a descriptor. Close the destination the peer
+        // opened instead of ignoring a live socket.
+        let Some(client_fd) = response.clientfd else {
             return Ok(());
+        };
+        let Some(pending) = self.pending.remove(&client_fd) else {
+            return self.reject_stale_destination(&response);
         };
         if response.error.is_some() {
             write_socks_reply(&pending.stream, pending.socks_version, false);
@@ -476,6 +479,59 @@ impl Worker {
                 window: None,
             },
         )
+    }
+
+    fn reject_stale_destination(
+        &mut self,
+        response: &PortForwardDestinationResponse,
+    ) -> Result<(), ForwardError> {
+        if response.error.is_some() {
+            return Ok(());
+        }
+        let Some(socket_id) = response.socketid.filter(|value| *value > 0) else {
+            return Ok(());
+        };
+        self.emit(
+            TerminalPacketType::PortForwardData as u8,
+            PortForwardData {
+                sourcetodestination: Some(true),
+                socketid: Some(socket_id),
+                buffer: None,
+                error: None,
+                closed: Some(true),
+                half_close: None,
+                window: None,
+            },
+        )
+    }
+
+    pub(super) fn expire_parked(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<i32> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| pending.deadline <= now)
+            .map(|(client_fd, _)| *client_fd)
+            .collect();
+        for client_fd in expired {
+            if let Some(pending) = self.pending.remove(&client_fd) {
+                pending.stream.shutdown();
+                if pending.stdio {
+                    self.clear_stdio();
+                }
+            }
+        }
+    }
+
+    pub(super) fn next_park_deadline(&self) -> Option<Instant> {
+        self.pending.values().map(|pending| pending.deadline).min()
+    }
+
+    #[cfg(test)]
+    pub(super) fn expire_for_test(&mut self, client_fd: i32) {
+        if let Some(pending) = self.pending.get_mut(&client_fd) {
+            pending.deadline = Instant::now() - std::time::Duration::from_secs(1);
+        }
     }
 
     fn clear_stdio(&mut self) {

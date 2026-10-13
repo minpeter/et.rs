@@ -12,9 +12,12 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+base64 = "0.22"
 crossbeam-channel = "0.5"
 et-core = { path = "../et-core" }
+getrandom = "0.2"
 prost = "0.13"
+sha2 = "0.10"
 rustix = { version = "1.1.4", features = ["event"] }
 socket2 = { version = "0.6.1", features = ["all"] }
 wait-timeout = "0.2"
@@ -25,6 +28,8 @@ rustix = { version = "1.1.4", features = ["event", "fs", "net", "process"] }
 wait-timeout = "0.2.1"
 
 [target.'cfg(windows)'.dependencies]
+interprocess = "2.2.3"
+widestring = "1"
 winapi = { version = "0.3", features = ["winsock2"] }
 winapi-wsapoll = "0.1.2"
 

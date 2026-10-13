@@ -53,3 +53,33 @@ fn trusted_root_parent_symlink_binds_but_explicit_parent_symlink_is_rejected() {
         Err(RouterError::Path(PathError::UnsafeDirectory(_)))
     ));
 }
+
+#[test]
+fn xdg_etserver_refuses_a_replaceable_parent_and_a_planted_symlink() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let root = TestRoot::new();
+    fs::set_permissions(&root.0, fs::Permissions::from_mode(0o777)).unwrap();
+    let selected = select_router_path_for(1000, None, Some(&root.0), None).unwrap();
+    assert!(selected.prepare().is_err());
+
+    fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
+    let victim = root.0.join("victim");
+    fs::create_dir(&victim).unwrap();
+    fs::set_permissions(&victim, fs::Permissions::from_mode(0o700)).unwrap();
+    symlink(&victim, root.0.join("etserver")).unwrap();
+    let selected = select_router_path_for(1000, None, Some(&root.0), None).unwrap();
+    assert!(selected.prepare().is_err());
+    assert!(fs::read_dir(&victim).unwrap().next().is_none());
+}
+
+#[test]
+fn home_etserver_checks_ancestors_and_stays_private() {
+    use std::os::unix::fs::MetadataExt;
+
+    let home = TestRoot::new();
+    let selected = select_router_path_for(1000, None, None, Some(&home.0)).unwrap();
+    selected.prepare().unwrap();
+    let etserver = home.0.join(".local").join("share").join("etserver");
+    assert_eq!(fs::metadata(&etserver).unwrap().mode() & 0o777, 0o700);
+}

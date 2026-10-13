@@ -53,7 +53,16 @@ impl RouterPath {
                     .path
                     .parent()
                     .ok_or_else(|| PathError::UnsafeDirectory(self.path.clone()))?;
-                validate_directory(parent, false)
+                // Every ancestor must be safe. A writable parent can rename a
+                // private child out from under the socket.
+                #[cfg(unix)]
+                {
+                    crate::private_storage::check_user_directory(parent)
+                }
+                #[cfg(not(unix))]
+                {
+                    validate_directory(parent, false)
+                }
             }
             DirectoryPlan::RootDefault => {
                 let parent = self
@@ -68,8 +77,25 @@ impl RouterPath {
                 validate_directory(&target, false)
             }
             DirectoryPlan::Xdg { base } => {
-                validate_directory(base, true)?;
-                create_and_validate(&base.join("etserver"), 0o700, true)
+                if !base.is_dir() {
+                    return Err(PathError::Io {
+                        operation: "open XDG_RUNTIME_DIR",
+                        path: base.clone(),
+                        source: io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "XDG_RUNTIME_DIR must already exist",
+                        ),
+                    });
+                }
+                #[cfg(unix)]
+                {
+                    crate::private_storage::ensure_directory(&base.join("etserver"))
+                }
+                #[cfg(not(unix))]
+                {
+                    validate_directory(base, true)?;
+                    create_and_validate(&base.join("etserver"), 0o700, true)
+                }
             }
             #[cfg(windows)]
             DirectoryPlan::LocalAppData { base } => {
@@ -77,12 +103,21 @@ impl RouterPath {
                 create_and_validate(&base.join("etserver"), 0, true)
             }
             DirectoryPlan::Home { home } => {
-                validate_directory(home, true)?;
-                let local = home.join(".local");
-                create_and_validate(&local, 0o755, false)?;
-                let share = local.join("share");
-                create_and_validate(&share, 0o755, false)?;
-                create_and_validate(&share.join("etserver"), 0o700, true)
+                #[cfg(unix)]
+                {
+                    crate::private_storage::ensure_directory(
+                        &home.join(".local").join("share").join("etserver"),
+                    )
+                }
+                #[cfg(not(unix))]
+                {
+                    validate_directory(home, true)?;
+                    let local = home.join(".local");
+                    create_and_validate(&local, 0o755, false)?;
+                    let share = local.join("share");
+                    create_and_validate(&share, 0o755, false)?;
+                    create_and_validate(&share.join("etserver"), 0o700, true)
+                }
             }
         }
     }
@@ -240,6 +275,7 @@ pub fn select_router_path_for(
     })
 }
 
+#[cfg_attr(unix, allow(dead_code))]
 fn create_and_validate(path: &Path, mode: u32, private: bool) -> Result<(), PathError> {
     match fs::create_dir(path) {
         #[cfg(unix)]

@@ -155,7 +155,34 @@ impl TerminalStream {
         let mut kept = Vec::new();
         let mut droppable = Vec::new();
         let mut skip_until_newline = false;
-        for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        // A control-mode line that was already partly sent must be finished,
+        // including later non-`%` lines, or the client sees a fragment and
+        // leaves tmux mode. Walk the backlog in a loop: the server decides
+        // how many lines are buffered, so this must not recurse per line.
+        let mut index = 0;
+        if state.control
+            && state.midline
+            && !bytes.is_empty()
+            && bytes[0] != b'%'
+            && bytes[0] != b'\n'
+        {
+            while index < bytes.len() && bytes[index] != b'%' && bytes[index] != b'\n' {
+                match bytes[index..].iter().position(|byte| *byte == b'\n') {
+                    None => {
+                        kept.extend_from_slice(&bytes[index..]);
+                        state.observe(&bytes[index..]);
+                        index = bytes.len();
+                    }
+                    Some(newline) => {
+                        let end = index + newline + 1;
+                        kept.extend_from_slice(&bytes[index..end]);
+                        state.observe(&bytes[index..end]);
+                        index = end;
+                    }
+                }
+            }
+        }
+        for line in bytes[index..].split_inclusive(|byte| *byte == b'\n') {
             let token = line
                 .split(|byte| byte.is_ascii_whitespace())
                 .next()

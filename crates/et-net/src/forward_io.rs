@@ -17,6 +17,29 @@ use super::forward_worker::{Command, CommandSender, Role, TryCommandError};
 
 const READ_CHUNK: usize = 16 * 1024;
 const IO_CANCEL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+/// Incomplete SOCKS handshakes beyond this are closed on accept.
+pub(crate) const MAX_PENDING_SOCKS: usize = 64;
+/// A SOCKS handshake that does not finish within this is closed.
+pub(crate) const SOCKS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Admit one incomplete SOCKS handshake, or refuse when the cap is reached.
+pub(crate) fn try_admit_socks(pending: &AtomicUsize) -> bool {
+    let previous = pending.fetch_add(1, Ordering::AcqRel);
+    if previous >= MAX_PENDING_SOCKS {
+        pending.fetch_sub(1, Ordering::AcqRel);
+        false
+    } else {
+        true
+    }
+}
+
+struct SocksAdmit(Arc<AtomicUsize>);
+
+impl Drop for SocksAdmit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FlowWindow {
@@ -246,6 +269,7 @@ pub(crate) fn spawn_socks_listener(
     stop: ListenerStop,
     next_client_fd: Arc<AtomicI32>,
 ) -> JoinHandle<()> {
+    let pending_socks = Arc::new(AtomicUsize::new(0));
     thread::spawn(move || {
         let BoundSource { listener, .. } = source;
         let Some(listener) = listener else {
@@ -281,12 +305,22 @@ pub(crate) fn spawn_socks_listener(
                 Ok(stream) => {
                     let client_fd = next_client_fd.fetch_add(1, Ordering::Relaxed);
                     if client_fd <= 0 || cancellation_requested(&cancel) {
+                        stream.shutdown();
                         return;
+                    }
+                    if !try_admit_socks(&pending_socks) {
+                        stream.shutdown();
+                        continue;
                     }
                     let commands = commands.clone();
                     let cancel = cancel.clone();
+                    let admit = SocksAdmit(pending_socks.clone());
                     thread::spawn(move || {
-                        if let Some(accepted) = finish_socks_handshake(client_fd, stream, &cancel) {
+                        let _admit = admit;
+                        let deadline = std::time::Instant::now() + SOCKS_HANDSHAKE_TIMEOUT;
+                        if let Some(accepted) =
+                            finish_socks_handshake(client_fd, stream, &cancel, deadline)
+                        {
                             let _ = commands.send(accepted);
                         }
                     });
@@ -305,6 +339,7 @@ fn finish_socks_handshake(
     client_fd: i32,
     mut stream: ForwardStream,
     cancel: &channel::Receiver<()>,
+    deadline: std::time::Instant,
 ) -> Option<Command> {
     use crate::socks::{feed_socks_handshake, SocksHandshake, SocksParseStatus};
 
@@ -324,6 +359,9 @@ fn finish_socks_handshake(
                 break false;
             }
             SocksParseStatus::NeedMore => {
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
                 if !state.reply.is_empty()
                     && stream.write_all(&std::mem::take(&mut state.reply)).is_err()
                 {
@@ -1320,5 +1358,91 @@ mod tests {
         let mut byte = [0u8; 1];
         assert_eq!(wake_reader.read(&mut byte).unwrap(), 1);
         assert!(!open.load(Ordering::Acquire));
+    }
+}
+
+#[cfg(test)]
+mod socks_limits {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use crossbeam_channel as channel;
+
+    use super::{finish_socks_handshake, try_admit_socks, MAX_PENDING_SOCKS};
+    use crate::forward_endpoint::ForwardStream;
+    use crate::forward_worker::Command;
+
+    fn pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        (client, accepted)
+    }
+
+    #[test]
+    fn socks_admission_stops_at_the_pending_cap() {
+        let pending = AtomicUsize::new(0);
+        for _ in 0..MAX_PENDING_SOCKS {
+            assert!(try_admit_socks(&pending));
+        }
+        assert!(!try_admit_socks(&pending));
+        assert_eq!(pending.load(Ordering::Acquire), MAX_PENDING_SOCKS);
+        pending.fetch_sub(1, Ordering::AcqRel);
+        assert!(try_admit_socks(&pending));
+    }
+
+    #[test]
+    fn a_stalled_socks_handshake_is_closed_at_the_deadline() {
+        let (mut peer, accepted) = pair();
+        let _ = peer.set_read_timeout(Some(Duration::from_secs(2)));
+        let (_cancel_tx, cancel) = channel::bounded::<()>(1);
+        let started = Instant::now();
+        let accepted = finish_socks_handshake(
+            7,
+            ForwardStream::Tcp(accepted),
+            &cancel,
+            Instant::now() - Duration::from_secs(1),
+        );
+        assert!(accepted.is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let mut byte = [0u8; 1];
+        assert_eq!(peer.read(&mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_finished_socks_handshake_still_reports_the_destination() {
+        let (mut peer, accepted) = pair();
+        let _ = peer.set_read_timeout(Some(Duration::from_secs(2)));
+        let (_cancel_tx, cancel) = channel::bounded::<()>(1);
+        let mut request = vec![0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x03, 11];
+        request.extend_from_slice(b"example.com");
+        request.extend_from_slice(&[0x00, 80]);
+        peer.write_all(&request).unwrap();
+        let accepted = finish_socks_handshake(
+            8,
+            ForwardStream::Tcp(accepted),
+            &cancel,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .expect("handshake");
+        match accepted {
+            Command::Accepted {
+                client_fd,
+                destination,
+                early,
+                socks_version,
+                ..
+            } => {
+                assert_eq!(client_fd, 8);
+                assert_eq!(destination.name.as_deref(), Some("example.com"));
+                assert_eq!(destination.port, Some(80));
+                assert!(early.is_empty());
+                assert_eq!(socks_version, Some(5));
+            }
+            _ => panic!("expected an accepted command"),
+        }
     }
 }

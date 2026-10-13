@@ -8,8 +8,9 @@
 //! proxy. This is the same message ssh itself sends on an agent-forwarding
 //! channel.
 //!
-//! Nothing records bindings yet (upstream #881 / #879 are still open), so the
-//! replay list stays empty and forwarding is unchanged.
+//! [`SshAgentSessionBindRecorder`] records the binding bootstrap ssh sends to
+//! its agent (#881). Wiring that recorder into the bootstrap ssh invocation is
+//! still upstream #879, which is open, so the client does not supply binds yet.
 
 use std::io::{self, Write};
 use std::sync::OnceLock;
@@ -178,6 +179,74 @@ fn slash_insensitive(path: &str) -> String {
     path.replace('\\', "/")
 }
 
+/// The forwarded form of a well-formed, non-forwarded session-bind request.
+///
+/// ProxyJump helpers bind before the destination, so callers keep the last
+/// value. Already-forwarded binds and every other agent message are rejected.
+pub fn forwarded_session_bind(request: &[u8]) -> Option<Vec<u8>> {
+    let (_host_key, forwarded) = parse_session_bind(request)?;
+    if forwarded {
+        return None;
+    }
+    let mut forwarded_request = request.to_vec();
+    *forwarded_request.last_mut()? = 1;
+    Some(forwarded_request)
+}
+
+/// OpenSSH-style `SHA256:` fingerprint of the host key inside a session-bind.
+pub fn session_bind_host_key_fingerprint(bind: &[u8]) -> Option<String> {
+    let (host_key, _forwarded) = parse_session_bind(bind)?;
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(&host_key);
+    let mut encoded = base64::engine::general_purpose::STANDARD.encode(digest);
+    while encoded.ends_with('=') {
+        encoded.pop();
+    }
+    Some(format!("SHA256:{encoded}"))
+}
+
+fn parse_session_bind(request: &[u8]) -> Option<(Vec<u8>, bool)> {
+    if request.first().copied() != Some(SSH_AGENTC_EXTENSION) {
+        return None;
+    }
+    let mut pos = 1usize;
+    let name = read_ssh_string(request, &mut pos)?;
+    if name != SESSION_BIND_EXTENSION.as_bytes() {
+        return None;
+    }
+    let host_key = read_ssh_string(request, &mut pos)?;
+    let session_id = read_ssh_string(request, &mut pos)?;
+    let signature = read_ssh_string(request, &mut pos)?;
+    if host_key.is_empty() || session_id.is_empty() || signature.is_empty() {
+        return None;
+    }
+    if pos + 1 != request.len() {
+        return None;
+    }
+    let flag = *request.get(pos)?;
+    if flag > 1 {
+        return None;
+    }
+    Some((host_key, flag == 1))
+}
+
+fn read_ssh_string(message: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
+    let rest = message.get(*pos..)?;
+    if rest.len() < 4 {
+        return None;
+    }
+    let length = u32::from_be_bytes(rest[..4].try_into().ok()?) as usize;
+    *pos += 4;
+    let bytes = message.get(*pos..*pos + length)?.to_vec();
+    *pos += length;
+    Some(bytes)
+}
+
+#[path = "ssh_agent_recorder.rs"]
+mod recorder;
+pub use recorder::SshAgentSessionBindRecorder;
+
 /// Removes the agent's replies to the session binds from the start of its
 /// output, so the forwarded client only sees replies to its own requests.
 ///
@@ -263,9 +332,12 @@ impl AgentSessionBindReplies {
 mod tests {
     use std::io::{self, Write};
 
+    use base64::Engine;
+
     use super::{
-        binds_for_destination, encode_session_bind, frame_agent_message, paths_equal,
-        write_session_binds, AgentSessionBindReplies, SESSION_BIND_EXTENSION, SSH_AGENTC_EXTENSION,
+        binds_for_destination, encode_session_bind, forwarded_session_bind, frame_agent_message,
+        paths_equal, session_bind_host_key_fingerprint, write_session_binds,
+        AgentSessionBindReplies, SESSION_BIND_EXTENSION, SSH_AGENTC_EXTENSION,
         SSH_AGENT_EXTENSION_FAILURE, SSH_AGENT_FAILURE, SSH_AGENT_MAX_MESSAGE_LENGTH,
         SSH_AGENT_SUCCESS,
     };
@@ -275,6 +347,38 @@ mod tests {
         out.extend(u32::try_from(bytes.len()).unwrap().to_be_bytes());
         out.extend_from_slice(bytes);
         out
+    }
+
+    #[test]
+    fn forwarded_session_bind_marks_ssh_own_binding_and_rejects_others() {
+        let bind = encode_session_bind(b"host-key", b"session", b"signature", false).unwrap();
+        assert_eq!(
+            forwarded_session_bind(&bind).as_deref(),
+            Some(
+                encode_session_bind(b"host-key", b"session", b"signature", true)
+                    .unwrap()
+                    .as_slice()
+            )
+        );
+        let already = encode_session_bind(b"host-key", b"session", b"signature", true).unwrap();
+        assert!(forwarded_session_bind(&already).is_none());
+        assert!(forwarded_session_bind(&[11]).is_none());
+        assert!(forwarded_session_bind(&[]).is_none());
+        assert!(forwarded_session_bind(&bind[..bind.len() - 1]).is_none());
+        assert!(forwarded_session_bind(&[bind.as_slice(), b"x"].concat()).is_none());
+        assert!(forwarded_session_bind(
+            &encode_session_bind(b"", b"session", b"signature", false).unwrap()
+        )
+        .is_none());
+        let host_key = base64::engine::general_purpose::STANDARD
+            .decode("AAAAC3NzaC1lZDI1NTE5AAAAID4NdJ9B1LOS7+li7shEB10b9lQEjdsbe2oNQEW8fZP7")
+            .unwrap();
+        let recorded = encode_session_bind(&host_key, b"sid", b"sig", true).unwrap();
+        assert_eq!(
+            session_bind_host_key_fingerprint(&recorded).as_deref(),
+            Some("SHA256:1Z8TElQaniPWrBI8ZeIOaUH5BDBpeoK85Bt65Kr7ppY")
+        );
+        assert!(session_bind_host_key_fingerprint(&[11]).is_none());
     }
 
     fn frame(body: &[u8]) -> Vec<u8> {

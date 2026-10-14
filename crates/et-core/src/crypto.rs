@@ -278,10 +278,21 @@ impl CryptoHandler {
         if ciphertext.len() < MAC_LEN {
             return Err(DecryptError::Short);
         }
+        // Advance the nonce only after the packet authenticates. A rejected
+        // packet must leave this side in step with the sender's retransmission
+        // (upstream #890 / de5dbd9).
+        let saved = self.nonce;
         self.bump();
-        self.cipher
+        match self
+            .cipher
             .decrypt(Nonce::from_slice(&self.nonce), ciphertext)
-            .map_err(|_| DecryptError::BadMac)
+        {
+            Ok(plaintext) => Ok(plaintext),
+            Err(_) => {
+                self.nonce = saved;
+                Err(DecryptError::BadMac)
+            }
+        }
     }
 
     fn bump(&mut self) {
@@ -316,6 +327,23 @@ mod tests {
         let mut dec = CryptoHandler::new(&key, DIR_SERVER_TO_CLIENT);
         let ct = enc.encrypt(b"x").unwrap();
         assert_eq!(dec.decrypt(&ct), Err(DecryptError::BadMac));
+    }
+
+    #[test]
+    fn rejected_ciphertext_does_not_advance_the_nonce() {
+        let key = [9u8; KEY_LEN];
+        let mut enc = CryptoHandler::new(&key, DIR_CLIENT_TO_SERVER);
+        let mut dec = CryptoHandler::new(&key, DIR_CLIENT_TO_SERVER);
+        let good = enc.encrypt(b"hello").unwrap();
+        let mut tampered = good.clone();
+        tampered[0] ^= 0xff;
+        assert_eq!(dec.decrypt(&tampered), Err(DecryptError::BadMac));
+        assert_eq!(dec.decrypt(&good).unwrap(), b"hello");
+        assert_eq!(dec.decrypt(&[0u8; MAC_LEN - 1]), Err(DecryptError::Short));
+        assert_eq!(
+            dec.decrypt(&enc.encrypt(b"next").unwrap()).unwrap(),
+            b"next"
+        );
     }
 
     #[test]

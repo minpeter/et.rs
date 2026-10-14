@@ -118,10 +118,12 @@ fn pump_services_inbound_while_forwarding_peer_refuses_to_read() {
     let _ = control.shutdown(Shutdown::Both);
     worker.join().unwrap();
 
-    // Then: dispatch ended the pump, not a write timeout/reconnect. No API
-    // contract requires ordinary synchronous Connection writes to be async.
+    // Then: the unknown packet was counted (sequence 1) and triggered one
+    // reconnect instead of sitting behind the stuck forward write. Pending
+    // forwarding makes that session-end return an error; a timeout would mean
+    // inbound dispatch never ran.
     assert!(
-        matches!(observed, Ok((Err(_), 0, 1))),
+        matches!(observed, Ok((Err(_), 1, 1))),
         "pump starved inbound dispatch behind forwarding output: {observed:?}"
     );
 }

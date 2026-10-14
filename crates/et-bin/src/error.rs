@@ -56,6 +56,9 @@ pub enum ClientError {
     MalformedInitialResponse(prost::DecodeError),
     InitialResponseRejected(String),
     Terminal(String),
+    /// A decrypted server packet had an unexpected type or unparsable payload.
+    /// The reader already consumed it; the session reconnects after it.
+    MalformedServerPacket(String),
     /// The server asked a challenge-capable client to retry during startup.
     RetryLater,
     /// The initial TCP/handshake attempts failed.
@@ -172,7 +175,7 @@ impl std::fmt::Display for ClientError {
             Self::InitialResponseRejected(message) => {
                 write!(f, "ET server rejected the initial payload: {message}")
             }
-            Self::Terminal(message) => write!(f, "{message}"),
+            Self::Terminal(message) | Self::MalformedServerPacket(message) => write!(f, "{message}"),
             Self::RetryLater => write!(f, "ET server asked the client to retry"),
             Self::InitialConnect { endpoint, message } => {
                 write!(f, "Could not make initial connection to {endpoint}: {message}")
@@ -242,7 +245,7 @@ impl ClientError {
                 | Self::UnreachableEndpoint { .. }
                 | Self::BootstrapTimeout(_)
                 | Self::ConnectIo { .. }
-                | Self::Transport(ConnError::Io(_))
+                | Self::Transport(ConnError::Io(_) | ConnError::Read(_))
                 | Self::RetryLater
         )
     }

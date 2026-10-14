@@ -3,7 +3,10 @@ use std::net::{Shutdown, TcpStream};
 use std::time::{Duration, Instant};
 
 use et_core::backed_reader::ReadItem;
-use et_core::backed_writer::{MAX_BACKUP_PACKETS, MAX_DISCONNECT_PACKETS};
+use et_core::backed_writer::{
+    DISCONNECT_BUFFER_BYTES, MAX_BACKUP_BYTES, MAX_BACKUP_PACKETS, MAX_DISCONNECT_PACKETS,
+    MAX_RECOVERY_BACKUP_BYTES,
+};
 use et_core::crypto::EPOCH_SALT_BYTES;
 use et_core::packet::Packet;
 use et_core::proto::{CatchupBuffer, SequenceHeader};
@@ -15,7 +18,16 @@ use crate::framing_io::{
 };
 use crate::handshake::MAX_HANDSHAKE_PROTO_LEN;
 
-pub const MAX_RECOVERY_PROTO_LEN: i64 = 80 * 1024 * 1024;
+/// Recovery `CatchupBuffer` limit. A full upstream writer keeps 64 MiB of
+/// connected history plus 64 MiB of disconnected output; protobuf framing
+/// pushes that past the generic 128 MiB proto cap, so both sides allow 144 MiB
+/// (upstream #890 / e3e49d5). This is a size limit, not a wire-format change.
+pub const MAX_RECOVERY_PROTO_LEN: i64 = 144 * 1024 * 1024;
+const _: () = {
+    // Protobuf adds at most 2 bytes per 18-byte catchup entry.
+    assert!((MAX_BACKUP_BYTES + DISCONNECT_BUFFER_BYTES) * 20 / 18 <= MAX_RECOVERY_PROTO_LEN);
+    assert!(MAX_RECOVERY_BACKUP_BYTES * 20 / 18 <= MAX_RECOVERY_PROTO_LEN);
+};
 pub const DEFAULT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Who sends its CatchupBuffer first, and whether this recovery zeroes history.

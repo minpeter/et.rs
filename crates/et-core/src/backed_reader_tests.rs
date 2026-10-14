@@ -1,6 +1,6 @@
 use super::*;
 use crate::backed_writer::{BackedWriter, WriterOutcome};
-use crate::crypto::{CryptoHandler, DIR_CLIENT_TO_SERVER, KEY_LEN};
+use crate::crypto::{CryptoHandler, DecryptError, DIR_CLIENT_TO_SERVER, KEY_LEN};
 
 fn pair() -> (BackedWriter, BackedReader) {
     let key = [9u8; KEY_LEN];
@@ -144,4 +144,41 @@ fn authenticated_replay_survives_another_disconnect() {
     };
     assert_eq!(second.payload(), b"second");
     assert_eq!(reader.sequence(), 2);
+}
+
+#[test]
+fn tiny_frame_is_rejected_before_it_is_a_packet() {
+    let key = [3u8; KEY_LEN];
+    let mut reader = BackedReader::new(CryptoHandler::new(&key, DIR_CLIENT_TO_SERVER), true);
+    reader.feed(&1u32.to_be_bytes());
+    reader.feed(&[0]);
+    assert!(matches!(
+        reader.pop(),
+        Err(ReadError::Frame(crate::framing::FrameError::TooSmall))
+    ));
+    assert_eq!(reader.sequence(), 0);
+}
+
+#[test]
+fn tampered_live_frame_keeps_the_nonce_for_the_genuine_packet() {
+    let key = [9u8; KEY_LEN];
+    let mut writer = BackedWriter::new(CryptoHandler::new(&key, DIR_CLIENT_TO_SERVER), true);
+    let WriterOutcome::Send(frame) = writer.write_packet(1, b"real").unwrap() else {
+        panic!("connected write should send");
+    };
+    let mut tampered = frame.clone();
+    tampered[6] ^= 0xff;
+    let mut reader = BackedReader::new(CryptoHandler::new(&key, DIR_CLIENT_TO_SERVER), true);
+    reader.feed(&tampered);
+    assert!(matches!(
+        reader.pop(),
+        Err(ReadError::Crypto(DecryptError::BadMac))
+    ));
+    assert_eq!(reader.sequence(), 0);
+    reader.feed(&frame);
+    let ReadItem::Packet(packet) = reader.pop().unwrap() else {
+        panic!("genuine retransmission should decrypt");
+    };
+    assert_eq!(packet.payload(), b"real");
+    assert_eq!(reader.sequence(), 1);
 }

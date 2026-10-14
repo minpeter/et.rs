@@ -432,8 +432,11 @@ fn accept_ready(
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) if matches!(error.raw_os_error(), Some(23 | 24)) => {
+            Err(error) if crate::runtime_accept::accept_resource_exhausted(&error) => {
+                // The listener stays readable until descriptors free up. Pause
+                // so this does not spin the accept loop.
                 emit_resource_error(&error);
+                std::thread::sleep(Duration::from_millis(10));
                 return Ok(());
             }
             Err(error) => return Err(RouterError::Io(error)),

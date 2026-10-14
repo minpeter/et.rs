@@ -175,7 +175,13 @@ configuration injection; ET applies the command to the session, not bootstrap.
   Only one `[user@]host[:sshport]` hop is supported, including bracketed IPv6;
   multi-hop and malformed/injection-shaped targets are rejected before bootstrap.
   The SSH port does not replace the ET `--jport`.
-- `--forward-ssh-agent` or `ForwardAgent yes` enables agent forwarding. Socket selection is
+- `--forward-ssh-agent` or `ForwardAgent yes` enables agent forwarding and, on
+  Unix, records the OpenSSH `session-bind@openssh.com` request the bootstrap
+  ssh makes (OpenSSH 8.9+). That binding is replayed on each forwarded agent
+  connection, so `ssh-add -h` destination constraints work as they do with
+  `ssh -A`. A jumphost binding is replayed first. If ssh makes no binding
+  (older OpenSSH, or an existing ControlMaster), ET logs a warning and
+  forwarded connections stay unbound. Socket selection is
   `--ssh-socket` → `IdentityAgent` → `SSH_AUTH_SOCK`. `IdentityAgent none`
   disables forwarding unless a CLI socket overrides it; `IdentityAgent SSH_AUTH_SOCK`
   selects the environment socket. A socket option alone does not enable forwarding.

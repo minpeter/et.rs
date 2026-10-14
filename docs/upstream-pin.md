@@ -10,7 +10,7 @@ Canonical machine files:
 - Ledger (every `master` commit after baseline):
   [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml)
 
-Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-10-13.
+Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-10-14.
 `#784` marked `ported` after et.rs [#31](https://github.com/minpeter/et.rs/pull/31) / `906a7ca86691f00a82f88b99b21d7afceb07bf97`.
 `#798` marked `ported` after et.rs [#77](https://github.com/minpeter/et.rs/pull/77).
 
@@ -20,11 +20,11 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-10-13.
 | Baseline / latest release tag | [`et-v7.0.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.0.0) |
 | Baseline / release commit | [`7656a32a5bc15c6746726a27a5a4ba1e468fab6e`](https://github.com/MisterTea/EternalTerminal/commit/7656a32a5bc15c6746726a27a5a4ba1e468fab6e) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`e02aefa`](https://github.com/MisterTea/EternalTerminal/commit/e02aefa2301a9544fe7a40564e612dcf122291e1) (#881 ssh-agent session-bind recorder, part 2/3, reviewed 2026-10-13) |
+| Pin tip (last classified) | [`7eb237e`](https://github.com/MisterTea/EternalTerminal/commit/7eb237e6d9822b674f4a527924b5f09117659321) (merge of #879 ssh-agent session-bind 3/3, reviewed 2026-10-14) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
 | ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.0.0` and `master`) |
 
-The reviewed baseline-to-tip range contains 109 classified commits. Unclassified commits would be drift. The product-parity ports below passed combined Linux verification: 824 tests passed, none failed, and two existing tests were ignored. Formatting, workspace clippy, Windows GNU/macOS ARM binary cross-checks, and release/AUR packaging checks passed. Real OpenSSH mux clients exercised the Rust master; no live C++ peer, native Windows/macOS runtime, or actual VS Code sleep cycle was tested in this port. `ported` covers the behavior described in each row, including its explicit limitations, not unrestricted product parity. Protocol remains v6.
+The reviewed baseline-to-tip range contains 129 classified commits. Unclassified commits would be drift. The product-parity ports below passed combined Linux verification: 824 tests passed, none failed, and two existing tests were ignored. Formatting, workspace clippy, Windows GNU/macOS ARM binary cross-checks, and release/AUR packaging checks passed. Real OpenSSH mux clients exercised the Rust master; no live C++ peer, native Windows/macOS runtime, or actual VS Code sleep cycle was tested in this port. `ported` covers the behavior described in each row, including its explicit limitations, not unrestricted product parity. Protocol remains v6.
 
 ## Ledger (classified 2026-10-12)
 
@@ -593,15 +593,66 @@ classified. Ported behavior:
 - `#895` keeps a mid-line tmux control prelude in one loop, including a large
   backlog. The OSC 133 scanner is skipped because et.rs has no OSC parser.
 - `#881` records the last non-forwarded bootstrap session-bind on a private
-  proxy, including a Windows named pipe. `#879`, which would hand that proxy
-  to bootstrap ssh, is still open and is not ported, so replay stays empty
-  until something calls the recorder.
+  proxy, including a Windows named pipe. At this earlier pin, `#879` had not
+  yet handed that proxy to bootstrap ssh. The 2026-10-14 classification below
+  ports that wiring.
 
 `#886`, `#888`, `#894`, `#896`, `#897`, and `e22996b` are ledger skips.
 `PROTOCOL_VERSION` stays 6. No live C++ peer was tested.
 
 et.rs still claims **protocol v6**. EternalTerminal’s latest product release is
 **v7.0.0**, and the reviewed tip is one hundred nine classified commits past that tag.
+
+## Ledger (classified 2026-10-14)
+
+Twenty commits after [`e02aefa`](https://github.com/MisterTea/EternalTerminal/commit/e02aefa2301a9544fe7a40564e612dcf122291e1).
+`PROTOCOL_VERSION` stays **6**. None of these commits change protobuf field
+numbers or the encrypted frame layout. The recovery `CatchupBuffer` acceptance
+limit moves from 80 MiB to **144 MiB** so a full upstream 64 MiB connected
+history plus 64 MiB disconnect buffer, with protobuf overhead, is not rejected.
+That is a size limit, not a new wire type. Upstream #891 (protocol 7) is still
+open and is not ported.
+
+| sha | date | kind | status | note |
+| --- | --- | --- | --- | --- |
+| [`9a987f7`](https://github.com/MisterTea/EternalTerminal/commit/9a987f7116bf596e3137aa70e7c65d495ff55b12) | 2026-10-01 | product | **ported** | #879 recorder is the bootstrap ssh `IdentityAgent` |
+| [`4545da5`](https://github.com/MisterTea/EternalTerminal/commit/4545da51aed065801162dd9f02a81374284e2e66) | 2026-10-10 | security | **ported** | #890 frame length bounds and short ciphertext |
+| [`bbd2c5f`](https://github.com/MisterTea/EternalTerminal/commit/bbd2c5fda81731e22b84e71371a0b2cc4d89a9da) | 2026-10-10 | security | skip | #890 malformed router packets already reject locally |
+| [`fd4e166`](https://github.com/MisterTea/EternalTerminal/commit/fd4e166236c6852f614b9e6966ac267a68d358b8) | 2026-10-10 | product | skip | #890 no blocked Windows handler thread before `TERMINAL_INIT` |
+| [`7d70aa2`](https://github.com/MisterTea/EternalTerminal/commit/7d70aa2c7a33bd4805d90429762ec7330fe52855) | 2026-10-10 | security | **ported** | #890 kernel peer credentials own the router session |
+| [`46319d9`](https://github.com/MisterTea/EternalTerminal/commit/46319d9e9302b459b57ee18e4d1a58dfb5d0c785) | 2026-10-10 | security | **ported** | #890 malformed session packets reconnect, daemon stays up |
+| [`f37750d`](https://github.com/MisterTea/EternalTerminal/commit/f37750d54c85160dfe0a2266719f03c31448532f) | 2026-10-10 | security | skip | #890 silent router peers already cannot block accept |
+| [`eecfdb3`](https://github.com/MisterTea/EternalTerminal/commit/eecfdb3b6f970ed69df1d629214f6a8d14e929a4) | 2026-10-10 | security | skip | #890 bad passkeys already cannot reach crypto init |
+| [`c0e36f2`](https://github.com/MisterTea/EternalTerminal/commit/c0e36f21ea5967d10a3e4cd937a418e3057fc6b1) | 2026-10-10 | security | **ported** | #890 accept exhaustion and 64 pending handshakes |
+| [`9c69c81`](https://github.com/MisterTea/EternalTerminal/commit/9c69c810bcd66d6f4948a7b667e6285f72ab96c7) | 2026-10-10 | security | **ported** | #890 proto bodies allocate as bytes arrive |
+| [`c87998a`](https://github.com/MisterTea/EternalTerminal/commit/c87998af7e2fb20d4ed722755c17397794c47c1b) | 2026-10-10 | security | skip | #890 pane dumps are not written to a shared temp file |
+| [`e3e49d5`](https://github.com/MisterTea/EternalTerminal/commit/e3e49d5ea176f0c4c6ee2dd325b8d9a823d65b36) | 2026-10-10 | security | **ported** | #890 144 MiB catchup limit and revive trim |
+| [`9d65d62`](https://github.com/MisterTea/EternalTerminal/commit/9d65d6273ce05ccb68cad1fcb9670dfd374de0d1) | 2026-10-10 | security | skip | #890 no HTM client pid file to follow |
+| [`d884fbd`](https://github.com/MisterTea/EternalTerminal/commit/d884fbd17fb585ad1d18f0b55233bb74e2a708a3) | 2026-10-12 | security | **ported** | #898 `--attach` refuses unchallenged success |
+| [`4f28887`](https://github.com/MisterTea/EternalTerminal/commit/4f288879dcb0666526a75a0c1e0f9a742dab5cd8) | 2026-10-10 | security | skip | #890 no pid-file SIGKILL cleanup |
+| [`de5dbd9`](https://github.com/MisterTea/EternalTerminal/commit/de5dbd9b9df68a7fbd1813adad9eff871d8a50bf) | 2026-10-11 | security | **ported** | #890 nonce moves only after authentication |
+| [`f8a3b18`](https://github.com/MisterTea/EternalTerminal/commit/f8a3b184260cf8d570d524611aa6378e498f1563) | 2026-10-10 | security | **ported** | #890 both ends of Unix HTM control check peer uid |
+| [`f2a332d`](https://github.com/MisterTea/EternalTerminal/commit/f2a332d813817ce0c4fdf8190aeea6c229bb7307) | 2026-10-13 | security | **ported** | Merge #898 |
+| [`6185ea3`](https://github.com/MisterTea/EternalTerminal/commit/6185ea3bf7b45ff1f88bab376b6c0d35e49c90a1) | 2026-10-13 | security | **ported** | Merge #890 |
+| [`7eb237e`](https://github.com/MisterTea/EternalTerminal/commit/7eb237e6d9822b674f4a527924b5f09117659321) | 2026-10-13 | product | **ported** | Merge #879 |
+
+Ported behavior at this tip:
+
+- `#890` rejects framed lengths outside `[2, 128 MiB]`, grows protobuf bodies
+  64 KiB at a time, accepts catchup up to 144 MiB, and trims writer history on
+  revive. Decrypt rolls the nonce back when Poly1305 fails, and the client
+  reconnects. Unix router registrations store kernel credentials. At most 64
+  handshakes are in flight, and descriptor exhaustion pauses accept. Unix HTM
+  drops a control peer whose uid is not the daemon's.
+- `#898` makes `et --attach` (`reset_intent`) refuse an unchallenged
+  `NEW_CLIENT` or `RETURNING_CLIENT`. A fresh session still accepts a legacy
+  server.
+- `#879` runs bootstrap ssh with `-oIdentityAgent=<recorder>
+  -oControlMaster=no` and replays the recorded binds, jumphost first.
+
+Skipped because et.rs already has the property or does not have the C++ path:
+malformed router packets, silent router peers, passkey length, HTM temp-file
+dumps and pid files, and the Windows pre-`TERMINAL_INIT` thread join.
 
 Review ports against the conflict policy in
 [`docs/upstream-factory.md`](upstream-factory.md). Gate any later port with

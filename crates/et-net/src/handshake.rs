@@ -70,6 +70,22 @@ pub fn client_handshake(
     let first: ConnectResponse =
         crate::framing_io::read_proto_limited_deadline(stream, MAX_HANDSHAKE_PROTO_LEN, deadline)?;
     let Some(challenge) = first.auth_challenge.clone() else {
+        // Legacy handshake for peers without the challenge capability. A
+        // reattaching client must refuse an unchallenged success: it carries
+        // no proof of the passkey and would restart the session key at nonce
+        // zero (upstream #898 / d884fbd). Fresh sessions still accept a legacy
+        // server because they use a new passkey.
+        if reset_intent {
+            let status = first.status.unwrap_or_default();
+            if status == ConnectStatus::NewClient as i32
+                || status == ConnectStatus::ReturningClient as i32
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Server does not support session reattach; upgrade etserver",
+                ));
+            }
+        }
         let mut legacy = first;
         legacy.reset_required = None;
         legacy.reset_salt = None;
@@ -231,6 +247,40 @@ mod tests {
         for st in s {
             let r = response_status(st);
             assert_eq!(r.status, Some(st as i32));
+        }
+    }
+
+    #[test]
+    fn reattach_refuses_unchallenged_success_and_fresh_sessions_do_not() {
+        for (reset_intent, status, refused) in [
+            (true, ConnectStatus::NewClient, true),
+            (true, ConnectStatus::ReturningClient, true),
+            (true, ConnectStatus::InvalidKey, false),
+            (false, ConnectStatus::NewClient, false),
+        ] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let _request: ConnectRequest = read_proto(&mut socket).unwrap();
+                write_proto(&mut socket, &response_status(status)).unwrap();
+            });
+            let mut client = TcpStream::connect(address).unwrap();
+            let result = client_handshake(
+                &mut client,
+                "client-id",
+                &[9u8; KEY_LEN],
+                reset_intent,
+                Instant::now() + std::time::Duration::from_secs(2),
+            );
+            if refused {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert!(error.to_string().contains("upgrade etserver"));
+            } else {
+                assert_eq!(result.unwrap().status, Some(status as i32));
+            }
+            server.join().unwrap();
         }
     }
 

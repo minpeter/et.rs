@@ -101,7 +101,7 @@ fn valid_plaintext_registration_is_retained() {
 }
 
 #[test]
-fn router_registration_rejects_forged_identity() {
+fn router_registration_stores_kernel_identity_instead_of_forged_ids() {
     let dir = TestDir::new();
     let path = dir.socket();
     let registry = Registry::new();
@@ -121,8 +121,14 @@ fn router_registration_rejects_forged_identity() {
         ),
     );
 
-    expect_rejected(&router, RouterReject::InvalidRegistration);
-    assert!(registry.is_empty().unwrap());
+    assert_eq!(
+        router.recv_event_timeout(Duration::from_secs(2)).unwrap(),
+        RouterEvent::Registered { id: ID.to_owned() }
+    );
+    let registered = registry.get(ID).unwrap().unwrap();
+    assert_eq!(registered.uid, rustix::process::geteuid().as_raw());
+    assert_eq!(registered.gid, rustix::process::getegid().as_raw());
+    assert_ne!(i64::from(registered.uid), forged_uid);
     router.shutdown().unwrap();
 }
 
@@ -177,9 +183,6 @@ fn missing_and_invalid_fields_are_rejected() {
             Some(1),
             Some(1),
         ),
-        info(Some(ID), Some(KEY), None, Some(1)),
-        info(Some(ID), Some(KEY), Some(1), None),
-        info(Some(ID), Some(KEY), Some(-1), Some(1)),
     ];
 
     for value in cases {

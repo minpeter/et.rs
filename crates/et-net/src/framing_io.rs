@@ -58,8 +58,7 @@ pub fn read_proto_limited<R: Read, M: Message + Default>(
     }
     let frame_len = usize::try_from(length)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative frame length"))?;
-    let mut buffer = vec![0u8; frame_len];
-    reader.read_exact(&mut buffer)?;
+    let buffer = read_body(reader, frame_len, |reader, chunk| reader.read_exact(chunk))?;
     M::decode(&*buffer).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
@@ -108,9 +107,28 @@ pub fn read_frame_limited_deadline(
     }
     let frame_len = usize::try_from(length)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative frame length"))?;
-    let mut buffer = vec![0u8; frame_len];
-    read_exact_deadline(stream, &mut buffer, deadline)?;
-    Ok(buffer)
+    read_body(stream, frame_len, |stream, chunk| {
+        read_exact_deadline(stream, chunk, deadline)
+    })
+}
+
+/// Grow a framed body in 64 KiB chunks as bytes arrive. One absolute deadline
+/// covers the whole body; the declared length is never reserved up front
+/// (upstream #890 / 9c69c81).
+const PROTO_READ_CHUNK: usize = 64 * 1024;
+
+fn read_body<R, F>(reader: &mut R, length: usize, mut read_exact: F) -> io::Result<Vec<u8>>
+where
+    F: FnMut(&mut R, &mut [u8]) -> io::Result<()>,
+{
+    let mut result = Vec::new();
+    while result.len() < length {
+        let count = (length - result.len()).min(PROTO_READ_CHUNK);
+        let offset = result.len();
+        result.resize(offset + count, 0);
+        read_exact(reader, &mut result[offset..])?;
+    }
+    Ok(result)
 }
 
 fn read_exact_deadline(
@@ -216,6 +234,21 @@ mod tests {
         write_proto(&mut buffer, &message).unwrap();
         let back: SequenceHeader = read_proto(&mut std::io::Cursor::new(&buffer)).unwrap();
         assert_eq!(back.sequence_number, Some(42));
+    }
+
+    #[test]
+    fn body_larger_than_one_chunk_roundtrips_without_a_single_reservation() {
+        let payload = vec![0xabu8; 70_000];
+        let mut framed = (payload.len() as i64).to_le_bytes().to_vec();
+        framed.extend_from_slice(&payload);
+        let body = super::read_body(
+            &mut std::io::Cursor::new(&framed[8..]),
+            payload.len(),
+            |reader, chunk| reader.read_exact(chunk),
+        )
+        .unwrap();
+        assert_eq!(body, payload);
+        assert!(payload.len() > super::PROTO_READ_CHUNK);
     }
 
     #[test]

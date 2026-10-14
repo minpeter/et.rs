@@ -796,8 +796,13 @@ where
                             connection.acknowledge_delivery(ack);
                         }
                     } else if packet.header() == Kind::TerminalBuffer as u8 {
-                        let bytes = TerminalBuffer::decode(packet.payload()).map_err(error)?;
-                        let bytes = bytes.buffer.unwrap_or_default();
+                        let bytes = match TerminalBuffer::decode(packet.payload()) {
+                            Ok(message) => message.buffer.unwrap_or_default(),
+                            Err(_) => {
+                                connection.disconnect();
+                                break;
+                            }
+                        };
                         if bytes.len() + 128 > ipc::MAX_REPLY {
                             return Err(error("terminal output packet exceeds local queue limit"));
                         }
@@ -815,7 +820,7 @@ where
                     }
                 }
                 Ok(None) => break,
-                Err(et_net::connection::ConnError::Io(_)) => break,
+                Err(e) if crate::client_terminal::connection_ended(&e) => break,
                 Err(e) => return Err(error(e)),
             }
         }

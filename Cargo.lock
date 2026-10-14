@@ -490,6 +490,7 @@ version = "0.0.26"
 dependencies = [
  "et-net",
  "filedescriptor",
+ "nix 0.31.3",
  "portable-pty",
  "rustix",
  "sysinfo",

@@ -78,6 +78,11 @@ impl BackedReader {
             return Ok(ReadItem::NeedMore);
         }
         let len = crate::framing::parse_be_u32_len(&self.partial).map_err(ReadError::Frame)?;
+        // Reject impossible lengths before copying a body. A length below the
+        // packet header cannot be a real frame (upstream #890 / 4545da5).
+        if len < crate::packet::HEADER_LEN {
+            return Err(ReadError::Frame(crate::framing::FrameError::TooSmall));
+        }
         if self.partial.len() < 4 + len {
             return Ok(ReadItem::NeedMore);
         }

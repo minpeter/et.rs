@@ -383,7 +383,24 @@ fn run_client(
     }
     let invocation = build_invocation(&request, &provisional);
     et_cli::logging::verbose(1, bootstrap_log_message(&request));
-    let mut credentials = run_bootstrap(&ssh_session, &invocation, deadline)?;
+    // #879: the ssh that opens the connection must see the recorder. Bypass
+    // the private control master for that invocation so it authenticates
+    // through IdentityAgent instead of an already-open master.
+    let (mut credentials, mut session_binds) = if args.forward_ssh_agent {
+        let (credentials, bind) = crate::ssh_agent_bootstrap::run_capturing(
+            runner,
+            &invocation,
+            &resolved.dump,
+            "destination",
+            deadline,
+        )?;
+        (credentials, bind.into_iter().collect::<Vec<_>>())
+    } else {
+        (
+            run_bootstrap(&ssh_session, &invocation, deadline)?,
+            Vec::new(),
+        )
+    };
     et_cli::logging::info("etserver started");
     // Without a jumphost the ET connection goes straight to the destination.
     // With one, upstream starts a second `etterminal --jump` on the jumphost
@@ -454,7 +471,21 @@ fn run_client(
             term: request.term.clone(),
         };
         let jump_invocation = build_jump_invocation(&jump_request, &provisional);
-        credentials = run_bootstrap(&jump_session, &jump_invocation, deadline)?;
+        if args.forward_ssh_agent {
+            let (jump_credentials, jump_bind) = crate::ssh_agent_bootstrap::run_capturing(
+                runner,
+                &jump_invocation,
+                &jump_resolved.dump,
+                "jumphost",
+                deadline,
+            )?;
+            credentials = jump_credentials;
+            if let Some(bind) = jump_bind {
+                session_binds.insert(0, bind);
+            }
+        } else {
+            credentials = run_bootstrap(&jump_session, &jump_invocation, deadline)?;
+        }
         endpoint = Endpoint {
             host: jump_resolved.hostname,
             port: args.jport,
@@ -477,7 +508,10 @@ fn run_client(
         args,
         &credentials.id,
         &mut initial_payload,
-        forward_config.ssh_agent_session_binds,
+        {
+            session_binds.extend(forward_config.ssh_agent_session_binds);
+            session_binds
+        },
     )?;
     et_cli::logging::info(format!("Connecting to {endpoint}"));
     let connection = connect_initial(

@@ -20,7 +20,10 @@ wasmi_core = { version = "=2.0.0", default-features = false, features = ["std"] 
 sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1.4", features = ["event", "process", "fs", "termios"] }
+rustix = { version = "1.1.4", features = ["event", "process", "fs", "termios", "net"] }
+
+[target.'cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))'.dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["socket", "user"] }
 
 [target.'cfg(windows)'.dependencies]
 et-net = { path = "../et-net" }

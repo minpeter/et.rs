@@ -112,6 +112,7 @@ mod local_mux;
 mod local_session;
 mod resolver;
 mod session_store;
+mod ssh_agent_bootstrap;
 mod ssh_config;
 mod ssh_process;
 

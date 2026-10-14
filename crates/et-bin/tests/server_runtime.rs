@@ -250,6 +250,123 @@ fn daemon_mode_detaches_and_writes_a_pid_file() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+fn foreground_pidfile_uses_the_daemon_writer_and_survives_shutdown() {
+    let directory = tempfile_path("foreground-pid");
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let missing = directory.join("missing/etserver.pid");
+    let failed = Command::new(env!("CARGO_BIN_EXE_et"))
+        .args(["server", "--port", "2022", "--pidfile"])
+        .arg(&missing)
+        .output()
+        .unwrap();
+    assert_eq!(failed.status.code(), Some(2), "{failed:?}");
+    let failure = String::from_utf8(failed.stderr).unwrap();
+    assert!(
+        failure.contains("Error opening pidfile for writing"),
+        "{failure}"
+    );
+    assert!(failure.contains(&missing.to_string_lossy().into_owned()));
+
+    let victim = directory.join("victim");
+    let original = "DO NOT OVERWRITE THIS FILE\n";
+    fs::write(&victim, original).unwrap();
+    fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
+    for plant in ["symlink", "hardlink"] {
+        let planted = directory.join(format!("{plant}.pid"));
+        match plant {
+            "symlink" => symlink(&victim, &planted).unwrap(),
+            "hardlink" => fs::hard_link(&victim, &planted).unwrap(),
+            _ => unreachable!(),
+        }
+        let refused = Command::new(env!("CARGO_BIN_EXE_et"))
+            .args(["server", "--port", "2022", "--pidfile"])
+            .arg(&planted)
+            .output()
+            .unwrap();
+        assert_eq!(refused.status.code(), Some(2), "{plant}: {refused:?}");
+        let message = String::from_utf8(refused.stderr).unwrap();
+        assert!(
+            message.contains("Error opening pidfile for writing"),
+            "{plant}: {message}"
+        );
+        assert_eq!(fs::read_to_string(&victim).unwrap(), original);
+        fs::remove_file(&planted).unwrap();
+    }
+
+    let router = directory.join("router.sock");
+    let pidfile = directory.join("etserver.pid");
+    let reserved = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = reserved.local_addr().unwrap().port();
+    drop(reserved);
+    let port_arg = port.to_string();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_et"))
+        .args([
+            "server",
+            "--bindip",
+            "127.0.0.1",
+            "--port",
+            port_arg.as_str(),
+            "--serverfifo",
+        ])
+        .arg(&router)
+        .arg("--pidfile")
+        .arg(&pidfile)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = Pid::from_raw(i32::try_from(child.id()).unwrap());
+    let stdout = child.stdout.take().unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let ready_worker = thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
+        let _ = ready_tx.send(result);
+    });
+    let ready = match ready_rx.recv_timeout(TIMEOUT) {
+        Ok(Ok(line)) => line,
+        other => {
+            let _ = kill(pid, Signal::SIGKILL);
+            let _ = child.wait();
+            panic!("foreground server did not become ready: {other:?}");
+        }
+    };
+    ready_worker.join().unwrap();
+    assert!(
+        ready.starts_with(&format!("ETSERVER_READY tcp=127.0.0.1:{port} ")),
+        "{ready}"
+    );
+    let recorded = fs::read_to_string(&pidfile).expect("foreground server wrote no pid file");
+    assert_eq!(recorded, format!("{}\n", child.id()));
+    let mode = fs::metadata(&pidfile).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let probe = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    drop(probe);
+
+    kill(pid, Signal::SIGTERM).unwrap();
+    let (wait_tx, wait_rx) = mpsc::channel();
+    let wait_worker = thread::spawn(move || {
+        let _ = wait_tx.send(child.wait());
+    });
+    let status = match wait_rx.recv_timeout(TIMEOUT) {
+        Ok(Ok(status)) => status,
+        other => {
+            let _ = kill(pid, Signal::SIGKILL);
+            panic!("foreground server did not exit after SIGTERM: {other:?}");
+        }
+    };
+    wait_worker.join().unwrap();
+    assert!(status.success());
+    // DaemonCreator never unlinks the pid file, so a clean foreground stop
+    // leaves the same record behind.
+    assert_eq!(fs::read_to_string(&pidfile).unwrap(), recorded);
+    assert!(!router.exists());
+    fs::remove_dir_all(directory).unwrap();
+}
+
 fn accept_daemon_status(
     listener: &UnixListener,
     expected: &[u8; 4],

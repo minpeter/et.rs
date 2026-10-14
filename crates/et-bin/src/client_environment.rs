@@ -11,19 +11,9 @@ use crate::terminal_protocol::{valid_environment_name, MAX_ENVIRONMENT, MAX_ENV_
 const MAX_LOSSY_FORWARD_ENV_VALUE: usize = MAX_UNIX_SOCKET_PATH * 3;
 
 pub(crate) fn normalize_terminal_type(term: Option<&str>) -> String {
-    match term {
-        None | Some("xterm-ghostty") => "xterm-256color".to_owned(),
+    match term.filter(|term| !term.is_empty()) {
+        None => "xterm-256color".to_owned(),
         Some(term) => term.to_owned(),
-    }
-}
-
-pub(crate) fn ghostty_colorterm<'a>(
-    term: Option<&str>,
-    colorterm: Option<&'a str>,
-) -> Option<&'a str> {
-    match (term, colorterm) {
-        (Some("xterm-ghostty"), Some(value @ ("truecolor" | "24bit"))) => Some(value),
-        _ => None,
     }
 }
 
@@ -54,8 +44,7 @@ fn select_send_environment(
     let mut selected: Vec<_> = environment
         .into_iter()
         .filter(|(name, value)| {
-            name != "TERM"
-                && valid_environment_name(name)
+            valid_environment_name(name)
                 && value.len() <= MAX_ENV_VALUE
                 && !value.contains('\0')
                 && patterns
@@ -97,16 +86,12 @@ pub(crate) fn environment_pattern_matches(pattern: &[u8], name: &[u8]) -> bool {
 
 pub(crate) fn reserved_environment_value_lengths<'a>(
     existing: impl IntoIterator<Item = (&'a str, usize)>,
-    colorterm: Option<&str>,
     forward_environment: impl IntoIterator<Item = &'a str>,
 ) -> BTreeMap<String, usize> {
     let mut reserved: BTreeMap<_, _> = existing
         .into_iter()
         .map(|(name, value_len)| (name.to_owned(), value_len))
         .collect();
-    if let Some(value) = colorterm {
-        reserved.insert("COLORTERM".to_owned(), value.len());
-    }
     for name in forward_environment {
         // A successfully bound Unix socket path is at most 107 raw bytes, but
         // `to_string_lossy()` can expand each non-UTF-8 byte to U+FFFD.
@@ -169,17 +154,10 @@ pub(crate) fn bounded_locale_environment(
 pub(crate) fn bound_jumphost_locale_environment(
     payload: &InitialPayload,
     locale: &mut Vec<(String, String)>,
-    colorterm: Option<&str>,
 ) -> Result<(), usize> {
     let mut modeled = payload.clone();
     modeled.jumphost = Some(true);
     modeled.environmentvariables.extend(locale.iter().cloned());
-    if let Some(value) = colorterm {
-        modeled
-            .environmentvariables
-            .insert("COLORTERM".to_owned(), value.to_owned());
-    }
-
     loop {
         let packet_len = Packet::new(
             TerminalPacketType::JumphostInit as u8,
@@ -214,9 +192,8 @@ fn varint_len(mut value: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        bound_jumphost_locale_environment, ghostty_colorterm, locale_environment_capacity,
-        locale_priority, normalize_terminal_type, reserved_environment_value_lengths,
-        MAX_LOSSY_FORWARD_ENV_VALUE,
+        bound_jumphost_locale_environment, locale_environment_capacity, locale_priority,
+        normalize_terminal_type, reserved_environment_value_lengths, MAX_LOSSY_FORWARD_ENV_VALUE,
     };
     use et_core::packet::Packet;
     use et_core::proto::{
@@ -242,7 +219,7 @@ mod tests {
                 ("APP_BAD-NAME".into(), "invalid".into()),
                 ("APP_LARGE".into(), "x".repeat(4097)),
                 ("APP_NUL".into(), "a\0b".into()),
-                ("TERM".into(), "reserved".into()),
+                ("TERM".into(), "xterm-kitty".into()),
                 ("UNRELATED".into(), "secret".into()),
             ],
         );
@@ -250,13 +227,17 @@ mod tests {
             selected,
             [
                 ("APP_FOO".into(), "local".into()),
-                ("CUSTOM_X".into(), "one".into())
+                ("CUSTOM_X".into(), "one".into()),
+                ("TERM".into(), "xterm-kitty".into()),
             ]
         );
         let merged = super::bounded_locale_environment(
-            [("APP_FOO".into(), "configured".into())]
-                .into_iter()
-                .chain(selected),
+            [
+                ("APP_FOO".into(), "configured".into()),
+                ("TERM".into(), "xterm-256color".into()),
+            ]
+            .into_iter()
+            .chain(selected),
             &Default::default(),
             None,
             None,
@@ -266,7 +247,8 @@ mod tests {
             merged,
             [
                 ("APP_FOO".into(), "configured".into()),
-                ("CUSTOM_X".into(), "one".into())
+                ("TERM".into(), "xterm-256color".into()),
+                ("CUSTOM_X".into(), "one".into()),
             ]
         );
         assert!(super::environment_pattern_matches(b"A*B?C", b"AXYBZBQC"));
@@ -327,27 +309,18 @@ mod tests {
             ("LANG".to_owned(), "ko_KR.UTF-8".to_owned()),
         ];
         locale.extend((0..15).map(|index| (format!("LC_000_{index:03}"), "x".repeat(4096))));
-        assert!(jumphost_packet_len(&payload, &locale, Some("truecolor")) > MAX_LOCAL_PACKET_LEN);
-        bound_jumphost_locale_environment(&payload, &mut locale, Some("truecolor")).unwrap();
-        assert!(jumphost_packet_len(&payload, &locale, Some("truecolor")) <= MAX_LOCAL_PACKET_LEN);
+        assert!(jumphost_packet_len(&payload, &locale) > MAX_LOCAL_PACKET_LEN);
+        bound_jumphost_locale_environment(&payload, &mut locale).unwrap();
+        assert!(jumphost_packet_len(&payload, &locale) <= MAX_LOCAL_PACKET_LEN);
         for name in ["LC_ALL", "LC_CTYPE", "LANG"] {
             assert!(locale.iter().any(|(candidate, _)| candidate == name));
         }
     }
 
-    fn jumphost_packet_len(
-        payload: &InitialPayload,
-        locale: &[(String, String)],
-        colorterm: Option<&str>,
-    ) -> usize {
+    fn jumphost_packet_len(payload: &InitialPayload, locale: &[(String, String)]) -> usize {
         let mut modeled = payload.clone();
         modeled.jumphost = Some(true);
         modeled.environmentvariables.extend(locale.iter().cloned());
-        if let Some(value) = colorterm {
-            modeled
-                .environmentvariables
-                .insert("COLORTERM".to_owned(), value.to_owned());
-        }
         Packet::new(
             TerminalPacketType::JumphostInit as u8,
             modeled.encode_to_vec(),
@@ -457,8 +430,7 @@ mod tests {
     #[test]
     fn locale_capacity_counts_distinct_reserved_names() {
         let reserved = reserved_environment_value_lengths(
-            [("COLORTERM", 4), ("LC_COLLISION", 1)],
-            Some("truecolor"),
+            [("COLORTERM", 9), ("LC_COLLISION", 1)],
             ["ET_PIPE", "ET_PIPE", "LC_COLLISION"],
         );
         assert_eq!(
@@ -466,8 +438,7 @@ mod tests {
             ["COLORTERM", "ET_PIPE", "LC_COLLISION"],
         );
         let reserved = reserved_environment_value_lengths(
-            [("COLORTERM", 4), ("LC_COLLISION", 1)],
-            Some("truecolor"),
+            [("COLORTERM", 9), ("LC_COLLISION", 1)],
             ["ET_PIPE", "ET_PIPE", "LC_COLLISION"],
         );
         assert_eq!(reserved["COLORTERM"], "truecolor".len());
@@ -476,41 +447,18 @@ mod tests {
     }
 
     #[test]
-    fn ghostty_term_uses_compatible_remote_fallback() {
+    fn terminal_type_defaults_only_when_unset_or_empty() {
         assert_eq!(normalize_terminal_type(None), "xterm-256color");
-        assert_eq!(
-            normalize_terminal_type(Some("xterm-ghostty")),
-            "xterm-256color"
-        );
+        assert_eq!(normalize_terminal_type(Some("")), "xterm-256color");
         for term in [
             "xterm-256color",
             "screen-256color",
             "linux",
+            "xterm-ghostty",
             "xterm-kitty",
             "arbitrary-term",
         ] {
             assert_eq!(normalize_terminal_type(Some(term)), term);
         }
-    }
-
-    #[test]
-    fn ghostty_truecolor_hint_is_forwarded_only_for_known_values() {
-        assert_eq!(
-            ghostty_colorterm(Some("xterm-ghostty"), Some("truecolor")),
-            Some("truecolor")
-        );
-        assert_eq!(
-            ghostty_colorterm(Some("xterm-ghostty"), Some("24bit")),
-            Some("24bit")
-        );
-        assert_eq!(
-            ghostty_colorterm(Some("xterm-ghostty"), Some("unexpected")),
-            None
-        );
-        assert_eq!(
-            ghostty_colorterm(Some("xterm-256color"), Some("truecolor")),
-            None
-        );
-        assert_eq!(ghostty_colorterm(Some("xterm-ghostty"), None), None);
     }
 }

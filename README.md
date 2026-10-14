@@ -199,17 +199,16 @@ configuration injection; ET applies the command to the session, not bootstrap.
 - Effective `SetEnv` assignments enter the initial payload for every session shell.
   Values retain spaces, quotes, backslashes, empty strings, and additional `=` signs.
   OpenSSH's effective first value wins for duplicate names. `SetEnv` takes precedence
-  over variables selected by `SendEnv`; ET's TERM, active Ghostty COLORTERM hint, and
-  forwarding-generated environment names take precedence over `SetEnv`.
+  over variables selected by `SendEnv` and over the bootstrap `TERM`;
+  forwarding-generated environment names take precedence over `SetEnv` and `SendEnv`.
   Names must be POSIX identifiers; supported values are single-line, NUL-free,
   and at most 4096 bytes. OpenSSH's unescaped dump cannot distinguish a newline
   followed by another `setenv NAME=value` row from a separate assignment, so
   multiline values are not a supported lossless representation.
   Entries share the 128-name and 64-KiB terminal/jumphost packet budgets: explicit
   entries are considered before `SendEnv`, and entries that do not fit are
-  omitted. Non-POSIX sessions also receive `SendEnv` but not the local Ghostty
-  COLORTERM hint, with first-wins case-insensitive
-  name deduplication and reserved-name checks.
+  omitted. Non-POSIX sessions also receive `SetEnv` and `SendEnv`, with first-wins
+  case-insensitive name deduplication and reserved-name checks.
 
 ### Local multiplexing and control (Unix)
 
@@ -275,15 +274,6 @@ path selects the Windows bootstrap (no `printf`, CRLF lines, `&` separator) and 
 `--terminal-path` to `et.exe`; a literal `%ComSpec%` preserves POSIX behavior. `--winserver`
 remains the explicit override. The session shell follows `%COMSPEC%`, or `ET_SHELL` if set on the
 server. OpenSSH on Windows must be reachable.
-
-### Connecting from Ghostty
-
-Ghostty identifies itself as `TERM=xterm-ghostty`, but many remote hosts do not have that terminfo
-entry and stock shell profiles may not recognize it as color-capable. ET sends
-`TERM=xterm-256color` for Ghostty clients so remote prompts and applications retain broadly
-supported 256-color behavior. Ghostty's standard `COLORTERM=truecolor` hint is also forwarded to
-POSIX sessions so applications that use it for 24-bit color detection do not downgrade. Other
-terminal types are forwarded unchanged.
 
 ## Feature set
 

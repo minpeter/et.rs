@@ -11,8 +11,8 @@ use crate::bootstrap::{
     validate_ssh_destination, BootstrapRequest, Credentials, JumpBootstrapRequest, RemoteShell,
 };
 use crate::client_environment::{
-    bound_jumphost_locale_environment, bounded_locale_environment, ghostty_colorterm,
-    normalize_terminal_type, reserved_environment_value_lengths,
+    bound_jumphost_locale_environment, bounded_locale_environment, normalize_terminal_type,
+    reserved_environment_value_lengths,
 };
 use crate::deadline::Deadline;
 use crate::error::ClientError;
@@ -216,21 +216,13 @@ fn run_client(
         crate::forward_config::build(args, std::env::var("SSH_AUTH_SOCK").ok().as_deref())?;
     forward_config.apply_ssh_config(&resolved)?;
     let local_term = std::env::var("TERM").ok();
-    let local_colorterm = std::env::var("COLORTERM").ok();
     let term = normalize_terminal_type(local_term.as_deref());
-    // Non-POSIX modes never inherit local locale or COLORTERM. A bare
-    // destination remains potentially POSIX until the credential-free probe.
-    let may_send_posix_environment = !args.remote_is_windows();
-    let colorterm = may_send_posix_environment
-        .then(|| ghostty_colorterm(local_term.as_deref(), local_colorterm.as_deref()))
-        .flatten();
     let reserved_environment = reserved_environment_value_lengths(
         forward_config
             .initial_payload
             .environmentvariables
             .iter()
             .map(|(name, value)| (name.as_str(), value.len())),
-        colorterm,
         forward_config
             .initial_payload
             .reversetunnels
@@ -245,29 +237,21 @@ fn run_client(
             .into(),
         );
     }
-    // ET owns TERM and its Ghostty COLORTERM hint. Forwarding owns its
-    // exported names. Explicit SetEnv otherwise wins over inherited locale.
-    let mut locale_environment = bounded_locale_environment(
-        resolved
-            .set_env
-            .iter()
-            .filter(|(name, _)| name != "TERM")
-            .cloned()
-            .chain(crate::client_environment::ssh_send_environment(
-                &resolved.send_env,
-            )),
-        &reserved_environment,
-        forward_config.initial_payload.flowcontrol,
-        forward_config.initial_payload.command.as_deref(),
-    )
-    .map_err(crate::forward_config::ForwardConfigError::EnvironmentPacketTooLarge)?;
-    if args.jumphost.is_some() {
-        bound_jumphost_locale_environment(
-            &forward_config.initial_payload,
-            &mut locale_environment,
-            colorterm,
+    // Forwarding owns its exported names. Explicit SetEnv wins over
+    // variables selected by SendEnv, including TERM overrides.
+    let mut locale_environment =
+        bounded_locale_environment(
+            resolved.set_env.iter().cloned().chain(
+                crate::client_environment::ssh_send_environment(&resolved.send_env),
+            ),
+            &reserved_environment,
+            forward_config.initial_payload.flowcontrol,
+            forward_config.initial_payload.command.as_deref(),
         )
-        .map_err(crate::forward_config::ForwardConfigError::JumphostPacketTooLarge)?;
+        .map_err(crate::forward_config::ForwardConfigError::EnvironmentPacketTooLarge)?;
+    if args.jumphost.is_some() {
+        bound_jumphost_locale_environment(&forward_config.initial_payload, &mut locale_environment)
+            .map_err(crate::forward_config::ForwardConfigError::JumphostPacketTooLarge)?;
     }
 
     let user = requested_user.or_else(|| resolved.user.clone());
@@ -313,11 +297,10 @@ fn run_client(
     };
     let remote_mode = resolve_remote_mode(args, detected_shell);
     if remote_mode.terminal_shell != RemoteShellKind::Posix {
-        // Explicit SetEnv applies to every session shell. Re-budget without
-        // inherited locale or a provisional Ghostty hint after shell detection.
+        // Windows environment variable names are case-insensitive: re-filter
+        // with case-insensitive reserved-name checks and first-wins deduplication.
         let reserved = reserved_environment_value_lengths(
             std::iter::empty(),
-            None,
             initial_payload
                 .reversetunnels
                 .iter()
@@ -333,10 +316,9 @@ fn run_client(
                     &resolved.send_env,
                 ))
                 .filter(|(name, _)| {
-                    !name.eq_ignore_ascii_case("TERM")
-                        && !reserved
-                            .keys()
-                            .any(|reserved| reserved.eq_ignore_ascii_case(name))
+                    !reserved
+                        .keys()
+                        .any(|reserved| reserved.eq_ignore_ascii_case(name))
                         && windows_names.insert(name.to_ascii_uppercase())
                 }),
             &reserved,
@@ -345,7 +327,7 @@ fn run_client(
         )
         .map_err(crate::forward_config::ForwardConfigError::EnvironmentPacketTooLarge)?;
         if args.jumphost.is_some() {
-            bound_jumphost_locale_environment(&initial_payload, &mut locale_environment, None)
+            bound_jumphost_locale_environment(&initial_payload, &mut locale_environment)
                 .map_err(crate::forward_config::ForwardConfigError::JumphostPacketTooLarge)?;
         }
     }
@@ -497,13 +479,6 @@ fn run_client(
     initial_payload
         .environmentvariables
         .extend(locale_environment);
-    if remote_mode.terminal_shell == RemoteShellKind::Posix {
-        if let Some(value) = colorterm {
-            initial_payload
-                .environmentvariables
-                .insert("COLORTERM".to_owned(), value.to_owned());
-        }
-    }
     let mut agent_forward = crate::agent_forward::AgentForward::prepare(
         args,
         &credentials.id,

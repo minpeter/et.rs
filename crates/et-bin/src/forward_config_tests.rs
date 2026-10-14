@@ -73,6 +73,90 @@ fn configured_remote_and_dynamic_forwards_merge_and_clear_without_disabling_agen
 }
 
 #[test]
+fn forward_only_sessions_advertise_a_bounded_disconnect_timeout() {
+    let bound = Some(et_cli::client::FORWARD_ONLY_DISCONNECT_TIMEOUT_SECONDS);
+    let cases: &[(&[&str], Option<i32>)] = &[
+        (&["et", "--no-terminal", "-L", "8080:80", "host"], bound),
+        (&["et", "--no-terminal", "-D", "1080", "host"], bound),
+        (&["et", "--no-terminal", "-R", "9000:90", "host"], bound),
+        (&["et", "-N", "host"], bound),
+        (&["et", "-W", "127.0.0.1:9", "host"], bound),
+        (&["et", "--no-terminal", "host"], None),
+        (&["et", "-L", "8080:80", "host"], None),
+        (
+            &[
+                "et",
+                "--no-terminal",
+                "-L",
+                "8080:80",
+                "--disconnect-timeout",
+                "0",
+                "host",
+            ],
+            Some(0),
+        ),
+        (
+            &["et", "--disconnect-timeout", "2", "-L", "8080:80", "host"],
+            Some(120),
+        ),
+        // Options after the destination stay et options until `--`.
+        (&["et", "host", "--no-terminal", "-L", "8080:80"], bound),
+        (&["et", "host", "-L", "8080:80", "echo", "-n"], None),
+        (
+            &[
+                "et",
+                "host",
+                "--no-terminal",
+                "-L",
+                "8080:80",
+                "--disconnect-timeout",
+                "0",
+            ],
+            Some(0),
+        ),
+    ];
+    for &(argv, expected) in cases {
+        let args = ClientArgs::try_parse_from(argv).unwrap();
+        let config = build(&args, None).unwrap();
+        assert_eq!(
+            config.initial_payload.disconnect_timeout_seconds, expected,
+            "{argv:?}"
+        );
+    }
+
+    let mut imported = build(
+        &ClientArgs::try_parse_from(["et", "--no-terminal", "host"]).unwrap(),
+        None,
+    )
+    .unwrap();
+    imported
+        .apply_ssh_config(&ResolvedSshConfig {
+            local_forwards: vec![PortForwardSourceRequest {
+                source: Some(SocketEndpoint {
+                    name: Some("localhost".into()),
+                    port: Some(8080),
+                }),
+                destination: Some(SocketEndpoint {
+                    name: Some("remote".into()),
+                    port: Some(80),
+                }),
+                environmentvariable: None,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(imported.initial_payload.disconnect_timeout_seconds, bound);
+
+    imported
+        .apply_ssh_config(&ResolvedSshConfig {
+            clear_all_forwardings: true,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(imported.initial_payload.disconnect_timeout_seconds, None);
+}
+
+#[test]
 fn builds_local_reverse_and_agent_forwarding_configuration() {
     let args = ClientArgs::try_parse_from([
         "et",

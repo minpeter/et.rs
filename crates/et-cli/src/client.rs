@@ -189,6 +189,11 @@ pub struct ClientArgs {
     pub kill_named: Option<String>,
 
     /// Per-session disconnect timeout in minutes. 0 disables the timeout.
+    ///
+    /// When this flag is omitted, interactive sessions keep the etserver
+    /// default. Forward-only sessions (`-N`, `-W`, or `--no-terminal` with
+    /// port forwards) use 5 minutes so a killed client does not leave the
+    /// remote session running.
     #[arg(
         long = "disconnect-timeout",
         value_name = "MINUTES",
@@ -327,6 +332,32 @@ fn is_known_client_option(command: &clap::Command, token: &str) -> bool {
                 .get_all_short_aliases()
                 .is_some_and(|aliases| aliases.contains(&short))
     })
+}
+
+/// Seconds a forward-only session may stay disconnected when
+/// `--disconnect-timeout` was omitted.
+///
+/// Upstream EternalTerminal applies one server default to every session, and
+/// that default is 0 (keep the terminal so a client can reconnect). et.rs
+/// fills `InitialPayload.disconnect_timeout_seconds` with this bound for
+/// forward-only sessions, so a killed client does not leave etterminal
+/// reparented forever. Five minutes still covers a short reconnect retry.
+pub const FORWARD_ONLY_DISCONNECT_TIMEOUT_SECONDS: i32 = 5 * 60;
+
+/// `InitialPayload.disconnect_timeout_seconds` for this session.
+///
+/// An explicit `--disconnect-timeout` always wins, including 0. Otherwise a
+/// forward-only session advertises [`FORWARD_ONLY_DISCONNECT_TIMEOUT_SECONDS`]
+/// and an interactive session leaves the field unset so the etserver default
+/// applies.
+pub fn effective_disconnect_timeout_seconds(
+    explicit_seconds: Option<i32>,
+    forward_only: bool,
+) -> Option<i32> {
+    if let Some(seconds) = explicit_seconds {
+        return Some(seconds);
+    }
+    forward_only.then_some(FORWARD_ONLY_DISCONNECT_TIMEOUT_SECONDS)
 }
 
 fn parse_disconnect_minutes(raw: &str) -> Result<i64, String> {
@@ -544,9 +575,9 @@ impl ClientArgs {
         Ok(parsed)
     }
 
-    /// Seconds to put in `InitialPayload.disconnect_timeout_seconds`.
+    /// Seconds from `--disconnect-timeout`, before the forward-only default.
     ///
-    /// `None` leaves the field unset. `Some(0)` is an explicit "no timeout".
+    /// `None` means the flag was omitted. `Some(0)` is an explicit "no timeout".
     pub fn disconnect_timeout_seconds(&self) -> Option<i32> {
         self.disconnect_timeout
             .map(|minutes| i32::try_from(minutes * 60).expect("parser rejected overflow"))
@@ -1222,6 +1253,32 @@ mod tests {
             ClientArgs::try_parse_from(["et", "--disconnect-timeout", "2", "host"]).unwrap();
         assert_eq!(timeout.disconnect_timeout_seconds(), Some(120));
         assert!(ClientArgs::try_parse_from(["et", "--disconnect-timeout", "-1", "host"]).is_err());
+    }
+
+    #[test]
+    fn forward_only_disconnect_timeout_defaults_to_five_minutes() {
+        assert_eq!(FORWARD_ONLY_DISCONNECT_TIMEOUT_SECONDS, 5 * 60);
+        assert_eq!(effective_disconnect_timeout_seconds(None, false), None);
+        assert_eq!(
+            effective_disconnect_timeout_seconds(None, true),
+            Some(FORWARD_ONLY_DISCONNECT_TIMEOUT_SECONDS)
+        );
+        let disabled =
+            ClientArgs::try_parse_from(["et", "--disconnect-timeout", "0", "host"]).unwrap();
+        assert_eq!(
+            effective_disconnect_timeout_seconds(disabled.disconnect_timeout_seconds(), true),
+            Some(0)
+        );
+        let custom =
+            ClientArgs::try_parse_from(["et", "--disconnect-timeout", "2", "host"]).unwrap();
+        assert_eq!(
+            effective_disconnect_timeout_seconds(custom.disconnect_timeout_seconds(), true),
+            Some(120)
+        );
+        assert_eq!(
+            effective_disconnect_timeout_seconds(custom.disconnect_timeout_seconds(), false),
+            Some(120)
+        );
     }
 
     #[test]

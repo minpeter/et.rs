@@ -78,6 +78,13 @@ pub struct ForwardConfig {
     /// forwarded agent connection. Empty until upstream #881 records them and
     /// #879 binds them to the bootstrap host key. Not part of the ET wire.
     pub ssh_agent_session_binds: Vec<Vec<u8>>,
+    /// `--disconnect-timeout` in seconds. `Some(0)` disables reaping.
+    explicit_disconnect_timeout: Option<i32>,
+    /// `--no-terminal`: hide the local console. A shell still starts unless
+    /// `shell_less` is set.
+    no_terminal: bool,
+    /// `-N` or `-W`: the remote session has no shell.
+    shell_less: bool,
 }
 
 impl ForwardConfig {
@@ -91,6 +98,7 @@ impl ForwardConfig {
                 request.source.is_none()
                     && request.environmentvariable.as_deref() == Some("SSH_AUTH_SOCK")
             });
+            self.refresh_disconnect_timeout();
             return validate_environment_names(&self.initial_payload.reversetunnels);
         }
         let mut local_requests = Vec::new();
@@ -147,7 +155,31 @@ impl ForwardConfig {
         }
         deduplicated.extend(agent);
         self.initial_payload.reversetunnels = deduplicated;
+        self.refresh_disconnect_timeout();
         validate_environment_names(&self.initial_payload.reversetunnels)
+    }
+
+    fn has_port_forwards(&self) -> bool {
+        !self.local_sources.is_empty() || !self.initial_payload.reversetunnels.is_empty()
+    }
+
+    /// Upstream uses one disconnect timeout for every session, and the server
+    /// default is 0, so a disconnected terminal stays up for reconnect. A
+    /// forward-only session does not: `-N` and `-W` have no shell, and
+    /// `--no-terminal` with port forwards exists only to hold those forwards.
+    /// After the client exits, etserver would otherwise keep the detached
+    /// etterminal (reparented to pid 1) forever. Those sessions advertise the
+    /// bounded default through the existing per-session field unless
+    /// `--disconnect-timeout` was set. A bare `--no-terminal` still starts a
+    /// reconnectable shell and leaves the field unset, as do interactive
+    /// sessions.
+    fn refresh_disconnect_timeout(&mut self) {
+        let forward_only = self.shell_less || (self.no_terminal && self.has_port_forwards());
+        self.initial_payload.disconnect_timeout_seconds =
+            et_cli::client::effective_disconnect_timeout_seconds(
+                self.explicit_disconnect_timeout,
+                forward_only,
+            );
     }
 }
 
@@ -192,7 +224,8 @@ pub fn build(
         // the recorder into bootstrap ssh.
     }
     validate_environment_names(&reverse_tunnels)?;
-    Ok(ForwardConfig {
+    let shell_less = args.stdio_forward.is_some() || args.no_remote_command;
+    let mut config = ForwardConfig {
         local_sources,
         ssh_agent_session_binds: Vec::new(),
         initial_payload: InitialPayload {
@@ -203,11 +236,16 @@ pub fn build(
             command: (args.no_pty && !args.no_remote_command)
                 .then(|| args.command.clone().unwrap_or_default()),
             supports_exit_status: Some(true),
-            no_shell: (args.stdio_forward.is_some() || args.no_remote_command).then_some(true),
+            no_shell: shell_less.then_some(true),
             flowcontrol: args.flow_control.protocol_value(),
-            disconnect_timeout_seconds: args.disconnect_timeout_seconds(),
+            disconnect_timeout_seconds: None,
         },
-    })
+        explicit_disconnect_timeout: args.disconnect_timeout_seconds(),
+        no_terminal: args.no_terminal,
+        shell_less,
+    };
+    config.refresh_disconnect_timeout();
+    Ok(config)
 }
 
 fn validate_environment_names(

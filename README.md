@@ -232,6 +232,9 @@ so password, passphrase and host-key prompts work, then detaches stdio before
 the session pump starts.
 `-N` starts a forwarding-only session without a remote shell; `--no-terminal`
 retains its older meaning of disabling the client terminal while starting a shell.
+`-N`, `-W`, and `--no-terminal` with port forwards are closed 5 minutes after
+the client disconnects unless `--disconnect-timeout` sets another limit (`0`
+keeps the session). A bare `--no-terminal` session stays available to reconnect.
 
 `et --ctl --name work user@host` starts a background control session and prints
 its private local socket path. The byte protocol exposes input, resize, output
@@ -300,6 +303,11 @@ terminal types are forwarded unchanged.
 - Remote PTYs export their actual path as `SSH_TTY`; server disconnect defaults
   are configurable in minutes with `--disconnect-timeout` or INI
   `[Networking] disconnect_timeout` (`0` disables the global default).
+  Forward-only sessions fill that same per-session field with 5 minutes when
+  the client flag is omitted, so etserver reaps them after the client is gone.
+  Interactive sessions still leave the field unset. Upstream EternalTerminal
+  uses one server default for every session and does not special-case
+  forward-only clients.
 - ET-native jumphost relay (client, `etserver` `JUMPHOST_INIT` dispatch, and `etterminal --jump`).
 - `etserver` INI configuration, daemon mode with pid file, log files honouring `--logdir`,
   `--logtostdout`, `--silent`, `--verbose`, and log rollover.

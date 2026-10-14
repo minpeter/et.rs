@@ -1072,6 +1072,10 @@ mod tests {
         assert_eq!(payload.no_shell, Some(true));
         assert_eq!(payload.no_pty, None);
         assert_eq!(payload.command, None);
+        assert_eq!(
+            payload.disconnect_timeout_seconds,
+            Some(et_cli::client::FORWARD_ONLY_DISCONNECT_TIMEOUT_SECONDS)
+        );
         let conflict = ClientArgs::try_parse_from(["et", "-N", "host", "true"]).unwrap();
         assert!(validate_bootstrap_mode(&conflict).is_err());
         for (interval, expected) in [(0, 5), (3, 3), (5, 5), (6, 5)] {

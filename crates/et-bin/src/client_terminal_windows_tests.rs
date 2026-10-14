@@ -171,7 +171,10 @@ fn pending_local_input_yields_to_forwarding_before_more_local_input() {
         .unwrap();
     // The stop packet reconnects and the test callback ends the session.
     // Packet order above is the fairness check; the pump must just finish.
-    worker.join().unwrap().expect("stop packet should end the pump");
+    worker
+        .join()
+        .unwrap()
+        .expect("stop packet should end the pump");
     assert_eq!(first.header(), TerminalPacketType::TerminalBuffer as u8);
     assert_eq!(
         et_core::proto::TerminalBuffer::decode(first.payload())

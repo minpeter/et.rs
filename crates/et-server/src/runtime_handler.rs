@@ -177,7 +177,19 @@ pub(crate) fn handle(
     if !legacy {
         match core.registry.get(&id) {
             Ok(Some(current)) if current.key == registration.key => registration = current,
-            _ => {
+            // The terminal ended after the challenge was issued. The proof
+            // already matched; this is a missing session, not a bad passkey.
+            Ok(None) | Err(_) => {
+                reject(
+                    &mut stream,
+                    ConnectStatus::InvalidKey,
+                    "client is not registered",
+                    &peer,
+                    Some(&id),
+                );
+                return;
+            }
+            Ok(Some(_)) => {
                 reject(
                     &mut stream,
                     ConnectStatus::InvalidKey,

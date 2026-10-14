@@ -78,6 +78,7 @@ fn ended_named_session_leaves_the_list_and_attach_says_it_ended() {
             .unwrap();
         match attach.wait_timeout(Duration::from_secs(2)).unwrap() {
             Some(status) => {
+                attach_error.clear();
                 attach
                     .stderr
                     .take()

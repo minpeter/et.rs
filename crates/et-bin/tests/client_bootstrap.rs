@@ -1219,6 +1219,19 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
     );
 }
 
+fn strip_agent_recorder(argv: &[String]) -> &[String] {
+    // The fixture drops `-oControlMaster=no` before these assertions. The
+    // recorder socket must still be the first option ssh sees.
+    if argv
+        .first()
+        .is_some_and(|arg| arg.starts_with("-oIdentityAgent="))
+    {
+        &argv[1..]
+    } else {
+        panic!("bootstrap ssh did not receive the session-bind recorder: {argv:?}");
+    }
+}
+
 #[test]
 fn effective_ssh_config_drives_native_jump_agent_and_environment() {
     for cli_override in [false, true] {
@@ -1307,9 +1320,11 @@ fn effective_ssh_config_drives_native_jump_agent_and_environment() {
             );
         }
         assert_eq!(&work[1][..2], ["-J", jump]);
-        assert_eq!(&work[2][..2], ["-J", jump]);
+        let destination = strip_agent_recorder(&work[2]);
+        assert_eq!(&destination[..2], ["-J", jump]);
         assert_eq!(work[3], ["-G", "-T", "-p", ssh_port, user_host]);
-        assert_eq!(&work[4][..2], ["-p", ssh_port]);
+        let jump_bootstrap = strip_agent_recorder(&work[4]);
+        assert_eq!(&jump_bootstrap[..2], ["-p", ssh_port]);
         assert!(work[4].contains(&user_host.to_owned()));
         assert!(work[4]
             .last()

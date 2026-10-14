@@ -301,6 +301,34 @@ pub struct ClientArgs {
     pub telemetry: bool,
 }
 
+/// True when `token` is a flag this client understands, including `--name=value`.
+///
+/// cxxopts accepts those flags anywhere before `--`. A dash token that does not
+/// match is a remote command word once the destination has been seen (`echo -n`).
+fn is_known_client_option(command: &clap::Command, token: &str) -> bool {
+    if let Some(long) = token.strip_prefix("--") {
+        let name = long.split('=').next().unwrap_or(long);
+        if name.is_empty() {
+            return false;
+        }
+        return command.get_arguments().any(|arg| {
+            arg.get_long() == Some(name)
+                || arg
+                    .get_all_aliases()
+                    .is_some_and(|aliases| aliases.contains(&name))
+        });
+    }
+    let Some(short) = token.strip_prefix('-').and_then(|rest| rest.chars().next()) else {
+        return false;
+    };
+    command.get_arguments().any(|arg| {
+        arg.get_short() == Some(short)
+            || arg
+                .get_all_short_aliases()
+                .is_some_and(|aliases| aliases.contains(&short))
+    })
+}
+
 fn parse_disconnect_minutes(raw: &str) -> Result<i64, String> {
     let minutes: i64 = raw
         .parse()
@@ -316,8 +344,14 @@ fn parse_disconnect_minutes(raw: &str) -> Result<i64, String> {
 }
 
 impl ClientArgs {
-    /// Stop option parsing at the destination, just like OpenSSH. In particular,
-    /// `host echo -v` must not change local verbosity.
+    /// Parse options the way EternalTerminal's cxxopts parser does.
+    ///
+    /// Known options are accepted on either side of the destination until an
+    /// explicit `--`. The first other token is the destination; later
+    /// non-options, and dash tokens that are not et options, are the remote
+    /// command (`echo -n`). `--` ends option parsing. When the destination has
+    /// not been seen, the next token is that destination even if it looks like
+    /// a flag, and every token after it is a remote command word.
     pub fn try_parse_from<I, T>(values: I) -> Result<Self, clap::Error>
     where
         I: IntoIterator<Item = T>,
@@ -326,24 +360,40 @@ impl ClientArgs {
         let values: Vec<std::ffi::OsString> = values.into_iter().map(Into::into).collect();
         let mut command = Self::command();
         command.build();
-        let mut normalized = values.first().cloned().into_iter().collect::<Vec<_>>();
+        let mut options = values.first().cloned().into_iter().collect::<Vec<_>>();
+        let mut positionals = Vec::new();
         let mut index = 1;
         let mut login_seen = false;
+        let mut options_ended = false;
+        let mut host_seen = false;
         while index < values.len() {
-            let token = values[index].to_str().ok_or_else(|| {
-                clap::Error::raw(
+            let raw = &values[index];
+            let Some(token) = raw.to_str() else {
+                if options_ended || host_seen {
+                    host_seen = true;
+                    positionals.push(raw.clone());
+                    index += 1;
+                    continue;
+                }
+                return Err(clap::Error::raw(
                     clap::error::ErrorKind::InvalidUtf8,
                     "option names and attached option values must be valid UTF-8",
-                )
-            })?;
-            if token == "--" {
-                normalized.extend_from_slice(&values[index..]);
-                break;
+                ));
+            };
+            if !options_ended && token == "--" {
+                options_ended = true;
+                index += 1;
+                continue;
             }
-            if !token.starts_with('-') || token == "-" {
-                normalized.push("--".into());
-                normalized.extend_from_slice(&values[index..]);
-                break;
+            let option_token = !options_ended && token.starts_with('-') && token != "-";
+            // Non-options are the destination, then the remote command. After
+            // the destination, a dash token that is not an et option is a
+            // command word as well. `--` makes every remaining token positional.
+            if !option_token || (host_seen && !is_known_client_option(&command, token)) {
+                host_seen = true;
+                positionals.push(raw.clone());
+                index += 1;
+                continue;
             }
             if let Some(long) = token.strip_prefix("--") {
                 let name = long.split('=').next().unwrap_or(long);
@@ -353,7 +403,7 @@ impl ClientArgs {
                             .get_all_aliases()
                             .is_some_and(|aliases| aliases.contains(&name))
                 }) {
-                    normalized.push(values[index].clone());
+                    options.push(values[index].clone());
                     if !long.contains('=')
                         && arg.get_action().takes_values()
                         && index + 1 < values.len()
@@ -361,10 +411,10 @@ impl ClientArgs {
                             || matches!(values[index + 1].to_str(), Some("true" | "false")))
                     {
                         index += 1;
-                        normalized.push(values[index].clone());
+                        options.push(values[index].clone());
                     }
                 } else {
-                    normalized.push(values[index].clone());
+                    options.push(values[index].clone());
                 }
             } else {
                 let mut chars = token[1..].char_indices().peekable();
@@ -384,7 +434,7 @@ impl ClientArgs {
                     let keep = arg.is_some() && !(short == 'l' && login_seen);
                     login_seen |= short == 'l';
                     if keep {
-                        normalized.push(format!("-{short}").into());
+                        options.push(format!("-{short}").into());
                     }
                     if takes_value {
                         let value = if chars.peek().is_some() {
@@ -402,7 +452,7 @@ impl ClientArgs {
                             )
                         })?;
                         if keep {
-                            normalized.push(value);
+                            options.push(value);
                         }
                         break;
                     }
@@ -410,7 +460,11 @@ impl ClientArgs {
             }
             index += 1;
         }
-        let matches = command.try_get_matches_from(normalized)?;
+        if !positionals.is_empty() {
+            options.push("--".into());
+            options.extend(positionals);
+        }
+        let matches = command.try_get_matches_from(options)?;
         let mut parsed = <Self as clap::FromArgMatches>::from_arg_matches(&matches)?;
         if !parsed.command_operands.is_empty() {
             parsed.command = Some(parsed.command_operands.join(" "));
@@ -751,8 +805,13 @@ mod tests {
     }
 
     #[test]
-    fn host_boundary_preserves_remote_operands_and_overrides_command_flag() {
-        let args = ClientArgs::try_parse_from([
+    fn options_after_the_host_are_et_options_until_separator() {
+        let quoted = ClientArgs::try_parse_from(["et", "qa", "--command", "echo hi"]).unwrap();
+        assert_eq!(quoted.host.as_deref(), Some("qa"));
+        assert_eq!(quoted.command.as_deref(), Some("echo hi"));
+        assert_eq!(quoted.port, DEFAULT_PORT);
+
+        let interleaved = ClientArgs::try_parse_from([
             "et",
             "--command",
             "ignored",
@@ -763,16 +822,62 @@ mod tests {
             "--port",
             "7",
             "-v",
-            "--",
+            "world",
         ])
         .unwrap();
-        assert_eq!(args.command.as_deref(), Some("printf a b --port 7 -v --"));
-        assert_eq!(args.port, DEFAULT_PORT);
-        assert_eq!(args.verbose, 1);
+        assert_eq!(interleaved.host.as_deref(), Some("host"));
+        assert_eq!(interleaved.command.as_deref(), Some("printf a b world"));
+        assert_eq!(interleaved.port, 7);
+        assert_eq!(interleaved.verbose, 2);
+
+        let separated =
+            ClientArgs::try_parse_from(["et", "qa", "--", "--command", "echo", "hi"]).unwrap();
+        assert_eq!(separated.host.as_deref(), Some("qa"));
+        assert_eq!(separated.command.as_deref(), Some("--command echo hi"));
+        assert_eq!(separated.port, DEFAULT_PORT);
+
+        let remote_flags =
+            ClientArgs::try_parse_from(["et", "host", "--", "echo", "-v", "--port", "7"]).unwrap();
+        assert_eq!(remote_flags.command.as_deref(), Some("echo -v --port 7"));
+        assert_eq!(remote_flags.verbose, 0);
+        assert_eq!(remote_flags.port, DEFAULT_PORT);
+
+        let unknown_dash = ClientArgs::try_parse_from(["et", "host", "echo", "-n", "hi"]).unwrap();
+        assert_eq!(unknown_dash.command.as_deref(), Some("echo -n hi"));
+        assert_eq!(unknown_dash.verbose, 0);
+
+        let verbosity = ClientArgs::try_parse_from(["et", "host", "echo", "-v"]).unwrap();
+        assert_eq!(verbosity.command.as_deref(), Some("echo"));
+        assert_eq!(verbosity.verbose, 1);
+
+        let before_host =
+            ClientArgs::try_parse_from(["et", "--command", "ls", "--", "host"]).unwrap();
+        assert_eq!(before_host.host.as_deref(), Some("host"));
+        assert_eq!(before_host.command.as_deref(), Some("ls"));
+
         let escaped = ClientArgs::try_parse_from(["et", "--", "-host", "-V"]).unwrap();
         assert_eq!(escaped.host.as_deref(), Some("-host"));
         assert!(!escaped.ssh_version);
         assert_eq!(escaped.command.as_deref(), Some("-V"));
+
+        assert_eq!(
+            ClientArgs::try_parse_from(["et", "host", "--help"])
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::DisplayHelp
+        );
+        assert_eq!(
+            ClientArgs::try_parse_from(["et", "host", "--version"])
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::DisplayVersion
+        );
+        assert_eq!(
+            ClientArgs::try_parse_from(["et", "host", "-h"])
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::DisplayHelp
+        );
     }
 
     #[test]

@@ -7,6 +7,8 @@ packages:
 ## Drop ended named sessions
 
 When a named session's shell exits, etserver removes that terminal from its
-registry. `et --list` no longer shows the session. Attaching to a session that
-has already ended reports that the session was not found or has ended, instead
-of rejecting the session key. Protocol v6 is unchanged.
+registry and the client deletes the saved session file. `et --list` no longer
+shows the session. `et --attach` reports that the session was not found or has
+ended when that file is missing, including a name that never existed, instead
+of failing to open the file or rejecting the session key. Other failures while
+opening the session file are unchanged. Protocol v6 is unchanged.

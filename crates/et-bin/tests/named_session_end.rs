@@ -7,7 +7,6 @@ mod reconnect_stack;
 
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -43,7 +42,6 @@ fn ended_named_session_leaves_the_list_and_attach_says_it_ended() {
     wait_until("named session is listed while the shell is running", || {
         session.is_file() && list(&stack, "127.0.0.1").contains(name)
     });
-    let saved = fs::read(&session).unwrap();
     fs::write(&stop, b"1").unwrap();
     let status = client
         .wait_timeout(TIMEOUT)
@@ -64,56 +62,19 @@ fn ended_named_session_leaves_the_list_and_attach_says_it_ended() {
         "ended session still listed: {}",
         list(&stack, "127.0.0.1")
     );
-
-    let mut attach_error = String::new();
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        restore_session(&stack, name, &saved);
-        let mut attach = et(&stack)
-            .args(["--attach", name])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        match attach.wait_timeout(Duration::from_secs(2)).unwrap() {
-            Some(status) => {
-                attach_error.clear();
-                attach
-                    .stderr
-                    .take()
-                    .unwrap()
-                    .read_to_string(&mut attach_error)
-                    .unwrap();
-                if !status.success() && attach_error.contains("session not found or ended") {
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    panic!("attach did not report a missing session: {attach_error:?}");
-                }
-            }
-            None => {
-                let _ = attach.kill();
-                let _ = attach.wait();
-                if Instant::now() >= deadline {
-                    panic!("server kept the ended session registered");
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(
-        !attach_error.contains("client is not registered"),
-        "{attach_error:?}"
-    );
-    assert!(
-        !attach_error.contains("rejected the session key"),
-        "{attach_error:?}"
-    );
+    assert!(!session.exists(), "ended session file is still present");
+    expect_attach_missing(&stack, name);
     assert!(
         !list(&stack, "127.0.0.1").contains(name),
         "stale session returned to the list"
     );
+    stack.shutdown();
+}
+
+#[test]
+fn attach_unknown_name_says_the_session_ended() {
+    let mut stack = Stack::start();
+    expect_attach_missing(&stack, "missing");
     stack.shutdown();
 }
 
@@ -146,18 +107,46 @@ fn list(stack: &Stack, host: &str) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
-fn restore_session(stack: &Stack, name: &str, bytes: &[u8]) {
-    let directory = stack.directory.join(".et/sessions");
-    fs::create_dir_all(&directory).unwrap();
-    fs::set_permissions(
-        stack.directory.join(".et"),
-        fs::Permissions::from_mode(0o700),
-    )
-    .unwrap();
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
-    let path = directory.join(name);
-    fs::write(&path, bytes).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+fn expect_attach_missing(stack: &Stack, name: &str) {
+    let mut attach = et(stack)
+        .args(["--attach", name, "127.0.0.1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let status = match attach.wait_timeout(TIMEOUT).unwrap() {
+        Some(status) => status,
+        None => {
+            let _ = attach.kill();
+            let _ = attach.wait();
+            panic!("attach to {name} did not exit");
+        }
+    };
+    let mut attach_error = String::new();
+    attach
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut attach_error)
+        .unwrap();
+    assert_eq!(status.code(), Some(1), "{attach_error:?}");
+    assert!(
+        attach_error.contains("session not found or ended"),
+        "{attach_error:?}"
+    );
+    assert!(
+        !attach_error.contains("could not open the session file"),
+        "{attach_error:?}"
+    );
+    assert!(
+        !attach_error.contains("client is not registered"),
+        "{attach_error:?}"
+    );
+    assert!(
+        !attach_error.contains("rejected the session key"),
+        "{attach_error:?}"
+    );
 }
 
 fn wait_until(description: &str, mut ready: impl FnMut() -> bool) {

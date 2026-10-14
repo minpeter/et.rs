@@ -10,10 +10,10 @@
 #   note: short string
 #   et_pr: optional upstream PR number
 #
-# Classified 2026-10-12. #804 passed independent review in et.rs #100.
+# Classified 2026-10-14. #804 passed independent review in et.rs #100.
 
 baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-10-13"
+classified: "2026-10-14"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -659,3 +659,123 @@ commits:
     status: ported
     note: "Merge #881 ssh-agent session-bind recorder, including the Windows named-pipe proxy. Bootstrap wiring remains open upstream #879 and is not ported. PROTOCOL_VERSION stays 6."
     et_pr: 881
+  - sha: 9a987f7116bf596e3137aa70e7c65d495ff55b12
+    date: "2026-10-01"
+    kind: product
+    status: ported
+    note: "#879 bind forwarded agent connections to the bootstrap ssh host key. The recorder is IdentityAgent for that ssh, with ControlMaster=no. Jumphost bind is replayed first. PROTOCOL_VERSION stays 6."
+    et_pr: 879
+  - sha: 4545da51aed065801162dd9f02a81374284e2e66
+    date: "2026-10-10"
+    kind: security
+    status: ported
+    note: "#890 reject framed lengths below the 2-byte header or above 128 MiB before use, and reject ciphertext shorter than the MAC before the nonce moves. Socket reads were already chunked. PROTOCOL_VERSION stays 6."
+    et_pr: 890
+  - sha: bbd2c5fda81731e22b84e71371a0b2cc4d89a9da
+    date: "2026-10-10"
+    kind: security
+    status: skip
+    note: "#890 malformed router packets already return RouterReject and leave the daemon up. Empty, wrong-type, and bad protobuf registrations are tested. PROTOCOL_VERSION stays 6."
+    et_pr: 890
+  - sha: fd4e166236c6852f614b9e6966ac267a68d358b8
+    date: "2026-10-10"
+    kind: product
+    status: skip
+    note: "#890 Windows UserTerminalHandler no longer blocks in readPacket before TERMINAL_INIT. et.rs has no joined handler thread with that hang; init failure returns an error. PROTOCOL_VERSION stays 6."
+    et_pr: 890
+  - sha: 7d70aa2c7a33bd4805d90429762ec7330fe52855
+    date: "2026-10-10"
+    kind: security
+    status: ported
+    note: "#890 Unix router registration stores kernel SO_PEERCRED/getpeereid uid and gid instead of the peer-supplied values. Windows still uses the authenticated pipe token. PROTOCOL_VERSION stays 6."
+    et_pr: 890
+  - sha: 46319d9e9302b459b57ee18e4d1a58dfb5d0c785
+    date: "2026-10-10"
+    kind: security
+    status: ported
+    note: "#890 unexpected or unparsable session packets reconnect the client; the server soft-drops that connection and keeps the terminal. Setup still fails a non-INITIAL_RESPONSE. Daemon does not abort. PROTOCOL_VERSION stays 6."
+    et_pr: 890
+  - sha: f37750d54c85160dfe0a2266719f03c31448532f
+    date: "2026-10-10"
+    kind: security
+    status: skip
+    note: "#890 silent router peers already cannot block accept: nonblocking reads, 64 pending, 5s timeout (stricter than upstream 30s), 64 KiB incremental cap. PROTOCOL_VERSION stays 6."
+    et_pr: 890
+  - sha: eecfdb3b6f970ed69df1d629214f6a8d14e929a4
+    date: "2026-10-10"
+    kind: security
+    status: skip
+    note: "#890 short or empty passkeys and ids are already rejected at registration. CryptoHandler::new takes a 32-byte key, so a bad length cannot abort the process. PROTOCOL_VERSION stays 6."
+    et_pr: 890
+  - sha: c0e36f21ea5967d10a3e4cd937a418e3057fc6b1
+    date: "2026-10-10"
+    kind: security
+    status: ported
+    note: "#890 accept EMFILE/ENFILE/ENOMEM/ENOBUFS, including Windows WSAEMFILE, pauses instead of aborting. Pending handshakes are capped at 64. PROTOCOL_VERSION stays 6."
+    et_pr: 890
+  - sha: 9c69c810bcd66d6f4948a7b667e6285f72ab96c7
+    date: "2026-10-10"
+    kind: security
+    status: ported
+    note: "#890 length-prefixed protobuf bodies grow in 64 KiB chunks under one absolute deadline instead of reserving the declared length. PROTOCOL_VERSION stays 6."
+    et_pr: 890
+  - sha: c87998af7e2fb20d4ed722755c17397794c47c1b
+    date: "2026-10-10"
+    kind: security
+    status: skip
+    note: "#890 HTM pane dumps use the private diagnostic socket, not a predictable /tmp file, so a planted symlink cannot redirect the dump. PROTOCOL_VERSION stays 6."
+    et_pr: 890
+  - sha: e3e49d5ea176f0c4c6ee2dd325b8d9a823d65b36
+    date: "2026-10-10"
+    kind: security
+    status: ported
+    note: "#890 recovery CatchupBuffer limit is 144 MiB so a full 64+64 MiB upstream catchup fits. Revive trims oldest history to 64 MiB. Not a wire-format change. PROTOCOL_VERSION stays 6."
+    et_pr: 890
+  - sha: 9d65d6273ce05ccb68cad1fcb9670dfd374de0d1
+    date: "2026-10-10"
+    kind: security
+    status: skip
+    note: "#890 et.rs does not write a predictable HTM client pid file, so the planted-symlink truncate does not apply. PROTOCOL_VERSION stays 6."
+    et_pr: 890
+  - sha: d884fbd17fb585ad1d18f0b55233bb74e2a708a3
+    date: "2026-10-12"
+    kind: security
+    status: ported
+    note: "#898 et --attach refuses unchallenged NEW_CLIENT and RETURNING_CLIENT. Fresh sessions still accept a legacy server. PROTOCOL_VERSION stays 6."
+    et_pr: 898
+  - sha: 4f288879dcb0666526a75a0c1e0f9a742dab5cd8
+    date: "2026-10-10"
+    kind: security
+    status: skip
+    note: "#890 et.rs does not SIGKILL from an HTM client pid file, so planted pid identity does not apply. PROTOCOL_VERSION stays 6."
+    et_pr: 890
+  - sha: de5dbd9b9df68a7fbd1813adad9eff871d8a50bf
+    date: "2026-10-11"
+    kind: security
+    status: ported
+    note: "#890 decrypt advances the nonce only after Poly1305 succeeds. Auth failures reconnect and recovery resends the genuine packet. PROTOCOL_VERSION stays 6."
+    et_pr: 890
+  - sha: f8a3b184260cf8d570d524611aa6378e498f1563
+    date: "2026-10-10"
+    kind: security
+    status: ported
+    note: "#890 Unix HTM control and diagnostic sockets check kernel peer uid on both ends and drop other users before control data. Windows stays on its authenticated endpoint. PROTOCOL_VERSION stays 6."
+    et_pr: 890
+  - sha: f2a332d813817ce0c4fdf8190aeea6c229bb7307
+    date: "2026-10-13"
+    kind: security
+    status: ported
+    note: "Merge #898. Reattach refuses unchallenged success and tampered packets recover. PROTOCOL_VERSION stays 6. Upstream #891 remains open and is not ported."
+    et_pr: 898
+  - sha: 6185ea3bf7b45ff1f88bab376b6c0d35e49c90a1
+    date: "2026-10-13"
+    kind: security
+    status: ported
+    note: "Merge #890. Framed reads, peer creds, handshake cap, catchup limit, nonce rollback, and HTM peer checks are ported. Router silence, passkey length, pane-dump files, pid files, and the Windows pre-init hang are existing skips. PROTOCOL_VERSION stays 6."
+    et_pr: 890
+  - sha: 7eb237e6d9822b674f4a527924b5f09117659321
+    date: "2026-10-13"
+    kind: product
+    status: ported
+    note: "Merge #879. Bootstrap ssh records session-bind and the forwarded-agent replay uses it. PROTOCOL_VERSION stays 6."
+    et_pr: 879

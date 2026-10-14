@@ -22,7 +22,9 @@ pub(crate) struct RuntimeCore {
     pub(crate) disconnect_timeout_seconds: i32,
 }
 
-pub(crate) const MAX_PRE_AUTH_CONNECTIONS: usize = 128;
+/// Queued or active handshakes. Further connections are closed on arrival
+/// until a slot frees (upstream #890 / c0e36f2).
+pub(crate) const MAX_PRE_AUTH_CONNECTIONS: usize = 64;
 
 pub(crate) struct PreAuthSlots {
     active: AtomicUsize,

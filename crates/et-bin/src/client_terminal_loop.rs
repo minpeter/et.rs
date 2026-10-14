@@ -511,38 +511,46 @@ where
                             terminal_modes,
                             &console_output,
                             remote_exit,
-                        )? {
-                            DisplayOutcome::Displayed { cursor_report }
-                                if cursor_report
-                                    && auto_cursor_report
-                                    && !console_output.is_async() =>
-                            {
-                                if connection.write_pending() {
-                                    pending_cursor_reports += 1;
-                                } else if matches!(
-                                    write_cursor_report(
-                                        connection,
-                                        &mut reconnect,
-                                        &mut stream,
-                                        terminal_enabled,
-                                    )?,
-                                    OwnedWriteOutcome::SessionEnded
-                                ) {
-                                    return finish_remote_completion(
-                                        console_output,
-                                        pending_output,
-                                        pending_forward,
-                                        terminal_enabled,
-                                        binary_stdio,
-                                        terminal_modes,
-                                        forwarder,
-                                        None,
-                                        remote_exit,
-                                    );
-                                }
+                        ) {
+                            Err(error @ ClientError::MalformedServerPacket(_)) => {
+                                et_cli::logging::warn(error.to_string());
+                                reconnect_needed = true;
+                                break;
                             }
-                            DisplayOutcome::Displayed { .. } => {}
-                            DisplayOutcome::Pending(packet) => pending_output = Some(packet),
+                            Err(error) => return Err(error),
+                            Ok(outcome) => match outcome {
+                                DisplayOutcome::Displayed { cursor_report }
+                                    if cursor_report
+                                        && auto_cursor_report
+                                        && !console_output.is_async() =>
+                                {
+                                    if connection.write_pending() {
+                                        pending_cursor_reports += 1;
+                                    } else if matches!(
+                                        write_cursor_report(
+                                            connection,
+                                            &mut reconnect,
+                                            &mut stream,
+                                            terminal_enabled,
+                                        )?,
+                                        OwnedWriteOutcome::SessionEnded
+                                    ) {
+                                        return finish_remote_completion(
+                                            console_output,
+                                            pending_output,
+                                            pending_forward,
+                                            terminal_enabled,
+                                            binary_stdio,
+                                            terminal_modes,
+                                            forwarder,
+                                            None,
+                                            remote_exit,
+                                        );
+                                    }
+                                }
+                                DisplayOutcome::Displayed { .. } => {}
+                                DisplayOutcome::Pending(packet) => pending_output = Some(packet),
+                            },
                         }
                     }
                 }
@@ -890,8 +898,8 @@ fn route_server_packet(
             cursor_report: false,
         });
     }
-    Err(terminal_text(
-        "server sent an unsupported no-terminal packet",
+    Err(ClientError::MalformedServerPacket(
+        "server sent an unsupported no-terminal packet".to_owned(),
     ))
 }
 

@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use std::thread;
 
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
+use et_core::backed_reader::ReadError;
 use et_core::proto::{TerminalBuffer, TerminalExitStatus, TerminalInfo, TerminalPacketType};
 use et_net::connection::{ConnError, Connection, WritePacketError};
 use et_net::forward::Forwarder;
@@ -358,8 +359,14 @@ where
 {
     match packet.header() {
         value if value == TerminalPacketType::TerminalBuffer as u8 => {
-            let message = TerminalBuffer::decode(packet.payload())
-                .map_err(|error| terminal_message("decoding terminal output", error))?;
+            let message = match TerminalBuffer::decode(packet.payload()) {
+                Ok(message) => message,
+                Err(error) => {
+                    return Err(ClientError::MalformedServerPacket(format!(
+                        "malformed terminal output: {error}"
+                    )));
+                }
+            };
             let bytes = message
                 .buffer
                 .ok_or_else(|| terminal_text("terminal output is missing bytes"))?;
@@ -379,7 +386,9 @@ where
                 cursor_report: false,
             })
         }
-        _ => Err(terminal_text("server sent an unsupported terminal packet")),
+        header => Err(ClientError::MalformedServerPacket(format!(
+            "unsupported server packet type {header}"
+        ))),
     }
 }
 
@@ -813,13 +822,23 @@ impl Drop for RawMode {
 /// (`io::ErrorKind::TimedOut`), not necessarily as EOF or reset.  There is no
 /// actionable socket I/O failure for the terminal loop: the connection state
 /// is preserved in the backed reader/writer, so every socket I/O error enters
-/// recovery.  Protocol, crypto, framing, backpressure, and local-terminal
-/// errors use other `ConnError` variants and still remain fatal.
+/// recovery. A packet that fails authentication is the same class: the nonce
+/// was not advanced, so recovery resends the genuine packet (upstream #890 /
+/// de5dbd9). Backpressure and local-terminal errors stay fatal.
 ///
 /// This matches upstream `Connection::read`/`write`, which closes and starts
 /// its reconnect loop for both skippable and "serious" socket errors.
 pub(crate) fn connection_ended(error: &ConnError) -> bool {
-    matches!(error, ConnError::Io(_))
+    matches!(
+        error,
+        ConnError::Io(_)
+            | ConnError::Read(
+                ReadError::Frame(_)
+                    | ReadError::Packet(_)
+                    | ReadError::Crypto(_)
+                    | ReadError::Unencrypted
+            )
+    )
 }
 
 pub(crate) fn terminal_error(error: ConnError) -> ClientError {
@@ -827,10 +846,6 @@ pub(crate) fn terminal_error(error: ConnError) -> ClientError {
 }
 
 pub(crate) fn terminal_io(operation: &str, error: io::Error) -> ClientError {
-    terminal_text(format!("{operation}: {error}"))
-}
-
-fn terminal_message(operation: &str, error: impl std::fmt::Display) -> ClientError {
     terminal_text(format!("{operation}: {error}"))
 }
 

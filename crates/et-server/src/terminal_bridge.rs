@@ -274,38 +274,60 @@ fn run_mode_poll(
                         true
                     }
                     Ok(Some(packet)) => {
-                        match forward_client_packet(&session, packet)? {
-                            ClientForward::ToTerminal(packet) => {
-                                if terminal_input_closed {
-                                    continue;
-                                }
-                                pending_local = Some(
-                                    PendingLocalFrame::new(&packet).map_err(SessionError::Io)?,
-                                );
-                            }
-                            ClientForward::KeepAlive(control) => {
-                                enqueue_outbound(
+                        let forwarded = match forward_client_packet(&session, packet) {
+                            Ok(forwarded) => Some(forwarded),
+                            Err(error) => {
+                                if client_transport_error(
+                                    &error,
                                     &session,
-                                    &mut pending_outbound,
-                                    control,
                                     &mut connected,
                                     &mut connection_generation,
-                                )?;
+                                )? {
+                                    None
+                                } else {
+                                    return Err(error);
+                                }
                             }
-                            ClientForward::CloseSession => {
-                                match write_local_terminal_close(&mut terminal, &mut pending_local)?
-                                {
-                                    LocalClose::Done => return Ok(()),
-                                    LocalClose::Pending => close_after_local = true,
-                                    LocalClose::InputGone => {
-                                        pending_local = None;
-                                        close_after_local = false;
-                                        terminal_input_closed = true;
+                        };
+                        if let Some(forwarded) = forwarded {
+                            match forwarded {
+                                ClientForward::ToTerminal(packet) => {
+                                    if terminal_input_closed {
+                                        continue;
+                                    }
+                                    pending_local = Some(
+                                        PendingLocalFrame::new(&packet)
+                                            .map_err(SessionError::Io)?,
+                                    );
+                                }
+                                ClientForward::KeepAlive(control) => {
+                                    enqueue_outbound(
+                                        &session,
+                                        &mut pending_outbound,
+                                        control,
+                                        &mut connected,
+                                        &mut connection_generation,
+                                    )?;
+                                }
+                                ClientForward::CloseSession => {
+                                    match write_local_terminal_close(
+                                        &mut terminal,
+                                        &mut pending_local,
+                                    )? {
+                                        LocalClose::Done => return Ok(()),
+                                        LocalClose::Pending => close_after_local = true,
+                                        LocalClose::InputGone => {
+                                            pending_local = None;
+                                            close_after_local = false;
+                                            terminal_input_closed = true;
+                                        }
                                     }
                                 }
                             }
+                            true
+                        } else {
+                            false
                         }
-                        true
                     }
                     Ok(None) => false,
                     Err(error) => {
@@ -489,7 +511,25 @@ fn run_mode_windows(
                         } else if is_forward_packet(packet.header()) {
                             enqueue_forwarding(&forwarder, &mut pending_forward, packet)?;
                         } else {
-                            match forward_client_packet(&session, packet)? {
+                            let forwarded = match forward_client_packet(&session, packet) {
+                                Ok(forwarded) => Some(forwarded),
+                                Err(error) => {
+                                    if client_transport_error(
+                                        &error,
+                                        &session,
+                                        &mut connected,
+                                        &mut connection_generation,
+                                    )? {
+                                        None
+                                    } else {
+                                        return Err(error);
+                                    }
+                                }
+                            };
+                            let Some(forwarded) = forwarded else {
+                                break;
+                            };
+                            match forwarded {
                                 ClientForward::ToTerminal(packet) => {
                                     if terminal_input_closed {
                                         continue;
@@ -701,6 +741,15 @@ fn client_transport_error(
         }
         SessionError::Connection(ConnError::Io(_))
         | SessionError::Connection(ConnError::Read(_)) => {
+            note_client_drop(
+                session,
+                connected,
+                connection_generation,
+                observed_generation,
+            )?;
+            Ok(true)
+        }
+        SessionError::Io(io_error) if io_error.kind() == io::ErrorKind::InvalidData => {
             note_client_drop(
                 session,
                 connected,

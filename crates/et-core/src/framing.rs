@@ -21,6 +21,8 @@ pub enum FrameError {
     Short,
     Negative,
     TooLarge,
+    /// Encrypted frames carry at least the 2-byte packet header.
+    TooSmall,
 }
 
 impl std::fmt::Display for FrameError {
@@ -29,6 +31,7 @@ impl std::fmt::Display for FrameError {
             Self::Short => write!(f, "frame truncated"),
             Self::Negative => write!(f, "negative length"),
             Self::TooLarge => write!(f, "length exceeds 128 MiB"),
+            Self::TooSmall => write!(f, "framed length is below the 2-byte packet header"),
         }
     }
 }

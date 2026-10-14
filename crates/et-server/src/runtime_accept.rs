@@ -111,7 +111,7 @@ fn accept_ready(listener: &TcpListener, core: &Arc<RuntimeCore>) -> Result<(), R
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(source) if matches!(source.raw_os_error(), Some(23 | 24)) => {
+            Err(source) if accept_resource_exhausted(&source) => {
                 crate::diag::info(format!("TCP accept resource exhaustion: {source}"));
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 return Ok(());
@@ -123,6 +123,50 @@ fn accept_ready(listener: &TcpListener, core: &Arc<RuntimeCore>) -> Result<(), R
                 });
             }
         }
+    }
+}
+
+/// `accept` failed because descriptors or kernel memory ran out. A peer can
+/// provoke these; they must not abort the listener (upstream #890 / c0e36f2).
+pub(crate) fn accept_resource_exhausted(error: &io::Error) -> bool {
+    let Some(code) = error.raw_os_error() else {
+        return false;
+    };
+    #[cfg(windows)]
+    {
+        // ENOMEM, WSAEMFILE, WSAENOBUFS.
+        matches!(code, 8 | 10024 | 10055)
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // ENOMEM, ENFILE, EMFILE, ENOBUFS.
+        matches!(code, 12 | 23 | 24 | 105)
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        // ENOMEM, ENFILE, EMFILE, ENOBUFS.
+        matches!(code, 12 | 23 | 24 | 55)
+    }
+    #[cfg(not(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )))]
+    {
+        matches!(code, 12 | 23 | 24)
     }
 }
 

@@ -65,25 +65,26 @@ pub(crate) fn validate(
     }
     let passkey = user_info.passkey.ok_or(RegistrationError::Invalid)?;
     let key = passkey_to_key(&passkey).ok_or(RegistrationError::Invalid)?;
-    let uid = user_info
-        .uid
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or(RegistrationError::Invalid)?;
-    let gid = user_info
-        .gid
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or(RegistrationError::Invalid)?;
-    match peer {
+    // Unix socket ownership comes from the kernel, not the peer. A client
+    // that claims uid 0 must not be allowed to listen or connect as root
+    // (upstream #890 / 7d70aa2). Windows has no AF_UNIX peer credentials;
+    // the supplied ids stay, and the router token authenticates the pipe.
+    let (uid, gid) = match peer {
         #[cfg(unix)]
-        PeerIdentity::Unix {
-            uid: peer_uid,
-            gid: peer_gid,
-        } if uid != peer_uid || gid != peer_gid => return Err(RegistrationError::Invalid),
-        #[cfg(unix)]
-        PeerIdentity::Unix { .. } => {}
+        PeerIdentity::Unix { uid, gid } => (uid, gid),
         #[cfg(windows)]
-        PeerIdentity::AuthenticatedWindowsToken => {}
-    }
+        PeerIdentity::AuthenticatedWindowsToken => {
+            let uid = user_info
+                .uid
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or(RegistrationError::Invalid)?;
+            let gid = user_info
+                .gid
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or(RegistrationError::Invalid)?;
+            (uid, gid)
+        }
+    };
     let startup_ack = user_info.fd == Some(-6);
     Ok(Registration {
         id,
@@ -126,5 +127,22 @@ mod tests {
         assert_eq!(first, second);
         assert!(!first.same_generation(&second));
         assert!(!first.identity().same_generation(&second.identity()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kernel_credentials_replace_a_forged_uid() {
+        let mut supplied = info();
+        supplied.uid = Some(0);
+        supplied.gid = Some(0);
+        let registration = validate(supplied, PeerIdentity::Unix { uid: 501, gid: 20 }).unwrap();
+        assert_eq!(registration.uid, 501);
+        assert_eq!(registration.gid, 20);
+
+        let mut omitted = info();
+        omitted.uid = None;
+        omitted.gid = None;
+        let registration = validate(omitted, PeerIdentity::Unix { uid: 501, gid: 20 }).unwrap();
+        assert_eq!((registration.uid, registration.gid), (501, 20));
     }
 }

@@ -17,8 +17,7 @@ pub struct AgentForward {
     /// replayed only on connections to this path.
     #[cfg(unix)]
     socket_path: Option<String>,
-    /// OpenSSH session-bind request bodies. Empty until upstream #881 records
-    /// them and #879 binds them to the bootstrap host key.
+    /// OpenSSH session-bind request bodies recorded from bootstrap ssh (#879).
     #[cfg(unix)]
     session_binds: Vec<Vec<u8>>,
 }

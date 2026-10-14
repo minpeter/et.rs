@@ -388,6 +388,12 @@ fn every_socket_error_reconnects_including_sleep_timeout() {
         assert!(connection_ended(&ConnError::Io(kind.into())), "{kind:?}");
     }
     assert!(!connection_ended(&ConnError::Backpressure));
+    assert!(connection_ended(&ConnError::Read(
+        et_core::backed_reader::ReadError::Crypto(et_core::crypto::DecryptError::BadMac)
+    )));
+    assert!(connection_ended(&ConnError::Read(
+        et_core::backed_reader::ReadError::Unencrypted
+    )));
 }
 
 #[test]

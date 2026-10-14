@@ -37,7 +37,46 @@ pub fn pipe_name() -> io::Result<PathBuf> {
 #[cfg(unix)]
 pub fn connect(path: &Path) -> io::Result<Stream> {
     check_path(path)?;
-    Stream::connect(path)
+    let stream = Stream::connect(path)?;
+    // A squatter can bind the predictable path first. Refuse to send
+    // keystrokes unless the kernel says the peer is this user
+    // (upstream #890 / f8a3b18).
+    peer_is_current_user(&stream)?;
+    Ok(stream)
+}
+
+#[cfg(unix)]
+fn peer_is_current_user(stream: &Stream) -> io::Result<()> {
+    if peer_uid(stream)? == current_uid() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "HTM IPC server belongs to a different user",
+        ))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_uid(stream: &Stream) -> io::Result<u32> {
+    Ok(rustix::net::sockopt::socket_peercred(stream)?.uid.as_raw())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn current_uid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn peer_uid(stream: &Stream) -> io::Result<u32> {
+    nix::unistd::getpeereid(stream)
+        .map(|(uid, _gid)| uid.as_raw())
+        .map_err(|error| io::Error::from_raw_os_error(error as i32))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn current_uid() -> u32 {
+    nix::unistd::geteuid().as_raw()
 }
 
 #[cfg(unix)]
@@ -100,7 +139,10 @@ impl Listener {
     }
 
     pub fn accept(&self) -> io::Result<Stream> {
-        self.listener.accept().map(|(stream, _)| stream)
+        let (stream, _) = self.listener.accept()?;
+        // Drop the connection before any control bytes if the peer is not us.
+        peer_is_current_user(&stream)?;
+        Ok(stream)
     }
 
     pub fn retire(&mut self) -> io::Result<()> {

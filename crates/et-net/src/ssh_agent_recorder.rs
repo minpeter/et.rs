@@ -3,7 +3,7 @@
 //! The proxy relays every request to the real agent and keeps the last
 //! non-forwarded `session-bind@openssh.com` request in forwarded form.
 //! ProxyJump helpers bind before the destination, so the last binding belongs
-//! to the final host. Bootstrap wiring is upstream #879 and is not done here.
+//! to the final host. The et client starts this proxy for bootstrap ssh (#879).
 
 #[cfg(unix)]
 use std::io::Write;

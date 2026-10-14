@@ -9,8 +9,8 @@
 //! channel.
 //!
 //! [`SshAgentSessionBindRecorder`] records the binding bootstrap ssh sends to
-//! its agent (#881). Wiring that recorder into the bootstrap ssh invocation is
-//! still upstream #879, which is open, so the client does not supply binds yet.
+//! its agent (#881). The client wires that proxy in as `IdentityAgent` for
+//! the bootstrap ssh (#879).
 
 use std::io::{self, Write};
 use std::sync::OnceLock;

@@ -186,6 +186,18 @@ impl BackedWriter {
         self.connected = true;
         self.disconnected_bytes = 0;
         self.disconnected_packets = 0;
+        // Drop the oldest history the way a connected write trims, so a quick
+        // reconnect cannot stack another disconnect buffer on an untrimmed
+        // backup (upstream #890 / e3e49d5). Newest packets stay: they are the
+        // catchup a retry may still need. The live 8 MiB cap still applies on
+        // the next connected write.
+        while self.backup_size > MAX_BACKUP_BYTES {
+            let Some(old) = self.backup.pop_back() else {
+                break;
+            };
+            self.backup_size -= old.wire_len() as i64;
+        }
+        self.release_slack_capacity();
     }
 
     /// Zero sequence history and rekey from the original passkey.
@@ -381,6 +393,33 @@ mod tests {
         }
         // Beyond the connected cap, but every packet must stay replayable.
         assert_eq!(w.recover(0).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn revive_trims_oldest_history_above_the_backup_cap() {
+        let mut writer = writer(true);
+        let old = vec![0u8; 1024 * 1024];
+        for _ in 0..6 {
+            writer.write_packet(0, &old).unwrap();
+        }
+        writer.invalidate();
+        let chunk = vec![0u8; 20 * 1024 * 1024];
+        for _ in 0..3 {
+            assert_eq!(
+                writer.write_packet(0, &chunk).unwrap(),
+                WriterOutcome::BufferedOnly
+            );
+        }
+        let before = writer.recover(0).unwrap().len();
+        assert!(before > 3);
+        let sequence = writer.sequence();
+        writer.revive();
+        assert!(writer.recover(0).is_err());
+        assert_eq!(writer.recover(sequence - 3).unwrap().len(), 3);
+        assert!(matches!(
+            writer.write_packet(0, b"y").unwrap(),
+            WriterOutcome::Send(_)
+        ));
     }
 
     #[test]

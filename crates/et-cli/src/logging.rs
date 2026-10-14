@@ -1,7 +1,9 @@
 //! File logging, mirroring upstream `LogHandler` behaviour that the `--logdir`,
 //! `--logtostdout`, `--silent`, and `--verbose` flags control.
 //!
-//! Log files are named exactly like upstream:
+//! Each log line starts with an RFC3339 UTC timestamp
+//! (`YYYY-MM-DDTHH:MM:SS.mmmZ`). The `Z` is required: the clock is UTC, and a
+//! bare civil time is ambiguous. Log files are named exactly like upstream:
 //! `<prefix>-<YYYY-MM-DD_HH-MM-SS>.<micros>[_<pid>].log`, created inside
 //! `logdir` (which is created if missing), and rolled over in place once they
 //! exceed the configured maximum size. Rotation truncates the open file so the
@@ -364,11 +366,15 @@ fn timestamp() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let (year, month, day, hour, minute, second) = civil_from_unix(now.as_secs());
-    format!(
-        "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02},{:03}",
-        now.subsec_millis()
-    )
+    format_log_timestamp(now.as_secs(), now.subsec_millis())
+}
+
+/// RFC3339 UTC with millisecond fraction and an explicit `Z` marker.
+/// `subsec_millis` is `0..=999`, matching [`std::time::Duration::subsec_millis`].
+fn format_log_timestamp(seconds: u64, subsec_millis: u32) -> String {
+    debug_assert!(subsec_millis < 1_000);
+    let (year, month, day, hour, minute, second) = civil_from_unix(seconds);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{subsec_millis:03}Z")
 }
 
 /// Days-from-civil conversion (Howard Hinnant's algorithm), UTC.
@@ -626,6 +632,65 @@ mod tests {
         assert_eq!(civil_from_unix(0), (1970, 1, 1, 0, 0, 0));
         assert_eq!(civil_from_unix(1_000_000_000), (2001, 9, 9, 1, 46, 40));
         assert_eq!(civil_from_unix(1_700_000_000), (2023, 11, 14, 22, 13, 20));
+    }
+
+    /// `YYYY-MM-DDTHH:MM:SS.mmmZ` — rejects the old space/comma civil time.
+    fn parse_log_timestamp(stamp: &str) -> (i64, u32, u32, u32, u32, u32, u32) {
+        assert!(
+            stamp.ends_with('Z'),
+            "log timestamp must end with an explicit UTC marker, got {stamp}"
+        );
+        assert_eq!(stamp.len(), 24, "{stamp}");
+        let year: i64 = stamp[0..4].parse().expect("year");
+        assert_eq!(&stamp[4..5], "-");
+        let month: u32 = stamp[5..7].parse().expect("month");
+        assert_eq!(&stamp[7..8], "-");
+        let day: u32 = stamp[8..10].parse().expect("day");
+        assert_eq!(&stamp[10..11], "T", "date and time must be separated by T");
+        let hour: u32 = stamp[11..13].parse().expect("hour");
+        assert_eq!(&stamp[13..14], ":");
+        let minute: u32 = stamp[14..16].parse().expect("minute");
+        assert_eq!(&stamp[16..17], ":");
+        let second: u32 = stamp[17..19].parse().expect("second");
+        assert_eq!(&stamp[19..20], ".", "fraction must use a dot, not a comma");
+        let millis: u32 = stamp[20..23].parse().expect("millis");
+        (year, month, day, hour, minute, second, millis)
+    }
+
+    #[test]
+    fn log_timestamps_are_rfc3339_utc() {
+        assert_eq!(format_log_timestamp(0, 0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            parse_log_timestamp(&format_log_timestamp(0, 0)),
+            (1970, 1, 1, 0, 0, 0, 0)
+        );
+        assert_eq!(
+            format_log_timestamp(1_000_000_000, 123),
+            "2001-09-09T01:46:40.123Z"
+        );
+        assert_eq!(
+            format_log_timestamp(1_700_000_000, 7),
+            "2023-11-14T22:13:20.007Z"
+        );
+    }
+
+    #[test]
+    fn written_lines_prefix_rfc3339_utc() {
+        let directory = TestDirectory::new();
+        let mut logger = Logger::open(directory.options()).unwrap();
+        logger.write(0, "zone marker").unwrap();
+        let contents = fs::read_to_string(logger.path.clone().unwrap()).unwrap();
+        let line = contents.lines().next().unwrap();
+        let stamp = line
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix("] zone marker"))
+            .expect("log line must be [timestamp] message");
+        let (year, month, day, hour, minute, second, millis) = parse_log_timestamp(stamp);
+        assert!((1970..10000).contains(&year));
+        assert!((1..=12).contains(&month));
+        assert!((1..=31).contains(&day));
+        assert!(hour < 24 && minute < 60 && second < 60 && millis < 1_000);
+        assert!(!stamp.contains(' ') && !stamp.contains(','));
     }
 
     #[test]

@@ -15,7 +15,7 @@ use wait_timeout::ChildExt;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 #[test]
-fn real_client_ghostty_fallback_bootstrap_server_bridge_and_pty_emit_color() {
+fn real_client_setenv_term_overrides_bootstrap_term_in_pty() {
     let directory = std::env::temp_dir().join(format!("et-rs-terminal-e2e-{}", std::process::id()));
     let _ = fs::remove_dir_all(&directory);
     fs::create_dir(&directory).unwrap();
@@ -51,7 +51,13 @@ fn real_client_ghostty_fallback_bootstrap_server_bridge_and_pty_emit_color() {
         &ssh,
         "#!/bin/sh\n\
          if [ \"$1\" = \"-G\" ]; then\n\
-           printf 'hostname 127.0.0.1\\nuser tester\\n'\n\
+           for arg in \"$@\"; do\n\
+             if [ \"$arg\" = \"-oSetEnv=ET_RS_CONFIG_SENTINEL=1\" ]; then\n\
+               printf 'hostname 127.0.0.1\\nuser tester\\nsetenv ET_RS_CONFIG_SENTINEL=1\\nsendenv COLORTERM\\n'\n\
+               exit 0\n\
+             fi\n\
+           done\n\
+           printf 'hostname 127.0.0.1\\nuser tester\\nsetenv TERM=xterm-256color\\nsendenv COLORTERM\\n'\n\
            exit 0\n\
          fi\n\
          for last do :; done\n\
@@ -66,7 +72,7 @@ fn real_client_ghostty_fallback_bootstrap_server_bridge_and_pty_emit_color() {
     let mut client = Command::new(env!("CARGO_BIN_EXE_et"))
         .env("PATH", format!("{}:{existing_path}", directory.display()))
         .env("HOME", &home)
-        .env("TERM", "xterm-ghostty")
+        .env("TERM", "xterm-kitty")
         .env("COLORTERM", "truecolor")
         .args(["--terminal-path"])
         .arg(&terminal)
@@ -76,7 +82,7 @@ fn real_client_ghostty_fallback_bootstrap_server_bridge_and_pty_emit_color() {
         .arg(port.to_string())
         .args([
             "--command",
-            "case \"$TERM\" in xterm-color|*-256color) printf '\\033[01;32mGHOSTTY-GREEN\\033[00m:\\033[01;34mGHOSTTY-BLUE\\033[00m\\n';; esac; printf 'FULL-PTY:%s:%s\\n' \"$TERM\" \"${COLORTERM-}\"",
+            "case \"$TERM\" in xterm-color|*-256color) printf '\\033[01;32mSETENV-GREEN\\033[00m:\\033[01;34mSETENV-BLUE\\033[00m\\n';; esac; printf 'FULL-PTY:%s:%s\\n' \"$TERM\" \"${COLORTERM-}\"",
             "127.0.0.1",
         ])
         .stdin(Stdio::null())
@@ -106,11 +112,11 @@ fn real_client_ghostty_fallback_bootstrap_server_bridge_and_pty_emit_color() {
         "{stdout_text:?}"
     );
     assert!(
-        stdout_text.contains("\u{1b}[01;32mGHOSTTY-GREEN\u{1b}[00m"),
+        stdout_text.contains("\u{1b}[01;32mSETENV-GREEN\u{1b}[00m"),
         "{stdout_text:?}"
     );
     assert!(
-        stdout_text.contains("\u{1b}[01;34mGHOSTTY-BLUE\u{1b}[00m"),
+        stdout_text.contains("\u{1b}[01;34mSETENV-BLUE\u{1b}[00m"),
         "{stdout_text:?}"
     );
 

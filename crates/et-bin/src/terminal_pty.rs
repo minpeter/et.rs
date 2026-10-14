@@ -103,7 +103,7 @@ where
         return run_idle(router, started);
     }
     if initialization.no_pty {
-        return crate::terminal_pipe::run(router, initialization, started);
+        return crate::terminal_pipe::run(router, term, initialization, started);
     }
     // Default sessions now also retain interruptible output in userspace.
     match initialization.flow_control {
@@ -124,6 +124,10 @@ where
         .map_err(|error| format!("could not open PTY: {error}"))?;
     command.env("TERM", term);
     for (name, value) in initialization.environment {
+        #[cfg(windows)]
+        if name.eq_ignore_ascii_case("TERM") {
+            command.env_remove("TERM");
+        }
         command.env(name, value);
     }
     // The bootstrap SSH tty (or client-provided SSH_TTY) is not this session's

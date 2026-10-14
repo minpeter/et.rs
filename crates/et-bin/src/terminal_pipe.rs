@@ -38,6 +38,7 @@ enum PipeEvent {
 
 pub(crate) fn run<F>(
     mut router: LocalStream,
+    term: &str,
     initialization: TerminalInitialization,
     started: F,
 ) -> Result<i32, String>
@@ -52,7 +53,7 @@ where
         return Err("pipe command contains NUL".to_owned());
     }
 
-    let mut child = spawn_command(&command, &initialization.environment)?;
+    let mut child = spawn_command(&command, term, &initialization.environment)?;
     let stdin = child
         .stdin
         .take()
@@ -147,7 +148,11 @@ where
     Ok(0)
 }
 
-fn spawn_command(script: &str, environment: &[(String, String)]) -> Result<Child, String> {
+fn spawn_command(
+    script: &str,
+    term: &str,
+    environment: &[(String, String)],
+) -> Result<Child, String> {
     let mut command = shell_command(script);
     command
         .stdin(Stdio::piped())
@@ -160,7 +165,12 @@ fn spawn_command(script: &str, environment: &[(String, String)]) -> Result<Child
             command.current_dir(home);
         }
     }
+    command.env("TERM", term);
     for (name, value) in environment {
+        #[cfg(windows)]
+        if name.eq_ignore_ascii_case("TERM") {
+            command.env_remove("TERM");
+        }
         command.env(name, value);
     }
     command.env("ET_VERSION", env!("CARGO_PKG_VERSION"));

@@ -1171,15 +1171,8 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
             .map(String::as_str),
         Some("C.UTF-8")
     );
-    assert_eq!(
-        payload
-            .environmentvariables
-            .get("COLORTERM")
-            .map(String::as_str),
-        Some("truecolor")
-    );
-    assert_eq!(payload.environmentvariables.len(), 3);
-
+    assert!(!payload.environmentvariables.contains_key("COLORTERM"));
+    assert_eq!(payload.environmentvariables.len(), 2);
     let invocations = fake.work_invocations();
     assert_eq!(invocations.len(), 3);
     assert_eq!(
@@ -1206,7 +1199,7 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
     );
     let prefix = "printf '%s\\n' '";
     let value = argv[6].strip_prefix(prefix).unwrap();
-    let provisional = value.split_once("_xterm-256color'").unwrap().0;
+    let provisional = value.split_once("_xterm-ghostty'").unwrap().0;
     let (id, key) = parse_id_passkey(provisional).unwrap();
     assert!(id.starts_with("XXX"));
     assert_eq!(id.len(), 16);
@@ -1214,7 +1207,7 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
     assert_eq!(
         argv[6],
         format!(
-            "printf '%s\\n' '{provisional}_xterm-256color' | '/opt/et terminal' '--verbose=2' '--serverfifo=/tmp/server fifo'"
+            "printf '%s\\n' '{provisional}_xterm-ghostty' | '/opt/et terminal' '--verbose=2' '--serverfifo=/tmp/server fifo'"
         )
     );
 }
@@ -1237,7 +1230,7 @@ fn effective_ssh_config_drives_native_jump_agent_and_environment() {
     for cli_override in [false, true] {
         let (port, server) = initial_payload_server_with_error(Some("captured config payload"));
         let fake = FakeSsh::new();
-        let config = format!("{RESOLVED_CONFIG}proxyjump config-user@jump-alias:2200\nforwardagent yes\nidentityagent /tmp/config agent\nsetenv APP=two words=a=b  \nsetenv EMPTY=\nsetenv LANG=config-locale\nsetenv TERM=bad-term\nsetenv COLORTERM=bad-color\nsetenv SSH_AUTH_SOCK=bad-agent\nsetenv ET_PIPE=bad-pipe\n");
+        let config = format!("{RESOLVED_CONFIG}proxyjump config-user@jump-alias:2200\nforwardagent yes\nidentityagent /tmp/config agent\nsetenv APP=two words=a=b  \nsetenv EMPTY=\nsetenv LANG=config-locale\nsetenv TERM=xterm-256color\nsetenv COLORTERM=config-color\nsetenv SSH_AUTH_SOCK=bad-agent\nsetenv ET_PIPE=bad-pipe\n");
         let mut command = fake.command(&config, VALID_MARKER, 0, "");
         command
             .env("TERM", "xterm-ghostty")
@@ -1266,12 +1259,13 @@ fn effective_ssh_config_drives_native_jump_agent_and_environment() {
             stderr(&output)
         );
         assert_eq!(payload.jumphost, Some(true));
-        assert_eq!(payload.environmentvariables.len(), 4);
+        assert_eq!(payload.environmentvariables.len(), 5);
         for (name, value) in [
             ("APP", "two words=a=b  "),
             ("EMPTY", ""),
             ("LANG", "config-locale"),
-            ("COLORTERM", "truecolor"),
+            ("TERM", "xterm-256color"),
+            ("COLORTERM", "config-color"),
         ] {
             assert_eq!(payload.environmentvariables[name], value);
         }
@@ -1406,7 +1400,7 @@ fn windows_sessions_receive_explicit_setenv_without_inherited_locale() {
     for explicit in [false, true] {
         let (port, server) = initial_payload_server_with_error(Some("captured Windows payload"));
         let fake = FakeSsh::new();
-        let config = format!("{RESOLVED_CONFIG}proxyjump jump-alias\nsetenv APP=literal & value\nsetenv app=wrong-case-duplicate\nsetenv COLORTERM=explicit-color\nsetenv LANG=explicit-locale\nsetenv term=do-not-override\nsetenv et_pipe=do-not-override\n");
+        let config = format!("{RESOLVED_CONFIG}proxyjump jump-alias\nsetenv APP=literal & value\nsetenv app=wrong-case-duplicate\nsetenv COLORTERM=explicit-color\nsetenv LANG=explicit-locale\nsetenv TERM=xterm-256color\nsetenv term=wrong-case-duplicate\nsetenv et_pipe=do-not-override\n");
         let mut command = fake.command(&config, VALID_MARKER, 0, "");
         command
             .env("TERM", "xterm-ghostty")
@@ -1434,11 +1428,12 @@ fn windows_sessions_receive_explicit_setenv_without_inherited_locale() {
             "{}",
             stderr(&output)
         );
-        assert_eq!(payload.environmentvariables.len(), 3);
+        assert_eq!(payload.environmentvariables.len(), 4);
         for (name, value) in [
             ("APP", "literal & value"),
             ("COLORTERM", "explicit-color"),
             ("LANG", "explicit-locale"),
+            ("TERM", "xterm-256color"),
         ] {
             assert_eq!(payload.environmentvariables[name], value);
         }
@@ -1588,13 +1583,6 @@ fn posix_client_filters_locale_to_terminal_environment_limits() {
             .map(String::as_str),
         Some("C")
     );
-    assert_eq!(
-        payload
-            .environmentvariables
-            .get("COLORTERM")
-            .map(String::as_str),
-        Some("truecolor")
-    );
     assert!(!payload.environmentvariables.contains_key("LC_\u{1f4a5}"));
     assert!(!payload.environmentvariables.contains_key("LC_OVERSIZED"));
     assert_eq!(payload.environmentvariables.len(), 128);
@@ -1652,13 +1640,6 @@ fn posix_client_counts_duplicate_tunnel_environment_names_once() {
             .get("LC_ALL")
             .map(String::as_str),
         Some("C")
-    );
-    assert_eq!(
-        payload
-            .environmentvariables
-            .get("COLORTERM")
-            .map(String::as_str),
-        Some("truecolor")
     );
     assert_eq!(payload.environmentvariables.len(), 127);
 }
@@ -1772,8 +1753,7 @@ fn bare_windows_login_shell_is_detected_before_bootstrap() {
     let bootstrap = invocations[2].last().unwrap();
     assert!(bootstrap.starts_with("echo "), "{bootstrap}");
     assert!(bootstrap.contains("\"et.exe\""), "{bootstrap}");
-    assert!(bootstrap.contains("_xterm-256color|"), "{bootstrap}");
-    assert!(!bootstrap.contains("_xterm-ghostty"), "{bootstrap}");
+    assert!(bootstrap.contains("_xterm-ghostty|"), "{bootstrap}");
     assert!(!bootstrap.contains("printf"), "{bootstrap}");
 }
 
@@ -1833,7 +1813,7 @@ fn explicit_posix_shell_skips_probe_and_uses_exact_posix_bootstrap() {
     let input = bootstrap[5]
         .strip_prefix("printf '%s\\n' '")
         .unwrap()
-        .strip_suffix("_xterm-256color' | 'etterminal' '--verbose=0'")
+        .strip_suffix("_xterm-ghostty' | 'etterminal' '--verbose=0'")
         .unwrap();
     let (id, passkey) = parse_id_passkey(input).unwrap();
     assert!(id.starts_with("XXX"));
@@ -2025,66 +2005,6 @@ fn excessive_unique_tunnel_environment_names_fail_before_ssh_bootstrap() {
 }
 
 #[test]
-fn colorterm_counts_toward_the_tunnel_environment_limit() {
-    let fake = FakeSsh::new();
-    let mut arguments = vec!["--no-terminal".to_owned()];
-    for index in 0..128 {
-        arguments.extend([
-            "-r".to_owned(),
-            format!("ET_PIPE_{index:03}:remote-{index}"),
-        ]);
-    }
-    arguments.push("server-alias:1".to_owned());
-    let output = fake
-        .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
-        .env("TERM", "xterm-ghostty")
-        .env("COLORTERM", "truecolor")
-        .args(arguments)
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert!(
-        stderr(&output).contains("terminal environment has 129 reserved names; maximum is 128"),
-        "{}",
-        stderr(&output)
-    );
-    assert_eq!(fake.invocations().len(), 1);
-}
-
-#[test]
-fn non_posix_colorterm_does_not_reserve_an_unsent_environment_name() {
-    let no_ssh = TestDir::new("honest");
-    let mut arguments = vec![
-        "--no-terminal".to_owned(),
-        "--winserver".to_owned(),
-        "--jumphost".to_owned(),
-        "jump-alias".to_owned(),
-    ];
-    for index in 0..128 {
-        arguments.extend([
-            "-r".to_owned(),
-            format!("ET_PIPE_{index:03}:remote-{index}"),
-        ]);
-    }
-    arguments.push("example.test".to_owned());
-
-    let output = Command::new(env!("CARGO_BIN_EXE_et"))
-        .env("PATH", &no_ssh.0)
-        .env("TERM", "xterm-ghostty")
-        .env("COLORTERM", "truecolor")
-        .args(arguments)
-        .output()
-        .unwrap();
-
-    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
-    assert!(
-        stderr(&output).contains("could not start system ssh"),
-        "{}",
-        stderr(&output)
-    );
-}
-
-#[test]
 fn oversized_tunnel_environment_name_exceeds_local_packet_limit() {
     let fake = FakeSsh::new();
     let environment_name = format!("E{}", "T".repeat(MAX_LOCAL_PACKET_LEN));
@@ -2134,39 +2054,6 @@ fn oversized_jumphost_initialization_fails_before_ssh_bootstrap() {
         stderr(&output)
     );
     assert_eq!(fake.invocations().len(), 1);
-}
-
-#[test]
-fn non_posix_jumphost_ignores_unsent_colorterm_in_packet_budget() {
-    let no_ssh = TestDir::new("honest");
-    let mut arguments = vec![
-        "--no-terminal".to_owned(),
-        "--winserver".to_owned(),
-        "--jumphost".to_owned(),
-        "jump-alias".to_owned(),
-    ];
-    let destination = format!("remote-{}", "x".repeat(486));
-    for _ in 0..127 {
-        arguments.extend(["-r".to_owned(), format!("ET_PIPE:{destination}")]);
-    }
-    let boundary_destination = format!("remote-{}", "x".repeat(587));
-    arguments.extend(["-r".to_owned(), format!("ET_PIPE:{boundary_destination}")]);
-    arguments.push("example.test".to_owned());
-
-    let output = Command::new(env!("CARGO_BIN_EXE_et"))
-        .env("PATH", &no_ssh.0)
-        .env("TERM", "xterm-ghostty")
-        .env("COLORTERM", "truecolor")
-        .args(arguments)
-        .output()
-        .unwrap();
-
-    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
-    assert!(
-        stderr(&output).contains("could not start system ssh"),
-        "{}",
-        stderr(&output)
-    );
 }
 
 #[test]
@@ -2256,11 +2143,7 @@ fn jumphost_starts_a_jump_terminal_and_connects_to_the_jumphost() {
         "{destination_command:?}"
     );
     assert!(
-        destination_command.contains("_xterm-256color|"),
-        "{destination_command:?}"
-    );
-    assert!(
-        !destination_command.contains("_xterm-ghostty"),
+        destination_command.contains("_xterm-ghostty|"),
         "{destination_command:?}"
     );
     assert_eq!(invocations[3], ["-G", "-T", "jump.example"]);
@@ -2279,11 +2162,7 @@ fn jumphost_starts_a_jump_terminal_and_connects_to_the_jumphost() {
     // The jumphost remains POSIX even when the destination probe selects Cmd.
     assert!(jump_command.contains("'etterminal'"), "{jump_command:?}");
     assert!(!jump_command.contains("et.exe"), "{jump_command:?}");
-    assert!(
-        jump_command.contains("_xterm-256color'"),
-        "{jump_command:?}"
-    );
-    assert!(!jump_command.contains("_xterm-ghostty"), "{jump_command:?}");
+    assert!(jump_command.contains("_xterm-ghostty'"), "{jump_command:?}");
     assert!(jump_command.contains("'--jump'"), "{jump_command:?}");
     assert!(
         jump_command.contains("'--dsthost=127.0.0.1'"),

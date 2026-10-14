@@ -18,6 +18,7 @@ use crate::initial_connect::{connect_initial_with_intent, Endpoint};
 use crate::resolver::EndpointResolver;
 
 const VERSION: &str = "1";
+const MISSING_SESSION: &str = "session not found or ended";
 
 #[cfg(unix)]
 pub fn load_for(
@@ -150,9 +151,7 @@ pub fn attach(
     match attach_saved(saved, args, resolver, deadline) {
         Err(ClientError::ServerInvalidKey(message)) if registration_missing(message.as_deref()) => {
             forget_ended(name, &id);
-            Err(ClientError::Terminal(
-                "session not found or ended".to_owned(),
-            ))
+            Err(ClientError::Terminal(MISSING_SESSION.to_owned()))
         }
         result => result,
     }
@@ -571,12 +570,15 @@ fn read_private(path: &Path) -> Result<String, String> {
 #[cfg(unix)]
 fn read_private_unix(path: &Path) -> Result<String, String> {
     use rustix::fs::{fstat, open, FileType, Mode, OFlags};
-    let descriptor = open(
+    let descriptor = match open(
         path,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::NOFOLLOW,
         Mode::empty(),
-    )
-    .map_err(|_| "could not open the session file".to_owned())?;
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(rustix::io::Errno::NOENT) => return Err(MISSING_SESSION.to_owned()),
+        Err(_) => return Err("could not open the session file".to_owned()),
+    };
     let stat = fstat(&descriptor).map_err(|_| "could not inspect the session file".to_owned())?;
     let regular = FileType::from_raw_mode(stat.st_mode).is_file();
     if !regular
@@ -601,8 +603,13 @@ fn read_private_windows(path: &Path) -> Result<String, String> {
     if !private_file(path)? {
         return Err("session file has unsafe owner or permissions".to_owned());
     }
-    let mut file =
-        fs::File::open(path).map_err(|_| "could not open the session file".to_owned())?;
+    let mut file = fs::File::open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            MISSING_SESSION.to_owned()
+        } else {
+            "could not open the session file".to_owned()
+        }
+    })?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)
         .map_err(|_| "could not read the session file".to_owned())?;
@@ -667,8 +674,13 @@ fn private_dir(path: &Path) -> Result<bool, String> {
 
 #[cfg(windows)]
 fn private_file(path: &Path) -> Result<bool, String> {
-    let metadata =
-        fs::symlink_metadata(path).map_err(|_| "could not inspect the session file".to_owned())?;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(MISSING_SESSION.to_owned());
+        }
+        Err(_) => return Err("could not inspect the session file".to_owned()),
+    };
     Ok(metadata.is_file() && !metadata.file_type().is_symlink())
 }
 
@@ -676,18 +688,30 @@ fn private_file(path: &Path) -> Result<bool, String> {
 mod tests {
     use super::*;
 
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn missing_session_file_reports_ended() {
+        let home = isolated_home();
+        assert_eq!(load("missing").unwrap_err(), MISSING_SESSION);
+        let sessions = home.directory.join(".et").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        assert_eq!(load("missing").unwrap_err(), MISSING_SESSION);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn other_session_open_errors_stay_generic() {
+        let home = isolated_home();
+        let sessions = home.directory.join(".et").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        std::os::unix::fs::symlink("missing-target", sessions.join("work")).unwrap();
+        assert_eq!(load("work").unwrap_err(), "could not open the session file");
+    }
+
     #[test]
     fn round_trip_hides_the_passkey_from_errors() {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock().unwrap();
-        let directory = std::env::temp_dir().join(format!(
-            "et-sessions-{}-{}",
-            std::process::id(),
-            saved_nonce()
-        ));
-        let _ = fs::remove_dir_all(&directory);
-        let previous = std::env::var_os("HOME");
-        std::env::set_var("HOME", &directory);
+        let home = isolated_home();
         let session = SavedSession {
             name: "work".to_owned(),
             host: "example.test".to_owned(),
@@ -717,23 +741,48 @@ mod tests {
             assert_eq!(load("work").unwrap().id, session.id);
         }
         let _ = fs::write(
-            directory.join(".et").join("sessions").join("work"),
+            home.directory.join(".et").join("sessions").join("work"),
             b"not a session\nSECRETKEY",
         );
         let error = load("work").unwrap_err();
         assert!(!error.contains("SECRETKEY"));
         assert!(!error.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"));
-        match previous {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
-        let _ = fs::remove_dir_all(&directory);
     }
 
-    fn saved_nonce() -> u128 {
-        std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+    struct IsolatedHome {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+        directory: PathBuf,
+    }
+
+    fn isolated_home() -> IsolatedHome {
+        let guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let directory = std::env::temp_dir().join(format!(
+            "et-sessions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let previous = std::env::var_os("HOME");
+        std::env::set_var("HOME", &directory);
+        IsolatedHome {
+            _guard: guard,
+            previous,
+            directory,
+        }
+    }
+
+    impl Drop for IsolatedHome {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+            let _ = fs::remove_dir_all(&self.directory);
+        }
     }
 }

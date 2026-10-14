@@ -55,7 +55,6 @@ pub fn load_for(
     }
 }
 
-#[cfg(unix)]
 pub fn remove_if_matches(name: &str, id: &str) -> Result<bool, ClientError> {
     if !valid_name(name) {
         return Err(ClientError::Terminal("invalid session name".to_owned()));
@@ -64,6 +63,7 @@ pub fn remove_if_matches(name: &str, id: &str) -> Result<bool, ClientError> {
     if !directory.exists() {
         return Ok(false);
     }
+    #[cfg(unix)]
     let _lock = crate::local_ipc::lock_directory(&directory)
         .map_err(|e| ClientError::Terminal(e.to_string()))?;
     let path = directory.join(name);
@@ -146,7 +146,30 @@ pub fn attach(
     deadline: Deadline,
 ) -> Result<i32, ClientError> {
     let saved = load(name).map_err(ClientError::Terminal)?;
-    attach_saved(saved, args, resolver, deadline)
+    let id = saved.id.clone();
+    match attach_saved(saved, args, resolver, deadline) {
+        Err(ClientError::ServerInvalidKey(message)) if registration_missing(message.as_deref()) => {
+            forget_ended(name, &id);
+            Err(ClientError::Terminal(
+                "session not found or ended".to_owned(),
+            ))
+        }
+        result => result,
+    }
+}
+
+/// The server no longer has this client, so a saved name must not stay listed.
+pub fn forget_ended(name: &str, id: &str) {
+    if let Err(error) = remove_if_matches(name, id) {
+        eprintln!("et: could not clean up saved session: {error}");
+    }
+}
+
+fn registration_missing(message: Option<&str>) -> bool {
+    message.is_some_and(|message| {
+        let message = message.to_ascii_lowercase();
+        message.contains("not registered") || message.contains("registration disconnected")
+    })
 }
 
 pub fn attach_saved(
@@ -223,7 +246,7 @@ pub fn attach_saved(
     }
     #[cfg(unix)]
     crate::local_daemon::ready().map_err(|e| ClientError::Terminal(e.to_string()))?;
-    crate::client_terminal::run(
+    let finish = crate::client_terminal::run(
         connection,
         crate::client_terminal::TerminalOptions {
             command: None,
@@ -239,7 +262,11 @@ pub fn attach_saved(
         },
         forwarder,
         reconnect_session,
-    )
+    )?;
+    if finish.remote_ended {
+        forget_ended(&saved.name, &saved.id);
+    }
+    Ok(finish.code)
 }
 
 pub fn kill(

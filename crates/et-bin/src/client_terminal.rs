@@ -72,6 +72,9 @@ pub(crate) fn wants_remote_exit_status(command: Option<&str>, no_exit: bool, std
 pub(crate) struct RemoteExit {
     want: bool,
     code: Mutex<Option<i32>>,
+    /// The remote shell reported `TERMINAL_EXIT_STATUS`. Interactive sessions
+    /// keep exit code 0, but the named-session file must still be dropped.
+    ended: std::sync::atomic::AtomicBool,
 }
 
 impl RemoteExit {
@@ -79,6 +82,7 @@ impl RemoteExit {
         Self {
             want,
             code: Mutex::new(None),
+            ended: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -91,6 +95,16 @@ impl RemoteExit {
                 *slot = Some(code);
             }
         }
+    }
+
+    pub(crate) fn mark_ended(&self) {
+        self.ended.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The remote shell has exited. Command sessions also expose that through
+    /// [`Self::ready`] once a status code is stored.
+    pub(crate) fn session_ended(&self) -> bool {
+        self.ended.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// A command session has received its status.
@@ -110,9 +124,17 @@ pub(crate) fn note_exit_status(remote_exit: &RemoteExit, packet: &et_core::packe
     let Ok(message) = TerminalExitStatus::decode(packet.payload()) else {
         return;
     };
+    remote_exit.mark_ended();
     if let Some(code) = message.exitcode {
         remote_exit.record(code);
     }
+}
+
+/// Result of a finished client terminal loop.
+pub struct TerminalFinish {
+    pub code: i32,
+    /// The remote shell exited, or the server no longer has this client.
+    pub remote_ended: bool,
 }
 
 pub(crate) fn console_pipe_closed(error: &io::Error) -> bool {
@@ -131,7 +153,7 @@ pub fn run<F>(
     options: TerminalOptions<'_>,
     mut forwarder: Forwarder,
     mut reconnect: F,
-) -> Result<i32, ClientError>
+) -> Result<TerminalFinish, ClientError>
 where
     F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
 {
@@ -148,6 +170,15 @@ where
         stdio_forward,
     } = options;
     let remote_exit = RemoteExit::new(wants_remote_exit_status(command, no_exit, stdio_forward));
+    let reconnect_ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reconnect_flag = std::sync::Arc::clone(&reconnect_ended);
+    let mut reconnect = move |connection: &mut Connection| {
+        let outcome = reconnect(connection)?;
+        if matches!(outcome, ReconnectOutcome::SessionEnded) {
+            reconnect_flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(outcome)
+    };
     let hangup = if close_on_hangup {
         crate::client_hangup::HangupClose::install()
             .map_err(|error| terminal_io("installing hangup close handler", error))?
@@ -177,7 +208,11 @@ where
                 write_terminal_size_recovering(&mut connection, &initial_size, &mut reconnect)?,
                 OwnedWriteOutcome::SessionEnded
             ) {
-                return raw_mode.finish(Ok(0), close_message, terminal_modes.alternate_screen());
+                return finished(
+                    raw_mode.finish(Ok(0), close_message, terminal_modes.alternate_screen()),
+                    &remote_exit,
+                    &reconnect_ended,
+                );
             }
         }
     }
@@ -196,7 +231,11 @@ where
                 )?,
                 OwnedWriteOutcome::SessionEnded
             ) {
-                return raw_mode.finish(Ok(0), close_message, terminal_modes.alternate_screen());
+                return finished(
+                    raw_mode.finish(Ok(0), close_message, terminal_modes.alternate_screen()),
+                    &remote_exit,
+                    &reconnect_ended,
+                );
             }
         }
     }
@@ -280,7 +319,24 @@ where
         &mut forwarder,
         reconnect,
     );
-    raw_mode.finish(result, close_message, terminal_modes.alternate_screen())
+    finished(
+        raw_mode.finish(result, close_message, terminal_modes.alternate_screen()),
+        &remote_exit,
+        &reconnect_ended,
+    )
+}
+
+fn finished(
+    result: Result<i32, ClientError>,
+    remote_exit: &RemoteExit,
+    reconnect_ended: &std::sync::atomic::AtomicBool,
+) -> Result<TerminalFinish, ClientError> {
+    let code = result?;
+    Ok(TerminalFinish {
+        code,
+        remote_ended: remote_exit.session_ended()
+            || reconnect_ended.load(std::sync::atomic::Ordering::Acquire),
+    })
 }
 
 /// Device Status Report request (`ESC [ 6 n`).

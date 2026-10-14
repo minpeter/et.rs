@@ -1,25 +1,9 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Write an explicit foreground pid file\n\n`etserver --pidfile PATH` now records the server process id when the server\nstays in the foreground. The file is written with the same hardened pid\nwriter as `--daemon`: mode 0600, and refused when the path is a symlink, an\nextra hard link, a fifo, or has a writable ancestor.\n\nUpstream EternalTerminal writes that file only inside `DaemonCreator::create`\nand never unlinks it. A clean foreground shutdown leaves the file in place,\nmatching the daemon. Protocol v6 is unchanged.\n"
-    filename: foreground-pidfile.md
-    v: 0.0.0
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Reap disconnected forward-only sessions\n\nA `--no-terminal` session that only serves port forwards, and a shell-less\n`-N` or `-W` session, now advertises a 5-minute\n`disconnect_timeout_seconds` when `--disconnect-timeout` is omitted. etserver\ncloses the detached terminal after that long with no client attached, instead\nof leaving it reparented forever while the server default stays 0.\n\nInteractive sessions, and `--no-terminal` with no forwards, still leave the\nfield unset so reconnect stays unlimited unless a timeout is configured.\n`--disconnect-timeout 0` keeps a forward-only session too. Upstream\nEternalTerminal applies one server default to every session and does not\nspecial-case forward-only clients. Protocol v6 is unchanged.\n"
-    filename: forward-only-disconnect.md
-    v: 0.0.0
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Drop ended named sessions\n\nWhen a named session's shell exits, etserver removes that terminal from its\nregistry and the client deletes the saved session file. `et --list` no longer\nshows the session. `et --attach` reports that the session was not found or has\nended when that file is missing, including a name that never existed, instead\nof failing to open the file or rejecting the session key. Other failures while\nopening the session file are unchanged. Protocol v6 is unchanged.\n"
-    filename: named-session-end.md
-    v: 0.0.0
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Parse et options after the destination\n\nFlags placed after the destination are et options, matching EternalTerminal's\ncxxopts parser. `et host --command 'echo hi'` runs `echo hi` on the remote\nshell. An explicit `--` ends option parsing, and the following words are the\nremote command, including tokens that look like flags. A token that is not an\net option, such as `echo -n`, also stays in that command. Protocol v6 is\nunchanged.\n"
-    filename: parse-options-after-host.md
-    v: 0.0.0
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Mark log timestamps as UTC\n\n`et`, `etserver`, and `etterminal` log lines now use an RFC3339 timestamp with\nan explicit `Z` UTC marker, for example `2026-10-14T02:48:00.123Z`. The\nprevious `YYYY-MM-DD HH:MM:SS,mmm` form was UTC with no zone, so a reader\ncould treat `02:48` as local time. Log file names are unchanged. Protocol v6\nis unchanged.\n"
-    filename: rfc3339-log-timestamps.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Match upstream TERM forwarding and SetEnv TERM overrides\n\nForward the local `TERM` value unchanged during SSH bootstrap (defaulting to\n`xterm-256color` only when `TERM` is unset or empty) and allow `SetEnv TERM`\nand `SendEnv TERM` from SSH configuration or `-o` to override the session\n`TERM`, matching upstream EternalTerminal (#679, #725, #870). Remove the\nnon-upstream `xterm-ghostty` fallback and automatic `COLORTERM` injection.\n"
+    filename: upstream-term-setenv.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - foreground-pidfile.md
-      - forward-only-disconnect.md
-      - named-session-end.md
-      - parse-options-after-host.md
-      - rfc3339-log-timestamps.md
+      - upstream-term-setenv.md
     id: cargo:et
     updated: true

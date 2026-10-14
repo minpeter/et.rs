@@ -20,6 +20,7 @@ use et_net::handshake::{
 use et_net::local_packet::{write_local_packet, write_local_packet_cancelled};
 use prost::Message;
 
+use crate::registry::RegistrationIdentity;
 use crate::runtime_state::{PreAuthGuard, RawSocketGuard, RuntimeCore};
 use crate::session::ActiveSession;
 use crate::session_table::SessionClaim;
@@ -176,7 +177,19 @@ pub(crate) fn handle(
     if !legacy {
         match core.registry.get(&id) {
             Ok(Some(current)) if current.key == registration.key => registration = current,
-            _ => {
+            // The terminal ended after the challenge was issued. The proof
+            // already matched; this is a missing session, not a bad passkey.
+            Ok(None) | Err(_) => {
+                reject(
+                    &mut stream,
+                    ConnectStatus::InvalidKey,
+                    "client is not registered",
+                    &peer,
+                    Some(&id),
+                );
+                return;
+            }
+            Ok(Some(_)) => {
                 reject(
                     &mut stream,
                     ConnectStatus::InvalidKey,
@@ -603,6 +616,7 @@ fn handle_new(
             .unwrap_or(core.disconnect_timeout_seconds),
     ));
     active.start_flow_writer();
+    let identity = start.registration().identity();
     if start.activate(active.clone()).is_err() {
         crate::diag::info(format!("id={id}: could not activate session for {peer}"));
         return;
@@ -611,6 +625,7 @@ fn handle_new(
     let _ = crate::terminal_bridge::run(active.clone(), terminal, forwarder);
     crate::diag::info(format!("id={id}: terminal bridge ended for {peer}"));
     let _ = active.finish_terminal();
+    retire_ended_terminal(core, &identity);
 }
 
 /// Upstream `TerminalServer::runJumpHost`: answer the initial response, hand
@@ -760,6 +775,7 @@ fn run_jumphost(
             .unwrap_or(core.disconnect_timeout_seconds),
     ));
     active.start_flow_writer();
+    let identity = start.registration().identity();
     if start.activate(active.clone()).is_err() {
         crate::diag::info(format!("id={id}: jumphost could not activate session"));
         return;
@@ -779,6 +795,7 @@ fn run_jumphost(
     );
     crate::diag::info(format!("id={id}: jumphost bridge ended for {peer}"));
     let _ = active.finish_terminal();
+    retire_ended_terminal(core, &identity);
 }
 
 fn wait_for_terminal_startup(
@@ -1002,6 +1019,7 @@ fn resume_pty_session(
             .unwrap_or(core.disconnect_timeout_seconds),
     ));
     active.start_flow_writer();
+    let identity = start.registration().identity();
     if start.activate(active.clone()).is_err() {
         return;
     }
@@ -1014,6 +1032,39 @@ fn resume_pty_session(
     ));
     let _ = crate::terminal_bridge::run(active.clone(), terminal, forwarder);
     let _ = active.finish_terminal();
+    retire_ended_terminal(core, &identity);
+}
+
+/// Drop a terminal generation after its bridge ends.
+///
+/// Upstream `TerminalServer::finishSession` removes the router entry when the
+/// terminal loop finishes. A replacement registration (a live pty whose router
+/// socket died and re-registered) has a different generation and is left in
+/// place. The ended id is recorded so a later attach is not told to retry it.
+fn retire_ended_terminal(core: &RuntimeCore, identity: &RegistrationIdentity) {
+    if let Err(error) = core.registry.remove_if_current(identity) {
+        crate::diag::info(format!(
+            "id={}: could not remove ended terminal registration: {error}",
+            identity.id()
+        ));
+    }
+    if let Err(error) = core.raw_sockets.shutdown_inactive_registration(identity) {
+        crate::diag::info(format!(
+            "id={}: could not shut down sockets for an ended terminal: {error}",
+            identity.id()
+        ));
+    }
+    match core.sessions.remove_registration_with(identity, |_| {}) {
+        Ok(Some(_)) => crate::diag::info(format!(
+            "id={}: removed session after the terminal ended",
+            identity.id()
+        )),
+        Ok(None) => {}
+        Err(error) => crate::diag::info(format!(
+            "id={}: session table error after the terminal ended: {error}",
+            identity.id()
+        )),
+    }
 }
 
 fn reject(

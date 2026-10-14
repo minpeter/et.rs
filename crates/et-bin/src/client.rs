@@ -604,7 +604,7 @@ fn run_client(
     }
     #[cfg(unix)]
     crate::local_daemon::ready().map_err(|e| ClientError::Terminal(e.to_string()))?;
-    crate::client_terminal::run(
+    let finish = crate::client_terminal::run(
         connection,
         crate::client_terminal::TerminalOptions {
             command: args.command.as_deref(),
@@ -620,7 +620,15 @@ fn run_client(
         },
         forwarder,
         reconnect_session,
-    )
+    )?;
+    if finish.remote_ended {
+        if let Some(name) = args.session_name.as_deref() {
+            if !args.no_persist && args.jumphost.is_none() {
+                crate::session_store::forget_ended(name, &credentials.id);
+            }
+        }
+    }
+    Ok(finish.code)
 }
 
 /// Reconnect, retrying transient network failures until the link returns.

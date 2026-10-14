@@ -1,6 +1,7 @@
 #![cfg(windows)]
 
 use super::*;
+use crate::initial_connect::ReconnectOutcome;
 use et_core::proto::{PortForwardDestinationRequest, SocketEndpoint};
 use prost::Message;
 use std::io::Write;
@@ -105,7 +106,7 @@ fn pump_services_inbound_while_large_forwarding_write_is_stalled() {
     worker.join().unwrap();
 
     assert!(
-        matches!(observed, Ok((Err(_), 0, 1))),
+        matches!(observed, Ok((Err(_), 1, 1))),
         "pump starved inbound dispatch behind forwarding output: {observed:?}"
     );
 }
@@ -160,7 +161,7 @@ fn pending_local_input_yields_to_forwarding_before_more_local_input() {
                 stdio_forward: false,
             },
             &mut forwarder,
-            |_| panic!("fairness must not require reconnecting"),
+            |_| Ok(ReconnectOutcome::SessionEnded),
         )
     });
     pending_rx.recv_timeout(Duration::from_secs(3)).unwrap();

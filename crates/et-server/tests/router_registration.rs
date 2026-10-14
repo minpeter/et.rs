@@ -113,7 +113,7 @@ fn router_registration_stores_kernel_identity_instead_of_forged_ids() {
         (0, 0)
     };
 
-    send_packet(
+    let _terminal = connect_packet(
         &path,
         &Packet::new(
             TerminalPacketType::TerminalUserInfo as u8,

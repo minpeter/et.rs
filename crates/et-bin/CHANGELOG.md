@@ -1,3 +1,56 @@
+## et@0.0.28
+
+### Write an explicit foreground pid file
+
+`etserver --pidfile PATH` now records the server process id when the server
+stays in the foreground. The file is written with the same hardened pid
+writer as `--daemon`: mode 0600, and refused when the path is a symlink, an
+extra hard link, a fifo, or has a writable ancestor.
+
+Upstream EternalTerminal writes that file only inside `DaemonCreator::create`
+and never unlinks it. A clean foreground shutdown leaves the file in place,
+matching the daemon. Protocol v6 is unchanged.
+
+### Reap disconnected forward-only sessions
+
+A `--no-terminal` session that only serves port forwards, and a shell-less
+`-N` or `-W` session, now advertises a 5-minute
+`disconnect_timeout_seconds` when `--disconnect-timeout` is omitted. etserver
+closes the detached terminal after that long with no client attached, instead
+of leaving it reparented forever while the server default stays 0.
+
+Interactive sessions, and `--no-terminal` with no forwards, still leave the
+field unset so reconnect stays unlimited unless a timeout is configured.
+`--disconnect-timeout 0` keeps a forward-only session too. Upstream
+EternalTerminal applies one server default to every session and does not
+special-case forward-only clients. Protocol v6 is unchanged.
+
+### Drop ended named sessions
+
+When a named session's shell exits, etserver removes that terminal from its
+registry and the client deletes the saved session file. `et --list` no longer
+shows the session. `et --attach` reports that the session was not found or has
+ended when that file is missing, including a name that never existed, instead
+of failing to open the file or rejecting the session key. Other failures while
+opening the session file are unchanged. Protocol v6 is unchanged.
+
+### Parse et options after the destination
+
+Flags placed after the destination are et options, matching EternalTerminal's
+cxxopts parser. `et host --command 'echo hi'` runs `echo hi` on the remote
+shell. An explicit `--` ends option parsing, and the following words are the
+remote command, including tokens that look like flags. A token that is not an
+et option, such as `echo -n`, also stays in that command. Protocol v6 is
+unchanged.
+
+### Mark log timestamps as UTC
+
+`et`, `etserver`, and `etterminal` log lines now use an RFC3339 timestamp with
+an explicit `Z` UTC marker, for example `2026-10-14T02:48:00.123Z`. The
+previous `YYYY-MM-DD HH:MM:SS,mmm` form was UTC with no zone, so a reader
+could treat `02:48` as local time. Log file names are unchanged. Protocol v6
+is unchanged.
+
 ## et@0.0.27
 
 ### Replay ssh-agent host-key bindings

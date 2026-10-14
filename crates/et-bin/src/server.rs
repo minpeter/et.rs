@@ -30,6 +30,13 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
     if parsed.daemon_child {
         crate::server_daemon::detach_child(parsed.pidfile.as_deref())
             .map_err(|error| clap::Error::raw(ErrorKind::Io, error))?;
+    } else if let Some(path) = parsed.pidfile.as_deref() {
+        // Upstream EternalTerminal writes a pid only inside
+        // `DaemonCreator::create` (the daemon child) and never unlinks it.
+        // An explicit foreground `--pidfile` uses that same hardened writer
+        // and is left in place after a clean shutdown, matching the daemon.
+        crate::server_daemon::write_pid_file(path)
+            .map_err(|error| clap::Error::raw(ErrorKind::Io, error))?;
     }
     let ini = load_config(args, &parsed)?;
     let config = resolve_config(&parsed, ini.as_deref())

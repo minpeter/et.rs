@@ -267,7 +267,13 @@ fn root_directory() -> PathBuf {
     }
 }
 
-fn write_pid_file(path: &Path) -> Result<(), String> {
+/// Record this process id at `path`.
+///
+/// Unix refuses symlinks, extra hard links, fifos, and writable ancestors,
+/// then truncates. Upstream calls this only from the daemon child and never
+/// removes the file. Foreground `etserver --pidfile` uses the same writer
+/// and the same retention.
+pub(crate) fn write_pid_file(path: &Path) -> Result<(), String> {
     let contents = format!("{}\n", std::process::id());
     #[cfg(unix)]
     {

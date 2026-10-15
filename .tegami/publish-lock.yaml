@@ -1,9 +1,9 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Do not inherit client stdin in bootstrap ssh\n\nRedirect the bootstrap `ssh` subprocess's `stdin` from `/dev/null`\n(`Stdio::null()`) instead of inheriting the `et` client's `stdin`, matching\nupstream `SubprocessToStringInteractive` (EternalTerminal #867). When `et` is\ninvoked with piped input (such as `printf ... | et -T host ...` or VS Code\nRemote-SSH writing its install script to `stdin`), bootstrap `ssh` no longer\nconsumes the input stream before the ET session starts. Interactive password,\npassphrase, and host-key prompts continue to use `/dev/tty` because `ssh`\nremains in the client's process group.\n"
-    filename: bootstrap-ssh-null-stdin.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Fix plain `%` output reordering and pipeline forwarding reads\n\n- Only enter `tmux -CC` control-mode output handling on a real `tmux -CC` DCS\n  introducer (`\\x1bP1000p`) or a known tmux control notification/block token\n  (`%begin`, `%output`, `%extended-output`, `%exit`, etc.), and leave control\n  mode on `%exit` (EternalTerminal #899). Plain terminal output starting with\n  `%` (such as `top` `%Cpu(s):` or a `%` shell prompt) is no longer reordered\n  or retained across an interrupt flush.\n- Pipeline windowed port-forwarding socket reads up to the negotiated window\n  without blocking after every 16 KiB read chunk, assemble non-blocking\n  transport frames with a 64 KiB read buffer, and reuse the server bridge's\n  polled client socket handle across iterations.\n"
+    filename: fix-tmux-percent-and-forward-pipelining.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - bootstrap-ssh-null-stdin.md
+      - fix-tmux-percent-and-forward-pipelining.md
     id: cargo:et
     updated: true

@@ -120,6 +120,7 @@ fn run_mode_poll(
     let mut terminal_closing = false;
     let mut terminal_eof = false;
     let mut client_buffered = false;
+    let mut cached_client: Option<(std::net::TcpStream, u64)> = None;
     loop {
         if session.is_shutting_down() {
             return Ok(());
@@ -142,9 +143,14 @@ fn run_mode_poll(
                     send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
             }
         }
-        let (client, polled_generation) = if connected {
+        if !connected {
+            cached_client = None;
+        } else if cached_client.as_ref().map(|(_, gen)| *gen) != Some(connection_generation) {
             match session.try_clone_stream() {
-                Ok((stream, generation)) => (Some(stream), Some(generation)),
+                Ok((stream, generation)) => {
+                    connection_generation = generation;
+                    cached_client = Some((stream, generation));
+                }
                 // Cloning a dead socket is a soft disconnect, not session death.
                 Err(_) => {
                     let observed_generation = connection_generation;
@@ -154,12 +160,11 @@ fn run_mode_poll(
                         &mut connection_generation,
                         observed_generation,
                     )?;
-                    (None, None)
+                    cached_client = None;
                 }
             }
-        } else {
-            (None, None)
-        };
+        }
+        let polled_generation = cached_client.as_ref().map(|(_, gen)| *gen);
         let terminal_flags = terminal_poll_flags(
             pending_terminal.is_none() && session.can_buffer_write((READ_BUFFER * 2) as i64)?,
             pending_local.is_some(),
@@ -171,7 +176,7 @@ fn run_mode_poll(
             &terminal,
             &wake,
             forwarder.wake().map_err(forward_error)?,
-            client.as_ref(),
+            cached_client.as_ref().map(|(stream, _)| stream),
             terminal_flags,
             // Keep draining the shared transport while the bounded spill has
             // room. Once full, stop polling readability to avoid a busy-loop;

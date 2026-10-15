@@ -77,6 +77,50 @@ fn command_requests_interrupt(bytes: &[u8]) -> bool {
     false
 }
 
+const TMUX_DCS: &[u8] = b"\x1bP1000p";
+
+fn is_tmux_control_token(token: &[u8]) -> bool {
+    let token = token.strip_prefix(TMUX_DCS).unwrap_or(token);
+    matches!(
+        token,
+        b"%begin"
+            | b"%end"
+            | b"%error"
+            | b"%output"
+            | b"%extended-output"
+            | b"%exit"
+            | b"%layout-change"
+            | b"%window-add"
+            | b"%window-close"
+            | b"%window-renamed"
+            | b"%window-pane-changed"
+            | b"%unlinked-window-add"
+            | b"%unlinked-window-close"
+            | b"%unlinked-window-renamed"
+            | b"%session-changed"
+            | b"%session-renamed"
+            | b"%session-window-changed"
+            | b"%sessions-changed"
+            | b"%client-detached"
+            | b"%client-session-changed"
+            | b"%subscription-changed"
+            | b"%message"
+            | b"%config-error"
+            | b"%continue"
+            | b"%pause"
+            | b"%paste-buffer-changed"
+            | b"%paste-buffer-deleted"
+    )
+}
+
+fn line_first_token(line: &[u8]) -> &[u8] {
+    let token = line
+        .split(|byte| byte.is_ascii_whitespace())
+        .next()
+        .unwrap_or_default();
+    token.strip_prefix(TMUX_DCS).unwrap_or(token)
+}
+
 /// State of the prefix already handed to the transport/console writer.
 /// Never truncate a line whose prefix a tmux client has already received.
 #[derive(Clone, Default)]
@@ -91,13 +135,15 @@ pub struct TerminalStream {
 impl TerminalStream {
     pub fn observe(&mut self, bytes: &[u8]) {
         for &byte in bytes {
-            if !self.midline && byte == b'%' {
-                self.control = true;
-            }
             if byte == b'\n' {
-                match self.token.as_slice() {
+                let token = self.token.strip_prefix(TMUX_DCS).unwrap_or(&self.token);
+                if is_tmux_control_token(token) {
+                    self.control = true;
+                }
+                match token {
                     b"%begin" => self.block = true,
                     b"%end" | b"%error" => self.block = false,
+                    b"%exit" if !self.block => self.control = false,
                     _ => {}
                 }
                 self.token.clear();
@@ -106,10 +152,18 @@ impl TerminalStream {
             } else {
                 self.midline = true;
                 if byte.is_ascii_whitespace() {
+                    if !self.token_done && is_tmux_control_token(&self.token) {
+                        self.control = true;
+                    }
                     self.token_done = true;
                 }
                 if !self.token_done && self.token.len() < 32 {
                     self.token.push(byte);
+                    if self.token == TMUX_DCS {
+                        self.control = true;
+                        self.token.clear();
+                        self.midline = false;
+                    }
                 }
             }
         }
@@ -125,7 +179,7 @@ impl TerminalStream {
         if !self.control
             && !bytes
                 .split(|byte| *byte == b'\n')
-                .any(|line| line.starts_with(b"%output ") || line.starts_with(b"%extended-output "))
+                .any(|line| is_tmux_control_token(line_first_token(line)))
         {
             return None;
         }
@@ -149,7 +203,6 @@ impl TerminalStream {
         result.kept.extend_from_slice(&bytes[complete..]);
         Some(result.kept)
     }
-
     fn partition(&self, bytes: &[u8], retain_droppable: bool) -> FilteredOutput {
         let mut state = self.clone();
         let mut kept = Vec::new();
@@ -183,14 +236,13 @@ impl TerminalStream {
             }
         }
         for line in bytes[index..].split_inclusive(|byte| *byte == b'\n') {
-            let token = line
-                .split(|byte| byte.is_ascii_whitespace())
-                .next()
-                .unwrap_or_default();
+            let token = line_first_token(line);
             let pane = matches!(token, b"%output" | b"%extended-output");
+            let control_token =
+                is_tmux_control_token(token) || (state.control && token.starts_with(b"%"));
             let keep = state.block
                 || (state.control && state.midline)
-                || (token.starts_with(b"%") && !pane)
+                || (control_token && !pane)
                 || (state.control && token.is_empty());
             if keep {
                 kept.extend_from_slice(line);

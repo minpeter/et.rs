@@ -159,8 +159,11 @@ impl CommandSender {
         if state.shutdown || !state.receiver_alive {
             return Err(command);
         }
+        let was_empty = state.commands.is_empty();
         state.commands.push_back(command);
-        self.queue.changed.notify_all();
+        if was_empty {
+            self.queue.changed.notify_all();
+        }
         Ok(())
     }
 
@@ -172,8 +175,11 @@ impl CommandSender {
         if state.commands.len() >= self.queue.capacity {
             return Err(TryCommandError::Full(command));
         }
+        let was_empty = state.commands.is_empty();
         state.commands.push_back(command);
-        self.queue.changed.notify_all();
+        if was_empty {
+            self.queue.changed.notify_all();
+        }
         Ok(())
     }
 
@@ -222,7 +228,9 @@ impl CommandReceiver {
                 return RecvStatus::Disconnected;
             }
             if let Some(command) = state.commands.pop_front() {
-                self.queue.changed.notify_all();
+                if state.commands.len() + 1 >= self.queue.capacity {
+                    self.queue.changed.notify_all();
+                }
                 return RecvStatus::Command(command);
             }
             let Some(deadline) = deadline else {

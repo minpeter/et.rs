@@ -1522,12 +1522,44 @@ exit 0
         assert!(matches!(result, Err(ClientError::SshOutputTooLarge(_))));
     }
 
+    #[cfg(unix)]
     #[test]
     fn system_runner_does_not_inherit_stdin() {
-        let runner = SystemSsh::with_timeout(Duration::from_secs(2));
-        let invocation = invocation("/bin/cat", &[]);
-        let output = runner.run(&invocation, runner.deadline()).unwrap();
-        assert!(output.status.unwrap().success());
-        assert!(output.stdout.is_empty());
+        use std::io::Write;
+
+        const CHILD_ENV: &str = "ET_RS_SSH_RUNNER_STDIN_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let runner = SystemSsh::with_timeout(Duration::from_secs(2));
+            let invocation = invocation("/bin/cat", &[]);
+            let output = runner.run(&invocation, runner.deadline()).unwrap();
+            assert!(output.status.unwrap().success());
+            assert!(output.stdout.is_empty());
+            return;
+        }
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .env(CHILD_ENV, "1")
+            .args([
+                "--exact",
+                "ssh_process::tests::system_runner_does_not_inherit_stdin",
+                "--nocapture",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"SECRET_STDIN\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

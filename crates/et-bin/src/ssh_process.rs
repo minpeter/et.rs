@@ -459,21 +459,21 @@ impl SshRunner for SystemSsh {
                 .args
                 .get(1)
                 .is_some_and(|argument| argument == "check");
+        // Do not inherit the client's stdin: OpenSSH would forward it to the
+        // bootstrap session and consume the remote command stream (e.g. piped
+        // `et -T` input or VS Code's install script). ssh stays in our process
+        // group so it can still prompt on the controlling terminal (/dev/tty)
+        // for passwords, passphrases, and host-key confirmations, matching
+        // upstream `SubprocessToStringInteractive`.
         command
             .args(&invocation.args)
-            .stdin(Stdio::inherit())
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(if checks_control_master {
                 Stdio::null()
             } else {
                 Stdio::inherit()
             });
-        // ssh stays in our process group so it can prompt on the controlling
-        // terminal (password, passphrase, host-key confirmation), matching
-        // upstream `SubprocessToStringInteractive`. Moving it to its own group
-        // would make terminal reads raise SIGTTIN and hang the bootstrap.
-        // Cleanup therefore targets the process subtree plus anything still
-        // holding the captured stdout pipe.
         let mut child = command.spawn().map_err(ClientError::SshSpawn)?;
         let child_pid = process_id(child.id());
         let stdout = match child.stdout.take() {
@@ -1520,5 +1520,46 @@ exit 0
         let invocation = invocation("/bin/cat", &["/dev/zero"]);
         let result = runner.run(&invocation, runner.deadline());
         assert!(matches!(result, Err(ClientError::SshOutputTooLarge(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_runner_does_not_inherit_stdin() {
+        use std::io::Write;
+
+        const CHILD_ENV: &str = "ET_RS_SSH_RUNNER_STDIN_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let runner = SystemSsh::with_timeout(Duration::from_secs(2));
+            let invocation = invocation("/bin/cat", &[]);
+            let output = runner.run(&invocation, runner.deadline()).unwrap();
+            assert!(output.status.unwrap().success());
+            assert!(output.stdout.is_empty());
+            return;
+        }
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .env(CHILD_ENV, "1")
+            .args([
+                "--exact",
+                "ssh_process::tests::system_runner_does_not_inherit_stdin",
+                "--nocapture",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"SECRET_STDIN\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

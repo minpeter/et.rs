@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -1128,7 +1128,7 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
     let (port, server) = initial_payload_server();
 
     let fake = FakeSsh::new();
-    let output = fake
+    let mut child = fake
         .command(
             &format!("{RESOLVED_CONFIG}sendenv LANG LC_*\n"),
             VALID_MARKER,
@@ -1139,6 +1139,9 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
         .env("COLORTERM", "truecolor")
         .env("LANG", "C.UTF-8")
         .env("LC_CTYPE", "C.UTF-8")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .args([
             "--no-terminal",
             // The long option retains the explicit ET verbosity level.
@@ -1152,8 +1155,15 @@ fn cli_proves_exact_ssh_bootstrap_v6_and_encrypted_initial_payload() {
             "StrictHostKeyChecking=no",
             &format!("test-user@server-alias:{port}"),
         ])
-        .output()
+        .spawn()
         .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"piped-client-stdin-must-not-reach-bootstrap-ssh")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
     let payload = server.join().unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(output.stdout.is_empty() && output.stderr.is_empty());

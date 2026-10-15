@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::process::{Command, Stdio};
@@ -60,6 +60,10 @@ fn real_client_setenv_term_overrides_bootstrap_term_in_pty() {
            printf 'hostname 127.0.0.1\\nuser tester\\nsetenv TERM=xterm-256color\\nsendenv COLORTERM\\n'\n\
            exit 0\n\
          fi\n\
+         if [ \"$1\" = \"-O\" ] || [ \"$1\" = \"-MNf\" ]; then\n\
+           exit 255\n\
+         fi\n\
+         /bin/cat >/dev/null\n\
          for last do :; done\n\
          unset COLORTERM\n\
          exec /bin/sh -c \"$last\"\n",
@@ -165,6 +169,50 @@ fn real_client_setenv_term_overrides_bootstrap_term_in_pty() {
         "{no_exit_stdout:?}"
     );
 
+    let mut piped_raw = Command::new(env!("CARGO_BIN_EXE_et"))
+        .env("PATH", format!("{}:{existing_path}", directory.display()))
+        .env("HOME", &home)
+        .env("TERM", "xterm-256color")
+        .args(["--terminal-path"])
+        .arg(&terminal)
+        .args(["--serverfifo"])
+        .arg(&router)
+        .arg("--port")
+        .arg(port.to_string())
+        .args(["-T", "127.0.0.1", "head -c 20; printf ':PIPE_ERR' >&2"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    piped_raw
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"PREFILLED_PIPE_STDIN")
+        .unwrap();
+    let status = piped_raw.wait_timeout(TIMEOUT).unwrap().unwrap();
+    let mut piped_stdout = Vec::new();
+    let mut piped_stderr = Vec::new();
+    piped_raw
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut piped_stdout)
+        .unwrap();
+    piped_raw
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_end(&mut piped_stderr)
+        .unwrap();
+    assert!(
+        status.success(),
+        "{}",
+        String::from_utf8_lossy(&piped_stderr)
+    );
+    assert_eq!(piped_stdout, b"PREFILLED_PIPE_STDIN");
+    assert_eq!(piped_stderr, b":PIPE_ERR");
     let server_pid = Pid::from_raw(i32::try_from(server.id()).unwrap());
     kill(server_pid, Signal::SIGTERM).unwrap();
     assert!(server.wait_timeout(TIMEOUT).unwrap().unwrap().success());

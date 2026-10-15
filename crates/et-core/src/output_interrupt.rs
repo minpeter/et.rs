@@ -93,6 +93,7 @@ fn is_tmux_control_token(token: &[u8]) -> bool {
             | b"%window-add"
             | b"%window-close"
             | b"%window-renamed"
+            | b"%pane-mode-changed"
             | b"%window-pane-changed"
             | b"%unlinked-window-add"
             | b"%unlinked-window-close"
@@ -130,11 +131,21 @@ pub struct TerminalStream {
     midline: bool,
     control: bool,
     block: bool,
+    escape: bool,
 }
 
 impl TerminalStream {
     pub fn observe(&mut self, bytes: &[u8]) {
         for &byte in bytes {
+            if self.control && !self.block && self.escape && byte == b'\\' {
+                self.control = false;
+                self.token.clear();
+                self.token_done = false;
+                self.midline = false;
+                self.escape = false;
+                continue;
+            }
+            self.escape = byte == b'\x1b';
             if byte == b'\n' {
                 let token = self.token.strip_prefix(TMUX_DCS).unwrap_or(&self.token);
                 if is_tmux_control_token(token) {
@@ -143,7 +154,6 @@ impl TerminalStream {
                 match token {
                     b"%begin" => self.block = true,
                     b"%end" | b"%error" => self.block = false,
-                    b"%exit" if !self.block => self.control = false,
                     _ => {}
                 }
                 self.token.clear();
@@ -240,9 +250,13 @@ impl TerminalStream {
             let pane = matches!(token, b"%output" | b"%extended-output");
             let control_token =
                 is_tmux_control_token(token) || (state.control && token.starts_with(b"%"));
+            let dcs_terminator = state.control
+                && !state.block
+                && (token.starts_with(b"\x1b\\") || (state.escape && line.starts_with(b"\\")));
             let keep = state.block
                 || (state.control && state.midline)
                 || (control_token && !pane)
+                || dcs_terminator
                 || (state.control && token.is_empty());
             if keep {
                 kept.extend_from_slice(line);

@@ -1,9 +1,9 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Match upstream TERM forwarding and SetEnv TERM overrides\n\nForward the local `TERM` value unchanged during SSH bootstrap (defaulting to\n`xterm-256color` only when `TERM` is unset or empty) and allow `SetEnv TERM`\nand `SendEnv TERM` from SSH configuration or `-o` to override the session\n`TERM`, matching upstream EternalTerminal (#679, #725, #870). Remove the\nnon-upstream `xterm-ghostty` fallback and automatic `COLORTERM` injection.\n"
-    filename: upstream-term-setenv.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n## Do not inherit client stdin in bootstrap ssh\n\nRedirect the bootstrap `ssh` subprocess's `stdin` from `/dev/null`\n(`Stdio::null()`) instead of inheriting the `et` client's `stdin`, matching\nupstream `SubprocessToStringInteractive` (EternalTerminal #867). When `et` is\ninvoked with piped input (such as `printf ... | et -T host ...` or VS Code\nRemote-SSH writing its install script to `stdin`), bootstrap `ssh` no longer\nconsumes the input stream before the ET session starts. Interactive password,\npassphrase, and host-key prompts continue to use `/dev/tty` because `ssh`\nremains in the client's process group.\n"
+    filename: bootstrap-ssh-null-stdin.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - upstream-term-setenv.md
+      - bootstrap-ssh-null-stdin.md
     id: cargo:et
     updated: true

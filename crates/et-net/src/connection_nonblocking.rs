@@ -183,31 +183,31 @@ pub(crate) fn try_read(
     stream: &mut TcpStream,
     reader: &mut BackedReader,
 ) -> Result<Option<Packet>, ConnError> {
-    match reader.pop()? {
-        ReadItem::Packet(packet) => return Ok(Some(packet)),
-        ReadItem::NeedMore => {}
-    }
-    let mut buffer = [0u8; 8192];
-    #[cfg(unix)]
-    let read = rustix::net::recv(stream, &mut buffer, rustix::net::RecvFlags::DONTWAIT)
-        .map(|(count, _)| count)
-        .map_err(io::Error::from);
-    #[cfg(windows)]
-    let read = {
-        stream.set_nonblocking(true)?;
-        stream.read(&mut buffer)
-    };
-    match read {
-        Ok(0) => Err(ConnError::Io(io::ErrorKind::UnexpectedEof.into())),
-        Ok(count) => {
-            reader.feed(&buffer[..count]);
-            match reader.pop()? {
-                ReadItem::Packet(packet) => Ok(Some(packet)),
-                ReadItem::NeedMore => Ok(None),
-            }
+    let mut buffer = [0u8; 64 * 1024];
+    for _ in 0..4 {
+        match reader.pop()? {
+            ReadItem::Packet(packet) => return Ok(Some(packet)),
+            ReadItem::NeedMore => {}
         }
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
-        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(None),
-        Err(error) => Err(ConnError::Io(error)),
+        #[cfg(unix)]
+        let read = rustix::net::recv(&*stream, &mut buffer, rustix::net::RecvFlags::DONTWAIT)
+            .map(|(count, _)| count)
+            .map_err(io::Error::from);
+        #[cfg(windows)]
+        let read = {
+            stream.set_nonblocking(true)?;
+            stream.read(&mut buffer)
+        };
+        match read {
+            Ok(0) => return Err(ConnError::Io(io::ErrorKind::UnexpectedEof.into())),
+            Ok(count) => reader.feed(&buffer[..count]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok(None),
+            Err(error) => return Err(ConnError::Io(error)),
+        }
+    }
+    match reader.pop()? {
+        ReadItem::Packet(packet) => Ok(Some(packet)),
+        ReadItem::NeedMore => Ok(None),
     }
 }

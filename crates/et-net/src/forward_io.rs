@@ -62,10 +62,10 @@ pub(crate) fn commit_reservation(active: &ActiveIo, bytes: i64) {
     if bytes <= 0 || active.window.load(Ordering::Acquire) < 0 {
         return;
     }
-    subtract_saturating(&active.reserved_bytes, bytes);
-    subtract_saturating(&active.reserved_packets, 1);
     active.in_flight.fetch_add(bytes, Ordering::AcqRel);
     active.packets_in_flight.fetch_add(1, Ordering::AcqRel);
+    subtract_saturating(&active.reserved_bytes, bytes);
+    subtract_saturating(&active.reserved_packets, 1);
 }
 
 pub(crate) struct BoundSource {
@@ -645,14 +645,19 @@ fn spawn_io_inner(
     let reader_window = window.clone();
     let reader_packet_window = packet_window.clone();
     let mut bind_replies = bind_replies;
+    let (committed_tx, commit_received) = channel::bounded::<()>(64);
     let reader_handle = thread::spawn(move || {
         let mut buffer = [0u8; READ_CHUNK];
+        let mut uncommitted = 0usize;
         loop {
             #[cfg(windows)]
             if cancellation_requested(&reader_cancel) {
                 return;
             }
             let (read_len, windowed) = loop {
+                while commit_received.try_recv().is_ok() {
+                    uncommitted = uncommitted.saturating_sub(1);
+                }
                 let byte_window = reader_window.load(Ordering::Acquire);
                 let packet_window = reader_packet_window.load(Ordering::Acquire);
                 if byte_window < 0 || packet_window < 0 {
@@ -667,6 +672,18 @@ fn spawn_io_inner(
                 let remaining_bytes = byte_window.saturating_sub(bytes);
                 let remaining_packets = packet_window.saturating_sub(packets);
                 if remaining_bytes <= 0 || remaining_packets <= 0 {
+                    if uncommitted > 0 {
+                        channel::select! {
+                            recv(commit_received) -> result => {
+                                if result.is_err() {
+                                    return;
+                                }
+                                uncommitted = uncommitted.saturating_sub(1);
+                            }
+                            recv(reader_cancel) -> _ => return,
+                        }
+                        continue;
+                    }
                     #[cfg(test)]
                     let _ = reader_window_blocked_tx.try_send(FlowWindow { bytes, packets });
                     channel::select! {
@@ -747,26 +764,20 @@ fn spawn_io_inner(
                         release_reservation(actual);
                         return;
                     }
-                    let (committed, commit_received) = channel::bounded(1);
                     if reader_commands
                         .send(Command::Read {
                             role,
                             socket_id,
                             buffer: forwarded,
-                            committed,
+                            committed: committed_tx.clone(),
                         })
                         .is_err()
                     {
                         release_reservation(actual);
                         return;
                     }
-                    channel::select! {
-                        recv(commit_received) -> result => {
-                            if result.is_err() {
-                                return;
-                            }
-                        }
-                        recv(reader_cancel) -> _ => return,
+                    if windowed {
+                        uncommitted += 1;
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {

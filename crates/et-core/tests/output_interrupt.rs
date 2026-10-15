@@ -283,3 +283,55 @@ fn mid_line_prelude_keeps_lines_until_the_next_command() {
     assert_eq!(stream.filter(data).kept, data);
     assert_eq!(stream.filter(data).dropped, 0);
 }
+
+#[test]
+fn plain_percent_lines_do_not_enter_tmux_control_mode_or_reorder_output() {
+    // Upstream #899: plain output like `top` (`%Cpu(s):`, `%MEM`) or a `% `
+    // shell prompt must not latch tmux control mode or reorder lines.
+    let mut stream = TerminalStream::default();
+    let sample = b"PID USER\n%Cpu(s):  3.0 us\nload ok\n% echo prompt\n%MEM 41.2\nnext line\n";
+    stream.observe(sample);
+    assert_eq!(stream.promote_control(sample), None);
+
+    let mut queue = queue();
+    queue
+        .push(terminal(b"%Cpu(s): 3.0 us\n% echo prompt\n"))
+        .unwrap();
+    assert!(queue.pop().is_some());
+
+    let flood = format!(
+        "PID USER\n%Cpu(s):  3.0 us\n% echo prompt\n{}\n%MEM 41.2\nnext line\n",
+        "x".repeat(70 * 1024)
+    );
+    queue.push(terminal(flood.as_bytes())).unwrap();
+    assert_eq!(drain(&mut queue), flood.as_bytes());
+
+    queue.push(terminal(flood.as_bytes())).unwrap();
+    assert_eq!(queue.flush_terminal_on_interrupt(), flood.len());
+    assert!(drain(&mut queue).is_empty());
+}
+
+#[test]
+fn dcs_introducer_and_exit_transition_tmux_control_mode_cleanly() {
+    let mut queue = queue();
+    queue
+        .push(terminal(
+            b"\x1bP1000p%begin 1 2\nresponse body\n%end 1 2\n%pane-mode-changed %0\n",
+        ))
+        .unwrap();
+    assert!(queue.pop().is_some());
+
+    // An interrupt flush before `ESC \` is delivered must preserve `%exit` and `ESC \`.
+    let exit_flood = format!("%output %0 {}\n%exit\n\x1b\\\n", "z".repeat(70 * 1024));
+    queue.push(terminal(exit_flood.as_bytes())).unwrap();
+    assert!(queue.flush_terminal_on_interrupt() >= 70 * 1024);
+    assert_eq!(drain(&mut queue), b"%exit\n\x1b\\\n");
+
+    // After `ESC \`, the session returns to plain mode and does not reorder `%` lines.
+    let plain = format!(
+        "first line\n{}\n%Cpu(s): 1.0 us\nlast line\n",
+        "p".repeat(70 * 1024)
+    );
+    queue.push(terminal(plain.as_bytes())).unwrap();
+    assert_eq!(drain(&mut queue), plain.as_bytes());
+}

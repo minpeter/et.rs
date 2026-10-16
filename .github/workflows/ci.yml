@@ -30,10 +30,23 @@ jobs:
           repo-token: ${{ github.token }}
 
       - uses: Swatinem/rust-cache@v2
+      - name: sccache
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o "$RUNNER_TEMP/sccache.tar.gz" \
+            https://github.com/mozilla/sccache/releases/download/v0.18.0/sccache-v0.18.0-x86_64-unknown-linux-musl.tar.gz
+          tar -xzf "$RUNNER_TEMP/sccache.tar.gz" -C "$RUNNER_TEMP" --strip-components=1 sccache-v0.18.0-x86_64-unknown-linux-musl/sccache
+          install -m 0755 "$RUNNER_TEMP/sccache" "$HOME/.local/bin/sccache"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
 
       - run: cargo fmt --all --check
 
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: clippy
+        run: |
+          export RUSTC_WRAPPER="$HOME/.local/bin/sccache"
+          cargo clippy --workspace --all-targets -- -D warnings
+          sccache --show-stats
 
   test:
     strategy:

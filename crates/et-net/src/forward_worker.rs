@@ -304,6 +304,7 @@ impl CommandSender {
         Ok(())
     }
 
+    #[cfg(unix)]
     pub(crate) fn try_send_queue(&self, queue: &mut VecDeque<Packet>) -> Result<(), ForwardError> {
         if queue.is_empty() {
             return Ok(());

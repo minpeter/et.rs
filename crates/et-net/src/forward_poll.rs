@@ -22,7 +22,7 @@ use crate::forward_io::{cancellation_requested, shutdown_write, FlowWindow};
 use crate::ssh_agent_session_bind::AgentSessionBindReplies;
 
 use super::state::{CREDIT_RETURN_THRESHOLD, PACKET_CREDIT_RETURN_THRESHOLD};
-use super::{ForwardError, Role, Worker};
+use super::{ForwardError, Role, Worker, MAX_DATA_PACKET};
 
 /// Queued network-to-socket buffers per socket, matching the bound of the
 /// writer channel the threaded model used.
@@ -155,7 +155,10 @@ impl SocketIo {
     }
 
     fn queue_write_span(&mut self, data: Vec<u8>, start: usize, len: usize) -> Result<(), Vec<u8>> {
-        if self.out.len() >= OUT_QUEUE_PACKETS {
+        if len == 0 {
+            return Ok(());
+        }
+        if len > MAX_DATA_PACKET || self.out.len() >= OUT_QUEUE_PACKETS {
             return Err(data);
         }
         self.out.push_back(QueuedBuffer { data, start, len });
@@ -421,7 +424,11 @@ impl Worker {
         let Some(socket) = map.get_mut(&socket_id) else {
             return Ok(());
         };
-        if socket.write_closed() {
+        if socket.write_closed() || len == 0 {
+            return Ok(());
+        }
+        if len > MAX_DATA_PACKET {
+            self.remove(role, socket_id);
             return Ok(());
         }
         if let Err(data) = socket.queue_write_span(data, start, len) {
@@ -430,7 +437,6 @@ impl Worker {
         }
         Ok(())
     }
-
     /// The peer closed this socket: echo the close, stop reading, and flush
     /// whatever is already queued before dropping the socket, matching the
     /// threaded model's `stop_io` drain.
@@ -846,7 +852,8 @@ impl Worker {
                     self.remove(role, socket_id);
                     continue;
                 }
-                let credit_to_flush = if socket.out.is_empty() && socket.credit_bytes > 0 {
+                let credit_to_flush = if socket.out.is_empty() && socket.credit_due(Instant::now())
+                {
                     socket.take_credit()
                 } else {
                     None

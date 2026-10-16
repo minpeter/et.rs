@@ -23,7 +23,7 @@ use prost::Message;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const WINDOW_BYTES: usize = 2 * 1024 * 1024;
-const WINDOW_PACKETS: usize = 64;
+const WINDOW_PACKETS: usize = 63;
 const TRANSFER_BYTES: usize = 2 * WINDOW_BYTES;
 
 #[test]

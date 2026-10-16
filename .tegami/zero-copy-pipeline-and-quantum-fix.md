@@ -19,10 +19,10 @@ packages:
 - In-place fast-path data serialization in `et-net`: encode forwarding data
   packets in one step and parse incoming data packets directly into queued
   buffer spans, bypassing protobuf intermediate copies.
-- Single-lock batch command drain in `CommandReceiver`: drain up to 128
+- Single-lock batch command drain in `CommandReceiver`: drain all pending
   commands per lock acquisition and batch forward packets during session read
   loops, slashing mutex contention and worker wake thrashing.
 - Enable `TCP_NODELAY` on the client connection and forward listeners, cutting
   interactive ping-pong latency from 44 ms to ~40–60 µs.
-- Expand flow-control window to 2 MiB and socket send buffer to 2 MiB to sustain
-  saturation during bulk transfers.
+- Expand flow-control window to 2 MiB while keeping the 256 KiB socket buffer
+  bound so interactive Ctrl-C remains responsive on slow links.

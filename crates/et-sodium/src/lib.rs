@@ -15,7 +15,7 @@ pub const NONCEBYTES: usize = 24;
 pub const MACBYTES: usize = 16;
 
 /// Encrypt `plaintext` into caller-provided buffer `out`, writing the MAC tag prepended
-/// to the ciphertext. Returns `Ok(())` on success.
+/// to the ciphertext. Returns the number of bytes written.
 ///
 /// # Panics
 /// Panics if `out.len() < plaintext.len() + MACBYTES`.

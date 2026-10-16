@@ -31,7 +31,7 @@ use crate::forward_io::{close_write, spawn_io_direct, subtract_saturating, Activ
 /// limit alone is insufficient because legal one-byte reads can create far
 /// more packets than the queue can absorb.
 pub(super) const WINDOW_BYTES: i64 = 2 * 1024 * 1024;
-pub(super) const WINDOW_PACKETS: i64 = 64;
+pub(super) const WINDOW_PACKETS: i64 = 63;
 
 /// Return credit once this much has drained, so a full window costs a bounded
 /// number of control packets instead of one per data packet.
@@ -192,6 +192,13 @@ impl Worker {
                     } else {
                         Role::Source
                     };
+                    if len == 0 {
+                        return Ok(());
+                    }
+                    if len > MAX_DATA_PACKET {
+                        self.remove(role, socket_id);
+                        return Ok(());
+                    }
                     return self.admit_data_span(
                         role,
                         socket_id,
@@ -803,7 +810,18 @@ impl Worker {
         let packet = Ok(Packet::new(header, payload));
         #[cfg(unix)]
         {
-            if self.outbound_spill.len() < crate::forward::CHANNEL_SPILL_LIMIT {
+            if !self.outbound_spill.is_empty() {
+                if self.outbound_spill.len() < crate::forward::CHANNEL_SPILL_LIMIT {
+                    self.outbound_spill.push_back(packet);
+                } else {
+                    channel::select! {
+                        send(self.outbound, packet) -> result => {
+                            result.map_err(|_| ForwardError::Unavailable)?;
+                        }
+                        recv(self.cancel) -> _ => return Err(ForwardError::Unavailable),
+                    }
+                }
+            } else if self.outbound_spill.len() < crate::forward::CHANNEL_SPILL_LIMIT {
                 match self.outbound.try_send(packet) {
                     Ok(()) => {}
                     Err(crossbeam_channel::TrySendError::Full(packet)) => {
@@ -871,7 +889,8 @@ pub(crate) fn try_fast_parse_data(payload: &[u8]) -> Option<(bool, i32, usize, u
     }
     offset += 1;
     let buf_len = decode_varint_usize(payload, &mut offset)?;
-    if offset + buf_len == payload.len() {
+    let end = offset.checked_add(buf_len)?;
+    if end == payload.len() {
         Some((source_to_dest, socket_id, offset, buf_len))
     } else {
         None
@@ -883,16 +902,20 @@ fn decode_varint_u32(slice: &[u8], offset: &mut usize) -> Option<u32> {
     let mut result = 0u32;
     let mut shift = 0;
     while *offset < slice.len() {
+        if shift >= 32 {
+            return None;
+        }
         let byte = slice[*offset];
         *offset += 1;
-        result |= ((byte & 0x7f) as u32) << shift;
+        let bits = (byte & 0x7f) as u32;
+        if shift == 28 && bits > 0x0f {
+            return None;
+        }
+        result |= bits << shift;
         if byte & 0x80 == 0 {
             return Some(result);
         }
         shift += 7;
-        if shift > 35 {
-            return None;
-        }
     }
     None
 }
@@ -902,6 +925,9 @@ fn decode_varint_usize(slice: &[u8], offset: &mut usize) -> Option<usize> {
     let mut result = 0usize;
     let mut shift = 0;
     while *offset < slice.len() {
+        if shift >= (usize::BITS as usize) {
+            return None;
+        }
         let byte = slice[*offset];
         *offset += 1;
         result |= ((byte & 0x7f) as usize) << shift;
@@ -909,9 +935,6 @@ fn decode_varint_usize(slice: &[u8], offset: &mut usize) -> Option<usize> {
             return Some(result);
         }
         shift += 7;
-        if shift > (usize::BITS as usize) {
-            return None;
-        }
     }
     None
 }

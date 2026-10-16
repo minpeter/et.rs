@@ -298,7 +298,7 @@ impl CommandSender {
             self.queue.changed.notify_all();
         }
         #[cfg(unix)]
-        if state.commands.len() >= 16 {
+        if state.commands.len() == 1 || state.commands.len() >= 16 {
             self.queue.signal_wake(true);
         }
         Ok(())

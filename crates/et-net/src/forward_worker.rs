@@ -455,7 +455,32 @@ impl CommandReceiver {
         if was_full && state.commands.len() < self.queue.capacity {
             self.queue.changed.notify_all();
         }
-        self.queue.clear_wake_if_empty(&state);
+        // If the queue was drained to empty, the wake pipe must be drained so
+        // the next poll does not spin on a stale byte.
+        if state.commands.is_empty() {
+            self.queue.wake_signalled.store(false, Ordering::Release);
+            if let Some(reader) = &self.wake_reader {
+                use std::io::Read;
+                let mut buffer = [0u8; 64];
+                loop {
+                    match (&mut &*reader).read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+            }
+        } else if !self.queue.wake_signalled.swap(true, Ordering::AcqRel) {
+            // If the queue still has packets but the flag was cleared by a
+            // racing session pop, re-write the wake byte so the next poll
+            // returns immediately.
+            if let Some(writer) = &self.queue.wake_writer {
+                use std::io::Write;
+                let _ = (&mut &*writer).write(&[1]);
+            }
+        }
         true
     }
 

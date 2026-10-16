@@ -824,6 +824,7 @@ where
                 Err(e) => return Err(error(e)),
             }
         }
+        forwarder.flush_receive();
         if !connection.connected() {
             continue;
         }

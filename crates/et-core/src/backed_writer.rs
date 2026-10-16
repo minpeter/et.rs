@@ -16,7 +16,6 @@
 use std::collections::VecDeque;
 
 use crate::crypto::{CryptoHandler, EncryptError, MAC_LEN};
-use crate::framing::frame_be_u32;
 use crate::packet::Packet;
 
 pub const MAX_BACKUP_BYTES: i64 = 64 * 1024 * 1024;
@@ -91,7 +90,6 @@ impl BackedWriter {
         header: u8,
         payload: &[u8],
     ) -> Result<WriterOutcome, EncryptError> {
-        let mut packet = Packet::new(header, payload);
         let packet_len = 2 + payload.len();
         let wire_len = i64::try_from(packet_len + MAC_LEN).unwrap_or(i64::MAX);
         let disconnected_fits = i64::try_from(packet_len)
@@ -109,27 +107,34 @@ impl BackedWriter {
         {
             return Ok(WriterOutcome::Skipped);
         }
-        packet.encrypt(&mut self.crypto)?;
-        self.backup.push_front(packet.clone());
-        self.backup_size += packet.wire_len() as i64;
+        let ciphertext = self.crypto.encrypt(payload)?;
+        let packet = Packet::raw(true, header, ciphertext);
+        let packet_wire_len = packet.wire_len();
+        if !self.connected {
+            self.backup.push_front(packet);
+            self.backup_size += packet_wire_len as i64;
+            self.sequence += 1;
+            self.disconnected_bytes += packet_wire_len as i64;
+            self.disconnected_packets += 1;
+            return Ok(WriterOutcome::BufferedOnly);
+        }
+        let mut framed = Vec::with_capacity(4 + packet_wire_len);
+        framed.extend_from_slice(&(packet_wire_len as u32).to_be_bytes());
+        framed.push(1);
+        framed.push(header);
+        framed.extend_from_slice(packet.payload());
+        self.backup.push_front(packet);
+        self.backup_size += packet_wire_len as i64;
         self.sequence += 1;
-        while self.connected
-            && (self.backup_size > CONNECTED_BACKUP_BYTES
-                || self.backup.len() > CONNECTED_BACKUP_PACKETS)
+        while self.backup_size > CONNECTED_BACKUP_BYTES
+            || self.backup.len() > CONNECTED_BACKUP_PACKETS
         {
             if let Some(old) = self.backup.pop_back() {
                 self.backup_size -= old.wire_len() as i64;
             }
         }
-        if self.connected {
-            self.release_slack_capacity();
-        }
-        if !self.connected {
-            self.disconnected_bytes += packet.wire_len() as i64;
-            self.disconnected_packets += 1;
-            return Ok(WriterOutcome::BufferedOnly);
-        }
-        Ok(WriterOutcome::Send(frame_be_u32(&packet.serialize())))
+        self.release_slack_capacity();
+        Ok(WriterOutcome::Send(framed))
     }
 
     pub fn recover(&self, last_valid_sequence: i64) -> Result<Vec<Vec<u8>>, RecoverError> {

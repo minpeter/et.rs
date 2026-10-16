@@ -9,8 +9,6 @@
 use blake2::digest::consts::U32;
 use blake2::digest::Mac;
 use blake2::Blake2bMac;
-use crypto_secretbox::aead::{Aead, KeyInit};
-use crypto_secretbox::{Nonce, XSalsa20Poly1305};
 
 pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 24;
@@ -236,20 +234,22 @@ pub fn verify_reset_decision_proof(
 
 #[derive(Clone)]
 pub struct CryptoHandler {
+    /// The passkey-derived key every reset derives from. Never overwritten:
+    /// a fresh client process only knows the passkey, so the server's Nth
+    /// reset must derive from the original key, not from the previous epoch.
+    original_key: [u8; KEY_LEN],
     base_key: [u8; KEY_LEN],
-    cipher: XSalsa20Poly1305,
     nonce: [u8; NONCE_LEN],
     direction: u8,
 }
 
 impl CryptoHandler {
     pub fn new(key: &[u8; KEY_LEN], direction: u8) -> Self {
-        let cipher = XSalsa20Poly1305::new(key.into());
         let mut nonce = [0u8; NONCE_LEN];
         nonce[NONCE_LEN - 1] = direction;
         Self {
+            original_key: *key,
             base_key: *key,
-            cipher,
             nonce,
             direction,
         }
@@ -260,8 +260,8 @@ impl CryptoHandler {
         if salt.len() != EPOCH_SALT_BYTES {
             return Err(ProofError);
         }
-        let derived = generichash(&self.base_key, salt)?;
-        self.cipher = XSalsa20Poly1305::new((&derived).into());
+        let derived = generichash(&self.original_key, salt)?;
+        self.base_key = derived;
         self.nonce = [0u8; NONCE_LEN];
         self.nonce[NONCE_LEN - 1] = self.direction;
         Ok(())
@@ -269,9 +269,7 @@ impl CryptoHandler {
 
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, EncryptError> {
         self.bump();
-        self.cipher
-            .encrypt(Nonce::from_slice(&self.nonce), plaintext)
-            .map_err(|_| EncryptError)
+        Ok(et_sodium::secretbox(plaintext, &self.nonce, &self.base_key))
     }
 
     pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, DecryptError> {
@@ -283,12 +281,9 @@ impl CryptoHandler {
         // (upstream #890 / de5dbd9).
         let saved = self.nonce;
         self.bump();
-        match self
-            .cipher
-            .decrypt(Nonce::from_slice(&self.nonce), ciphertext)
-        {
-            Ok(plaintext) => Ok(plaintext),
-            Err(_) => {
+        match et_sodium::secretbox_open(ciphertext, &self.nonce, &self.base_key) {
+            Some(plaintext) => Ok(plaintext),
+            None => {
                 self.nonce = saved;
                 Err(DecryptError::BadMac)
             }
@@ -437,5 +432,23 @@ mod tests {
         let mut peer = CryptoHandler::new(&key, DIR_CLIENT_TO_SERVER);
         peer.rekey(&salt).unwrap();
         assert_eq!(peer.decrypt(&after).unwrap(), b"x");
+    }
+
+    #[test]
+    fn repeated_rekeys_still_derive_from_the_original_key() {
+        // A fresh client process only knows the passkey: the server's Nth
+        // reset must match a peer that rekeys once from the original key.
+        let key = [0x42u8; KEY_LEN];
+        let first_salt = [0x11u8; EPOCH_SALT_BYTES];
+        let second_salt = [0x22u8; EPOCH_SALT_BYTES];
+        let mut handler = CryptoHandler::new(&key, DIR_CLIENT_TO_SERVER);
+        handler.rekey(&first_salt).unwrap();
+        let _ = handler.encrypt(b"epoch one").unwrap();
+        handler.rekey(&second_salt).unwrap();
+        let epoch_two = handler.encrypt(b"epoch two").unwrap();
+
+        let mut fresh = CryptoHandler::new(&key, DIR_CLIENT_TO_SERVER);
+        fresh.rekey(&second_salt).unwrap();
+        assert_eq!(fresh.decrypt(&epoch_two).unwrap(), b"epoch two");
     }
 }

@@ -99,7 +99,9 @@ cargo build --release                                  # host
 cargo build --release --target x86_64-pc-windows-gnu -p et   # et.exe
 ```
 
-Requires `protoc` (Protocol Buffers compiler) on the build host.
+Requires `protoc` (Protocol Buffers compiler) and a C toolchain (`cc`, make) on
+the build host: the wire crypto links the bundled libsodium, which is compiled
+from source.
 
 ## Roles
 

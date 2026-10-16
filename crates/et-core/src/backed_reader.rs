@@ -40,6 +40,7 @@ impl std::error::Error for ReadError {}
 pub struct BackedReader {
     crypto: CryptoHandler,
     partial: Vec<u8>,
+    offset: usize,
     replay: VecDeque<Packet>,
     sequence: i64,
     connected: bool,
@@ -50,6 +51,7 @@ impl BackedReader {
         Self {
             crypto,
             partial: Vec::new(),
+            offset: 0,
             replay: VecDeque::new(),
             sequence: 0,
             connected,
@@ -74,40 +76,53 @@ impl BackedReader {
         if !self.connected {
             return Ok(ReadItem::NeedMore);
         }
-        if self.partial.len() < 4 {
+        let available = &self.partial[self.offset..];
+        if available.len() < 4 {
             return Ok(ReadItem::NeedMore);
         }
-        let len = crate::framing::parse_be_u32_len(&self.partial).map_err(ReadError::Frame)?;
+        let len = crate::framing::parse_be_u32_len(available).map_err(ReadError::Frame)?;
         // Reject impossible lengths before copying a body. A length below the
         // packet header cannot be a real frame (upstream #890 / 4545da5).
         if len < crate::packet::HEADER_LEN {
             return Err(ReadError::Frame(crate::framing::FrameError::TooSmall));
         }
-        if self.partial.len() < 4 + len {
+        if available.len() < 4 + len {
             return Ok(ReadItem::NeedMore);
         }
-        let serialized = self.partial[4..4 + len].to_vec();
-        self.partial.drain(0..4 + len);
-        let packet = self.decode_packet(&serialized)?;
+        let start = self.offset + 4;
+        let end = start + len;
+        self.offset = end;
+        let result = Self::decode_packet(&mut self.crypto, &self.partial[start..end]);
+        if self.offset == self.partial.len() {
+            self.partial.clear();
+            self.offset = 0;
+        } else if self.offset >= 64 * 1024 {
+            self.partial.drain(0..self.offset);
+            self.offset = 0;
+        }
+        let packet = result?;
         self.sequence += 1;
         Ok(ReadItem::Packet(packet))
     }
 
-    fn decode_packet(&mut self, serialized: &[u8]) -> Result<Packet, ReadError> {
-        let mut packet = Packet::from_serialized(serialized).map_err(ReadError::Packet)?;
-        if !packet.is_encrypted() {
+    fn decode_packet(crypto: &mut CryptoHandler, serialized: &[u8]) -> Result<Packet, ReadError> {
+        if serialized.len() < crate::packet::HEADER_LEN {
+            return Err(ReadError::Packet(PacketError::Short));
+        }
+        if serialized[0] == 0 {
             return Err(ReadError::Unencrypted);
         }
-        packet
-            .decrypt(&mut self.crypto)
+        let plaintext = crypto
+            .decrypt(&serialized[crate::packet::HEADER_LEN..])
             .map_err(ReadError::Crypto)?;
-        Ok(packet)
+        Ok(Packet::raw(false, serialized[1], plaintext))
     }
 
     /// Zero sequence history and rekey. Used by authenticated reset recovery.
     pub fn reset(&mut self, salt: &[u8]) -> Result<(), crate::crypto::ProofError> {
         self.crypto.rekey(salt)?;
         self.partial.clear();
+        self.offset = 0;
         self.replay.clear();
         self.sequence = 0;
         self.connected = false;
@@ -118,15 +133,12 @@ impl BackedReader {
         let mut crypto = self.crypto.clone();
         let mut decoded = VecDeque::with_capacity(catchup.len());
         for serialized in &catchup {
-            let mut packet = Packet::from_serialized(serialized).map_err(ReadError::Packet)?;
-            if !packet.is_encrypted() {
-                return Err(ReadError::Unencrypted);
-            }
-            packet.decrypt(&mut crypto).map_err(ReadError::Crypto)?;
+            let packet = Self::decode_packet(&mut crypto, serialized)?;
             decoded.push_back(packet);
         }
         let n = catchup.len();
         self.partial.clear();
+        self.offset = 0;
         self.crypto = crypto;
         self.replay.append(&mut decoded);
         self.sequence += n as i64;
@@ -145,6 +157,7 @@ impl BackedReader {
 
     pub fn invalidate(&mut self) {
         self.partial.clear();
+        self.offset = 0;
         self.connected = false;
     }
 

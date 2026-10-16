@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use et_core::flow_control::{FlowControlMode, OutputQueue, QueuePushError};
@@ -29,7 +30,7 @@ struct WriterState {
     connected: bool,
     paused: bool,
     in_flight: bool,
-    reader_waiting: bool,
+    bridge_waiting: bool,
     stop: StopMode,
     unrecoverable: bool,
     default_buffering: bool,
@@ -52,6 +53,8 @@ impl WriterState {
 pub(super) struct FlowControl {
     state: Mutex<WriterState>,
     wake: Condvar,
+    reader_waiting: AtomicBool,
+    writer_waiting_for_reader: AtomicBool,
     #[cfg(test)]
     enqueue_hook: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
 }
@@ -72,22 +75,31 @@ impl FlowControl {
                 connected: true,
                 paused: false,
                 in_flight: false,
-                reader_waiting: false,
+                bridge_waiting: false,
                 stop: StopMode::Running,
                 unrecoverable: false,
                 default_buffering: limit == CONNECTED_OUTPUT_BYTES,
                 input: et_core::output_interrupt::InterruptInput::default(),
             }),
             wake: Condvar::new(),
+            reader_waiting: AtomicBool::new(false),
+            writer_waiting_for_reader: AtomicBool::new(false),
             #[cfg(test)]
             enqueue_hook: Mutex::new(None),
         }
     }
 
     pub(super) fn enqueue(&self, packet: Packet) -> Result<(), SessionError> {
-        let mut state = self.state.lock().map_err(|_| SessionError::Unavailable)?;
+        self.enqueue_owned(packet).map_err(|(_, error)| error)
+    }
+
+    pub(super) fn enqueue_owned(&self, packet: Packet) -> Result<(), (Packet, SessionError)> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return Err((packet, SessionError::Unavailable)),
+        };
         if state.stop != StopMode::Running {
-            return Err(SessionError::Unavailable);
+            return Err((packet, SessionError::Unavailable));
         }
         // The client may exit as soon as it sees status. Do not let the
         // fair control lane overtake preceding terminal output. The bridge
@@ -95,21 +107,27 @@ impl FlowControl {
         if packet.header() == et_core::proto::TerminalPacketType::TerminalExitStatus as u8
             && (state.in_flight || !state.queue.is_empty())
         {
-            return Err(SessionError::Connection(ConnError::Backpressure));
+            state.bridge_waiting = true;
+            return Err((packet, SessionError::Connection(ConnError::Backpressure)));
         }
+        let was_empty = state.queue.is_empty();
         match state.queue.push(packet) {
             Ok(()) => {
                 #[cfg(test)]
                 self.run_enqueue_hook();
+                let should_wake = was_empty && !state.in_flight;
                 drop(state);
-                self.wake.notify_one();
+                if should_wake {
+                    self.wake.notify_one();
+                }
                 Ok(())
             }
-            Err(QueuePushError::Full(_packet)) => {
-                Err(SessionError::Connection(ConnError::Backpressure))
+            Err(QueuePushError::Full(packet)) => {
+                state.bridge_waiting = true;
+                Err((packet, SessionError::Connection(ConnError::Backpressure)))
             }
-            Err(QueuePushError::Oversized(_packet)) => {
-                Err(SessionError::Connection(ConnError::PacketTooLarge))
+            Err(QueuePushError::Oversized(packet)) => {
+                Err((packet, SessionError::Connection(ConnError::PacketTooLarge)))
             }
         }
     }
@@ -126,8 +144,12 @@ impl FlowControl {
     }
 
     pub(super) fn can_accept_terminal(&self, bytes: usize) -> Result<bool, SessionError> {
-        let state = self.state.lock().map_err(|_| SessionError::Unavailable)?;
-        Ok(state.stop == StopMode::Running && state.queue.can_accept_terminal(bytes))
+        let mut state = self.state.lock().map_err(|_| SessionError::Unavailable)?;
+        let ok = state.stop == StopMode::Running && state.queue.can_accept_terminal(bytes);
+        if !ok {
+            state.bridge_waiting = true;
+        }
+        Ok(ok)
     }
 
     pub(super) fn pause(&self) -> Result<(), SessionError> {
@@ -165,18 +187,29 @@ impl FlowControl {
     }
 
     pub(super) fn set_reader_waiting(&self, waiting: bool) {
-        if let Ok(mut state) = self.state.lock() {
-            state.reader_waiting = waiting;
-            self.wake.notify_all();
+        self.reader_waiting.store(waiting, Ordering::Release);
+        if !waiting && self.writer_waiting_for_reader.swap(false, Ordering::AcqRel) {
+            if let Ok(_state) = self.state.lock() {
+                self.wake.notify_all();
+            }
         }
     }
 
     fn wait_for_reader(&self) -> bool {
+        if !self.reader_waiting.load(Ordering::Acquire) {
+            return !self.is_hard_stopped();
+        }
         let Ok(state) = self.state.lock() else {
             return false;
         };
         let Ok(state) = self.wake.wait_while(state, |state| {
-            state.reader_waiting && state.stop != StopMode::Hard
+            if self.reader_waiting.load(Ordering::Acquire) && state.stop != StopMode::Hard {
+                self.writer_waiting_for_reader
+                    .store(true, Ordering::Release);
+                true
+            } else {
+                false
+            }
         }) else {
             return false;
         };
@@ -271,14 +304,24 @@ impl FlowControl {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn complete(
         &self,
         packet: Packet,
         result: &writer::FlowWriteResult,
         connected: bool,
     ) -> bool {
+        self.complete_with_signal(packet, result, connected).0
+    }
+
+    pub(super) fn complete_with_signal(
+        &self,
+        packet: Packet,
+        result: &writer::FlowWriteResult,
+        connected: bool,
+    ) -> (bool, bool) {
         let Ok(mut state) = self.state.lock() else {
-            return false;
+            return (false, true);
         };
         state.in_flight = false;
         state.set_connected(connected);
@@ -312,8 +355,12 @@ impl FlowControl {
                 state.stop = StopMode::Hard;
             }
         }
+        let should_signal = std::mem::replace(&mut state.bridge_waiting, false)
+            || !connected
+            || !matches!(result, writer::FlowWriteResult::Delivered)
+            || state.stop == StopMode::Hard;
         self.wake.notify_all();
-        state.stop != StopMode::Hard
+        (state.stop != StopMode::Hard, should_signal)
     }
 }
 
@@ -326,11 +373,14 @@ pub(super) fn run_writer(session: Weak<ActiveSession>, flow: Arc<FlowControl>) {
             return;
         };
         let (result, connected) = writer::write_packet(&session, &flow, &packet);
-        let running = flow.complete(packet, &result, connected);
+        let (running, should_signal) = flow.complete_with_signal(packet, &result, connected);
         // In-flight packets still own queue capacity until complete. Wake
-        // after releasing it, including when this was the final queued frame:
-        // a signal before the write can strand the bridge's retained packet.
-        let _ = session.signal();
+        // after releasing it when the bridge observed backpressure or a
+        // state transition: a signal before the write can strand the
+        // bridge's retained packet.
+        if should_signal {
+            let _ = session.signal();
+        }
         if !running {
             return;
         }

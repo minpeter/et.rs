@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
-#[cfg(unix)]
-use std::io::Read;
 use std::io::{self};
+#[cfg(unix)]
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -21,6 +21,9 @@ use crate::forward_worker::{
 };
 
 const CHANNEL_CAPACITY: usize = 256;
+/// How many outbound packets the Unix poll worker holds itself when the
+/// session has not drained the channel yet, before it blocks.
+pub(crate) const CHANNEL_SPILL_LIMIT: usize = CHANNEL_CAPACITY;
 /// Maximum reverse listeners owned by one terminal session, after DNS fanout
 /// and address deduplication.
 pub const MAX_SESSION_LISTENERS: usize = 32;
@@ -406,6 +409,12 @@ pub struct Forwarder {
     /// this way is not selectable there.
     #[cfg(unix)]
     wake: UnixStream,
+    #[cfg(unix)]
+    wake_writer: Arc<UnixStream>,
+    #[cfg(unix)]
+    wake_signalled: Arc<AtomicBool>,
+    #[cfg(windows)]
+    routes: crate::forward_worker::FastRoutes,
     shutdown: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     abandoned: Arc<AtomicBool>,
@@ -525,11 +534,25 @@ fn start_forwarder_hook(
     let abandoned = Arc::new(AtomicBool::new(false));
     let worker_abandoned = abandoned.clone();
     #[cfg(unix)]
-    let (wake, wake_writer) = {
+    let (wake, wake_writer, forwarder_wake_writer, wake_signalled) = {
         let (reader, writer) = UnixStream::pair()?;
         reader.set_nonblocking(true)?;
-        (reader, writer)
+        writer.set_nonblocking(true)?;
+        let shared_writer = Arc::new(writer.try_clone()?);
+        (
+            reader,
+            writer,
+            shared_writer,
+            Arc::new(AtomicBool::new(false)),
+        )
     };
+    #[cfg(unix)]
+    let worker_wake_signalled = wake_signalled.clone();
+    #[cfg(windows)]
+    let routes: crate::forward_worker::FastRoutes =
+        Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    #[cfg(windows)]
+    let worker_routes = routes.clone();
     #[cfg(unix)]
     let (listener_stop, listener_stop_reader) = UnixStream::pair()?;
     #[cfg(windows)]
@@ -577,6 +600,10 @@ fn start_forwarder_hook(
                     abandoned: worker_abandoned,
                     stdio_open: worker_stdio.clone(),
                     next_client_fd: worker_next_client_fd,
+                    #[cfg(windows)]
+                    routes: worker_routes,
+                    #[cfg(unix)]
+                    wake_signalled: worker_wake_signalled,
                 },
                 #[cfg(unix)]
                 wake_writer,
@@ -596,6 +623,12 @@ fn start_forwarder_hook(
         cancel: Some(cancel_tx),
         #[cfg(unix)]
         wake,
+        #[cfg(unix)]
+        wake_writer: forwarder_wake_writer,
+        #[cfg(unix)]
+        wake_signalled,
+        #[cfg(windows)]
+        routes,
         shutdown,
         worker: Some(worker),
         abandoned,
@@ -712,6 +745,7 @@ impl Forwarder {
     /// Pollable readiness handle for outbound forwarding packets (Unix only).
     #[cfg(unix)]
     pub fn wake(&self) -> Result<&UnixStream, ForwardError> {
+        self.commands.flush_wake();
         Ok(&self.wake)
     }
 
@@ -745,7 +779,91 @@ impl Forwarder {
     /// and retry later. Callers must not read further session packets while
     /// holding a returned packet, or forwarding data would be reordered.
     pub fn try_receive(&self, packet: Packet) -> Result<Option<Packet>, ForwardError> {
-        match self.commands.try_send(Command::Packet(packet)) {
+        // The Windows threaded model lets the session loop hand data straight
+        // to the writer channel, skipping the worker hop. The Unix poll
+        // worker instead wakes once per batch and writes sockets inline, so
+        // every packet takes the command queue there.
+        #[cfg(windows)]
+        if self.commands.is_idle()
+            && packet.header() == et_core::proto::TerminalPacketType::PortForwardData as u8
+        {
+            use prost::Message;
+            if let Ok(data) = et_core::proto::PortForwardData::decode(packet.payload()) {
+                if data.error.is_none()
+                    && !data.closed.unwrap_or(false)
+                    && !data.half_close.unwrap_or(false)
+                {
+                    let socket_id = data.socketid.unwrap_or(0);
+                    let role = if data.sourcetodestination.unwrap_or(false) {
+                        crate::forward_worker::Role::Destination
+                    } else {
+                        crate::forward_worker::Role::Source
+                    };
+                    let buffer = data.buffer.unwrap_or_default();
+                    if buffer.len() <= crate::forward_worker::MAX_DATA_PACKET {
+                        let routes = self.routes.read().unwrap();
+                        if let Some(route) = routes.get(&(role, socket_id)) {
+                            if !buffer.is_empty() {
+                                if let Some(writer) = &route.writer {
+                                    let byte_count = buffer.len();
+                                    route.pending_bytes.fetch_add(byte_count, Ordering::AcqRel);
+                                    match writer.try_send(buffer) {
+                                        Ok(()) => {
+                                            if let Some(delivered) =
+                                                crate::forward_worker::state::decode_window(
+                                                    data.window,
+                                                )
+                                            {
+                                                crate::forward_worker::state::apply_delivery_route(
+                                                    route, delivered,
+                                                );
+                                            }
+                                            return Ok(None);
+                                        }
+                                        Err(channel::TrySendError::Full(_)) => {
+                                            route
+                                                .pending_bytes
+                                                .fetch_sub(byte_count, Ordering::AcqRel);
+                                        }
+                                        Err(channel::TrySendError::Disconnected(_)) => {
+                                            route
+                                                .pending_bytes
+                                                .fetch_sub(byte_count, Ordering::AcqRel);
+                                            return Err(ForwardError::Unavailable);
+                                        }
+                                    }
+                                } else {
+                                    if let Some(delivered) =
+                                        crate::forward_worker::state::decode_window(data.window)
+                                    {
+                                        crate::forward_worker::state::apply_delivery_route(
+                                            route, delivered,
+                                        );
+                                    }
+                                    return Ok(None);
+                                }
+                            } else {
+                                if let Some(delivered) =
+                                    crate::forward_worker::state::decode_window(data.window)
+                                {
+                                    crate::forward_worker::state::apply_delivery_route(
+                                        route, delivered,
+                                    );
+                                }
+                                return Ok(None);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let send_result =
+            if packet.header() == et_core::proto::TerminalPacketType::PortForwardData as u8 {
+                self.commands.try_send_batched(Command::Packet(packet))
+            } else {
+                self.commands.try_send(Command::Packet(packet))
+            };
+        match send_result {
             Ok(()) => Ok(None),
             Err(TryCommandError::Full(Command::Packet(packet))) => Ok(Some(packet)),
             Err(TryCommandError::Full(_)) | Err(TryCommandError::Closed) => {
@@ -754,20 +872,47 @@ impl Forwarder {
         }
     }
 
+    /// Wake the forwarding worker after a batch of [`Forwarder::try_receive`]
+    /// calls if it was not already woken mid-batch.
+    pub fn flush_receive(&self) {
+        #[cfg(unix)]
+        self.commands.flush_wake();
+    }
+
     pub fn try_outbound(&self) -> Result<Option<Packet>, ForwardError> {
         #[cfg(unix)]
-        drain_wake(&self.wake)?;
+        self.commands.flush_wake();
         if let Ok(result) = self.priority.try_recv() {
-            return result.map(Some);
-        }
-        match self.outbound.try_recv() {
-            Ok(result) => result.map(Some),
-            Err(channel::TryRecvError::Empty) => Ok(None),
-            Err(channel::TryRecvError::Disconnected) => Err(ForwardError::Unavailable),
+            result.map(Some)
+        } else {
+            match self.outbound.try_recv() {
+                Ok(result) => result.map(Some),
+                Err(channel::TryRecvError::Empty) => {
+                    #[cfg(unix)]
+                    {
+                        // Drain any old wake bytes first, then clear the flag,
+                        // then re-check the queues. If the worker pushed a
+                        // packet at any point, the re-check sees it and writes
+                        // a fresh byte; the worker's own write cannot be
+                        // drained by a stale drain.
+                        drain_wake(&self.wake)?;
+                        self.wake_signalled.store(false, Ordering::Release);
+                        if (!self.priority.is_empty() || !self.outbound.is_empty())
+                            && !self.wake_signalled.swap(true, Ordering::AcqRel)
+                        {
+                            let _ = (&*self.wake_writer).write(&[1]);
+                        }
+                    }
+                    Ok(None)
+                }
+                Err(channel::TryRecvError::Disconnected) => Err(ForwardError::Unavailable),
+            }
         }
     }
 
     pub fn wait_outbound(&self, timeout: Duration) -> Result<Packet, ForwardError> {
+        #[cfg(unix)]
+        self.commands.flush_wake();
         wait_outbound_from(&self.priority, &self.outbound, timeout)
     }
 

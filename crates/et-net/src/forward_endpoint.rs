@@ -630,6 +630,7 @@ impl ForwardStream {
         }
     }
 
+    #[cfg(windows)]
     pub(crate) fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         match self {
             Self::Tcp(stream) => stream.set_write_timeout(timeout),
@@ -663,6 +664,16 @@ impl Write for ForwardStream {
             Self::Tcp(stream) => stream.flush(),
             #[cfg(unix)]
             Self::Unix(stream) => stream.flush(),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsFd for ForwardStream {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        match self {
+            Self::Tcp(stream) => stream.as_fd(),
+            Self::Unix(stream) => stream.as_fd(),
         }
     }
 }

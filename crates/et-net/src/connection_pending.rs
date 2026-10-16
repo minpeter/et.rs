@@ -10,11 +10,13 @@ use super::{ConnError, Connection, PreparedWrite, WritePacketError};
 use crate::connection_nonblocking::wait_writable;
 
 // One syscall and at most this many bytes per pump turn, even on a fast socket.
-const WRITE_QUANTUM: usize = 64 * 1024;
+// Sized above a full 64 KiB framed forwarding packet (65,558 bytes) so an ordinary
+// data packet never spills 22 leftover bytes across an extra poll/advance cycle.
+const WRITE_QUANTUM: usize = 256 * 1024;
 
 pub(super) struct PendingWrite {
     stream: Arc<TcpStream>,
-    frame: Vec<u8>,
+    frame: Arc<[u8]>,
     offset: usize,
     pub(super) deadline: Instant,
 }

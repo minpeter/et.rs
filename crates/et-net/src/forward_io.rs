@@ -20,7 +20,7 @@ use et_core::proto::SocketEndpoint;
 use super::forward_worker::Role;
 use super::forward_worker::{Command, CommandSender, TryCommandError};
 
-pub(crate) const READ_CHUNK: usize = 32 * 1024;
+pub(crate) const READ_CHUNK: usize = 64 * 1024;
 
 #[cfg(windows)]
 const IO_CANCEL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -678,6 +678,9 @@ fn spawn_io_inner(
     );
     #[cfg(windows)]
     {
+        if let ForwardStream::Tcp(tcp) = &stream {
+            let _ = tcp.set_nodelay(true);
+        }
         // Winsock does not reliably interrupt an in-flight synchronous I/O
         // call when another handle for the same socket is shut down. Finite
         // deadlines make both sibling threads observe hard cancellation.

@@ -75,6 +75,10 @@ impl Packet {
         &self.payload
     }
 
+    pub fn into_payload(self) -> Vec<u8> {
+        self.payload
+    }
+
     pub fn wire_len(&self) -> usize {
         HEADER_LEN + self.payload.len()
     }

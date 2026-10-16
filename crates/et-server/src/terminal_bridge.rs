@@ -18,10 +18,8 @@ use rustix::time::Timespec;
 use crate::session::{ActiveSession, SessionError, SessionWriteError};
 
 const READ_BUFFER: usize = 16 * 1024;
-const CLIENT_READ_BATCH: usize = 64;
-// A saturated peer can have one held packet behind its 256-slot worker queue.
-// Reading that bounded amount breaks the cycle without making ingress unbounded.
-const FORWARD_BACKLOG_CAPACITY: usize = 257;
+const CLIENT_READ_BATCH: usize = 128;
+const FORWARD_BACKLOG_CAPACITY: usize = 513;
 
 struct PendingLocalFrame {
     bytes: Vec<u8>,
@@ -275,7 +273,7 @@ fn run_mode_poll(
                         true
                     }
                     Ok(Some(packet)) if is_forward_packet(packet.header()) => {
-                        enqueue_forwarding(&forwarder, &mut pending_forward, packet)?;
+                        pending_forward.push_back(packet);
                         true
                     }
                     Ok(Some(packet)) => {
@@ -362,7 +360,7 @@ fn run_mode_poll(
                 }
             }
         }
-        forwarder.flush_receive();
+        flush_forwarding(&forwarder, &mut pending_forward)?;
         if !client_events_are_stale && client_events.intersects(PollFlags::HUP | PollFlags::ERR) {
             let observed_generation = polled_generation.unwrap_or(connection_generation);
             note_client_drop(
@@ -627,6 +625,7 @@ fn drain_available(wake: &mut LocalStream) -> Result<bool, SessionError> {
     }
 }
 
+#[allow(dead_code)]
 fn enqueue_forwarding(
     forwarder: &Forwarder,
     pending: &mut VecDeque<Packet>,
@@ -647,14 +646,7 @@ fn flush_forwarding(
     forwarder: &Forwarder,
     pending: &mut VecDeque<Packet>,
 ) -> Result<(), SessionError> {
-    while let Some(packet) = pending.pop_front() {
-        if let Some(packet) = forwarder.try_receive(packet).map_err(forward_error)? {
-            pending.push_front(packet);
-            break;
-        }
-    }
-    forwarder.flush_receive();
-    Ok(())
+    forwarder.try_receive_queue(pending).map_err(forward_error)
 }
 
 fn enqueue_outbound(

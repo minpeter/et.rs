@@ -145,6 +145,7 @@ pub(crate) enum TryCommandError {
 }
 
 /// Non-blocking pop result for the Unix poll loop.
+#[allow(dead_code)]
 pub(crate) enum CommandPop {
     Command(Command),
     Empty,
@@ -303,6 +304,33 @@ impl CommandSender {
         Ok(())
     }
 
+    pub(crate) fn try_send_queue(&self, queue: &mut VecDeque<Packet>) -> Result<(), ForwardError> {
+        if queue.is_empty() {
+            return Ok(());
+        }
+        let mut state = self.queue.state.lock().unwrap();
+        if state.shutdown || !state.receiver_alive {
+            return Err(ForwardError::Unavailable);
+        }
+        let was_empty = state.commands.is_empty();
+        let avail = self.queue.capacity.saturating_sub(state.commands.len());
+        let count = queue.len().min(avail);
+        for _ in 0..count {
+            if let Some(packet) = queue.pop_front() {
+                state.commands.push_back(Command::Packet(packet));
+            }
+        }
+        if count > 0 {
+            self.queue.in_flight.fetch_add(count, Ordering::AcqRel);
+            if was_empty {
+                self.queue.changed.notify_all();
+            }
+            #[cfg(unix)]
+            self.queue.signal_wake(true);
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     pub(crate) fn flush_wake(&self) {
         if self.queue.in_flight.load(Ordering::Acquire) == 0
@@ -414,11 +442,34 @@ impl CommandReceiver {
             }
         }
     }
+
+    #[cfg(unix)]
+    pub(crate) fn drain_batch(&self, batch: &mut Vec<Command>) -> bool {
+        let mut state = self.queue.state.lock().unwrap();
+        if state.shutdown || state.senders == 0 {
+            return false;
+        }
+        let was_full = state.commands.len() >= self.queue.capacity;
+        batch.extend(state.commands.drain(..));
+        if was_full && state.commands.len() < self.queue.capacity {
+            self.queue.changed.notify_all();
+        }
+        self.queue.clear_wake_if_empty(&state);
+        true
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn complete_count(&self, count: usize) {
+        if count > 0 {
+            self.queue.in_flight.fetch_sub(count, Ordering::AcqRel);
+        }
+    }
     /// Non-blocking pop for the Unix poll loop. Like `recv_until`, shutdown
     /// (or all senders leaving) short-circuits even a full queue: graceful
     /// stop discards pending commands rather than draining them behind a
     /// congested outbound channel.
     #[cfg(unix)]
+    #[allow(dead_code)]
     pub(crate) fn pop(&self) -> CommandPop {
         let mut state = self.queue.state.lock().unwrap();
         if state.shutdown || state.senders == 0 {
@@ -475,6 +526,7 @@ impl CommandReceiver {
         }
     }
 
+    #[allow(dead_code)]
     fn complete_one(&self) {
         self.queue.in_flight.fetch_sub(1, Ordering::AcqRel);
     }

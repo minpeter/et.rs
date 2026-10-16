@@ -30,8 +30,8 @@ use crate::forward_io::{close_write, spawn_io_direct, subtract_saturating, Activ
 /// Both limits must stay below the socket's 64-slot writer channel. A byte
 /// limit alone is insufficient because legal one-byte reads can create far
 /// more packets than the queue can absorb.
-pub(super) const WINDOW_BYTES: i64 = 512 * 1024;
-pub(super) const WINDOW_PACKETS: i64 = 32;
+pub(super) const WINDOW_BYTES: i64 = 2 * 1024 * 1024;
+pub(super) const WINDOW_PACKETS: i64 = 64;
 
 /// Return credit once this much has drained, so a full window costs a bounded
 /// number of control packets instead of one per data packet.
@@ -183,6 +183,23 @@ impl Worker {
                 self.destination_response(response)
             }
             value if value == TerminalPacketType::PortForwardData as u8 => {
+                #[cfg(unix)]
+                if let Some((source_to_dest, socket_id, start, len)) =
+                    try_fast_parse_data(packet.payload())
+                {
+                    let role = if source_to_dest {
+                        Role::Destination
+                    } else {
+                        Role::Source
+                    };
+                    return self.admit_data_span(
+                        role,
+                        socket_id,
+                        packet.into_payload(),
+                        start,
+                        len,
+                    );
+                }
                 let data = PortForwardData::decode(packet.payload())
                     .map_err(|_| ForwardError::Protocol("malformed forwarding data"))?;
                 self.receive_data(data)
@@ -781,6 +798,45 @@ impl Worker {
             Ok(())
         }
     }
+
+    pub(super) fn emit_raw(&mut self, header: u8, payload: Vec<u8>) -> Result<(), ForwardError> {
+        let packet = Ok(Packet::new(header, payload));
+        #[cfg(unix)]
+        {
+            if self.outbound_spill.len() < crate::forward::CHANNEL_SPILL_LIMIT {
+                match self.outbound.try_send(packet) {
+                    Ok(()) => {}
+                    Err(crossbeam_channel::TrySendError::Full(packet)) => {
+                        self.outbound_spill.push_back(packet);
+                    }
+                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                        return Err(ForwardError::Unavailable);
+                    }
+                }
+            } else {
+                channel::select! {
+                    send(self.outbound, packet) -> result => {
+                        result.map_err(|_| ForwardError::Unavailable)?;
+                    }
+                    recv(self.cancel) -> _ => return Err(ForwardError::Unavailable),
+                }
+            }
+            if !self.defer_outbound_wake {
+                self.flush_outbound_wake();
+            }
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            channel::select! {
+                send(self.outbound, packet) -> result => {
+                    result.map_err(|_| ForwardError::Unavailable)?;
+                }
+                recv(self.cancel) -> _ => return Err(ForwardError::Unavailable),
+            }
+            Ok(())
+        }
+    }
 }
 
 fn write_socks_reply(stream: &ForwardStream, version: Option<u8>, success: bool) {
@@ -795,6 +851,86 @@ fn write_socks_reply(stream: &ForwardStream, version: Option<u8>, success: bool)
     let _ = std::io::Write::write_all(&mut stream, &reply);
 }
 
+#[cfg(unix)]
+pub(crate) fn try_fast_parse_data(payload: &[u8]) -> Option<(bool, i32, usize, usize)> {
+    if payload.len() < 6 || payload[0] != 0x08 {
+        return None;
+    }
+    let source_to_dest = match payload[1] {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    if payload[2] != 0x10 {
+        return None;
+    }
+    let mut offset = 3;
+    let socket_id = decode_varint_u32(payload, &mut offset)? as i32;
+    if offset >= payload.len() || payload[offset] != 0x1a {
+        return None;
+    }
+    offset += 1;
+    let buf_len = decode_varint_usize(payload, &mut offset)?;
+    if offset + buf_len == payload.len() {
+        Some((source_to_dest, socket_id, offset, buf_len))
+    } else {
+        None
+    }
+}
+
+#[cfg(unix)]
+fn decode_varint_u32(slice: &[u8], offset: &mut usize) -> Option<u32> {
+    let mut result = 0u32;
+    let mut shift = 0;
+    while *offset < slice.len() {
+        let byte = slice[*offset];
+        *offset += 1;
+        result |= ((byte & 0x7f) as u32) << shift;
+        if byte & 0x80 == 0 {
+            return Some(result);
+        }
+        shift += 7;
+        if shift > 35 {
+            return None;
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn decode_varint_usize(slice: &[u8], offset: &mut usize) -> Option<usize> {
+    let mut result = 0usize;
+    let mut shift = 0;
+    while *offset < slice.len() {
+        let byte = slice[*offset];
+        *offset += 1;
+        result |= ((byte & 0x7f) as usize) << shift;
+        if byte & 0x80 == 0 {
+            return Some(result);
+        }
+        shift += 7;
+        if shift > (usize::BITS as usize) {
+            return None;
+        }
+    }
+    None
+}
+
+pub(crate) fn encode_data_packet(
+    source_to_destination: bool,
+    socket_id: i32,
+    buffer: &[u8],
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(12 + buffer.len());
+    payload.push(0x08);
+    payload.push(source_to_destination as u8);
+    payload.push(0x10);
+    prost::encoding::encode_varint(socket_id as u64, &mut payload);
+    payload.push(0x1a);
+    prost::encoding::encode_varint(buffer.len() as u64, &mut payload);
+    payload.extend_from_slice(buffer);
+    payload
+}
 #[cfg(test)]
 mod tests {
     use super::{decode_window, FlowWindow, PortForwardWindow, WINDOW_BYTES, WINDOW_PACKETS};

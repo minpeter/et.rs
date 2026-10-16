@@ -22,7 +22,7 @@ use crate::forward_io::{cancellation_requested, shutdown_write, FlowWindow};
 use crate::ssh_agent_session_bind::AgentSessionBindReplies;
 
 use super::state::{CREDIT_RETURN_THRESHOLD, PACKET_CREDIT_RETURN_THRESHOLD};
-use super::{CommandPop, ForwardError, Role, Worker};
+use super::{ForwardError, Role, Worker};
 
 /// Queued network-to-socket buffers per socket, matching the bound of the
 /// writer channel the threaded model used.
@@ -33,14 +33,21 @@ const IDLE_CREDIT_FLUSH: Duration = Duration::from_millis(2);
 /// Reads serviced per socket per poll cycle before moving to the next socket.
 /// Large enough to drain a saturated socket buffer in one cycle, so a bulk
 /// transfer does not return to poll once per handful of packets.
-const READS_PER_CYCLE: usize = 64;
+const READS_PER_CYCLE: usize = 128;
+
+#[derive(Debug)]
+pub(crate) struct QueuedBuffer {
+    pub(crate) data: Vec<u8>,
+    pub(crate) start: usize,
+    pub(crate) len: usize,
+}
 
 pub(crate) struct SocketIo {
     pub(crate) stream: ForwardStream,
     pub(crate) role: Role,
     pub(crate) socket_id: i32,
     /// Network data queued for the local socket.
-    out: VecDeque<Vec<u8>>,
+    out: VecDeque<QueuedBuffer>,
     /// Write progress into the front buffer.
     out_offset: usize,
     read_open: bool,
@@ -89,6 +96,9 @@ impl SocketIo {
         bind_replies: Option<AgentSessionBindReplies>,
     ) -> io::Result<Self> {
         stream.set_nonblocking(true)?;
+        if let ForwardStream::Tcp(tcp) = &stream {
+            let _ = tcp.set_nodelay(true);
+        }
         Ok(Self {
             role,
             socket_id,
@@ -135,7 +145,20 @@ impl SocketIo {
         if self.out.len() >= OUT_QUEUE_PACKETS {
             return Err(buffer);
         }
-        self.out.push_back(buffer);
+        let len = buffer.len();
+        self.out.push_back(QueuedBuffer {
+            data: buffer,
+            start: 0,
+            len,
+        });
+        Ok(())
+    }
+
+    fn queue_write_span(&mut self, data: Vec<u8>, start: usize, len: usize) -> Result<(), Vec<u8>> {
+        if self.out.len() >= OUT_QUEUE_PACKETS {
+            return Err(data);
+        }
+        self.out.push_back(QueuedBuffer { data, start, len });
         Ok(())
     }
 
@@ -184,24 +207,19 @@ impl SocketIo {
             match self.stream.read(&mut scratch[..limit]) {
                 Ok(0) => return Ok(ReadOutcome::Eof),
                 Ok(count) => {
-                    let forwarded = match self.bind_replies.as_mut() {
-                        Some(replies) => match replies.consume(&scratch[..count]) {
-                            Ok(forwarded) => forwarded,
-                            Err(()) => {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "invalid ssh agent reply to session binding",
-                                ));
-                            }
-                        },
-                        None => scratch[..count].to_vec(),
-                    };
-                    // Only session-bind replies so far: keep reading, and do
-                    // not present an empty read as EOF.
-                    if forwarded.is_empty() {
-                        continue;
+                    if let Some(replies) = self.bind_replies.as_mut() {
+                        let forwarded = replies.consume(&scratch[..count]).map_err(|()| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid ssh agent reply to session binding",
+                            )
+                        })?;
+                        if forwarded.is_empty() {
+                            continue;
+                        }
+                        return Ok(ReadOutcome::Data(forwarded));
                     }
-                    return Ok(ReadOutcome::Data(forwarded));
+                    return Ok(ReadOutcome::Data(scratch[..count].to_vec()));
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -217,7 +235,7 @@ impl SocketIo {
     /// credit — see `Command::Drained`).
     fn flush_out(&mut self) -> io::Result<()> {
         while let Some(front) = self.out.front() {
-            let pending = &front[self.out_offset..];
+            let pending = &front.data[front.start + self.out_offset..front.start + front.len];
             match self.stream.write(pending) {
                 Ok(0) => {
                     return Err(io::Error::new(
@@ -227,13 +245,14 @@ impl SocketIo {
                 }
                 Ok(written) => {
                     self.out_offset += written;
-                    if self.out_offset == front.len() {
-                        let done = self.out.pop_front().unwrap_or_default();
+                    if self.out_offset == front.len {
+                        let done_len = front.len;
+                        self.out.pop_front();
                         self.out_offset = 0;
                         if self.windowed() {
                             self.credit_bytes = self
                                 .credit_bytes
-                                .saturating_add(i64::try_from(done.len()).unwrap_or(i64::MAX));
+                                .saturating_add(i64::try_from(done_len).unwrap_or(i64::MAX));
                             self.credit_packets = self.credit_packets.saturating_add(1);
                         }
                     }
@@ -376,14 +395,37 @@ impl Worker {
             Role::Destination => &mut self.destinations,
         };
         let Some(socket) = map.get_mut(&socket_id) else {
-            // Data for an already-closed socket id is a normal race; upstream
-            // logs a warning and drops it.
             return Ok(());
         };
         if socket.write_closed() {
             return Ok(());
         }
         if let Err(buffer) = socket.queue_write(buffer) {
+            self.held.push_back((role, socket_id, buffer));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn admit_data_span(
+        &mut self,
+        role: Role,
+        socket_id: i32,
+        data: Vec<u8>,
+        start: usize,
+        len: usize,
+    ) -> Result<(), ForwardError> {
+        let map = match role {
+            Role::Source => &mut self.sources,
+            Role::Destination => &mut self.destinations,
+        };
+        let Some(socket) = map.get_mut(&socket_id) else {
+            return Ok(());
+        };
+        if socket.write_closed() {
+            return Ok(());
+        }
+        if let Err(data) = socket.queue_write_span(data, start, len) {
+            let buffer = data[start..start + len].to_vec();
             self.held.push_back((role, socket_id, buffer));
         }
         Ok(())
@@ -494,6 +536,34 @@ impl Worker {
         }
     }
 
+    fn send_credit(
+        &mut self,
+        role: Role,
+        socket_id: i32,
+        credit: i64,
+        packet_credit: i64,
+    ) -> Result<(), ForwardError> {
+        self.emit_priority(
+            TerminalPacketType::PortForwardData as u8,
+            PortForwardData {
+                // Credit travels toward the peer that SENDS on this
+                // socket, the same direction flag data uses for this
+                // role. Inverting it would land the credit in the
+                // peer's other map and silently strand the sender.
+                sourcetodestination: Some(role == Role::Source),
+                socketid: Some(socket_id),
+                buffer: None,
+                error: None,
+                closed: None,
+                half_close: None,
+                window: Some(PortForwardWindow {
+                    bytes: Some(credit),
+                    packets: Some(i32::try_from(packet_credit).unwrap_or(i32::MAX)),
+                }),
+            },
+        )
+    }
+
     /// Return window credit whose batch or idle timer is due.
     fn flush_due_credits(&mut self) -> Result<(), ForwardError> {
         let now = Instant::now();
@@ -512,25 +582,7 @@ impl Worker {
                 else {
                     continue;
                 };
-                self.emit_priority(
-                    TerminalPacketType::PortForwardData as u8,
-                    PortForwardData {
-                        // Credit travels toward the peer that SENDS on this
-                        // socket, the same direction flag data uses for this
-                        // role. Inverting it would land the credit in the
-                        // peer's other map and silently strand the sender.
-                        sourcetodestination: Some(role == Role::Source),
-                        socketid: Some(socket_id),
-                        buffer: None,
-                        error: None,
-                        closed: None,
-                        half_close: None,
-                        window: Some(PortForwardWindow {
-                            bytes: Some(credit),
-                            packets: Some(i32::try_from(packet_credit).unwrap_or(i32::MAX)),
-                        }),
-                    },
-                )?;
+                self.send_credit(role, socket_id, credit, packet_credit)?;
             }
         }
         Ok(())
@@ -671,7 +723,12 @@ impl Worker {
                 match outcome {
                     Ok(ReadOutcome::Data(data)) => {
                         socket.note_sent(data.len());
-                        self.send_data(socket.role, socket.socket_id, data, false, None)?;
+                        let payload = super::state::encode_data_packet(
+                            socket.role == Role::Source,
+                            socket.socket_id,
+                            &data,
+                        );
+                        self.emit_raw(TerminalPacketType::PortForwardData as u8, payload)?;
                         reads += 1;
                     }
                     Ok(ReadOutcome::Idle) => break,
@@ -789,9 +846,17 @@ impl Worker {
                     self.remove(role, socket_id);
                     continue;
                 }
+                let credit_to_flush = if socket.out.is_empty() && socket.credit_bytes > 0 {
+                    socket.take_credit()
+                } else {
+                    None
+                };
                 if socket.out.is_empty() {
                     if socket.close_when_drained {
                         self.map_mut(role).insert(socket_id, socket);
+                        if let Some((credit, packet_credit)) = credit_to_flush {
+                            self.send_credit(role, socket_id, credit, packet_credit)?;
+                        }
                         self.remove(role, socket_id);
                         continue;
                     }
@@ -802,6 +867,9 @@ impl Worker {
                     }
                 }
                 self.map_mut(role).insert(socket_id, socket);
+                if let Some((credit, packet_credit)) = credit_to_flush {
+                    self.send_credit(role, socket_id, credit, packet_credit)?;
+                }
             }
             if !progressed || self.held.is_empty() {
                 break;
@@ -833,24 +901,16 @@ impl Worker {
             self.defer_outbound_wake = true;
             if wake_ready || commands.has_pending() {
                 commands.drain_wake();
-                loop {
-                    match commands.pop() {
-                        CommandPop::Command(command) => {
-                            let step = self.handle_command(command);
-                            commands.complete_one();
-                            step?;
-                        }
-                        CommandPop::Empty => {
-                            // One wake covered the whole batch. Clear the
-                            // flag only now, so pushes that arrived mid-drain
-                            // did not each write a wake byte; any push that
-                            // lands after this point writes exactly one.
-                            commands.arm_wake();
-                            break;
-                        }
-                        CommandPop::Disconnected => return Ok(()),
-                    }
+                let mut batch = Vec::with_capacity(128);
+                if !commands.drain_batch(&mut batch) {
+                    return Ok(());
                 }
+                let count = batch.len();
+                for command in batch {
+                    self.handle_command(command)?;
+                }
+                commands.complete_count(count);
+                commands.arm_wake();
                 self.flush_queued_writes()?;
                 self.flush_due_credits()?;
             }

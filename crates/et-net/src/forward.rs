@@ -872,6 +872,10 @@ impl Forwarder {
         }
     }
 
+    pub fn try_receive_queue(&self, queue: &mut VecDeque<Packet>) -> Result<(), ForwardError> {
+        self.commands.try_send_queue(queue)
+    }
+
     /// Wake the forwarding worker after a batch of [`Forwarder::try_receive`]
     /// calls if it was not already woken mid-batch.
     pub fn flush_receive(&self) {

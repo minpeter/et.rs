@@ -28,7 +28,7 @@ pub use recovery::{RecoveryExchange, DEFAULT_RECOVERY_TIMEOUT, MAX_RECOVERY_PROT
 /// and recovery can proceed.
 pub const DEFAULT_LIVE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const FLOW_CONTROL_LIVE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-pub const FLOW_CONTROL_SOCKET_BUFFER_BYTES: usize = 256 * 1024;
+pub const FLOW_CONTROL_SOCKET_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum ConnError {
@@ -51,7 +51,7 @@ pub struct Connection {
 }
 
 pub struct PreparedWrite {
-    live: Option<(Arc<TcpStream>, Vec<u8>, Duration)>,
+    live: Option<(Arc<TcpStream>, Arc<[u8]>, Duration)>,
 }
 
 #[derive(Debug)]
@@ -95,6 +95,7 @@ impl Connection {
     }
 
     fn new(stream: TcpStream, key: &[u8; KEY_LEN], encrypt: u8, decrypt: u8) -> Self {
+        let _ = stream.set_nodelay(true);
         Self {
             stream: Arc::new(stream),
             writer: BackedWriter::new(CryptoHandler::new(key, encrypt), true),

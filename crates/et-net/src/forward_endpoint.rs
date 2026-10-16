@@ -704,6 +704,7 @@ impl ForwardListener {
         let stream = match &self.inner {
             ListenerKind::Tcp(listener) => listener.accept().map(|(stream, _)| {
                 let _ = stream.set_nonblocking(false);
+                let _ = stream.set_nodelay(true);
                 ForwardStream::Tcp(stream)
             }),
             #[cfg(unix)]

@@ -188,7 +188,10 @@ fn connect_endpoint(
             "connecting to the ET endpoint",
         ))?;
         match TcpStream::connect_timeout(&address, remaining.min(CONNECT_TIMEOUT)) {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                let _ = stream.set_nodelay(true);
+                return Ok(stream);
+            }
             Err(error) => last_error = Some(error),
         }
     }

@@ -112,9 +112,16 @@ impl BackedReader {
         if serialized[0] == 0 {
             return Err(ReadError::Unencrypted);
         }
-        let plaintext = crypto
-            .decrypt(&serialized[crate::packet::HEADER_LEN..])
-            .map_err(ReadError::Crypto)?;
+        let ciphertext = &serialized[crate::packet::HEADER_LEN..];
+        if ciphertext.len() < crate::crypto::MAC_LEN {
+            return Err(ReadError::Crypto(DecryptError::Short));
+        }
+        let pt_len = ciphertext.len() - crate::crypto::MAC_LEN;
+        let mut plaintext = vec![0u8; pt_len];
+        let decrypted_len = crypto
+            .decrypt_into(&mut plaintext, ciphertext)
+            .ok_or(ReadError::Crypto(DecryptError::BadMac))?;
+        debug_assert_eq!(decrypted_len, pt_len);
         Ok(Packet::raw(false, serialized[1], plaintext))
     }
 

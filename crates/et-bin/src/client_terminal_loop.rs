@@ -490,7 +490,7 @@ where
         while (!input.contains(PollFlags::IN) || connection.write_pending())
             && pending_forward.len() < FORWARD_BACKLOG_CAPACITY
             && pending_output.is_none()
-            && read_batch < 64
+            && read_batch < 128
         {
             read_batch += 1;
             match connection.try_read_packet() {
@@ -502,7 +502,7 @@ where
                         }
                     }
                     if is_forward_packet(packet.header()) {
-                        enqueue_forwarding(forwarder, &mut pending_forward, packet)?;
+                        pending_forward.push_back(packet);
                     } else {
                         match route_server_packet(
                             packet,
@@ -562,8 +562,8 @@ where
                 Err(error) => return Err(terminal_error(error)),
             }
         }
-        forwarder.flush_receive();
-        inbound_ready = read_batch == 64;
+        flush_forwarding(forwarder, &mut pending_forward)?;
+        inbound_ready = read_batch == 128;
         if connection.write_pending() {
             match connection.advance_write() {
                 Ok(true) => local_turn = true,
@@ -580,7 +580,7 @@ where
         if !reconnect_needed && !connection.write_pending() && !local_turn {
             // try_outbound drains its wake socket even when queue entries
             // remain. Remember that readiness until the queue is empty.
-            for _ in 0..64 {
+            for _ in 0..128 {
                 let Some(packet) = forwarder
                     .try_outbound()
                     .map_err(|error| terminal_text(error.to_string()))?
@@ -767,6 +767,7 @@ where
 }
 
 #[cfg(unix)]
+#[allow(dead_code)]
 fn enqueue_forwarding(
     forwarder: &Forwarder,
     pending: &mut VecDeque<et_core::packet::Packet>,
@@ -791,17 +792,9 @@ fn flush_forwarding(
     forwarder: &Forwarder,
     pending: &mut VecDeque<et_core::packet::Packet>,
 ) -> Result<(), ClientError> {
-    while let Some(packet) = pending.pop_front() {
-        if let Some(packet) = forwarder
-            .try_receive(packet)
-            .map_err(|error| terminal_text(error.to_string()))?
-        {
-            pending.push_front(packet);
-            break;
-        }
-    }
-    forwarder.flush_receive();
-    Ok(())
+    forwarder
+        .try_receive_queue(pending)
+        .map_err(|error| terminal_text(error.to_string()))
 }
 
 #[cfg(unix)]

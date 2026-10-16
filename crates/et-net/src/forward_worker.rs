@@ -490,6 +490,12 @@ impl CommandReceiver {
             return;
         }
         self.queue.in_flight.fetch_sub(count, Ordering::AcqRel);
+        // If the worker had to queue commands because the queue was empty,
+        // we must re-arm the wake flag so `has_pending()` is false and the
+        // worker sleeps until new work arrives.
+        if self.queue.in_flight.load(Ordering::Acquire) == 0 {
+            self.queue.wake_signalled.store(false, Ordering::Release);
+        }
     }
     /// Non-blocking pop for the Unix poll loop. Like `recv_until`, shutdown
     /// (or all senders leaving) short-circuits even a full queue: graceful

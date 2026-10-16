@@ -678,6 +678,7 @@ fn spawn_io_inner(
     );
     #[cfg(windows)]
     {
+        #[allow(irrefutable_let_patterns)]
         if let ForwardStream::Tcp(tcp) = &stream {
             let _ = tcp.set_nodelay(true);
         }

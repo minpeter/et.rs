@@ -872,6 +872,7 @@ impl Forwarder {
         }
     }
 
+    #[cfg(unix)]
     pub fn try_receive_queue(&self, queue: &mut VecDeque<Packet>) -> Result<(), ForwardError> {
         self.commands.try_send_queue(queue)
     }

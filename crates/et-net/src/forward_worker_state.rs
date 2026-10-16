@@ -17,11 +17,13 @@ use crate::ssh_agent_session_bind::{
 };
 
 #[cfg(windows)]
-use super::{close_write, spawn_io_direct, subtract_saturating, ActiveIo, DirectLanes, FastRoute};
+use super::FastRoute;
 use super::{
     spawn_connector, FlowWindow, ForwardError, ForwardStream, Role, Worker, MAX_ACTIVE_SOCKETS,
     MAX_DATA_PACKET, MAX_UNASSIGNED_FDS,
 };
+#[cfg(windows)]
+use crate::forward_io::{close_write, spawn_io_direct, subtract_saturating, ActiveIo, DirectLanes};
 
 /// Per-socket receive window.
 ///

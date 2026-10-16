@@ -28,7 +28,7 @@ pub use recovery::{RecoveryExchange, DEFAULT_RECOVERY_TIMEOUT, MAX_RECOVERY_PROT
 /// and recovery can proceed.
 pub const DEFAULT_LIVE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const FLOW_CONTROL_LIVE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-pub const FLOW_CONTROL_SOCKET_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+pub const FLOW_CONTROL_SOCKET_BUFFER_BYTES: usize = 256 * 1024;
 
 #[derive(Debug)]
 pub enum ConnError {

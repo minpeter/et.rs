@@ -362,6 +362,7 @@ fn run_mode_poll(
                 }
             }
         }
+        forwarder.flush_receive();
         if !client_events_are_stale && client_events.intersects(PollFlags::HUP | PollFlags::ERR) {
             let observed_generation = polled_generation.unwrap_or(connection_generation);
             note_client_drop(
@@ -652,6 +653,7 @@ fn flush_forwarding(
             break;
         }
     }
+    forwarder.flush_receive();
     Ok(())
 }
 
@@ -703,19 +705,20 @@ fn send_or_hold(
     connected: &mut bool,
     connection_generation: &mut u64,
 ) -> Result<Option<Packet>, SessionError> {
-    match session.send_bridge_packet_owned(packet.header(), packet.payload()) {
+    match session.send_bridge_packet_owned(packet) {
         Ok(()) => Ok(None),
-        Err(SessionWriteError::BeforeReplay(SessionError::Connection(ConnError::Backpressure))) => {
-            Ok(Some(packet))
-        }
-        Err(SessionWriteError::BeforeReplay(error)) => {
+        Err((
+            packet,
+            SessionWriteError::BeforeReplay(SessionError::Connection(ConnError::Backpressure)),
+        )) => Ok(Some(packet)),
+        Err((packet, SessionWriteError::BeforeReplay(error))) => {
             if client_transport_error(&error, session, connected, connection_generation)? {
                 Ok(Some(packet))
             } else {
                 Err(error)
             }
         }
-        Err(SessionWriteError::ReplayOwned(error)) => {
+        Err((_packet, SessionWriteError::ReplayOwned(error))) => {
             if client_transport_error(&error, session, connected, connection_generation)? {
                 Ok(None)
             } else {
@@ -853,7 +856,7 @@ fn client_wait_policy(
     } else if forwarding_retry_pending {
         Some(Duration::from_millis(10))
     } else {
-        None
+        Some(Duration::from_millis(100))
     };
     (client_flags, timeout)
 }

@@ -1,0 +1,22 @@
+[package]
+name = "et-sodium"
+description = "Safe wrapper over libsodium crypto_secretbox (XSalsa20-Poly1305) for the et.rs wire protocol."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# This crate is the workspace's single FFI boundary. The workspace forbids
+# unsafe code elsewhere; this crate does not inherit workspace lints, and its
+# unsafe surface is scoped to the two audited libsodium calls in src/lib.rs.
+[lints.rust]
+unsafe_code = "allow"
+
+[dependencies]
+# libsodium-sys-stable >= 1.22 cannot resolve today (its `zip` build
+# dependencies are all yanked on crates.io). libsodium-sys 0.2.7 builds the
+# bundled libsodium 1.0.18 from source with `cc`; the XSalsa20-Poly1305 code
+# path is unchanged since.
+libsodium-sys = "0.2.7"

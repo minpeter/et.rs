@@ -4,9 +4,11 @@ use std::io::Write;
 use std::io::{self};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 #[cfg(all(test, unix))]
 use std::sync::mpsc;
+#[cfg(windows)]
+use std::sync::{atomic::AtomicI64, RwLock};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -15,26 +17,41 @@ use crossbeam_channel as channel;
 
 use crate::forward::{ForwardError, Outbound};
 use crate::forward_endpoint::ForwardStream;
+#[cfg(windows)]
+use crate::forward_io::{abort_io, commit_reservation, stop_io, ActiveIo};
 use crate::forward_io::{
-    abort_io, close_write, commit_reservation, spawn_connector, spawn_io, spawn_listener,
-    spawn_socks_listener, stop_io, subtract_saturating, ActiveIo, BoundSource, FlowWindow,
-    ListenerStop,
+    spawn_connector, spawn_listener, spawn_socks_listener, BoundSource, FlowWindow, ListenerStop,
 };
 use et_core::packet::Packet;
 use et_core::proto::SocketEndpoint;
 
 const MAX_ACTIVE_SOCKETS: usize = 256;
-const MAX_DATA_PACKET: usize = 64 * 1024;
+pub(crate) const MAX_DATA_PACKET: usize = 64 * 1024;
 /// Accepted forwards parked until a destination response. A withholding peer
 /// must not exhaust the process by leaving this set unbounded.
 pub(crate) const MAX_UNASSIGNED_FDS: usize = 128;
 pub(crate) const UNASSIGNED_FD_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Role {
     Source,
     Destination,
 }
+
+#[cfg(windows)]
+#[derive(Clone)]
+pub(crate) struct FastRoute {
+    pub(crate) writer: Option<channel::Sender<Vec<u8>>>,
+    pub(crate) pending_bytes: Arc<AtomicUsize>,
+    pub(crate) in_flight: Arc<AtomicI64>,
+    pub(crate) packets_in_flight: Arc<AtomicI64>,
+    pub(crate) window: Arc<AtomicI64>,
+    pub(crate) packet_window: Arc<AtomicI64>,
+    pub(crate) in_flight_wake: channel::Sender<()>,
+}
+
+#[cfg(windows)]
+pub(crate) type FastRoutes = Arc<RwLock<HashMap<(Role, i32), FastRoute>>>;
 
 pub(crate) enum Command {
     Packet(Packet),
@@ -52,6 +69,10 @@ pub(crate) enum Command {
         socket_id: i32,
         result: io::Result<ForwardStream>,
     },
+    // The next four variants exist only for the Windows threaded model: on
+    // Unix the poll worker reads, writes, and detects socket EOF/errors
+    // inline and never round-trips them through the command queue.
+    #[cfg(windows)]
     Read {
         role: Role,
         socket_id: i32,
@@ -59,19 +80,22 @@ pub(crate) enum Command {
         committed: channel::Sender<()>,
     },
     /// A chunk was written to the local socket. Credit returns on DELIVERY,
-    /// not on receipt: returning on receipt makes each side's credit depend on
-    /// the peer still being able to send, which deadlocks two saturated
+    /// not on receipt: returning on receipt makes each side's credit depend
+    /// on the peer still being able to send, which deadlocks two saturated
     /// endpoints. Delivery is independent of the peer's credit, so it always
     /// makes progress.
+    #[cfg(windows)]
     Drained {
         role: Role,
         socket_id: i32,
         bytes: usize,
     },
+    #[cfg(windows)]
     Closed {
         role: Role,
         socket_id: i32,
     },
+    #[cfg(windows)]
     IoFailed {
         role: Role,
         socket_id: i32,
@@ -94,8 +118,15 @@ struct CommandQueueState {
 
 struct CommandQueue {
     capacity: usize,
+    in_flight: AtomicUsize,
     state: Mutex<CommandQueueState>,
     changed: Condvar,
+    /// Unix poll-loop wake pipe: the first push onto an empty queue (or a
+    /// shutdown) writes one byte so the worker's `poll(2)` wakes.
+    #[cfg(unix)]
+    wake_writer: Option<std::os::unix::net::UnixStream>,
+    #[cfg(unix)]
+    wake_signalled: AtomicBool,
 }
 
 pub(crate) struct CommandSender {
@@ -104,6 +135,8 @@ pub(crate) struct CommandSender {
 
 pub(crate) struct CommandReceiver {
     queue: Arc<CommandQueue>,
+    #[cfg(unix)]
+    wake_reader: Option<std::os::unix::net::UnixStream>,
 }
 
 pub(crate) enum TryCommandError {
@@ -111,9 +144,27 @@ pub(crate) enum TryCommandError {
     Closed,
 }
 
+/// Non-blocking pop result for the Unix poll loop.
+pub(crate) enum CommandPop {
+    Command(Command),
+    Empty,
+    Disconnected,
+}
+
 pub(crate) fn command_channel(capacity: usize) -> (CommandSender, CommandReceiver) {
+    #[cfg(unix)]
+    let (wake_reader, wake_writer) = std::os::unix::net::UnixStream::pair()
+        .ok()
+        .and_then(|(reader, writer)| {
+            reader.set_nonblocking(true).ok()?;
+            writer.set_nonblocking(true).ok()?;
+            Some((reader, writer))
+        })
+        .map(|(reader, writer)| (Some(reader), Some(writer)))
+        .unwrap_or((None, None));
     let queue = Arc::new(CommandQueue {
         capacity,
+        in_flight: AtomicUsize::new(0),
         state: Mutex::new(CommandQueueState {
             commands: VecDeque::with_capacity(capacity),
             senders: 1,
@@ -121,12 +172,20 @@ pub(crate) fn command_channel(capacity: usize) -> (CommandSender, CommandReceive
             shutdown: false,
         }),
         changed: Condvar::new(),
+        #[cfg(unix)]
+        wake_writer,
+        #[cfg(unix)]
+        wake_signalled: AtomicBool::new(false),
     });
     (
         CommandSender {
             queue: queue.clone(),
         },
-        CommandReceiver { queue },
+        CommandReceiver {
+            queue,
+            #[cfg(unix)]
+            wake_reader,
+        },
     )
 }
 
@@ -149,6 +208,38 @@ impl Drop for CommandSender {
     }
 }
 
+impl CommandQueue {
+    /// Wake the Unix poll loop when a push transitions the queue from empty.
+    /// Must be called with the state lock held; the byte write itself is
+    /// non-blocking and idempotent because of the signalled flag.
+    #[cfg(unix)]
+    fn signal_wake(&self, was_empty: bool) {
+        if !was_empty {
+            return;
+        }
+        if self.wake_signalled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(writer) = &self.wake_writer {
+            use std::io::Write;
+            let _ = (&mut &*writer).write(&[1]);
+        }
+    }
+
+    /// Clear the signalled flag once the queue drains to empty. Must be
+    /// called with the state lock held so a concurrent push cannot lose its
+    /// wake byte. Returns whether the queue was empty.
+    #[cfg(unix)]
+    fn clear_wake_if_empty(&self, state: &CommandQueueState) -> bool {
+        if state.commands.is_empty() {
+            self.wake_signalled.store(false, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 impl CommandSender {
     pub(crate) fn send(&self, command: Command) -> Result<(), Command> {
         let mut state = self.queue.state.lock().unwrap();
@@ -160,10 +251,13 @@ impl CommandSender {
             return Err(command);
         }
         let was_empty = state.commands.is_empty();
+        self.queue.in_flight.fetch_add(1, Ordering::AcqRel);
         state.commands.push_back(command);
         if was_empty {
             self.queue.changed.notify_all();
         }
+        #[cfg(unix)]
+        self.queue.signal_wake(was_empty);
         Ok(())
     }
 
@@ -176,17 +270,65 @@ impl CommandSender {
             return Err(TryCommandError::Full(command));
         }
         let was_empty = state.commands.is_empty();
+        self.queue.in_flight.fetch_add(1, Ordering::AcqRel);
         state.commands.push_back(command);
         if was_empty {
             self.queue.changed.notify_all();
         }
+        #[cfg(unix)]
+        self.queue.signal_wake(was_empty);
         Ok(())
+    }
+
+    pub(crate) fn try_send_batched(&self, command: Command) -> Result<(), TryCommandError> {
+        let mut state = self.queue.state.lock().unwrap();
+        if state.shutdown || !state.receiver_alive {
+            return Err(TryCommandError::Closed);
+        }
+        if state.commands.len() >= self.queue.capacity {
+            #[cfg(unix)]
+            self.queue.signal_wake(true);
+            return Err(TryCommandError::Full(command));
+        }
+        let was_empty = state.commands.is_empty();
+        self.queue.in_flight.fetch_add(1, Ordering::AcqRel);
+        state.commands.push_back(command);
+        if was_empty {
+            self.queue.changed.notify_all();
+        }
+        #[cfg(unix)]
+        if state.commands.len() >= 16 {
+            self.queue.signal_wake(true);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn flush_wake(&self) {
+        if self.queue.in_flight.load(Ordering::Acquire) == 0
+            || self.queue.wake_signalled.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let state = self.queue.state.lock().unwrap();
+        if !state.commands.is_empty() {
+            self.queue.signal_wake(true);
+        }
     }
 
     pub(crate) fn shutdown(&self) {
         let mut state = self.queue.state.lock().unwrap();
         state.shutdown = true;
         self.queue.changed.notify_all();
+        #[cfg(unix)]
+        {
+            if !self.queue.wake_signalled.swap(true, Ordering::AcqRel) {
+                if let Some(writer) = &self.queue.wake_writer {
+                    use std::io::Write;
+                    let _ = (&mut &*writer).write(&[1]);
+                }
+            }
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -196,6 +338,10 @@ impl CommandSender {
             .map_or(true, |state| state.commands.is_empty())
     }
 
+    #[cfg(windows)]
+    pub(crate) fn is_idle(&self) -> bool {
+        self.queue.in_flight.load(Ordering::Acquire) == 0
+    }
     #[cfg(all(test, unix))]
     pub(crate) fn wait_shutdown_timeout(&self, timeout: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
@@ -214,6 +360,7 @@ impl CommandSender {
     }
 }
 
+#[cfg(windows)]
 enum RecvStatus {
     Command(Command),
     Timeout,
@@ -221,6 +368,75 @@ enum RecvStatus {
 }
 
 impl CommandReceiver {
+    /// Read end of the wake pipe, polled by the Unix worker loop.
+    #[cfg(unix)]
+    pub(crate) fn wake_reader(&self) -> &std::os::unix::net::UnixStream {
+        self.wake_reader
+            .as_ref()
+            .expect("command wake pipe unavailable")
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn has_pending(&self) -> bool {
+        self.queue.in_flight.load(Ordering::Acquire) > 0
+    }
+
+    /// Drain pending wake bytes after the pipe reports readable.
+    #[cfg(unix)]
+    pub(crate) fn drain_wake(&self) {
+        use std::io::Read;
+        let Some(reader) = &self.wake_reader else {
+            return;
+        };
+        let mut buffer = [0u8; 64];
+        loop {
+            match (&mut &*reader).read(&mut buffer) {
+                Ok(0) => return,
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// Re-arm the wake after a drain cycle emptied the queue. If a push
+    /// landed after the last pop, the flag stays set and a wake byte is
+    /// written: that push skipped its own byte because the flag was still
+    /// set, so the pipe would otherwise stay quiet.
+    #[cfg(unix)]
+    pub(crate) fn arm_wake(&self) {
+        let state = self.queue.state.lock().unwrap();
+        if !self.queue.clear_wake_if_empty(&state) {
+            if let Some(writer) = &self.queue.wake_writer {
+                use std::io::Write;
+                let _ = (&mut &*writer).write(&[1]);
+            }
+        }
+    }
+    /// Non-blocking pop for the Unix poll loop. Like `recv_until`, shutdown
+    /// (or all senders leaving) short-circuits even a full queue: graceful
+    /// stop discards pending commands rather than draining them behind a
+    /// congested outbound channel.
+    #[cfg(unix)]
+    pub(crate) fn pop(&self) -> CommandPop {
+        let mut state = self.queue.state.lock().unwrap();
+        if state.shutdown || state.senders == 0 {
+            return CommandPop::Disconnected;
+        }
+        if let Some(command) = state.commands.pop_front() {
+            if state.commands.len() + 1 >= self.queue.capacity {
+                self.queue.changed.notify_all();
+            }
+            // The wake flag stays set until the poll cycle finishes draining
+            // the queue. Clearing it per pop would make every packet pushed
+            // during the drain write its own wake byte.
+            return CommandPop::Command(command);
+        }
+        CommandPop::Empty
+    }
+
+    #[cfg(windows)]
     fn recv_until(&self, deadline: Option<Instant>) -> RecvStatus {
         let mut state = self.queue.state.lock().unwrap();
         loop {
@@ -231,6 +447,8 @@ impl CommandReceiver {
                 if state.commands.len() + 1 >= self.queue.capacity {
                     self.queue.changed.notify_all();
                 }
+                #[cfg(unix)]
+                self.queue.clear_wake_if_empty(&state);
                 return RecvStatus::Command(command);
             }
             let Some(deadline) = deadline else {
@@ -257,6 +475,10 @@ impl CommandReceiver {
         }
     }
 
+    fn complete_one(&self) {
+        self.queue.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+
     #[cfg(all(test, unix))]
     pub(crate) fn recv_timeout(
         &self,
@@ -270,6 +492,8 @@ impl CommandReceiver {
             }
             if let Some(command) = state.commands.pop_front() {
                 self.queue.changed.notify_all();
+                #[cfg(unix)]
+                self.queue.clear_wake_if_empty(&state);
                 return Ok(command);
             }
             let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
@@ -301,12 +525,16 @@ pub(crate) struct WorkerChannels {
     pub(crate) abandoned: Arc<AtomicBool>,
     pub(crate) stdio_open: Option<Arc<AtomicBool>>,
     pub(crate) next_client_fd: Arc<AtomicI32>,
+    #[cfg(windows)]
+    pub(crate) routes: FastRoutes,
+    #[cfg(unix)]
+    pub(crate) wake_signalled: Arc<AtomicBool>,
 }
 
 pub(crate) fn run(
     sources: Vec<BoundSource>,
     channels: WorkerChannels,
-    #[cfg(unix)] mut outbound_wake: UnixStream,
+    #[cfg(unix)] outbound_wake: UnixStream,
     control: (ListenerStop, Option<(u32, u32)>, Arc<AtomicBool>),
 ) {
     let WorkerChannels {
@@ -318,6 +546,10 @@ pub(crate) fn run(
         abandoned,
         stdio_open,
         next_client_fd,
+        #[cfg(windows)]
+        routes,
+        #[cfg(unix)]
+        wake_signalled,
     } = channels;
     let (listener_stop, session_user, shutdown) = control;
     #[cfg(unix)]
@@ -330,6 +562,7 @@ pub(crate) fn run(
         abandoned,
     )
     .and_then(|mut worker| {
+        worker.wake_signalled = wake_signalled.clone();
         worker.run(
             sources,
             commands,
@@ -348,6 +581,8 @@ pub(crate) fn run(
         abandoned,
     )
     .and_then(|mut worker| {
+        worker.routes = routes;
+        worker.direct_enabled = true;
         worker.run(
             sources,
             commands,
@@ -368,7 +603,10 @@ pub(crate) fn run(
             }
         }
         #[cfg(unix)]
-        let _ = outbound_wake.write(&[1]);
+        {
+            wake_signalled.store(true, Ordering::Release);
+            let _ = (&outbound_wake).write(&[1]);
+        }
     }
 }
 
@@ -378,12 +616,36 @@ struct Worker {
     priority: channel::Sender<Outbound>,
     cancel: channel::Receiver<()>,
     abandoned: Arc<AtomicBool>,
+    #[cfg(windows)]
+    routes: FastRoutes,
+    #[cfg(windows)]
+    direct_enabled: bool,
     #[cfg(unix)]
-    outbound_wake: UnixStream,
+    outbound_wake: Arc<UnixStream>,
+    /// Outbound packets the poll loop could not hand to the session because
+    /// the channel was full. Drained before new socket reads so ordering holds.
+    #[cfg(unix)]
+    outbound_spill: std::collections::VecDeque<crate::forward::Outbound>,
+    #[cfg(unix)]
+    wake_signalled: Arc<AtomicBool>,
+    #[cfg(unix)]
+    pub(super) defer_outbound_wake: bool,
     pending: HashMap<i32, PendingAccept>,
     connecting: HashSet<i32>,
+    #[cfg(unix)]
+    sources: HashMap<i32, poll::SocketIo>,
+    #[cfg(unix)]
+    destinations: HashMap<i32, poll::SocketIo>,
+    #[cfg(windows)]
     sources: HashMap<i32, ActiveIo>,
+    #[cfg(windows)]
     destinations: HashMap<i32, ActiveIo>,
+    /// Network data held because the target socket's queue was full. Unix
+    /// only: the poll worker retries these before popping new commands.
+    #[cfg(unix)]
+    held: std::collections::VecDeque<(Role, i32, Vec<u8>)>,
+    #[cfg(unix)]
+    read_scratch: Box<[u8; crate::forward_io::READ_CHUNK]>,
     /// Window the peer advertised for a socket still being connected, held
     /// until the socket becomes active and credit can be attached to it.
     pending_windows: HashMap<i32, Option<FlowWindow>>,
@@ -443,7 +705,7 @@ impl Worker {
         let outbound_wake = {
             let wake = outbound_wake.ok_or(ForwardError::Unavailable)?;
             wake.set_nonblocking(true).map_err(ForwardError::Io)?;
-            wake
+            Arc::new(wake)
         };
         Ok(Self {
             commands,
@@ -451,12 +713,26 @@ impl Worker {
             priority,
             cancel,
             abandoned,
+            #[cfg(windows)]
+            routes: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(windows)]
+            direct_enabled: false,
             #[cfg(unix)]
             outbound_wake,
+            #[cfg(unix)]
+            outbound_spill: std::collections::VecDeque::new(),
+            #[cfg(unix)]
+            wake_signalled: Arc::new(AtomicBool::new(false)),
+            #[cfg(unix)]
+            defer_outbound_wake: false,
             pending: HashMap::new(),
             connecting: HashSet::new(),
             sources: HashMap::new(),
             destinations: HashMap::new(),
+            #[cfg(unix)]
+            held: std::collections::VecDeque::new(),
+            #[cfg(unix)]
+            read_scratch: Box::new([0u8; crate::forward_io::READ_CHUNK]),
             pending_windows: HashMap::new(),
             threads: Vec::new(),
             next_socket_id: 1,
@@ -529,78 +805,9 @@ impl Worker {
             };
             self.threads.push(thread);
         }
-        let result = loop {
-            self.expire_parked();
-            let command = match commands.recv_until(self.next_park_deadline()) {
-                RecvStatus::Command(command) => command,
-                RecvStatus::Timeout => continue,
-                RecvStatus::Disconnected => break Ok(()),
-            };
-            let step = match command {
-                Command::Packet(packet) => self.handle_packet(packet),
-                Command::Accepted {
-                    client_fd,
-                    destination,
-                    stream,
-                    early,
-                    socks_version,
-                    half_close_on_eof,
-                    stdio,
-                } => self.accepted(
-                    client_fd,
-                    destination,
-                    PendingAccept::park(stream, early, socks_version, half_close_on_eof, stdio),
-                ),
-                Command::Connected {
-                    client_fd,
-                    socket_id,
-                    result,
-                } => {
-                    let advertised = self.pending_windows.remove(&socket_id).flatten();
-                    self.connected(client_fd, socket_id, result, advertised)
-                }
-                Command::Read {
-                    role,
-                    socket_id,
-                    buffer,
-                    committed,
-                } => {
-                    let Some(active) = self.map_ref(role).get(&socket_id) else {
-                        let _ = committed.try_send(());
-                        continue;
-                    };
-                    commit_reservation(active, i64::try_from(buffer.len()).unwrap_or(i64::MAX));
-                    let _ = committed.try_send(());
-                    self.send_data(role, socket_id, buffer, false, None)
-                }
-                Command::Drained {
-                    role,
-                    socket_id,
-                    bytes,
-                } => self.return_credit(role, socket_id, bytes),
-                Command::Closed { role, socket_id } => self.read_closed(role, socket_id),
-                Command::IoFailed {
-                    role,
-                    socket_id,
-                    error,
-                } => {
-                    self.remove(role, socket_id);
-                    self.send_data(role, socket_id, Vec::new(), true, Some(error.to_string()))
-                }
-                Command::SetSshAgentSessionBinds {
-                    agent_socket_path,
-                    binds,
-                } => {
-                    self.ssh_agent_socket_path = agent_socket_path;
-                    self.ssh_agent_session_binds = binds;
-                    Ok(())
-                }
-            };
-            if let Err(error) = step {
-                break Err(error);
-            }
-        };
-        drop(commands);
+        let result = self.run_loop(commands);
+        #[cfg(windows)]
+        self.routes.write().unwrap().clear();
         #[cfg(unix)]
         let _ = listener_stop.shutdown(std::net::Shutdown::Both);
         #[cfg(windows)]
@@ -609,6 +816,9 @@ impl Worker {
             pending.stream.shutdown();
         }
         let hard_cancelled = !matches!(self.cancel.try_recv(), Err(channel::TryRecvError::Empty));
+        #[cfg(unix)]
+        self.stop_sockets(hard_cancelled);
+        #[cfg(windows)]
         for (_, io) in self.sources.drain().chain(self.destinations.drain()) {
             if hard_cancelled {
                 abort_io(io);
@@ -621,9 +831,103 @@ impl Worker {
         }
         result
     }
+
+    #[cfg(windows)]
+    fn run_loop(&mut self, commands: CommandReceiver) -> Result<(), ForwardError> {
+        loop {
+            self.expire_parked();
+            let command = match commands.recv_until(self.next_park_deadline()) {
+                RecvStatus::Command(command) => command,
+                RecvStatus::Timeout => continue,
+                RecvStatus::Disconnected => break Ok(()),
+            };
+            let step = self.handle_command(command);
+            commands.complete_one();
+            if let Err(error) = step {
+                break Err(error);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn run_loop(&mut self, commands: CommandReceiver) -> Result<(), ForwardError> {
+        self.run_poll(&commands)
+    }
+
+    fn handle_command(&mut self, command: Command) -> Result<(), ForwardError> {
+        match command {
+            Command::Packet(packet) => self.handle_packet(packet),
+            Command::Accepted {
+                client_fd,
+                destination,
+                stream,
+                early,
+                socks_version,
+                half_close_on_eof,
+                stdio,
+            } => self.accepted(
+                client_fd,
+                destination,
+                PendingAccept::park(stream, early, socks_version, half_close_on_eof, stdio),
+            ),
+            Command::Connected {
+                client_fd,
+                socket_id,
+                result,
+            } => {
+                let advertised = self.pending_windows.remove(&socket_id).flatten();
+                self.connected(client_fd, socket_id, result, advertised)
+            }
+            #[cfg(windows)]
+            Command::Read {
+                role,
+                socket_id,
+                buffer,
+                committed,
+            } => {
+                if let Some(active) = self.map_ref(role).get(&socket_id) {
+                    commit_reservation(active, i64::try_from(buffer.len()).unwrap_or(i64::MAX));
+                    let _ = committed.try_send(());
+                    self.send_data(role, socket_id, buffer, false, None)
+                } else {
+                    let _ = committed.try_send(());
+                    Ok(())
+                }
+            }
+            #[cfg(windows)]
+            Command::Drained {
+                role,
+                socket_id,
+                bytes,
+            } => self.return_credit(role, socket_id, bytes),
+            #[cfg(windows)]
+            Command::Closed { role, socket_id } => self.read_closed(role, socket_id),
+            #[cfg(windows)]
+            Command::IoFailed {
+                role,
+                socket_id,
+                error,
+            } => {
+                self.remove(role, socket_id);
+                self.send_data(role, socket_id, Vec::new(), true, Some(error.to_string()))
+            }
+            Command::SetSshAgentSessionBinds {
+                agent_socket_path,
+                binds,
+            } => {
+                self.ssh_agent_socket_path = agent_socket_path;
+                self.ssh_agent_session_binds = binds;
+                Ok(())
+            }
+        }
+    }
 }
 #[path = "forward_worker_state.rs"]
 pub(crate) mod state;
+
+#[cfg(unix)]
+#[path = "forward_poll.rs"]
+pub(crate) mod poll;
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -792,7 +1096,7 @@ mod tests {
     #[test]
     fn destination_half_close_keeps_the_reply_and_drops_later_writes() {
         // Given: an active destination socket.
-        let (mut worker, commands, outbound, _cancel) = worker();
+        let (mut worker, _commands, outbound, _cancel) = worker();
         let (stream, mut application) = UnixStream::pair().unwrap();
         application.set_read_timeout(Some(EVENT_TIMEOUT)).unwrap();
         worker
@@ -822,10 +1126,10 @@ mod tests {
         // without failing the forwarder and the reply direction still reads.
         assert_eq!(worker.destinations.len(), 1);
         application.write_all(b"reply").unwrap();
-        let Command::Read { buffer, .. } = commands.recv_timeout(EVENT_TIMEOUT).unwrap() else {
-            panic!("reply direction stopped reading after half-close");
-        };
-        assert_eq!(buffer, b"reply");
+        worker.poll_once(EVENT_TIMEOUT).unwrap();
+        let reply = outbound.recv_timeout(EVENT_TIMEOUT).unwrap().unwrap();
+        let data = PortForwardData::decode(reply.payload()).unwrap();
+        assert_eq!(data.buffer.as_deref(), Some(b"reply".as_slice()));
         worker
             .handle_packet(forward_data(true, 7, closed()))
             .unwrap();
@@ -850,152 +1154,158 @@ mod tests {
     }
 
     #[test]
-    fn local_eof_does_not_block_worker_behind_full_writer_queue() {
-        check_close_with_full_writer_queue(
-            |worker| worker.read_closed(Role::Destination, 7).unwrap(),
-            true,
-        );
-    }
-
-    #[test]
-    fn peer_close_drains_full_writer_queue_without_blocking_worker() {
-        check_close_with_full_writer_queue(
-            |worker| {
-                worker
-                    .handle_packet(forward_data(true, 7, closed()))
-                    .unwrap()
-            },
-            true,
-        );
-    }
-
-    #[test]
-    fn half_close_drains_full_writer_queue_without_blocking_worker() {
-        check_close_with_full_writer_queue(
-            |worker| {
-                worker
-                    .handle_packet(forward_data(
-                        true,
-                        7,
-                        PortForwardData {
-                            half_close: Some(true),
-                            ..closed()
-                        },
-                    ))
-                    .unwrap();
-                assert!(worker.destinations.contains_key(&7));
-            },
-            true,
-        );
-    }
-
-    #[test]
-    fn hard_cancel_joins_removed_socket_with_blocked_writer() {
-        check_close_with_full_writer_queue(
-            |worker| {
-                worker
-                    .handle_packet(forward_data(true, 7, closed()))
-                    .unwrap();
-                assert!(worker.destinations.is_empty());
-            },
-            false,
-        );
-    }
-
-    fn check_close_with_full_writer_queue(close: fn(&mut Worker), drain: bool) {
-        let (mut worker, commands, outbound, cancel) = worker();
+    fn local_eof_reports_close_immediately_and_graceful_stop_flushes_the_queue() {
+        let (mut worker, outbound, mut peer, _cancel) = queued_destination();
         let abandoned = worker.abandoned.clone();
-        let (stream, mut peer) = UnixStream::pair().unwrap();
-        peer.set_read_timeout(Some(EVENT_TIMEOUT)).unwrap();
-        socket2::SockRef::from(&stream)
-            .set_send_buffer_size(2048)
+        assert_eq!(worker.held.len(), 1);
+
+        // Local EOF reports the close immediately, independent of the queued
+        // backlog, and keeps the socket until its queue drains — upstream
+        // flushes pending writes before closing the socket in full.
+        worker.read_closed(Role::Destination, 7).unwrap();
+        let close = outbound.recv_timeout(EVENT_TIMEOUT).unwrap().unwrap();
+        assert_eq!(
+            PortForwardData::decode(close.payload()).unwrap().closed,
+            Some(true)
+        );
+        assert!(worker.destinations.contains_key(&7));
+
+        // Graceful stop delivers the admitted queue in order. The packet
+        // still held worker-side is dropped, as the threaded model dropped
+        // commands admitted after a close.
+        let draining = std::thread::spawn(move || {
+            let mut received = Vec::new();
+            peer.read_to_end(&mut received).unwrap();
+            received
+        });
+        worker.stop_sockets(false);
+        let received = draining.join().unwrap();
+        let expected: Vec<u8> = (1..=64).collect();
+        assert_eq!(received, expected);
+        assert!(!abandoned.load(Ordering::Acquire));
+        assert!(worker.destinations.is_empty());
+    }
+
+    #[test]
+    fn peer_close_flushes_queued_writes_before_full_close() {
+        let (mut worker, outbound, mut peer, _cancel) = queued_destination();
+
+        // When: the peer closes behind a full queue, the close is echoed at
+        // once but the socket stays until the backlog is written out.
+        worker
+            .handle_packet(forward_data(true, 7, closed()))
             .unwrap();
-        let mut saturator = stream.try_clone().unwrap();
-        saturator.set_nonblocking(true).unwrap();
-        let mut expected = Vec::new();
-        loop {
-            match saturator.write(&[0; 16 * 1024]) {
-                Ok(0) => panic!("socket closed"),
-                Ok(count) => expected.resize(expected.len() + count, 0),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) => panic!("saturation failed: {error}"),
-            }
+        let echo = outbound.recv_timeout(EVENT_TIMEOUT).unwrap().unwrap();
+        assert_eq!(
+            PortForwardData::decode(echo.payload()).unwrap().closed,
+            Some(true)
+        );
+        assert!(worker.destinations.contains_key(&7));
+
+        let draining = std::thread::spawn(move || {
+            let mut received = Vec::new();
+            peer.read_to_end(&mut received).unwrap();
+            received
+        });
+        while worker.destinations.contains_key(&7) {
+            worker.poll_once(EVENT_TIMEOUT).unwrap();
         }
-        saturator.set_nonblocking(false).unwrap();
+        let received = draining.join().unwrap();
+        let expected: Vec<u8> = (1..=64).collect();
+        assert_eq!(received, expected);
+    }
+
+    #[test]
+    fn peer_half_close_flushes_then_shuts_only_the_write_side() {
+        let (mut worker, _outbound, mut peer, _cancel) = queued_destination();
+        worker
+            .handle_packet(forward_data(
+                true,
+                7,
+                PortForwardData {
+                    half_close: Some(true),
+                    ..closed()
+                },
+            ))
+            .unwrap();
+        assert!(worker.destinations.contains_key(&7));
+
+        // Then: queued bytes drain in order and the app sees EOF afterwards,
+        // while the socket stays open for the reply direction.
+        let mut received = Vec::new();
+        while received.len() < 64 {
+            worker.poll_once(EVENT_TIMEOUT).unwrap();
+            let mut chunk = [0u8; 64];
+            let count = peer.read(&mut chunk).unwrap();
+            received.extend_from_slice(&chunk[..count]);
+        }
+        let expected: Vec<u8> = (1..=64).collect();
+        assert_eq!(received, expected);
+        let mut eof = [0u8; 1];
+        assert_eq!(peer.read(&mut eof).unwrap(), 0);
+        assert!(worker.destinations.contains_key(&7));
+    }
+
+    #[test]
+    fn graceful_stop_flushes_held_data_for_healthy_sockets() {
+        let (mut worker, _outbound, mut peer, _cancel) = queued_destination();
+        let abandoned = worker.abandoned.clone();
+
+        // Then: with no close in play, graceful stop delivers the full queue
+        // AND the packet held behind it, in order.
+        let draining = std::thread::spawn(move || {
+            let mut received = Vec::new();
+            peer.read_to_end(&mut received).unwrap();
+            received
+        });
+        worker.stop_sockets(false);
+        let received = draining.join().unwrap();
+        let expected: Vec<u8> = (1..=65).collect();
+        assert_eq!(received, expected);
+        assert!(!abandoned.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn hard_cancel_abandons_queued_and_held_socket_writes() {
+        let (mut worker, _outbound, _peer, _cancel) = queued_destination();
+        let abandoned = worker.abandoned.clone();
+        assert_eq!(worker.held.len(), 1);
+
+        // Then: hard cancellation reports the queued and held bytes as
+        // abandoned and closes everything without waiting for the peer.
+        worker.stop_sockets(true);
+        assert!(abandoned.load(Ordering::Acquire));
+        assert!(worker.destinations.is_empty());
+        assert!(worker.held.is_empty());
+    }
+
+    fn queued_destination() -> (
+        Worker,
+        channel::Receiver<crate::forward::Outbound>,
+        UnixStream,
+        channel::Sender<()>,
+    ) {
+        let (mut worker, _commands, outbound, cancel) = worker();
+        let (stream, peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(EVENT_TIMEOUT)).unwrap();
         worker
             .connected(1, 7, Ok(ForwardStream::Unix(stream)), None)
             .unwrap();
         let _ = outbound.recv_timeout(EVENT_TIMEOUT).unwrap();
-        // One command is held by the blocked writer and 64 fill its queue.
-        for byte in 1..=65 {
-            let active = worker.destinations.get(&7).unwrap();
-            active.pending_bytes.fetch_add(1, Ordering::AcqRel);
-            active.writer.as_ref().unwrap().send(vec![byte]).unwrap();
-            expected.push(byte);
-        }
-        peer.shutdown(std::net::Shutdown::Write).unwrap();
-        let (done_tx, done_rx) = channel::bounded(1);
-        let closing = std::thread::spawn(move || {
-            close(&mut worker);
-            done_tx.send(()).unwrap();
+        // 64 buffers fill the per-socket queue; the 65th is held worker-side.
+        for byte in 1..=65u8 {
             worker
-        });
-        let progressed = done_rx.recv_timeout(EVENT_TIMEOUT).is_ok();
-        let mut received = Vec::new();
-        let drained = if drain && progressed {
-            peer.read_to_end(&mut received)
-        } else {
-            Err(std::io::ErrorKind::Interrupted.into())
-        };
-        // Cancellation must join even a removed writer whose peer never reads.
-        // Keep a control clone only as emergency cleanup on test failure.
-        drop(cancel);
-        if !progressed {
-            saturator.shutdown(std::net::Shutdown::Both).unwrap();
+                .handle_packet(forward_data(
+                    true,
+                    7,
+                    PortForwardData {
+                        buffer: Some(vec![byte]),
+                        ..Default::default()
+                    },
+                ))
+                .unwrap();
         }
-        let mut worker = closing.join().unwrap();
-        worker.remove(Role::Destination, 7);
-        let (joined_tx, joined_rx) = channel::bounded(1);
-        let joining = std::thread::spawn(move || {
-            for thread in worker.threads.drain(..) {
-                thread.join().unwrap();
-            }
-            joined_tx.send(()).unwrap();
-        });
-        let joined = joined_rx.recv_timeout(EVENT_TIMEOUT).is_ok();
-        if !joined {
-            saturator.shutdown(std::net::Shutdown::Both).unwrap();
-        }
-        joining.join().unwrap();
-        let io_errors: Vec<_> = commands
-            .queue
-            .state
-            .lock()
-            .unwrap()
-            .commands
-            .iter()
-            .filter_map(|command| match command {
-                Command::IoFailed { error, .. } => Some(error.to_string()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            progressed,
-            "close blocked the forwarding worker behind a full writer queue"
-        );
-        assert!(joined, "removed writer did not observe hard cancellation");
-        if drain {
-            assert!(
-                drained.is_ok(),
-                "writer did not close: {drained:?}; received {}/{} bytes; I/O errors: {io_errors:?}",
-                received.len(),
-                expected.len(),
-            );
-            assert_eq!(received, expected);
-            assert!(!abandoned.load(Ordering::Acquire));
-        } else {
-            assert!(abandoned.load(Ordering::Acquire));
-        }
+        (worker, outbound, peer, cancel)
     }
 
     #[test]

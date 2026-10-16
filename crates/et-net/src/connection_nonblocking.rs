@@ -180,7 +180,7 @@ fn blocking_io(
 }
 
 pub(crate) fn try_read(
-    stream: &mut TcpStream,
+    stream: &TcpStream,
     reader: &mut BackedReader,
 ) -> Result<Option<Packet>, ConnError> {
     let mut buffer = [0u8; 64 * 1024];
@@ -190,13 +190,13 @@ pub(crate) fn try_read(
             ReadItem::NeedMore => {}
         }
         #[cfg(unix)]
-        let read = rustix::net::recv(&*stream, &mut buffer, rustix::net::RecvFlags::DONTWAIT)
+        let read = rustix::net::recv(stream, &mut buffer, rustix::net::RecvFlags::DONTWAIT)
             .map(|(count, _)| count)
             .map_err(io::Error::from);
         #[cfg(windows)]
         let read = {
             stream.set_nonblocking(true)?;
-            stream.read(&mut buffer)
+            (&*stream).read(&mut buffer)
         };
         match read {
             Ok(0) => return Err(ConnError::Io(io::ErrorKind::UnexpectedEof.into())),

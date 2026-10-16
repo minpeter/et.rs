@@ -83,7 +83,7 @@ impl Connection {
     /// for the duration of [`Self::run_recovery_handshake`].
     pub fn prepare_recovery_candidate(&self, new_stream: TcpStream) -> Self {
         let mut candidate = Self {
-            stream: new_stream,
+            stream: std::sync::Arc::new(new_stream),
             writer: self.writer.clone(),
             reader: self.reader.clone(),
             live_write_timeout: self.live_write_timeout,

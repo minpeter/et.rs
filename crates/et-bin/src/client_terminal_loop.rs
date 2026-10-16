@@ -562,6 +562,7 @@ where
                 Err(error) => return Err(terminal_error(error)),
             }
         }
+        forwarder.flush_receive();
         inbound_ready = read_batch == 64;
         if connection.write_pending() {
             match connection.advance_write() {
@@ -799,6 +800,7 @@ fn flush_forwarding(
             break;
         }
     }
+    forwarder.flush_receive();
     Ok(())
 }
 
@@ -948,6 +950,7 @@ fn finish_remote_completion(
                     .map_err(|error| terminal_text(error.to_string()))
             },
         )? {
+            forwarder.flush_receive();
             if let Some(packet) = pending_forward.pop_front() {
                 retained = RetainedCompletion::new(None, Some(packet));
                 continue;

@@ -1,6 +1,8 @@
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering};
+#[cfg(windows)]
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -10,12 +12,17 @@ use crossbeam_channel as channel;
 use rustix::event::{poll, PollFd, PollFlags};
 
 use crate::forward_endpoint::{Endpoint, ForwardListener, ForwardStream};
+#[cfg(windows)]
 use crate::ssh_agent_session_bind::AgentSessionBindReplies;
 use et_core::proto::SocketEndpoint;
 
-use super::forward_worker::{Command, CommandSender, Role, TryCommandError};
+#[cfg(windows)]
+use super::forward_worker::Role;
+use super::forward_worker::{Command, CommandSender, TryCommandError};
 
-const READ_CHUNK: usize = 16 * 1024;
+pub(crate) const READ_CHUNK: usize = 32 * 1024;
+
+#[cfg(windows)]
 const IO_CANCEL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 /// Incomplete SOCKS handshakes beyond this are closed on accept.
 pub(crate) const MAX_PENDING_SOCKS: usize = 64;
@@ -47,6 +54,7 @@ pub(crate) struct FlowWindow {
     pub(crate) packets: i64,
 }
 
+#[cfg(windows)]
 pub(crate) fn subtract_saturating(counter: &AtomicI64, amount: i64) -> i64 {
     if amount <= 0 {
         return counter.load(Ordering::Acquire);
@@ -58,6 +66,7 @@ pub(crate) fn subtract_saturating(counter: &AtomicI64, amount: i64) -> i64 {
         .unwrap_or(0)
 }
 
+#[cfg(windows)]
 pub(crate) fn commit_reservation(active: &ActiveIo, bytes: i64) {
     if bytes <= 0 || active.window.load(Ordering::Acquire) < 0 {
         return;
@@ -76,6 +85,29 @@ pub(crate) struct BoundSource {
     pub(crate) request: Option<et_core::proto::PortForwardSourceRequest>,
 }
 
+#[cfg(windows)]
+#[derive(Clone)]
+pub(crate) struct DirectLanes {
+    pub(crate) outbound: channel::Sender<crate::forward::Outbound>,
+    pub(crate) priority: channel::Sender<crate::forward::Outbound>,
+    #[cfg(unix)]
+    pub(crate) wake_writer: Arc<std::os::unix::net::UnixStream>,
+    #[cfg(unix)]
+    pub(crate) wake_signalled: Arc<AtomicBool>,
+    pub(crate) active_flag: Arc<AtomicBool>,
+}
+
+#[cfg(windows)]
+impl DirectLanes {
+    pub(crate) fn signal_wake(&self) {
+        #[cfg(unix)]
+        if !self.wake_signalled.swap(true, Ordering::AcqRel) {
+            let _ = (&*self.wake_writer).write(&[1]);
+        }
+    }
+}
+
+#[cfg(windows)]
 pub(crate) struct ActiveIo {
     // Dropping the sole sender requests shutdown after the queued data drains.
     pub(crate) writer: Option<channel::Sender<Vec<u8>>>,
@@ -83,6 +115,7 @@ pub(crate) struct ActiveIo {
     pub(crate) cancel: channel::Receiver<()>,
     pub(crate) pending_bytes: Arc<AtomicUsize>,
     pub(crate) abandoned: Arc<AtomicBool>,
+    pub(crate) active_flag: Arc<AtomicBool>,
     /// Stdio (`-W`) EOF shuts the remote write side and keeps the reply open.
     pub(crate) half_close_on_eof: bool,
     /// Bytes sent on this socket but not yet confirmed delivered by the peer.
@@ -533,6 +566,7 @@ pub(crate) fn spawn_connector(
     })
 }
 
+#[cfg(all(test, windows))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_io(
     role: Role,
@@ -544,6 +578,32 @@ pub(crate) fn spawn_io(
     abandoned: Arc<AtomicBool>,
     bind_replies: Option<AgentSessionBindReplies>,
 ) -> io::Result<(ActiveIo, [JoinHandle<()>; 2])> {
+    spawn_io_direct(
+        role,
+        socket_id,
+        stream,
+        peer_window,
+        commands,
+        cancel,
+        abandoned,
+        bind_replies,
+        None,
+    )
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_io_direct(
+    role: Role,
+    socket_id: i32,
+    stream: ForwardStream,
+    peer_window: Option<FlowWindow>,
+    commands: CommandSender,
+    cancel: channel::Receiver<()>,
+    abandoned: Arc<AtomicBool>,
+    bind_replies: Option<AgentSessionBindReplies>,
+    direct: Option<DirectLanes>,
+) -> io::Result<(ActiveIo, [JoinHandle<()>; 2])> {
     spawn_io_inner(
         ReaderSetup {
             role,
@@ -551,6 +611,7 @@ pub(crate) fn spawn_io(
             peer_window,
             read_limit: READ_CHUNK,
             bind_replies,
+            direct,
         },
         stream,
         commands,
@@ -559,7 +620,7 @@ pub(crate) fn spawn_io(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 fn spawn_io_with_read_limit(
     socket: (Role, i32),
     stream: ForwardStream,
@@ -576,6 +637,7 @@ fn spawn_io_with_read_limit(
             peer_window,
             read_limit,
             bind_replies: None,
+            direct: None,
         },
         stream,
         commands,
@@ -584,14 +646,17 @@ fn spawn_io_with_read_limit(
     )
 }
 
+#[cfg(windows)]
 struct ReaderSetup {
     role: Role,
     socket_id: i32,
     peer_window: Option<FlowWindow>,
     read_limit: usize,
     bind_replies: Option<AgentSessionBindReplies>,
+    direct: Option<DirectLanes>,
 }
 
+#[cfg(windows)]
 fn spawn_io_inner(
     setup: ReaderSetup,
     stream: ForwardStream,
@@ -605,7 +670,12 @@ fn spawn_io_inner(
         peer_window,
         read_limit,
         bind_replies,
+        direct,
     } = setup;
+    let active_flag = direct.as_ref().map_or_else(
+        || Arc::new(AtomicBool::new(true)),
+        |lanes| lanes.active_flag.clone(),
+    );
     #[cfg(windows)]
     {
         // Winsock does not reliably interrupt an in-flight synchronous I/O
@@ -645,6 +715,7 @@ fn spawn_io_inner(
     let reader_window = window.clone();
     let reader_packet_window = packet_window.clone();
     let mut bind_replies = bind_replies;
+    let reader_direct = direct.clone();
     let (committed_tx, commit_received) = channel::bounded::<()>(64);
     let reader_handle = thread::spawn(move || {
         let mut buffer = [0u8; READ_CHUNK];
@@ -764,20 +835,56 @@ fn spawn_io_inner(
                         release_reservation(actual);
                         return;
                     }
-                    if reader_commands
-                        .send(Command::Read {
-                            role,
-                            socket_id,
-                            buffer: forwarded,
-                            committed: committed_tx.clone(),
-                        })
-                        .is_err()
-                    {
-                        release_reservation(actual);
-                        return;
-                    }
-                    if windowed {
-                        uncommitted += 1;
+                    if let Some(lanes) = reader_direct.as_ref() {
+                        if !lanes.active_flag.load(Ordering::Acquire) {
+                            release_reservation(actual);
+                            return;
+                        }
+                        if windowed && actual > 0 {
+                            reader_in_flight.fetch_add(actual, Ordering::AcqRel);
+                            reader_packets_in_flight.fetch_add(1, Ordering::AcqRel);
+                            subtract_saturating(&reader_reserved_bytes, actual);
+                            subtract_saturating(&reader_reserved_packets, 1);
+                        }
+                        use prost::Message;
+                        let packet = Ok(et_core::packet::Packet::new(
+                            et_core::proto::TerminalPacketType::PortForwardData as u8,
+                            et_core::proto::PortForwardData {
+                                sourcetodestination: Some(role == Role::Source),
+                                socketid: Some(socket_id),
+                                buffer: Some(forwarded),
+                                error: None,
+                                closed: None,
+                                half_close: None,
+                                window: None,
+                            }
+                            .encode_to_vec(),
+                        ));
+                        channel::select! {
+                            send(lanes.outbound, packet) -> result => {
+                                if result.is_err() {
+                                    return;
+                                }
+                            }
+                            recv(reader_cancel) -> _ => return,
+                        }
+                        lanes.signal_wake();
+                    } else {
+                        if reader_commands
+                            .send(Command::Read {
+                                role,
+                                socket_id,
+                                buffer: forwarded,
+                                committed: committed_tx.clone(),
+                            })
+                            .is_err()
+                        {
+                            release_reservation(actual);
+                            return;
+                        }
+                        if windowed {
+                            uncommitted += 1;
+                        }
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {
@@ -811,20 +918,104 @@ fn spawn_io_inner(
     let pending_bytes = Arc::new(AtomicUsize::new(0));
     let writer_pending_bytes = pending_bytes.clone();
     let writer_abandoned = abandoned.clone();
+    let writer_window = window.clone();
+    let writer_direct = direct;
     let writer_handle = thread::spawn(move || {
         let mut writer = stream;
-        loop {
-            let buffer = channel::select! {
-                recv(writer_rx) -> command => match command {
-                    Ok(command) => command,
-                    Err(_) => {
-                        // Disconnection is observed only after all admitted
-                        // buffers drain, without needing a spare queue slot.
-                        shutdown_write(&writer);
-                        break;
+        let mut credit_to_return = 0i64;
+        let mut packet_credit_to_return = 0i64;
+        let flush_credit = |lanes: &DirectLanes,
+                            credit: &mut i64,
+                            packets: &mut i64,
+                            cancel: &channel::Receiver<()>|
+         -> bool {
+            let bytes = std::mem::take(credit);
+            let pkt = std::mem::take(packets);
+            if bytes <= 0 || pkt <= 0 {
+                return true;
+            }
+            use prost::Message;
+            let packet = Ok(et_core::packet::Packet::new(
+                et_core::proto::TerminalPacketType::PortForwardData as u8,
+                et_core::proto::PortForwardData {
+                    sourcetodestination: Some(role == Role::Source),
+                    socketid: Some(socket_id),
+                    buffer: None,
+                    error: None,
+                    closed: None,
+                    half_close: None,
+                    window: Some(et_core::proto::PortForwardWindow {
+                        bytes: Some(bytes),
+                        packets: Some(i32::try_from(pkt).unwrap_or(i32::MAX)),
+                    }),
+                }
+                .encode_to_vec(),
+            ));
+            channel::select! {
+                send(lanes.priority, packet) -> result => {
+                    if result.is_err() {
+                        return false;
                     }
-                },
-                recv(writer_cancel) -> _ => break,
+                }
+                recv(cancel) -> _ => return false,
+            }
+            lanes.signal_wake();
+            true
+        };
+        loop {
+            let buffer = if credit_to_return > 0 && writer_rx.is_empty() {
+                channel::select! {
+                    recv(writer_rx) -> command => match command {
+                        Ok(command) => command,
+                        Err(_) => {
+                            if let Some(lanes) = writer_direct.as_ref() {
+                                let _ = flush_credit(
+                                    lanes,
+                                    &mut credit_to_return,
+                                    &mut packet_credit_to_return,
+                                    &writer_cancel,
+                                );
+                            }
+                            shutdown_write(&writer);
+                            break;
+                        }
+                    },
+                    recv(writer_cancel) -> _ => break,
+                    default(std::time::Duration::from_millis(2)) => {
+                        if let Some(lanes) = writer_direct.as_ref() {
+                            if !flush_credit(
+                                lanes,
+                                &mut credit_to_return,
+                                &mut packet_credit_to_return,
+                                &writer_cancel,
+                            ) {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                channel::select! {
+                    recv(writer_rx) -> command => match command {
+                        Ok(command) => command,
+                        Err(_) => {
+                            // Disconnection is observed only after all admitted
+                            // buffers drain, without needing a spare queue slot.
+                            if let Some(lanes) = writer_direct.as_ref() {
+                                let _ = flush_credit(
+                                    lanes,
+                                    &mut credit_to_return,
+                                    &mut packet_credit_to_return,
+                                    &writer_cancel,
+                                );
+                            }
+                            shutdown_write(&writer);
+                            break;
+                        }
+                    },
+                    recv(writer_cancel) -> _ => break,
+                }
             };
             let delivered = match write_all_cancellable(&mut writer, &buffer, &writer_cancel) {
                 Ok(delivered) => delivered,
@@ -843,12 +1034,32 @@ fn spawn_io_inner(
                 break;
             }
             writer_pending_bytes.fetch_sub(buffer.len(), Ordering::AcqRel);
-            // Return credit only after delivery to the local socket.
-            let _ = writer_commands.send(Command::Drained {
-                role,
-                socket_id,
-                bytes: buffer.len(),
-            });
+            if let Some(lanes) = writer_direct.as_ref() {
+                if writer_window.load(Ordering::Acquire) >= 0 {
+                    let drained = i64::try_from(buffer.len()).unwrap_or(i64::MAX);
+                    credit_to_return = credit_to_return.saturating_add(drained);
+                    packet_credit_to_return = packet_credit_to_return.saturating_add(1);
+                    if (credit_to_return >= crate::forward_worker::state::CREDIT_RETURN_THRESHOLD
+                        || packet_credit_to_return
+                            >= crate::forward_worker::state::PACKET_CREDIT_RETURN_THRESHOLD)
+                        && !flush_credit(
+                            lanes,
+                            &mut credit_to_return,
+                            &mut packet_credit_to_return,
+                            &writer_cancel,
+                        )
+                    {
+                        break;
+                    }
+                }
+            } else {
+                // Return credit only after delivery to the local socket.
+                let _ = writer_commands.send(Command::Drained {
+                    role,
+                    socket_id,
+                    bytes: buffer.len(),
+                });
+            }
         }
         if writer_pending_bytes.load(Ordering::Acquire) != 0 {
             writer_abandoned.store(true, Ordering::Release);
@@ -861,6 +1072,7 @@ fn spawn_io_inner(
             cancel,
             pending_bytes,
             abandoned,
+            active_flag,
             half_close_on_eof: false,
             in_flight,
             packets_in_flight,
@@ -880,7 +1092,7 @@ fn spawn_io_inner(
     ))
 }
 
-fn shutdown_write(stream: &ForwardStream) {
+pub(crate) fn shutdown_write(stream: &ForwardStream) {
     let _ = match stream {
         ForwardStream::Tcp(stream) => stream.shutdown(Shutdown::Write),
         #[cfg(unix)]
@@ -888,6 +1100,7 @@ fn shutdown_write(stream: &ForwardStream) {
     };
 }
 
+#[cfg(windows)]
 fn write_all_cancellable(
     writer: &mut ForwardStream,
     mut remaining: &[u8],
@@ -912,15 +1125,18 @@ fn write_all_cancellable(
     Ok(true)
 }
 
-fn cancellation_requested(cancel: &channel::Receiver<()>) -> bool {
+pub(crate) fn cancellation_requested(cancel: &channel::Receiver<()>) -> bool {
     !matches!(cancel.try_recv(), Err(channel::TryRecvError::Empty))
 }
 
+#[cfg(windows)]
 pub(crate) fn close_write(io: &mut ActiveIo) {
     io.writer.take();
 }
 
+#[cfg(windows)]
 pub(crate) fn stop_io(mut io: ActiveIo) {
+    io.active_flag.store(false, Ordering::Release);
     close_write(&mut io);
     if !cancellation_requested(&io.cancel) {
         io.control.shutdown_read();
@@ -932,7 +1148,9 @@ pub(crate) fn stop_io(mut io: ActiveIo) {
     }
 }
 
+#[cfg(windows)]
 pub(crate) fn abort_io(io: ActiveIo) {
+    io.active_flag.store(false, Ordering::Release);
     // Hard cancellation abandons queued output and closes both socket halves
     // before joining, waking a writer blocked inside write_all.
     io.control.shutdown();
@@ -944,354 +1162,16 @@ mod tests {
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-    use std::sync::{mpsc, Arc};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use crossbeam_channel as channel;
     use et_core::proto::SocketEndpoint;
 
-    use super::{
-        commit_reservation, spawn_io, spawn_io_with_read_limit, spawn_stdio_with, stop_io,
-        FlowWindow, ForwardStream, Role, READ_CHUNK,
-    };
-    use crate::forward_worker::state::apply_delivery;
+    use super::{spawn_stdio_with, ForwardStream};
     use crate::forward_worker::{command_channel, Command};
 
     const EVENT_TIMEOUT: Duration = Duration::from_secs(3);
-
-    #[test]
-    fn one_byte_reads_park_at_packet_window_and_resume_after_delivery() {
-        // Given: a reader forced to emit one-byte packets and a two-packet
-        // window whose byte allowance is intentionally much larger.
-        let (stream, mut peer) = UnixStream::pair().unwrap();
-        let limit = FlowWindow {
-            bytes: i64::try_from(READ_CHUNK).unwrap(),
-            packets: 2,
-        };
-        let (commands, command_receiver) = command_channel(8);
-        let (cancel, cancel_receiver) = channel::bounded(1);
-        let abandoned = Arc::new(AtomicBool::new(false));
-        let (active, handles) = spawn_io_with_read_limit(
-            (Role::Source, 1),
-            ForwardStream::Unix(stream),
-            Some(limit),
-            commands.clone(),
-            cancel_receiver.clone(),
-            abandoned.clone(),
-            1,
-        )
-        .unwrap();
-        peer.write_all(&[1, 2, 3, 4]).unwrap();
-
-        for _ in 0..2 {
-            let Command::Read {
-                socket_id: 1,
-                buffer,
-                committed,
-                ..
-            } = command_receiver.recv_timeout(EVENT_TIMEOUT).unwrap()
-            else {
-                panic!("first reader did not emit its one-byte packet");
-            };
-            commit_reservation(&active, i64::try_from(buffer.len()).unwrap());
-            committed.try_send(()).unwrap();
-        }
-        let first = active
-            .reader_window_blocked
-            .recv_timeout(EVENT_TIMEOUT)
-            .unwrap();
-
-        // Then: packet credit, not the generous byte credit, is the bound;
-        // returning both credits resumes that reader for exactly two more.
-        assert_eq!(first.bytes, 2);
-        assert_eq!(first.packets, 2);
-
-        // A sibling socket sharing the same worker command queue still reads
-        // while socket 1 is parked at its own packet window.
-        let (sibling_stream, mut sibling_peer) = UnixStream::pair().unwrap();
-        let (sibling, sibling_handles) = spawn_io_with_read_limit(
-            (Role::Source, 2),
-            ForwardStream::Unix(sibling_stream),
-            Some(limit),
-            commands,
-            cancel_receiver,
-            abandoned,
-            1,
-        )
-        .unwrap();
-        sibling_peer.write_all(&[9]).unwrap();
-        let Command::Read {
-            socket_id: 2,
-            buffer,
-            committed,
-            ..
-        } = command_receiver.recv_timeout(EVENT_TIMEOUT).unwrap()
-        else {
-            panic!("sibling reader did not progress");
-        };
-        assert_eq!(buffer, [9]);
-        commit_reservation(&sibling, 1);
-        committed.try_send(()).unwrap();
-
-        apply_delivery(
-            &active,
-            FlowWindow {
-                bytes: 2,
-                packets: 2,
-            },
-        );
-        for _ in 0..2 {
-            let Command::Read {
-                socket_id: 1,
-                buffer,
-                committed,
-                ..
-            } = command_receiver.recv_timeout(EVENT_TIMEOUT).unwrap()
-            else {
-                panic!("first reader did not resume");
-            };
-            commit_reservation(&active, i64::try_from(buffer.len()).unwrap());
-            committed.try_send(()).unwrap();
-        }
-        let second = active
-            .reader_window_blocked
-            .recv_timeout(EVENT_TIMEOUT)
-            .unwrap();
-        assert_eq!(second.bytes, 2);
-        assert_eq!(second.packets, 2);
-
-        drop(cancel);
-        stop_io(active);
-        stop_io(sibling);
-        for handle in handles {
-            handle.join().unwrap();
-        }
-        for handle in sibling_handles {
-            handle.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn hostile_credit_during_pending_read_cannot_consume_unsent_reservation() {
-        // Given: a windowed reader has begun a read but no byte or packet has
-        // yet been handed to the forwarding worker.
-        let (stream, mut peer) = UnixStream::pair().unwrap();
-        let limit = FlowWindow {
-            bytes: i64::try_from(READ_CHUNK).unwrap(),
-            packets: 1,
-        };
-        let (commands, command_receiver) = command_channel(8);
-        let (cancel, cancel_receiver) = channel::bounded(1);
-        let abandoned = Arc::new(AtomicBool::new(false));
-        let (active, handles) = spawn_io(
-            Role::Source,
-            1,
-            ForwardStream::Unix(stream),
-            Some(limit),
-            commands,
-            cancel_receiver,
-            abandoned,
-            None,
-        )
-        .unwrap();
-        let started = active
-            .reader_read_started
-            .recv_timeout(EVENT_TIMEOUT)
-            .unwrap();
-        assert_eq!(
-            started,
-            FlowWindow {
-                bytes: i64::try_from(READ_CHUNK).unwrap(),
-                packets: 1,
-            }
-        );
-
-        // When: a hostile peer returns impossible credit while that read is
-        // pending, then one byte becomes readable.
-        apply_delivery(
-            &active,
-            FlowWindow {
-                bytes: i64::MAX,
-                packets: i64::MAX,
-            },
-        );
-        peer.write_all(&[9]).unwrap();
-        let command = command_receiver.recv_timeout(EVENT_TIMEOUT).unwrap();
-
-        // Then: only the byte actually handed to the worker is outstanding;
-        // neither counter underflows or grants unaccounted capacity.
-        let Command::Read {
-            buffer, committed, ..
-        } = command
-        else {
-            panic!("reader did not emit its one-byte packet");
-        };
-        assert_eq!(buffer, [9]);
-        assert_eq!(active.in_flight.load(Ordering::Acquire), 0);
-        assert_eq!(active.packets_in_flight.load(Ordering::Acquire), 0);
-        assert_eq!(active.reserved_bytes.load(Ordering::Acquire), 1);
-        assert_eq!(active.reserved_packets.load(Ordering::Acquire), 1);
-
-        commit_reservation(&active, 1);
-        committed.try_send(()).unwrap();
-        assert_eq!(active.in_flight.load(Ordering::Acquire), 1);
-        assert_eq!(active.packets_in_flight.load(Ordering::Acquire), 1);
-        assert_eq!(active.reserved_bytes.load(Ordering::Acquire), 0);
-        assert_eq!(active.reserved_packets.load(Ordering::Acquire), 0);
-
-        drop(cancel);
-        stop_io(active);
-        for handle in handles {
-            handle.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn same_reader_parks_at_exact_window_and_resumes_after_delivery() {
-        let (stream, mut peer) = UnixStream::pair().unwrap();
-        let window = FlowWindow {
-            bytes: 2,
-            packets: 4,
-        };
-        let transfer = 4;
-        let (commands, command_receiver) = command_channel(4);
-        let (cancel, cancel_receiver) = channel::bounded(1);
-        let abandoned = Arc::new(AtomicBool::new(false));
-        let (active, handles) = spawn_io_with_read_limit(
-            (Role::Source, 1),
-            ForwardStream::Unix(stream),
-            Some(window),
-            commands,
-            cancel_receiver,
-            abandoned,
-            1,
-        )
-        .unwrap();
-        let (write_done_tx, write_done_rx) = mpsc::sync_channel(0);
-        let writer = std::thread::spawn(move || {
-            peer.write_all(&vec![7_u8; transfer]).unwrap();
-            write_done_tx.send(()).unwrap();
-        });
-
-        for _ in 0..2 {
-            let Command::Read {
-                buffer, committed, ..
-            } = command_receiver.recv_timeout(EVENT_TIMEOUT).unwrap()
-            else {
-                panic!("reader did not emit its reserved packet");
-            };
-            commit_reservation(&active, i64::try_from(buffer.len()).unwrap());
-            committed.try_send(()).unwrap();
-        }
-        let first = active
-            .reader_window_blocked
-            .recv_timeout(EVENT_TIMEOUT)
-            .unwrap();
-        assert_eq!(first.bytes, window.bytes);
-        assert_eq!(active.in_flight.load(Ordering::Acquire), window.bytes);
-
-        apply_delivery(&active, first);
-
-        for _ in 0..2 {
-            let Command::Read {
-                buffer, committed, ..
-            } = command_receiver.recv_timeout(EVENT_TIMEOUT).unwrap()
-            else {
-                panic!("reader did not resume its reserved packet");
-            };
-            commit_reservation(&active, i64::try_from(buffer.len()).unwrap());
-            committed.try_send(()).unwrap();
-        }
-        let second = active
-            .reader_window_blocked
-            .recv_timeout(EVENT_TIMEOUT)
-            .unwrap();
-        assert_eq!(second.bytes, window.bytes);
-        assert_eq!(active.in_flight.load(Ordering::Acquire), window.bytes);
-        write_done_rx.recv_timeout(EVENT_TIMEOUT).unwrap();
-
-        drop(cancel);
-        stop_io(active);
-        for handle in handles {
-            handle.join().unwrap();
-        }
-        writer.join().unwrap();
-    }
-
-    #[test]
-    fn stop_io_cancellation_bypasses_a_full_writer_queue() {
-        // Given: the writer owns one command in a blocked socket write and its
-        // bounded queue is full. Admission of the final command proves this
-        // state without scheduler timing assumptions.
-        let (stream, peer) = UnixStream::pair().unwrap();
-        socket2::SockRef::from(&stream)
-            .set_send_buffer_size(2 * 1024)
-            .unwrap();
-        socket2::SockRef::from(&peer)
-            .set_recv_buffer_size(2 * 1024)
-            .unwrap();
-        let mut saturator = stream.try_clone().unwrap();
-        saturator.set_nonblocking(true).unwrap();
-        loop {
-            match saturator.write(&[0u8; 16 * 1024]) {
-                Ok(0) => panic!("forward socket closed before reaching backpressure"),
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) => panic!("could not saturate forward socket: {error}"),
-            }
-        }
-        saturator.set_nonblocking(false).unwrap();
-        let control = stream.try_clone().unwrap();
-        let (commands, _command_receiver) = command_channel(1);
-        let (cancel, cancel_receiver) = channel::bounded(1);
-        let abandoned = Arc::new(AtomicBool::new(false));
-        let (active, handles) = spawn_io(
-            Role::Destination,
-            1,
-            ForwardStream::Unix(stream),
-            None,
-            commands,
-            cancel_receiver,
-            abandoned,
-            None,
-        )
-        .unwrap();
-        for _ in 0..64 {
-            active.writer.as_ref().unwrap().send(vec![1]).unwrap();
-        }
-        let writer = active.writer.as_ref().unwrap().clone();
-        let (admitted_tx, admitted_rx) = mpsc::sync_channel(0);
-        let admission = std::thread::spawn(move || {
-            writer.send(vec![1]).unwrap();
-            admitted_tx.send(()).unwrap();
-        });
-        admitted_rx.recv_timeout(EVENT_TIMEOUT).unwrap();
-        admission.join().unwrap();
-
-        // When: hard cancellation races graceful writer disconnection.
-        let (done_tx, done_rx) = mpsc::sync_channel(0);
-        let stopping = std::thread::spawn(move || {
-            stop_io(active);
-            done_tx.send(()).unwrap();
-        });
-        drop(cancel);
-        let completed_before_abort = done_rx.recv_timeout(EVENT_TIMEOUT).is_ok();
-
-        // Then: cancellation itself must complete removal; the retained clone
-        // is used only to guarantee cleanup after observing a regression.
-        let _ = control.shutdown(std::net::Shutdown::Both);
-        let _ = done_rx.recv_timeout(EVENT_TIMEOUT);
-        stopping.join().unwrap();
-        for handle in handles {
-            handle.join().unwrap();
-        }
-        drop(peer);
-        assert!(
-            completed_before_abort,
-            "stop_io remained blocked behind the full writer queue after cancellation"
-        );
-    }
 
     #[test]
     fn stdio_bridge_reports_closed_only_after_the_final_reply_reaches_stdout() {

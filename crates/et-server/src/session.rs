@@ -378,15 +378,17 @@ impl ActiveSession {
     /// enter the replay catch-up buffer in order while disconnected.
     pub(crate) fn send_bridge_packet_owned(
         &self,
-        header: u8,
-        payload: &[u8],
-    ) -> Result<(), SessionWriteError> {
+        packet: Packet,
+    ) -> Result<(), (Packet, SessionWriteError)> {
         if let Some(state) = self.output_flow() {
             return state
-                .enqueue(Packet::new(header, payload))
-                .map_err(SessionWriteError::BeforeReplay);
+                .enqueue_owned(packet)
+                .map_err(|(packet, error)| (packet, SessionWriteError::BeforeReplay(error)));
         }
-        self.send_packet_owned(header, payload)
+        match self.send_packet_owned(packet.header(), packet.payload()) {
+            Ok(()) => Ok(()),
+            Err(error) => Err((packet, error)),
+        }
     }
 
     fn send_packet_owned_with<W>(

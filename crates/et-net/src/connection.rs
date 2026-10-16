@@ -1,5 +1,6 @@
 use std::io;
 use std::net::{Shutdown, TcpStream};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::connection_nonblocking::read_blocking;
@@ -27,7 +28,7 @@ pub use recovery::{RecoveryExchange, DEFAULT_RECOVERY_TIMEOUT, MAX_RECOVERY_PROT
 /// and recovery can proceed.
 pub const DEFAULT_LIVE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const FLOW_CONTROL_LIVE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-pub const FLOW_CONTROL_SOCKET_BUFFER_BYTES: usize = 32 * 1024;
+pub const FLOW_CONTROL_SOCKET_BUFFER_BYTES: usize = 256 * 1024;
 
 #[derive(Debug)]
 pub enum ConnError {
@@ -42,7 +43,7 @@ pub enum ConnError {
 }
 
 pub struct Connection {
-    stream: TcpStream,
+    stream: Arc<TcpStream>,
     writer: BackedWriter,
     reader: BackedReader,
     live_write_timeout: Duration,
@@ -50,7 +51,7 @@ pub struct Connection {
 }
 
 pub struct PreparedWrite {
-    live: Option<(TcpStream, Vec<u8>, Duration)>,
+    live: Option<(Arc<TcpStream>, Vec<u8>, Duration)>,
 }
 
 #[derive(Debug)]
@@ -95,7 +96,7 @@ impl Connection {
 
     fn new(stream: TcpStream, key: &[u8; KEY_LEN], encrypt: u8, decrypt: u8) -> Self {
         Self {
-            stream,
+            stream: Arc::new(stream),
             writer: BackedWriter::new(CryptoHandler::new(key, encrypt), true),
             reader: BackedReader::new(CryptoHandler::new(key, decrypt), true),
             live_write_timeout: DEFAULT_LIVE_WRITE_TIMEOUT,
@@ -141,7 +142,31 @@ impl Connection {
         header: u8,
         payload: &[u8],
     ) -> Result<PreparedWrite, WritePacketError> {
-        self.prepare_write_packet_with(header, payload, TcpStream::try_clone)
+        if self.pending_live.is_some() {
+            return Err(WritePacketError::BeforeReplay(ConnError::Backpressure));
+        }
+        #[cfg(unix)]
+        if self.refresh_connectivity().is_err() {
+            self.disconnect();
+        }
+        #[cfg(windows)]
+        if let Err(error) = self.refresh_connectivity() {
+            self.disconnect();
+            return Err(WritePacketError::BeforeReplay(error));
+        }
+        let live_stream = self.writer.connected().then(|| Arc::clone(&self.stream));
+        match self
+            .writer
+            .write_packet(header, payload)
+            .map_err(ConnError::Encrypt)
+            .map_err(WritePacketError::BeforeReplay)?
+        {
+            WriterOutcome::Send(frame) => Ok(PreparedWrite {
+                live: live_stream.map(|stream| (stream, frame, self.live_write_timeout)),
+            }),
+            WriterOutcome::BufferedOnly => Ok(PreparedWrite { live: None }),
+            WriterOutcome::Skipped => Err(WritePacketError::BeforeReplay(ConnError::Backpressure)),
+        }
     }
 
     pub fn prepare_write_packet_with<F>(
@@ -178,6 +203,7 @@ impl Connection {
             .connected()
             .then(|| {
                 clone_stream(&self.stream)
+                    .map(Arc::new)
                     .map_err(ConnError::Io)
                     .map_err(WritePacketError::BeforeReplay)
             })
@@ -310,7 +336,7 @@ impl Connection {
     }
 
     pub fn try_read_packet(&mut self) -> Result<Option<Packet>, ConnError> {
-        match crate::connection_nonblocking::try_read(&mut self.stream, &mut self.reader) {
+        match crate::connection_nonblocking::try_read(&self.stream, &mut self.reader) {
             Ok(packet) => Ok(packet),
             Err(error) => {
                 self.disconnect();
@@ -375,10 +401,12 @@ impl Connection {
     }
 
     /// Keep opt-in flow-control backlog in the application queue instead of
-    /// allowing the kernel send queue to autotune to multiple megabytes.
+    /// letting the kernel send queue autotune to multiple megabytes. The cap
+    /// stays above a single forwarding frame so one full packet does not stall
+    /// the session loop's write batch on every iteration.
     pub fn minimize_output_buffering(&mut self) -> Result<(), ConnError> {
         self.live_write_timeout = FLOW_CONTROL_LIVE_WRITE_TIMEOUT;
-        let socket = SockRef::from(&self.stream);
+        let socket = SockRef::from(&*self.stream);
         socket
             .set_send_buffer_size(FLOW_CONTROL_SOCKET_BUFFER_BYTES)
             .map_err(ConnError::Io)?;
@@ -396,7 +424,7 @@ impl Connection {
     /// reproduce the saturation seen on a real link (mss 1228, cwnd 64-99).
     /// Tests use this to force the same pressure deterministically.
     pub fn shrink_transport_window_for_tests(&self, bytes: usize) -> Result<(), ConnError> {
-        let socket = SockRef::from(&self.stream);
+        let socket = SockRef::from(&*self.stream);
         socket.set_send_buffer_size(bytes).map_err(ConnError::Io)?;
         socket.set_recv_buffer_size(bytes).map_err(ConnError::Io)?;
         #[cfg(target_os = "linux")]

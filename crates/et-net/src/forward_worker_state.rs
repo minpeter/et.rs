@@ -16,11 +16,14 @@ use crate::ssh_agent_session_bind::{
     binds_for_destination, write_session_binds, AgentSessionBindReplies,
 };
 
+#[cfg(windows)]
+use super::FastRoute;
 use super::{
-    close_write, spawn_connector, spawn_io, subtract_saturating, ActiveIo, FlowWindow,
-    ForwardError, ForwardStream, Role, Worker, MAX_ACTIVE_SOCKETS, MAX_DATA_PACKET,
-    MAX_UNASSIGNED_FDS,
+    spawn_connector, FlowWindow, ForwardError, ForwardStream, Role, Worker, MAX_ACTIVE_SOCKETS,
+    MAX_DATA_PACKET, MAX_UNASSIGNED_FDS,
 };
+#[cfg(windows)]
+use crate::forward_io::{close_write, spawn_io_direct, subtract_saturating, ActiveIo, DirectLanes};
 
 /// Per-socket receive window.
 ///
@@ -32,8 +35,8 @@ pub(super) const WINDOW_PACKETS: i64 = 32;
 
 /// Return credit once this much has drained, so a full window costs a bounded
 /// number of control packets instead of one per data packet.
-const CREDIT_RETURN_THRESHOLD: i64 = WINDOW_BYTES / 4;
-const PACKET_CREDIT_RETURN_THRESHOLD: i64 = WINDOW_PACKETS / 4;
+pub(crate) const CREDIT_RETURN_THRESHOLD: i64 = WINDOW_BYTES / 4;
+pub(crate) const PACKET_CREDIT_RETURN_THRESHOLD: i64 = WINDOW_PACKETS / 4;
 
 pub(super) fn advertised_window() -> PortForwardWindow {
     PortForwardWindow {
@@ -42,7 +45,7 @@ pub(super) fn advertised_window() -> PortForwardWindow {
     }
 }
 
-fn decode_window(window: Option<PortForwardWindow>) -> Option<FlowWindow> {
+pub(crate) fn decode_window(window: Option<PortForwardWindow>) -> Option<FlowWindow> {
     let window = window?;
     let bytes = window.bytes.filter(|bytes| *bytes > 0)?;
     let packets = window.packets.filter(|packets| *packets > 0)?;
@@ -52,6 +55,7 @@ fn decode_window(window: Option<PortForwardWindow>) -> Option<FlowWindow> {
     })
 }
 
+#[cfg(windows)]
 pub(crate) fn apply_delivery(active: &ActiveIo, delivered: FlowWindow) {
     use std::sync::atomic::Ordering;
     if delivered.bytes <= 0 || delivered.packets <= 0 {
@@ -65,6 +69,23 @@ pub(crate) fn apply_delivery(active: &ActiveIo, delivered: FlowWindow) {
         || (packet_window >= 0 && prior_packets >= packet_window)
     {
         let _ = active.in_flight_wake.try_send(());
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn apply_delivery_route(route: &FastRoute, delivered: FlowWindow) {
+    use std::sync::atomic::Ordering;
+    if delivered.bytes <= 0 || delivered.packets <= 0 {
+        return;
+    }
+    let prior_bytes = subtract_saturating(&route.in_flight, delivered.bytes);
+    let prior_packets = subtract_saturating(&route.packets_in_flight, delivered.packets);
+    let byte_window = route.window.load(Ordering::Acquire);
+    let packet_window = route.packet_window.load(Ordering::Acquire);
+    if (byte_window >= 0 && prior_bytes >= byte_window)
+        || (packet_window >= 0 && prior_packets >= packet_window)
+    {
+        let _ = route.in_flight_wake.try_send(());
     }
 }
 
@@ -254,15 +275,15 @@ impl Worker {
             stdio,
             ..
         } = pending;
+        if !early.is_empty() {
+            self.send_data(Role::Source, socket_id, early, false, None)?;
+        }
         self.activate(Role::Source, socket_id, stream, peer_advertised, None)?;
         if let Some(active) = self.sources.get_mut(&socket_id) {
             active.half_close_on_eof = half_close_on_eof;
         }
         if stdio {
             self.stdio_socket = Some(socket_id);
-        }
-        if !early.is_empty() {
-            self.send_data(Role::Source, socket_id, early, false, None)?;
         }
         Ok(())
     }
@@ -287,9 +308,7 @@ impl Worker {
         // A pure credit packet carries no buffer and must not be mistaken for
         // an empty-data close.
         if let Some(delivered) = decode_window(data.window) {
-            if let Some(active) = self.map(role).get_mut(&socket_id) {
-                apply_delivery(active, delivered);
-            }
+            self.apply_window(role, socket_id, delivered);
             if buffer.is_empty()
                 && !data.closed.unwrap_or(false)
                 && !data.half_close.unwrap_or(false)
@@ -301,22 +320,14 @@ impl Worker {
             // Upstream `ForwardDestinationHandler::shutdownWrite`: the source
             // finished writing (`et -W` stdin EOF). Keep this socket readable
             // so the reply still flows back.
-            let Some(active) = self.map(role).get_mut(&socket_id) else {
-                return Ok(());
-            };
-            close_write(active);
-            return Ok(());
+            return self.peer_half_close(role, socket_id);
         }
         if data.closed.unwrap_or(false) {
             // Upstream closes the local socket in full on a peer close, in
             // either role (`destinationHandlers.erase`, `closeSourceSocketId`).
             // Writes already queued still flush first: upstream wrote them
             // synchronously before it handled this packet.
-            if self.map_ref(role).contains_key(&socket_id) {
-                self.send_data(role, socket_id, Vec::new(), true, None)?;
-            }
-            self.remove(role, socket_id);
-            return Ok(());
+            return self.peer_closed(role, socket_id);
         }
         if buffer.is_empty() {
             return Ok(());
@@ -326,6 +337,48 @@ impl Worker {
             self.remove(role, socket_id);
             return Ok(());
         }
+        self.admit_data(role, socket_id, buffer)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn peer_closed(&mut self, role: Role, socket_id: i32) -> Result<(), ForwardError> {
+        if self.map_ref(role).contains_key(&socket_id) {
+            self.send_data(role, socket_id, Vec::new(), true, None)?;
+        }
+        self.remove(role, socket_id);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn apply_window(&mut self, role: Role, socket_id: i32, delivered: FlowWindow) {
+        if let Some(active) = self.map(role).get_mut(&socket_id) {
+            apply_delivery(active, delivered);
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn peer_half_close(
+        &mut self,
+        role: Role,
+        socket_id: i32,
+    ) -> Result<(), ForwardError> {
+        let Some(active) = self.map(role).get_mut(&socket_id) else {
+            return Ok(());
+        };
+        close_write(active);
+        if let Some(route) = self.routes.write().unwrap().get_mut(&(role, socket_id)) {
+            route.writer = None;
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn admit_data(
+        &mut self,
+        role: Role,
+        socket_id: i32,
+        buffer: Vec<u8>,
+    ) -> Result<(), ForwardError> {
         // Data for an already-closed socket id is a normal race; upstream
         // logs a warning and drops it.
         let Some(active) = self.map_ref(role).get(&socket_id) else {
@@ -357,6 +410,7 @@ impl Worker {
     /// This is what replaces "stop reading the transport": the peer's sender
     /// is throttled per socket, so a congested forwarded socket never stalls
     /// the shared transport that also carries keepalives.
+    #[cfg(windows)]
     pub(super) fn return_credit(
         &mut self,
         role: Role,
@@ -415,6 +469,7 @@ impl Worker {
         )
     }
 
+    #[cfg(windows)]
     pub(super) fn read_closed(&mut self, role: Role, socket_id: i32) -> Result<(), ForwardError> {
         // A socket the peer already closed reports nothing: upstream only
         // emits EOF for a socket it still owns.
@@ -466,7 +521,11 @@ impl Worker {
         )
     }
 
-    fn send_half_close(&mut self, role: Role, socket_id: i32) -> Result<(), ForwardError> {
+    pub(super) fn send_half_close(
+        &mut self,
+        role: Role,
+        socket_id: i32,
+    ) -> Result<(), ForwardError> {
         self.emit(
             TerminalPacketType::PortForwardData as u8,
             PortForwardData {
@@ -558,6 +617,7 @@ impl Worker {
         )
     }
 
+    #[cfg(windows)]
     fn activate(
         &mut self,
         role: Role,
@@ -566,7 +626,17 @@ impl Worker {
         peer_window: Option<FlowWindow>,
         bind_replies: Option<AgentSessionBindReplies>,
     ) -> Result<(), ForwardError> {
-        let (active, handles) = spawn_io(
+        let active_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let direct = self.direct_enabled.then(|| DirectLanes {
+            outbound: self.outbound.clone(),
+            priority: self.priority.clone(),
+            #[cfg(unix)]
+            wake_writer: self.outbound_wake.clone(),
+            #[cfg(unix)]
+            wake_signalled: self.wake_signalled.clone(),
+            active_flag: active_flag.clone(),
+        });
+        let (active, handles) = spawn_io_direct(
             role,
             socket_id,
             stream,
@@ -575,24 +645,40 @@ impl Worker {
             self.cancel.clone(),
             self.abandoned.clone(),
             bind_replies,
+            direct,
         )
         .map_err(ForwardError::Io)?;
+        self.routes.write().unwrap().insert(
+            (role, socket_id),
+            FastRoute {
+                writer: active.writer.clone(),
+                pending_bytes: active.pending_bytes.clone(),
+                in_flight: active.in_flight.clone(),
+                packets_in_flight: active.packets_in_flight.clone(),
+                window: active.window.clone(),
+                packet_window: active.packet_window.clone(),
+                in_flight_wake: active.in_flight_wake.clone(),
+            },
+        );
         self.map(role).insert(socket_id, active);
         self.threads.extend(handles);
         Ok(())
     }
 
+    #[cfg(windows)]
     pub(super) fn remove(&mut self, role: Role, socket_id: i32) {
         if role == Role::Source && self.stdio_socket == Some(socket_id) {
             // The stdout copier clears the bridge flag once every queued byte
             // is flushed, so `et -W` cannot exit ahead of its trailing output.
             self.stdio_socket = None;
         }
+        self.routes.write().unwrap().remove(&(role, socket_id));
         if let Some(active) = self.map(role).remove(&socket_id) {
             super::stop_io(active);
         }
     }
 
+    #[cfg(windows)]
     fn map(&mut self, role: Role) -> &mut std::collections::HashMap<i32, ActiveIo> {
         match role {
             Role::Source => &mut self.sources,
@@ -600,6 +686,7 @@ impl Worker {
         }
     }
 
+    #[cfg(windows)]
     pub(crate) fn map_ref(&self, role: Role) -> &std::collections::HashMap<i32, ActiveIo> {
         match role {
             Role::Source => &self.sources,
@@ -623,7 +710,11 @@ impl Worker {
     /// Emit on the priority lane, which the consumer drains before ordinary
     /// outbound packets. Only valid for control messages whose delivery must
     /// not wait behind the data flow they regulate.
-    fn emit_priority<M: Message>(&mut self, header: u8, message: M) -> Result<(), ForwardError> {
+    pub(super) fn emit_priority<M: Message>(
+        &mut self,
+        header: u8,
+        message: M,
+    ) -> Result<(), ForwardError> {
         let packet = Ok(Packet::new(header, message.encode_to_vec()));
         channel::select! {
             send(self.priority, packet) -> result => {
@@ -632,23 +723,63 @@ impl Worker {
             recv(self.cancel) -> _ => return Err(ForwardError::Unavailable),
         }
         #[cfg(unix)]
-        let _ = self.outbound_wake.write(&[1]);
+        {
+            self.flush_outbound_wake();
+        }
         Ok(())
     }
-
-    fn emit<M: Message>(&mut self, header: u8, message: M) -> Result<(), ForwardError> {
-        let packet = Ok(Packet::new(header, message.encode_to_vec()));
-        channel::select! {
-            send(self.outbound, packet) -> result => {
-                result.map_err(|_| ForwardError::Unavailable)?;
-            }
-            recv(self.cancel) -> _ => return Err(ForwardError::Unavailable),
+    #[cfg(unix)]
+    pub(super) fn flush_outbound_wake(&self) {
+        // Always write the byte. Gating it on the queues being non-empty
+        // loses the wake when the session drains the last packet and goes
+        // back to poll between this check and the write.
+        if !self
+            .wake_signalled
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let _ = (&*self.outbound_wake).write(&[1]);
         }
-        // Unix consumers poll the wake socket; Windows consumers drain
-        // `try_outbound` on the client loop's 10ms cadence.
+    }
+
+    pub(super) fn emit<M: Message>(&mut self, header: u8, message: M) -> Result<(), ForwardError> {
+        let packet = Ok(Packet::new(header, message.encode_to_vec()));
         #[cfg(unix)]
-        let _ = self.outbound_wake.write(&[1]);
-        Ok(())
+        {
+            // A full outbound channel must not freeze the poll loop: the
+            // session drains it, and the worker has sockets to service in the
+            // meantime. Spill up to one channel's worth and retry next cycle.
+            // Past that the session is not draining, so block as before.
+            if self.outbound_spill.len() < crate::forward::CHANNEL_SPILL_LIMIT {
+                match self.outbound.try_send(packet) {
+                    Ok(()) => {}
+                    Err(crossbeam_channel::TrySendError::Full(packet)) => {
+                        self.outbound_spill.push_back(packet);
+                    }
+                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                        return Err(ForwardError::Unavailable);
+                    }
+                }
+            } else {
+                channel::select! {
+                    send(self.outbound, packet) -> result => {
+                        result.map_err(|_| ForwardError::Unavailable)?;
+                    }
+                    recv(self.cancel) -> _ => return Err(ForwardError::Unavailable),
+                }
+            }
+            self.flush_outbound_wake();
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            channel::select! {
+                send(self.outbound, packet) -> result => {
+                    result.map_err(|_| ForwardError::Unavailable)?;
+                }
+                recv(self.cancel) -> _ => return Err(ForwardError::Unavailable),
+            }
+            Ok(())
+        }
     }
 }
 
@@ -666,12 +797,7 @@ fn write_socks_reply(stream: &ForwardStream, version: Option<u8>, success: bool)
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicI64, Ordering};
-
-    use super::{
-        decode_window, subtract_saturating, FlowWindow, PortForwardWindow, WINDOW_BYTES,
-        WINDOW_PACKETS,
-    };
+    use super::{decode_window, FlowWindow, PortForwardWindow, WINDOW_BYTES, WINDOW_PACKETS};
 
     #[test]
     fn hostile_window_values_are_rejected_or_bounded() {
@@ -707,14 +833,5 @@ mod tests {
                 packets: WINDOW_PACKETS,
             })
         );
-    }
-
-    #[test]
-    fn delivery_confirmation_cannot_underflow_in_flight_bytes() {
-        let in_flight = AtomicI64::new(128);
-        assert_eq!(subtract_saturating(&in_flight, 64), 128);
-        assert_eq!(in_flight.load(Ordering::Acquire), 64);
-        assert_eq!(subtract_saturating(&in_flight, i64::MAX), 64);
-        assert_eq!(in_flight.load(Ordering::Acquire), 0);
     }
 }

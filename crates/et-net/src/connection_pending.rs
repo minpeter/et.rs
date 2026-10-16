@@ -3,6 +3,7 @@ use std::io;
 #[cfg(windows)]
 use std::io::Write;
 use std::net::{Shutdown, TcpStream};
+use std::sync::Arc;
 use std::time::Instant;
 
 use super::{ConnError, Connection, PreparedWrite, WritePacketError};
@@ -12,7 +13,7 @@ use crate::connection_nonblocking::wait_writable;
 const WRITE_QUANTUM: usize = 64 * 1024;
 
 pub(super) struct PendingWrite {
-    stream: TcpStream,
+    stream: Arc<TcpStream>,
     frame: Vec<u8>,
     offset: usize,
     pub(super) deadline: Instant,
@@ -65,7 +66,7 @@ impl PendingWrite {
         {
             // Preparation enabled nonblocking mode before replay admission;
             // cloned Winsock handles keep that shared mode permanently.
-            match self.stream.write(&self.frame[self.offset..end]) {
+            match (&*self.stream).write(&self.frame[self.offset..end]) {
                 Ok(0) => Err(io::ErrorKind::WriteZero.into()),
                 Ok(count) => {
                     self.offset += count;

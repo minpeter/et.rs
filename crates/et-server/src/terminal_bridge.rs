@@ -646,7 +646,20 @@ fn flush_forwarding(
     forwarder: &Forwarder,
     pending: &mut VecDeque<Packet>,
 ) -> Result<(), SessionError> {
-    forwarder.try_receive_queue(pending).map_err(forward_error)
+    #[cfg(unix)]
+    forwarder
+        .try_receive_queue(pending)
+        .map_err(forward_error)?;
+    #[cfg(windows)]
+    {
+        while let Some(packet) = pending.pop_front() {
+            if let Some(packet) = forwarder.try_receive(packet).map_err(forward_error)? {
+                pending.push_front(packet);
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn enqueue_outbound(

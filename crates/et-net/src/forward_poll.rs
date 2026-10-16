@@ -1116,15 +1116,12 @@ mod tests {
             packets: 32,
         };
         let (mut socket, mut peer, _scratch) = socket_pair(Some(window));
-        let drained = std::thread::spawn(move || {
-            let mut buf = vec![0u8; super::CREDIT_RETURN_THRESHOLD as usize];
-            peer.read_exact(&mut buf).unwrap();
-        });
-        socket
-            .queue_write(vec![0; super::CREDIT_RETURN_THRESHOLD as usize])
-            .unwrap();
+        for _ in 0..super::PACKET_CREDIT_RETURN_THRESHOLD {
+            socket.queue_write(vec![0; 10]).unwrap();
+        }
         socket.flush_out().unwrap();
-        drained.join().unwrap();
+        let mut buf = [0u8; 80];
+        peer.read_exact(&mut buf).unwrap();
         assert!(socket.credit_due(std::time::Instant::now()));
     }
 }

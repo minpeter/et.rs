@@ -314,24 +314,51 @@ impl CryptoHandler {
         }
     }
 
+    pub fn next_nonce_and_key(&mut self) -> ([u8; NONCE_LEN], [u8; KEY_LEN]) {
+        self.bump();
+        (self.nonce, self.base_key)
+    }
+
+    pub fn encrypt_detached(
+        prefix: &[u8],
+        plaintext: &[u8],
+        nonce: &[u8; NONCE_LEN],
+        key: &[u8; KEY_LEN],
+    ) -> Vec<u8> {
+        et_sodium::secretbox_with_prefix(prefix, plaintext, nonce, key)
+    }
+
+    pub fn encrypt_with_prefix(
+        &mut self,
+        prefix: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, EncryptError> {
+        self.bump();
+        Ok(et_sodium::secretbox_with_prefix(
+            prefix,
+            plaintext,
+            &self.nonce,
+            &self.base_key,
+        ))
+    }
+
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, EncryptError> {
-        let mut out = vec![0u8; plaintext.len() + MAC_LEN];
-        self.encrypt_into(&mut out, plaintext)
-            .map_err(|_| EncryptError)?;
-        Ok(out)
+        self.bump();
+        Ok(et_sodium::secretbox(plaintext, &self.nonce, &self.base_key))
     }
 
     pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, DecryptError> {
         if ciphertext.len() < MAC_LEN {
             return Err(DecryptError::Short);
         }
-        let mut out = vec![0u8; ciphertext.len() - MAC_LEN];
-        match self.decrypt_into(&mut out, ciphertext) {
-            Some(len) => {
-                debug_assert_eq!(len, out.len());
-                Ok(out)
+        let saved = self.nonce;
+        self.bump();
+        match et_sodium::secretbox_open(ciphertext, &self.nonce, &self.base_key) {
+            Some(out) => Ok(out),
+            None => {
+                self.nonce = saved;
+                Err(DecryptError::BadMac)
             }
-            None => Err(DecryptError::BadMac),
         }
     }
 

@@ -242,6 +242,12 @@ impl Worker {
             );
         }
         let socket_id = self.allocate_socket_id()?;
+        if destination.can_connect_inline(self.session_user)
+            && self.recorded_binds_for(&destination).is_none()
+        {
+            let result = destination.connect_with_user(self.session_user);
+            return self.connected(client_fd, socket_id, result, peer_advertised);
+        }
         self.connecting.insert(socket_id);
         self.pending_windows.insert(socket_id, peer_advertised);
         if let Some(pending) = self.recorded_binds_for(&destination) {
@@ -748,12 +754,13 @@ impl Worker {
         }
         #[cfg(unix)]
         {
-            self.flush_outbound_wake();
+            self.note_outbound_emitted();
         }
         Ok(())
     }
     #[cfg(unix)]
-    pub(super) fn flush_outbound_wake(&self) {
+    pub(super) fn flush_outbound_wake(&mut self) {
+        self.outbound_wake_needed = false;
         // Always write the byte. Gating it on the queues being non-empty
         // loses the wake when the session drains the last packet and goes
         // back to poll between this check and the write.
@@ -762,6 +769,15 @@ impl Worker {
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
             let _ = (&*self.outbound_wake).write(&[1]);
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn note_outbound_emitted(&mut self) {
+        if !self.defer_outbound_wake || self.outbound.len() >= 4 {
+            self.flush_outbound_wake();
+        } else {
+            self.outbound_wake_needed = true;
         }
     }
 
@@ -791,7 +807,7 @@ impl Worker {
                     recv(self.cancel) -> _ => return Err(ForwardError::Unavailable),
                 }
             }
-            self.flush_outbound_wake();
+            self.note_outbound_emitted();
             Ok(())
         }
         #[cfg(windows)]
@@ -807,6 +823,8 @@ impl Worker {
     }
 
     pub(super) fn emit_raw(&mut self, header: u8, payload: Vec<u8>) -> Result<(), ForwardError> {
+        #[cfg(unix)]
+        let is_small = payload.len() <= 4096;
         let packet = Ok(Packet::new(header, payload));
         #[cfg(unix)]
         {
@@ -839,8 +857,10 @@ impl Worker {
                     recv(self.cancel) -> _ => return Err(ForwardError::Unavailable),
                 }
             }
-            if !self.defer_outbound_wake {
+            if is_small {
                 self.flush_outbound_wake();
+            } else {
+                self.note_outbound_emitted();
             }
             Ok(())
         }

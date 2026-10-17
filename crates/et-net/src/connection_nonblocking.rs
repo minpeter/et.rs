@@ -183,24 +183,25 @@ pub(crate) fn try_read(
     stream: &TcpStream,
     reader: &mut BackedReader,
 ) -> Result<Option<Packet>, ConnError> {
-    let mut buffer = [0u8; 64 * 1024];
+    const READ_CHUNK_SIZE: usize = 256 * 1024;
     for _ in 0..4 {
         match reader.pop()? {
             ReadItem::Packet(packet) => return Ok(Some(packet)),
             ReadItem::NeedMore => {}
         }
+        let buffer = reader.prepare_read_slice(READ_CHUNK_SIZE);
         #[cfg(unix)]
-        let read = rustix::net::recv(stream, &mut buffer, rustix::net::RecvFlags::DONTWAIT)
+        let read = rustix::net::recv(stream, buffer, rustix::net::RecvFlags::DONTWAIT)
             .map(|(count, _)| count)
             .map_err(io::Error::from);
         #[cfg(windows)]
         let read = {
             stream.set_nonblocking(true)?;
-            (&*stream).read(&mut buffer)
+            (&*stream).read(buffer)
         };
         match read {
             Ok(0) => return Err(ConnError::Io(io::ErrorKind::UnexpectedEof.into())),
-            Ok(count) => reader.feed(&buffer[..count]),
+            Ok(count) => reader.commit_read(count),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok(None),
             Err(error) => return Err(ConnError::Io(error)),

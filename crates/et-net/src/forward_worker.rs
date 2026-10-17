@@ -4,12 +4,10 @@ use std::io::Write;
 use std::io::{self};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering};
 #[cfg(all(test, unix))]
 use std::sync::mpsc;
-#[cfg(windows)]
-use std::sync::{atomic::AtomicI64, RwLock};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -52,6 +50,60 @@ pub(crate) struct FastRoute {
 
 #[cfg(windows)]
 pub(crate) type FastRoutes = Arc<RwLock<HashMap<(Role, i32), FastRoute>>>;
+
+#[cfg(unix)]
+pub(crate) struct UnixFastRoute {
+    pub(crate) role: Role,
+    pub(crate) socket_id: i32,
+    pub(crate) stream: ForwardStream,
+    pub(crate) direct_ok: AtomicBool,
+    pub(crate) direct_read_ok: AtomicBool,
+    pub(crate) windowed: bool,
+    pub(crate) window_bytes: i64,
+    pub(crate) window_packets: i64,
+    pub(crate) in_flight_bytes: AtomicI64,
+    pub(crate) in_flight_packets: AtomicI64,
+    pub(crate) credit_bytes: AtomicI64,
+    pub(crate) credit_packets: AtomicI64,
+}
+
+#[cfg(unix)]
+impl UnixFastRoute {
+    pub(crate) fn read_interest(&self) -> bool {
+        self.direct_read_ok.load(Ordering::Acquire)
+            && (!self.windowed
+                || (self.in_flight_bytes.load(Ordering::Acquire) < self.window_bytes
+                    && self.in_flight_packets.load(Ordering::Acquire) < self.window_packets))
+    }
+
+    pub(crate) fn note_sent(&self, bytes: usize) {
+        if !self.windowed {
+            return;
+        }
+        let add = i64::try_from(bytes).unwrap_or(i64::MAX);
+        self.in_flight_bytes.fetch_add(add, Ordering::AcqRel);
+        self.in_flight_packets.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn apply_delivery(&self, delivered: FlowWindow) {
+        if delivered.bytes > 0 {
+            let _ = self
+                .in_flight_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                    Some(cur.saturating_sub(delivered.bytes).max(0))
+                });
+        }
+        if delivered.packets > 0 {
+            let _ =
+                self.in_flight_packets
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                        Some(cur.saturating_sub(delivered.packets).max(0))
+                    });
+        }
+    }
+}
+#[cfg(unix)]
+pub(crate) type UnixFastRoutes = Arc<RwLock<HashMap<(Role, i32), Arc<UnixFastRoute>>>>;
 
 pub(crate) enum Command {
     Packet(Packet),
@@ -345,6 +397,16 @@ impl CommandSender {
         }
     }
 
+    #[cfg(unix)]
+    pub(crate) fn force_wake(&self) {
+        if !self.queue.wake_signalled.swap(true, Ordering::AcqRel) {
+            if let Some(writer) = &self.queue.wake_writer {
+                use std::io::Write;
+                let _ = (&mut &*writer).write(&[1]);
+            }
+        }
+    }
+
     pub(crate) fn shutdown(&self) {
         let mut state = self.queue.state.lock().unwrap();
         state.shutdown = true;
@@ -367,7 +429,6 @@ impl CommandSender {
             .map_or(true, |state| state.commands.is_empty())
     }
 
-    #[cfg(windows)]
     pub(crate) fn is_idle(&self) -> bool {
         self.queue.in_flight.load(Ordering::Acquire) == 0
     }
@@ -595,6 +656,10 @@ pub(crate) struct WorkerChannels {
     #[cfg(windows)]
     pub(crate) routes: FastRoutes,
     #[cfg(unix)]
+    pub(crate) routes: UnixFastRoutes,
+    #[cfg(unix)]
+    pub(crate) session_polls_reads: Arc<AtomicBool>,
+    #[cfg(unix)]
     pub(crate) wake_signalled: Arc<AtomicBool>,
 }
 
@@ -616,6 +681,10 @@ pub(crate) fn run(
         #[cfg(windows)]
         routes,
         #[cfg(unix)]
+        routes,
+        #[cfg(unix)]
+        session_polls_reads,
+        #[cfg(unix)]
         wake_signalled,
     } = channels;
     let (listener_stop, session_user, shutdown) = control;
@@ -629,6 +698,8 @@ pub(crate) fn run(
         abandoned,
     )
     .and_then(|mut worker| {
+        worker.routes = routes;
+        worker.session_polls_reads = session_polls_reads;
         worker.wake_signalled = wake_signalled.clone();
         worker.run(
             sources,
@@ -688,6 +759,9 @@ struct Worker {
     #[cfg(windows)]
     direct_enabled: bool,
     #[cfg(unix)]
+    routes: UnixFastRoutes,
+    #[cfg(unix)]
+    session_polls_reads: Arc<AtomicBool>,
     outbound_wake: Arc<UnixStream>,
     /// Outbound packets the poll loop could not hand to the session because
     /// the channel was full. Drained before new socket reads so ordering holds.
@@ -697,6 +771,8 @@ struct Worker {
     wake_signalled: Arc<AtomicBool>,
     #[cfg(unix)]
     pub(super) defer_outbound_wake: bool,
+    #[cfg(unix)]
+    pub(super) outbound_wake_needed: bool,
     pending: HashMap<i32, PendingAccept>,
     connecting: HashSet<i32>,
     #[cfg(unix)]
@@ -785,6 +861,9 @@ impl Worker {
             #[cfg(windows)]
             direct_enabled: false,
             #[cfg(unix)]
+            routes: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(unix)]
+            session_polls_reads: Arc::new(AtomicBool::new(false)),
             outbound_wake,
             #[cfg(unix)]
             outbound_spill: std::collections::VecDeque::new(),
@@ -792,6 +871,8 @@ impl Worker {
             wake_signalled: Arc::new(AtomicBool::new(false)),
             #[cfg(unix)]
             defer_outbound_wake: false,
+            #[cfg(unix)]
+            outbound_wake_needed: false,
             pending: HashMap::new(),
             connecting: HashSet::new(),
             sources: HashMap::new(),
@@ -873,7 +954,6 @@ impl Worker {
             self.threads.push(thread);
         }
         let result = self.run_loop(commands);
-        #[cfg(windows)]
         self.routes.write().unwrap().clear();
         #[cfg(unix)]
         let _ = listener_stop.shutdown(std::net::Shutdown::Both);

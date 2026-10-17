@@ -4,7 +4,7 @@ packages:
     type: patch
 ---
 
-## Optimize forwarding pipeline with zero-copy framing and batch queuing
+## Optimize forwarding and terminal pipeline with zero-hop polling and lock-free crypto
 
 - Eliminate 22-byte frame truncation in `PendingWrite`: raise `WRITE_QUANTUM`
   from 64 KiB to 256 KiB so full 64 KiB forwarding frames (65,558 wire bytes)
@@ -13,16 +13,18 @@ packages:
 - Zero-copy framing and backup in `BackedWriter`: share wire frames via
   `Arc<[u8]>` directly between live transport sends and the reconnect backup
   queue, removing per-packet 64 KiB vector clones.
-- Direct-buffer crypto in `et-sodium` and `et-core`: add `secretbox_into`,
-  `secretbox_open_into`, and `secretbox_open_in_place` to eliminate intermediate
-  ciphertext allocations.
-- In-place fast-path data serialization in `et-net`: encode forwarding data
-  packets in one step and parse incoming data packets directly into queued
-  buffer spans, bypassing protobuf intermediate copies.
-- On Unix, single-lock batch command drain in `CommandReceiver`: drain all pending
-  commands per lock acquisition and batch forward packets during session read
-  loops, slashing mutex contention and worker wake thrashing.
-- Enable `TCP_NODELAY` on the client connection and forward listeners, cutting
-  interactive ping-pong latency from 44 ms to ~40–60 µs.
-- Expand flow-control window to 2 MiB while keeping the 256 KiB socket buffer
-  bound so interactive Ctrl-C remains responsive on slow links.
+- Direct-buffer crypto in `et-sodium` and `et-core`: link system `libsodium` on
+  Unix and add `secretbox_into`, `secretbox_open_into`, and
+  `secretbox_open_in_place` to eliminate intermediate ciphertext allocations.
+- Decouple 64 KiB XSalsa20-Poly1305 encryption from the session `Connection`
+  mutex in `et-server` and `et-net` via `BackedWriter::reserve_write` and
+  `commit_reserved`, allowing full-duplex reads and writes to encrypt and
+  decrypt concurrently across CPU cores.
+- Zero-hop adaptive fast poll (`FastPollState`) in `et-net`, `et-bin`, and
+  `et-server`: poll active Unix forwarding routes directly inside the client
+  and terminal bridge `poll()` loops for sub-200 µs interactive ping-pong RTT,
+  automatically handing off sustained bulk streams (> 4 KiB) to the parallel
+  forwarding worker thread.
+- Enable `TCP_NODELAY` on client, server, and forwarded TCP sockets, and expand
+  the per-socket flow-control window to 2 MiB while keeping the 256 KiB socket
+  buffer bound so interactive Ctrl-C remains responsive on slow links.

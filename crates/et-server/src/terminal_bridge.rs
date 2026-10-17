@@ -119,6 +119,7 @@ fn run_mode_poll(
     let mut terminal_eof = false;
     let mut client_buffered = false;
     let mut cached_client: Option<(std::net::TcpStream, u64)> = None;
+    let mut fast_poll = et_net::forward::FastPollState::new();
     loop {
         if session.is_shutting_down() {
             return Ok(());
@@ -170,6 +171,9 @@ fn run_mode_poll(
         // When the client is down, poll with a short timeout so recovery wakes
         // (via the wake pipe) are still processed promptly and we re-check
         // `session.connected()` after recover installs a new stream.
+        if pending_outbound.is_empty() {
+            forwarder.collect_fast_poll_routes(&mut fast_poll);
+        }
         let (terminal_events, wake_events, forward_events, client_events) = wait(
             &terminal,
             &wake,
@@ -186,6 +190,7 @@ fn run_mode_poll(
                 !pending_forward.is_empty() || !connected,
                 client_buffered,
             ),
+            pending_outbound.is_empty().then_some(&fast_poll),
         )?;
         let client_events_are_stale = wake_events.intersects(PollFlags::IN | PollFlags::HUP);
         if client_events_are_stale {
@@ -224,23 +229,35 @@ fn run_mode_poll(
             && !terminal_eof
             && (terminal_closing || terminal_events.contains(PollFlags::IN))
         {
-            match read_terminal_packet(&mut terminal, &mut decoder) {
-                Ok(Some(packet)) => {
-                    let Some(packet) = accept_terminal_packet(&session, mode, packet)? else {
+            for _ in 0..32 {
+                match read_terminal_packet(&mut terminal, &mut decoder) {
+                    Ok(Some(packet)) => {
+                        let Some(packet) = accept_terminal_packet(&session, mode, packet)? else {
+                            decoder = LocalPacketDecoder::new();
+                            continue;
+                        };
                         decoder = LocalPacketDecoder::new();
-                        continue;
-                    };
-                    decoder = LocalPacketDecoder::new();
-                    pending_terminal =
-                        send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
+                        pending_terminal = send_or_hold(
+                            &session,
+                            packet,
+                            &mut connected,
+                            &mut connection_generation,
+                        )?;
+                        if pending_terminal.is_some()
+                            || !session.can_buffer_write((READ_BUFFER * 2) as i64)?
+                        {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(SessionError::Io(error))
+                        if terminal_closing && error.kind() == io::ErrorKind::UnexpectedEof =>
+                    {
+                        terminal_eof = true;
+                        break;
+                    }
+                    Err(error) => return Err(error),
                 }
-                Ok(None) => {}
-                Err(SessionError::Io(error))
-                    if terminal_closing && error.kind() == io::ErrorKind::UnexpectedEof =>
-                {
-                    terminal_eof = true;
-                }
-                Err(error) => return Err(error),
             }
         }
         if terminal_eof && pending_terminal.is_none() {
@@ -274,6 +291,9 @@ fn run_mode_poll(
                     }
                     Ok(Some(packet)) if is_forward_packet(packet.header()) => {
                         pending_forward.push_back(packet);
+                        if pending_forward.len() >= 16 {
+                            flush_forwarding(&forwarder, &mut pending_forward)?;
+                        }
                         true
                     }
                     Ok(Some(packet)) => {
@@ -353,7 +373,7 @@ fn run_mode_poll(
                     client_buffered = true;
                     break;
                 }
-                if index + 1 == CLIENT_READ_BATCH {
+                if index + 1 == CLIENT_READ_BATCH || session.has_buffered_read() {
                     // `try_read_packet` can leave complete packets in its
                     // userspace decoder after the kernel socket is drained.
                     client_buffered = true;
@@ -370,8 +390,11 @@ fn run_mode_poll(
                 observed_generation,
             )?;
         }
+        let fast_ready = pending_outbound.is_empty() && forwarder.service_fast_poll(&mut fast_poll);
         if pending_outbound.is_empty()
-            && (resume_outbound_drain || forward_events.intersects(PollFlags::IN | PollFlags::HUP))
+            && (resume_outbound_drain
+                || fast_ready
+                || forward_events.intersects(PollFlags::IN | PollFlags::HUP))
         {
             while let Some(packet) = forwarder.try_outbound().map_err(forward_error)? {
                 enqueue_outbound(
@@ -812,6 +835,7 @@ fn wait(
     client: Option<&std::net::TcpStream>,
     terminal_flags: PollFlags,
     client_policy: (PollFlags, Option<Duration>),
+    fast_poll: Option<&et_net::forward::FastPollState>,
 ) -> Result<(PollFlags, PollFlags, PollFlags, PollFlags), SessionError> {
     let (client_flags, timeout) = client_policy;
     let timeout = timeout.map(|duration| {
@@ -825,6 +849,10 @@ fn wait(
     if let Some(client) = client {
         descriptors.push(PollFd::new(client, client_flags));
     }
+    let fast_offset = descriptors.len();
+    if let Some(fast_poll) = fast_poll {
+        fast_poll.push_descriptors(&mut descriptors);
+    }
     // poll() is never restarted by SA_RESTART; retry on EINTR instead of
     // tearing the session down when a signal interrupts the wait.
     loop {
@@ -833,6 +861,9 @@ fn wait(
             Err(error) if error == rustix::io::Errno::INTR => {}
             Err(error) => return Err(SessionError::Io(io::Error::from(error))),
         }
+    }
+    if let Some(fast_poll) = fast_poll {
+        fast_poll.record_revents(&descriptors[fast_offset..]);
     }
     Ok((
         descriptors[0].revents(),

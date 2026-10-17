@@ -398,7 +398,7 @@ fn listen_tcp_at_address(address: SocketAddr) -> io::Result<TcpListener> {
         .ok_or_else(|| io::Error::from_raw_os_error(rustix::io::Errno::AFNOSUPPORT.raw_os_error()))
 }
 
-fn already_session_user(uid: u32, gid: u32) -> bool {
+pub(crate) fn already_session_user(uid: u32, gid: u32) -> bool {
     rustix::process::geteuid().as_raw() == uid && rustix::process::getegid().as_raw() == gid
 }
 

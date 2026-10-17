@@ -16,7 +16,7 @@ const WRITE_QUANTUM: usize = 256 * 1024;
 
 pub(super) struct PendingWrite {
     stream: Arc<TcpStream>,
-    frame: Arc<[u8]>,
+    frame: Arc<Vec<u8>>,
     offset: usize,
     pub(super) deadline: Instant,
 }
@@ -127,6 +127,24 @@ impl Connection {
     ) -> Result<(), WritePacketError> {
         self.pending_live = self.prepare_write_packet(header, payload)?.into_pending();
         self.advance_write().map(|_| ())
+    }
+
+    pub fn start_write_packet_owned_unprobed(
+        &mut self,
+        header: u8,
+        payload: &[u8],
+    ) -> Result<(), WritePacketError> {
+        self.pending_live = self
+            .prepare_write_packet_unprobed(header, payload)?
+            .into_pending();
+        self.advance_write().map(|_| ())
+    }
+
+    pub fn finish_pending_live_detached(
+        &mut self,
+    ) -> Option<impl FnOnce() -> Result<(), WritePacketError>> {
+        let pending = self.pending_live.take()?;
+        Some(move || pending.finish())
     }
 
     pub fn write_pending(&self) -> bool {

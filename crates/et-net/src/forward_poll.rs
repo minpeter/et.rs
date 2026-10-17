@@ -69,6 +69,7 @@ pub(crate) struct SocketIo {
     credit_bytes: i64,
     credit_packets: i64,
     credit_flush_at: Option<Instant>,
+    fast_route: Option<std::sync::Arc<super::UnixFastRoute>>,
 }
 
 pub(crate) enum ReadOutcome {
@@ -118,6 +119,7 @@ impl SocketIo {
             credit_bytes: 0,
             credit_packets: 0,
             credit_flush_at: None,
+            fast_route: None,
         })
     }
 
@@ -126,11 +128,25 @@ impl SocketIo {
     }
 
     fn read_interest(&self) -> bool {
-        self.read_open
-            && !self.close_when_drained
-            && (!self.windowed()
-                || (self.in_flight_bytes < self.window_bytes
-                    && self.in_flight_packets < self.window_packets))
+        if !self.read_open || self.close_when_drained {
+            return false;
+        }
+        if !self.windowed() {
+            return true;
+        }
+        let (in_b, in_p) = if let Some(route) = &self.fast_route {
+            (
+                route
+                    .in_flight_bytes
+                    .load(std::sync::atomic::Ordering::Acquire),
+                route
+                    .in_flight_packets
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+        } else {
+            (self.in_flight_bytes, self.in_flight_packets)
+        };
+        in_b < self.window_bytes && in_p < self.window_packets
     }
 
     fn write_interest(&self) -> bool {
@@ -144,6 +160,11 @@ impl SocketIo {
     fn queue_write(&mut self, buffer: Vec<u8>) -> Result<(), Vec<u8>> {
         if self.out.len() >= OUT_QUEUE_PACKETS {
             return Err(buffer);
+        }
+        if let Some(route) = &self.fast_route {
+            route
+                .direct_ok
+                .store(false, std::sync::atomic::Ordering::Release);
         }
         let len = buffer.len();
         self.out.push_back(QueuedBuffer {
@@ -161,6 +182,11 @@ impl SocketIo {
         if len > MAX_DATA_PACKET || self.out.len() >= OUT_QUEUE_PACKETS {
             return Err(data);
         }
+        if let Some(route) = &self.fast_route {
+            route
+                .direct_ok
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
         self.out.push_back(QueuedBuffer { data, start, len });
         Ok(())
     }
@@ -173,6 +199,10 @@ impl SocketIo {
     }
 
     fn apply_delivery(&mut self, delivered: FlowWindow) {
+        if let Some(route) = &self.fast_route {
+            route.apply_delivery(delivered);
+            return;
+        }
         if delivered.bytes > 0 {
             self.in_flight_bytes = self.in_flight_bytes.saturating_sub(delivered.bytes).max(0);
         }
@@ -188,6 +218,10 @@ impl SocketIo {
         if !self.windowed() {
             return;
         }
+        if let Some(route) = &self.fast_route {
+            route.note_sent(bytes);
+            return;
+        }
         self.in_flight_bytes = self
             .in_flight_bytes
             .saturating_add(i64::try_from(bytes).unwrap_or(i64::MAX));
@@ -196,6 +230,7 @@ impl SocketIo {
 
     /// Read one chunk, bounded by the remaining window. Bind replies are
     /// consumed locally and never charged against the peer's window.
+    #[cfg(test)]
     fn read_chunk(&mut self, scratch: &mut [u8]) -> io::Result<ReadOutcome> {
         let limit = if self.windowed() {
             let remaining = self.window_bytes.saturating_sub(self.in_flight_bytes);
@@ -233,30 +268,105 @@ impl SocketIo {
         }
     }
 
+    /// Read one chunk and encode it directly into a `PortForwardData` payload
+    /// without an intermediate `Vec<u8>` copy.
+    fn read_encoded_chunk(&mut self, scratch: &mut [u8]) -> io::Result<ReadOutcome> {
+        let limit = if self.windowed() {
+            let in_b = self.fast_route.as_ref().map_or(self.in_flight_bytes, |r| {
+                r.in_flight_bytes.load(std::sync::atomic::Ordering::Acquire)
+            });
+            let remaining = self.window_bytes.saturating_sub(in_b);
+            usize::try_from(remaining.min(scratch.len() as i64)).unwrap_or(0)
+        } else {
+            scratch.len()
+        };
+        if limit == 0 {
+            return Ok(ReadOutcome::Idle);
+        }
+        loop {
+            match self.stream.read(&mut scratch[..limit]) {
+                Ok(0) => return Ok(ReadOutcome::Eof),
+                Ok(count) => {
+                    if let Some(replies) = self.bind_replies.as_mut() {
+                        let forwarded = replies.consume(&scratch[..count]).map_err(|()| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid ssh agent reply to session binding",
+                            )
+                        })?;
+                        if forwarded.is_empty() {
+                            continue;
+                        }
+                        self.note_sent(forwarded.len());
+                        let payload = super::state::encode_data_packet(
+                            self.role == Role::Source,
+                            self.socket_id,
+                            &forwarded,
+                        );
+                        return Ok(ReadOutcome::Data(payload));
+                    }
+                    self.note_sent(count);
+                    let payload = super::state::encode_data_packet(
+                        self.role == Role::Source,
+                        self.socket_id,
+                        &scratch[..count],
+                    );
+                    return Ok(ReadOutcome::Data(payload));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok(ReadOutcome::Idle);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Flush queued network data toward the local socket, crediting the peer
     /// for every buffer fully delivered (delivery, not receipt, returns
     /// credit — see `Command::Drained`).
     fn flush_out(&mut self) -> io::Result<()> {
-        while let Some(front) = self.out.front() {
-            let pending = &front.data[front.start + self.out_offset..front.start + front.len];
-            match self.stream.write(pending) {
+        while !self.out.is_empty() {
+            let result = if self.out.len() == 1 {
+                let front = self.out.front().unwrap();
+                let pending = &front.data[front.start + self.out_offset..front.start + front.len];
+                self.stream.write(pending)
+            } else {
+                let mut slices = [io::IoSlice::new(&[]); 16];
+                let mut count = 0;
+                for (idx, buf) in self.out.iter().take(16).enumerate() {
+                    let offset = if idx == 0 { self.out_offset } else { 0 };
+                    slices[idx] =
+                        io::IoSlice::new(&buf.data[buf.start + offset..buf.start + buf.len]);
+                    count += 1;
+                }
+                self.stream.write_vectored(&slices[..count])
+            };
+            match result {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,
                         "forwarded socket closed during write",
                     ));
                 }
-                Ok(written) => {
-                    self.out_offset += written;
-                    if self.out_offset == front.len {
-                        let done_len = front.len;
-                        self.out.pop_front();
-                        self.out_offset = 0;
-                        if self.windowed() {
-                            self.credit_bytes = self
-                                .credit_bytes
-                                .saturating_add(i64::try_from(done_len).unwrap_or(i64::MAX));
-                            self.credit_packets = self.credit_packets.saturating_add(1);
+                Ok(mut written) => {
+                    while written > 0 {
+                        let front = self.out.front().unwrap();
+                        let rem = front.len - self.out_offset;
+                        if written >= rem {
+                            written -= rem;
+                            let done_len = front.len;
+                            self.out.pop_front();
+                            self.out_offset = 0;
+                            if self.windowed() {
+                                self.credit_bytes = self
+                                    .credit_bytes
+                                    .saturating_add(i64::try_from(done_len).unwrap_or(i64::MAX));
+                                self.credit_packets = self.credit_packets.saturating_add(1);
+                            }
+                        } else {
+                            self.out_offset += written;
+                            break;
                         }
                     }
                 }
@@ -265,12 +375,38 @@ impl SocketIo {
                 Err(error) => return Err(error),
             }
         }
-        if self.out.is_empty() && self.credit_bytes > 0 && self.credit_flush_at.is_none() {
-            self.credit_flush_at = Some(Instant::now());
+        if self.out.is_empty() {
+            if !self.write_closed && !self.close_when_drained && !self.shutdown_write_when_drained {
+                if let Some(route) = &self.fast_route {
+                    route
+                        .direct_ok
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+            if self.credit_bytes > 0 && self.credit_flush_at.is_none() {
+                self.credit_flush_at = Some(Instant::now());
+            }
         }
         Ok(())
     }
 
+    fn sync_fast_credit(&mut self) {
+        if let Some(route) = &self.fast_route {
+            let cb = route
+                .credit_bytes
+                .swap(0, std::sync::atomic::Ordering::AcqRel);
+            let cp = route
+                .credit_packets
+                .swap(0, std::sync::atomic::Ordering::AcqRel);
+            if cb > 0 || cp > 0 {
+                self.credit_bytes = self.credit_bytes.saturating_add(cb);
+                self.credit_packets = self.credit_packets.saturating_add(cp);
+                if self.out.is_empty() && self.credit_flush_at.is_none() {
+                    self.credit_flush_at = Some(Instant::now());
+                }
+            }
+        }
+    }
     fn credit_due(&self, now: Instant) -> bool {
         if self.credit_bytes <= 0 || self.credit_packets <= 0 {
             return false;
@@ -325,9 +461,42 @@ impl Worker {
         peer_window: Option<FlowWindow>,
         bind_replies: Option<AgentSessionBindReplies>,
     ) -> Result<(), ForwardError> {
-        let socket = SocketIo::new(role, socket_id, stream, peer_window, bind_replies)
+        let fast_route = if bind_replies.is_none() {
+            stream.try_clone().ok().map(|cloned| {
+                std::sync::Arc::new(super::UnixFastRoute {
+                    role,
+                    socket_id,
+                    stream: cloned,
+                    direct_ok: std::sync::atomic::AtomicBool::new(true),
+                    direct_read_ok: std::sync::atomic::AtomicBool::new(true),
+                    windowed: peer_window.is_some(),
+                    window_bytes: peer_window.map_or(-1, |w| w.bytes),
+                    window_packets: peer_window.map_or(-1, |w| w.packets),
+                    in_flight_bytes: std::sync::atomic::AtomicI64::new(0),
+                    in_flight_packets: std::sync::atomic::AtomicI64::new(0),
+                    credit_bytes: std::sync::atomic::AtomicI64::new(0),
+                    credit_packets: std::sync::atomic::AtomicI64::new(0),
+                })
+            })
+        } else {
+            None
+        };
+        let mut socket = SocketIo::new(role, socket_id, stream, peer_window, bind_replies)
             .map_err(ForwardError::Io)?;
+        if let Some(route) = fast_route {
+            socket.fast_route = Some(std::sync::Arc::clone(&route));
+            self.routes
+                .write()
+                .unwrap()
+                .insert((role, socket_id), route);
+        }
         self.map_mut(role).insert(socket_id, socket);
+        if self
+            .session_polls_reads
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.flush_outbound_wake();
+        }
         Ok(())
     }
 
@@ -351,6 +520,7 @@ impl Worker {
             // is flushed, so `et -W` cannot exit ahead of its trailing output.
             self.stdio_socket = None;
         }
+        self.routes.write().unwrap().remove(&(role, socket_id));
         // Dropping the socket closes the local descriptor in full.
         self.map_mut(role).remove(&socket_id);
     }
@@ -375,6 +545,11 @@ impl Worker {
         let Some(socket) = map.get_mut(&socket_id) else {
             return Ok(());
         };
+        if let Some(route) = &socket.fast_route {
+            route
+                .direct_ok
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
         socket.shutdown_write_when_drained = true;
         if socket.out.is_empty() && !socket.write_closed {
             socket.shutdown_write_when_drained = false;
@@ -452,6 +627,14 @@ impl Worker {
             };
             match map.get_mut(&socket_id) {
                 Some(socket) => {
+                    if let Some(route) = &socket.fast_route {
+                        route
+                            .direct_ok
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        route
+                            .direct_read_ok
+                            .store(false, std::sync::atomic::Ordering::Release);
+                    }
                     socket.close_when_drained = true;
                     socket.read_open = false;
                     socket.stream.shutdown_read();
@@ -574,6 +757,9 @@ impl Worker {
     fn flush_due_credits(&mut self) -> Result<(), ForwardError> {
         let now = Instant::now();
         for role in [Role::Source, Role::Destination] {
+            for socket in self.map_mut(role).values_mut() {
+                socket.sync_fast_credit();
+            }
             let due: Vec<i32> = self
                 .map_ref(role)
                 .iter()
@@ -623,10 +809,21 @@ impl Worker {
         if let Some(wake) = wake {
             descriptors.push(PollFd::new(wake, PollFlags::IN));
         }
+        let session_polls = wake.is_some()
+            && self
+                .session_polls_reads
+                .load(std::sync::atomic::Ordering::Acquire);
         for role in [Role::Source, Role::Destination] {
             for (socket_id, socket) in self.map_ref(role).iter() {
+                let delegated_read = session_polls
+                    && socket.fast_route.as_ref().is_some_and(|r| {
+                        r.direct_read_ok.load(std::sync::atomic::Ordering::Acquire)
+                    });
+                if delegated_read && !socket.write_interest() {
+                    continue;
+                }
                 let mut flags = PollFlags::empty();
-                if socket.read_interest() {
+                if !delegated_read && socket.read_interest() {
                     flags |= PollFlags::IN;
                 }
                 if socket.write_interest() {
@@ -724,18 +921,16 @@ impl Worker {
             while socket.read_interest() && reads < READS_PER_CYCLE {
                 let outcome = {
                     let scratch = &mut self.read_scratch[..];
-                    socket.read_chunk(scratch)
+                    socket.read_encoded_chunk(scratch)
                 };
                 match outcome {
-                    Ok(ReadOutcome::Data(data)) => {
-                        socket.note_sent(data.len());
-                        let payload = super::state::encode_data_packet(
-                            socket.role == Role::Source,
-                            socket.socket_id,
-                            &data,
-                        );
+                    Ok(ReadOutcome::Data(payload)) => {
+                        let is_small = payload.len() <= 4096;
                         self.emit_raw(TerminalPacketType::PortForwardData as u8, payload)?;
                         reads += 1;
+                        if is_small {
+                            break;
+                        }
                     }
                     Ok(ReadOutcome::Idle) => break,
                     Ok(ReadOutcome::Eof) => return Ok(SocketVerdict::Eof),
@@ -892,6 +1087,7 @@ impl Worker {
         &mut self,
         commands: &super::CommandReceiver,
     ) -> Result<(), ForwardError> {
+        let mut batch = Vec::with_capacity(128);
         loop {
             if cancellation_requested(&self.cancel) {
                 return Ok(());
@@ -902,18 +1098,19 @@ impl Worker {
             self.flush_held();
             self.flush_due_credits()?;
             self.defer_outbound_wake = false;
-            self.flush_outbound_wake();
+            if self.outbound_wake_needed {
+                self.flush_outbound_wake();
+            }
             let (wake_ready, ready) =
                 self.poll_cycle(Some(commands.wake_reader()), self.next_poll_timeout())?;
             self.defer_outbound_wake = true;
             if wake_ready || commands.has_pending() {
-                commands.drain_wake();
-                let mut batch = Vec::with_capacity(128);
+                batch.clear();
                 if !commands.drain_batch(&mut batch) {
                     return Ok(());
                 }
                 let count = batch.len();
-                for command in batch {
+                for command in batch.drain(..) {
                     self.handle_command(command)?;
                 }
                 commands.complete_count(count);
@@ -926,7 +1123,9 @@ impl Worker {
             }
             self.flush_due_credits()?;
             self.defer_outbound_wake = false;
-            self.flush_outbound_wake();
+            if self.outbound_wake_needed {
+                self.flush_outbound_wake();
+            }
         }
     }
 
@@ -935,13 +1134,15 @@ impl Worker {
     /// the socket closes. Hard mirrors `abort_io`: close immediately and
     /// report abandoned bytes.
     pub(crate) fn stop_sockets(&mut self, hard: bool) {
+        self.routes.write().unwrap().clear();
         if hard {
             if !self.held.is_empty() {
                 self.abandoned
                     .store(true, std::sync::atomic::Ordering::Release);
             }
             self.held.clear();
-            for (_, socket) in self.sources.drain().chain(self.destinations.drain()) {
+            for (_, mut socket) in self.sources.drain().chain(self.destinations.drain()) {
+                socket.fast_route = None;
                 if !socket.out.is_empty() {
                     self.abandoned
                         .store(true, std::sync::atomic::Ordering::Release);
@@ -955,6 +1156,7 @@ impl Worker {
             .values_mut()
             .chain(self.destinations.values_mut())
         {
+            socket.fast_route = None;
             socket.stream.shutdown_read();
         }
         // Drain held data into queues, then flush every queue to completion.

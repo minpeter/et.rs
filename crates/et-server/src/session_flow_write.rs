@@ -16,11 +16,128 @@ pub(crate) fn write_packet(
     flow: &FlowControl,
     packet: &Packet,
 ) -> (FlowWriteResult, bool) {
-    write_packet_with(session, flow, packet, |connection, packet| {
-        connection.prepare_write_packet(packet.header(), packet.payload())
-    })
+    let _write_serial = match session.write_serial.lock() {
+        Ok(guard) => guard,
+        Err(_) => return (FlowWriteResult::Fatal(SessionError::Unavailable), false),
+    };
+    let reserved = match session.connection.lock() {
+        Ok(_connection) if flow.is_hard_stopped() => {
+            return (FlowWriteResult::Fatal(SessionError::Unavailable), false);
+        }
+        Ok(mut connection) => {
+            connection.reserve_write_packet(packet.header(), packet.payload().len())
+        }
+        Err(_) => return (FlowWriteResult::Fatal(SessionError::Unavailable), false),
+    };
+    let reserved = match reserved {
+        Ok(reserved) => reserved,
+        Err(WritePacketError::BeforeReplay(ConnError::Io(error))) => {
+            if let Ok(mut connection) = session.connection.lock() {
+                connection.disconnect();
+            }
+            return (
+                FlowWriteResult::BeforeReplay(SessionError::Connection(ConnError::Io(error))),
+                false,
+            );
+        }
+        Err(WritePacketError::BeforeReplay(error)) => {
+            if let Ok(mut connection) = session.connection.lock() {
+                connection.disconnect();
+            }
+            return (
+                FlowWriteResult::Fatal(SessionError::Connection(error)),
+                false,
+            );
+        }
+        Err(WritePacketError::ReplayOwned(error)) => {
+            if let Ok(mut connection) = session.connection.lock() {
+                connection.disconnect();
+            }
+            return (
+                FlowWriteResult::ReplayOwned(SessionError::Connection(error)),
+                false,
+            );
+        }
+    };
+    let frame = reserved.encrypt(packet.payload());
+    let (prepared, was_connected) = match session.connection.lock() {
+        Ok(mut connection) => (
+            connection.commit_write_packet(reserved, frame),
+            connection.connected(),
+        ),
+        Err(_) => return (FlowWriteResult::Fatal(SessionError::Unavailable), false),
+    };
+    #[cfg(test)]
+    if let Some((reached, release)) = session.prepared_write_hook.lock().unwrap().take() {
+        reached.send(()).unwrap();
+        release
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+    }
+    let result = match prepared.send() {
+        Ok(()) => return (FlowWriteResult::Delivered, was_connected),
+        Err(WritePacketError::BeforeReplay(ConnError::Io(error))) => {
+            FlowWriteResult::BeforeReplay(SessionError::Connection(ConnError::Io(error)))
+        }
+        Err(WritePacketError::BeforeReplay(error)) => {
+            FlowWriteResult::Fatal(SessionError::Connection(error))
+        }
+        Err(WritePacketError::ReplayOwned(error)) => {
+            FlowWriteResult::ReplayOwned(SessionError::Connection(error))
+        }
+    };
+    match session.connection.lock() {
+        Ok(mut connection) => {
+            connection.disconnect();
+            (result, connection.connected())
+        }
+        Err(_) => (FlowWriteResult::Fatal(SessionError::Unavailable), false),
+    }
 }
 
+pub(crate) fn finish_pending_packet(
+    session: &ActiveSession,
+    flow: &FlowControl,
+) -> (FlowWriteResult, bool) {
+    let _write_serial = match session.write_serial.lock() {
+        Ok(guard) => guard,
+        Err(_) => return (FlowWriteResult::Fatal(SessionError::Unavailable), false),
+    };
+    let (finish, was_connected) = match session.connection.lock() {
+        Ok(_connection) if flow.is_hard_stopped() => {
+            return (FlowWriteResult::Fatal(SessionError::Unavailable), false);
+        }
+        Ok(mut connection) => (
+            connection.finish_pending_live_detached(),
+            connection.connected(),
+        ),
+        Err(_) => return (FlowWriteResult::Fatal(SessionError::Unavailable), false),
+    };
+    let Some(finish) = finish else {
+        return (FlowWriteResult::Delivered, was_connected);
+    };
+    let result = match finish() {
+        Ok(()) => return (FlowWriteResult::Delivered, was_connected),
+        Err(WritePacketError::BeforeReplay(ConnError::Io(error))) => {
+            FlowWriteResult::BeforeReplay(SessionError::Connection(ConnError::Io(error)))
+        }
+        Err(WritePacketError::BeforeReplay(error)) => {
+            FlowWriteResult::Fatal(SessionError::Connection(error))
+        }
+        Err(WritePacketError::ReplayOwned(error)) => {
+            FlowWriteResult::ReplayOwned(SessionError::Connection(error))
+        }
+    };
+    match session.connection.lock() {
+        Ok(mut connection) => {
+            connection.disconnect();
+            (result, connection.connected())
+        }
+        Err(_) => (FlowWriteResult::Fatal(SessionError::Unavailable), false),
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn write_packet_with<F>(
     session: &ActiveSession,
     flow: &FlowControl,
@@ -37,11 +154,14 @@ where
         Ok(guard) => guard,
         Err(_) => return (FlowWriteResult::Fatal(SessionError::Unavailable), false),
     };
-    let prepared = match session.connection.lock() {
+    let (prepared, was_connected) = match session.connection.lock() {
         Ok(_connection) if flow.is_hard_stopped() => {
             return (FlowWriteResult::Fatal(SessionError::Unavailable), false);
         }
-        Ok(mut connection) => prepare(&mut connection, packet),
+        Ok(mut connection) => {
+            let res = prepare(&mut connection, packet);
+            (res, connection.connected())
+        }
         Err(_) => return (FlowWriteResult::Fatal(SessionError::Unavailable), false),
     };
     #[cfg(test)]
@@ -52,7 +172,7 @@ where
             .unwrap();
     }
     let result = match prepared.and_then(et_net::connection::PreparedWrite::send) {
-        Ok(()) => FlowWriteResult::Delivered,
+        Ok(()) => return (FlowWriteResult::Delivered, was_connected),
         Err(WritePacketError::BeforeReplay(ConnError::Io(error))) => {
             FlowWriteResult::BeforeReplay(SessionError::Connection(ConnError::Io(error)))
         }

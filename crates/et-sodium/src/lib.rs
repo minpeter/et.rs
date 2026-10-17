@@ -14,6 +14,14 @@ pub const NONCEBYTES: usize = 24;
 /// Prepended Poly1305 tag length.
 pub const MACBYTES: usize = 16;
 
+#[inline]
+fn ensure_init() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let rc = unsafe { libsodium_sys::sodium_init() };
+        assert!(rc >= 0, "libsodium initialization failed");
+    });
+}
 /// Encrypt `plaintext` into caller-provided buffer `out`, writing the MAC tag prepended
 /// to the ciphertext. Returns the number of bytes written.
 ///
@@ -25,6 +33,7 @@ pub fn secretbox_into(
     nonce: &[u8; NONCEBYTES],
     key: &[u8; KEYBYTES],
 ) -> usize {
+    ensure_init();
     assert!(out.len() >= plaintext.len() + MACBYTES);
     let rc = unsafe {
         libsodium_sys::crypto_secretbox_easy(
@@ -47,6 +56,7 @@ pub fn secretbox_open_into(
     nonce: &[u8; NONCEBYTES],
     key: &[u8; KEYBYTES],
 ) -> Option<usize> {
+    ensure_init();
     if ciphertext.len() < MACBYTES || out.len() < ciphertext.len() - MACBYTES {
         return None;
     }
@@ -71,6 +81,7 @@ pub fn secretbox_open_in_place(
     nonce: &[u8; NONCEBYTES],
     key: &[u8; KEYBYTES],
 ) -> Option<usize> {
+    ensure_init();
     if buffer.len() < MACBYTES {
         return None;
     }
@@ -87,11 +98,37 @@ pub fn secretbox_open_in_place(
     (rc == 0).then_some(pt_len)
 }
 
+/// Encrypt `plaintext` directly into an uninitialized heap `Vec<u8>`, prepending `prefix`
+/// before the MAC+ciphertext without zero-filling the output buffer first.
+pub fn secretbox_with_prefix(
+    prefix: &[u8],
+    plaintext: &[u8],
+    nonce: &[u8; NONCEBYTES],
+    key: &[u8; KEYBYTES],
+) -> Vec<u8> {
+    ensure_init();
+    let total_len = prefix.len() + plaintext.len() + MACBYTES;
+    let mut out = Vec::with_capacity(total_len);
+    out.extend_from_slice(prefix);
+    let rc = unsafe {
+        libsodium_sys::crypto_secretbox_easy(
+            out.as_mut_ptr().add(prefix.len()),
+            plaintext.as_ptr(),
+            plaintext.len() as u64,
+            nonce.as_ptr(),
+            key.as_ptr(),
+        )
+    };
+    debug_assert_eq!(rc, 0);
+    unsafe {
+        out.set_len(total_len);
+    }
+    out
+}
+
 /// Encrypt `plaintext`, returning the MAC tag prepended to the ciphertext.
 pub fn secretbox(plaintext: &[u8], nonce: &[u8; NONCEBYTES], key: &[u8; KEYBYTES]) -> Vec<u8> {
-    let mut out = vec![0u8; plaintext.len() + MACBYTES];
-    secretbox_into(&mut out, plaintext, nonce, key);
-    out
+    secretbox_with_prefix(&[], plaintext, nonce, key)
 }
 
 /// Decrypt a tag-prepended `ciphertext`. `None` when authentication fails.
@@ -100,12 +137,27 @@ pub fn secretbox_open(
     nonce: &[u8; NONCEBYTES],
     key: &[u8; KEYBYTES],
 ) -> Option<Vec<u8>> {
+    ensure_init();
     if ciphertext.len() < MACBYTES {
         return None;
     }
-    let mut out = vec![0u8; ciphertext.len() - MACBYTES];
-    let len = secretbox_open_into(&mut out, ciphertext, nonce, key)?;
-    out.truncate(len);
+    let pt_len = ciphertext.len() - MACBYTES;
+    let mut out = Vec::with_capacity(pt_len);
+    let rc = unsafe {
+        libsodium_sys::crypto_secretbox_open_easy(
+            out.as_mut_ptr(),
+            ciphertext.as_ptr(),
+            ciphertext.len() as u64,
+            nonce.as_ptr(),
+            key.as_ptr(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    unsafe {
+        out.set_len(pt_len);
+    }
     Some(out)
 }
 #[cfg(test)]

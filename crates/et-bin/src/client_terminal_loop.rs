@@ -428,7 +428,11 @@ where
                 revents(1),
                 revents(2),
                 revents(4),
-                revents(5),
+                if producers_polled && read_stdin {
+                    revents(5)
+                } else {
+                    PollFlags::empty()
+                },
             )
         };
         #[cfg(test)]

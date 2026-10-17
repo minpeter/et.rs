@@ -822,33 +822,13 @@ impl Worker {
         }
     }
 
+    #[cfg(unix)]
     pub(super) fn emit_raw(&mut self, header: u8, payload: Vec<u8>) -> Result<(), ForwardError> {
-        #[cfg(unix)]
         let is_small = payload.len() <= 4096;
         let packet = Ok(Packet::new(header, payload));
-        #[cfg(unix)]
-        {
-            if !self.outbound_spill.is_empty() {
-                if self.outbound_spill.len() < crate::forward::CHANNEL_SPILL_LIMIT {
-                    self.outbound_spill.push_back(packet);
-                } else {
-                    channel::select! {
-                        send(self.outbound, packet) -> result => {
-                            result.map_err(|_| ForwardError::Unavailable)?;
-                        }
-                        recv(self.cancel) -> _ => return Err(ForwardError::Unavailable),
-                    }
-                }
-            } else if self.outbound_spill.len() < crate::forward::CHANNEL_SPILL_LIMIT {
-                match self.outbound.try_send(packet) {
-                    Ok(()) => {}
-                    Err(crossbeam_channel::TrySendError::Full(packet)) => {
-                        self.outbound_spill.push_back(packet);
-                    }
-                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                        return Err(ForwardError::Unavailable);
-                    }
-                }
+        if !self.outbound_spill.is_empty() {
+            if self.outbound_spill.len() < crate::forward::CHANNEL_SPILL_LIMIT {
+                self.outbound_spill.push_back(packet);
             } else {
                 channel::select! {
                     send(self.outbound, packet) -> result => {
@@ -857,23 +837,30 @@ impl Worker {
                     recv(self.cancel) -> _ => return Err(ForwardError::Unavailable),
                 }
             }
-            if is_small {
-                self.flush_outbound_wake();
-            } else {
-                self.note_outbound_emitted();
+        } else if self.outbound_spill.len() < crate::forward::CHANNEL_SPILL_LIMIT {
+            match self.outbound.try_send(packet) {
+                Ok(()) => {}
+                Err(crossbeam_channel::TrySendError::Full(packet)) => {
+                    self.outbound_spill.push_back(packet);
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    return Err(ForwardError::Unavailable);
+                }
             }
-            Ok(())
-        }
-        #[cfg(windows)]
-        {
+        } else {
             channel::select! {
                 send(self.outbound, packet) -> result => {
                     result.map_err(|_| ForwardError::Unavailable)?;
                 }
                 recv(self.cancel) -> _ => return Err(ForwardError::Unavailable),
             }
-            Ok(())
         }
+        if is_small {
+            self.flush_outbound_wake();
+        } else {
+            self.note_outbound_emitted();
+        }
+        Ok(())
     }
 }
 
@@ -959,6 +946,7 @@ fn decode_varint_usize(slice: &[u8], offset: &mut usize) -> Option<usize> {
     None
 }
 
+#[cfg(unix)]
 pub(crate) fn encode_data_packet(
     source_to_destination: bool,
     socket_id: i32,

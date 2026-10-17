@@ -762,6 +762,7 @@ struct Worker {
     routes: UnixFastRoutes,
     #[cfg(unix)]
     session_polls_reads: Arc<AtomicBool>,
+    #[cfg(unix)]
     outbound_wake: Arc<UnixStream>,
     /// Outbound packets the poll loop could not hand to the session because
     /// the channel was full. Drained before new socket reads so ordering holds.
@@ -864,6 +865,7 @@ impl Worker {
             routes: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(unix)]
             session_polls_reads: Arc::new(AtomicBool::new(false)),
+            #[cfg(unix)]
             outbound_wake,
             #[cfg(unix)]
             outbound_spill: std::collections::VecDeque::new(),

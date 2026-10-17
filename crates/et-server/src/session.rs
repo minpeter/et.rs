@@ -382,12 +382,18 @@ impl ActiveSession {
     ) -> Result<(), (Packet, SessionWriteError)> {
         if let Some(state) = self.output_flow() {
             return state
-                .enqueue_owned(packet)
+                .enqueue_bridge_owned(self, packet)
                 .map_err(|(packet, error)| (packet, SessionWriteError::BeforeReplay(error)));
         }
         match self.send_packet_owned(packet.header(), packet.payload()) {
             Ok(()) => Ok(()),
             Err(error) => Err((packet, error)),
+        }
+    }
+
+    pub(crate) fn flush_bridge_outbound(&self) {
+        if let Some(state) = self.output_flow() {
+            state.flush_bridge_wake();
         }
     }
 
@@ -435,6 +441,26 @@ impl ActiveSession {
                 .map_err(SessionWriteError::BeforeReplay)?
             {
                 return Ok(());
+            }
+            connection = self
+                .connection
+                .lock()
+                .map_err(|_| SessionWriteError::BeforeReplay(SessionError::Unavailable))?;
+        }
+        if let Some(finish) = connection.finish_pending_live_detached() {
+            drop(connection);
+            if let Err(error) = finish() {
+                if let Ok(mut conn) = self.connection.lock() {
+                    conn.disconnect();
+                }
+                return Err(match error {
+                    et_net::connection::WritePacketError::BeforeReplay(err) => {
+                        SessionWriteError::BeforeReplay(SessionError::Connection(err))
+                    }
+                    et_net::connection::WritePacketError::ReplayOwned(err) => {
+                        SessionWriteError::ReplayOwned(SessionError::Connection(err))
+                    }
+                });
             }
             connection = self
                 .connection

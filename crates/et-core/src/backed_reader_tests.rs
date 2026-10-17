@@ -166,7 +166,7 @@ fn tampered_live_frame_keeps_the_nonce_for_the_genuine_packet() {
     let WriterOutcome::Send(frame) = writer.write_packet(1, b"real").unwrap() else {
         panic!("connected write should send");
     };
-    let mut tampered = frame.clone();
+    let mut tampered = frame.to_vec();
     tampered[6] ^= 0xff;
     let mut reader = BackedReader::new(CryptoHandler::new(&key, DIR_CLIENT_TO_SERVER), true);
     reader.feed(&tampered);

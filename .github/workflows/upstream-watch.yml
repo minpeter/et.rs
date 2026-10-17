@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   watch:
-    runs-on: instabox-k3s
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 

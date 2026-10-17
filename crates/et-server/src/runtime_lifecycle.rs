@@ -58,16 +58,31 @@ fn release_idle_memory() -> Result<IdleMemoryAccounting, tikv_jemalloc_ctl::Erro
     })
 }
 
+#[cfg(target_os = "linux")]
+fn restore_active_decay() {
+    use tikv_jemalloc_ctl::{Access, AsName};
+
+    let _ = b"arenas.dirty_decay_ms\0".name().write(1000_isize);
+    let _ = b"arenas.muzzy_decay_ms\0".name().write(1000_isize);
+    if let Ok(limit) = b"arenas.narenas\0".name().read() {
+        let limit: u32 = limit;
+        for index in 0..limit {
+            let dirty = format!("arena.{index}.dirty_decay_ms\0");
+            if dirty.as_bytes().name().write(1000_isize).is_err() {
+                continue;
+            }
+            let muzzy = format!("arena.{index}.muzzy_decay_ms\0");
+            let _ = muzzy.as_bytes().name().write(1000_isize);
+        }
+    }
+}
+
 pub(crate) fn run(
     events: Receiver<LifecycleEvent>,
     core: Arc<RuntimeCore>,
 ) -> Result<(), RuntimeError> {
     #[cfg(target_os = "linux")]
-    if let Err(error) = release_idle_memory() {
-        crate::diag::info(format!(
-            "could not configure allocator idle-page release: {error}"
-        ));
-    }
+    restore_active_decay();
     let mut first_error = None;
     let mut next_sweep = Instant::now();
     let mut sweep_failed = false;
@@ -155,11 +170,14 @@ pub(crate) fn run(
                 // The removed session and its replay queues are out of scope;
                 // now return their freed allocator pages to the kernel.
                 #[cfg(target_os = "linux")]
-                if let Err(error) = release_idle_memory() {
-                    crate::diag::info(format!(
-                        "could not release allocator pages after id={}: {error}",
-                        identity.id()
-                    ));
+                {
+                    if let Err(error) = release_idle_memory() {
+                        crate::diag::info(format!(
+                            "could not release allocator pages after id={}: {error}",
+                            identity.id()
+                        ));
+                    }
+                    restore_active_decay();
                 }
             }
             LifecycleEvent::Shutdown => return first_error.map_or(Ok(()), Err),

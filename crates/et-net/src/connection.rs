@@ -51,7 +51,7 @@ pub struct Connection {
 }
 
 pub struct PreparedWrite {
-    live: Option<(Arc<TcpStream>, Vec<u8>, Duration)>,
+    live: Option<(Arc<TcpStream>, Arc<Vec<u8>>, Duration)>,
 }
 
 #[derive(Debug)]
@@ -95,6 +95,7 @@ impl Connection {
     }
 
     fn new(stream: TcpStream, key: &[u8; KEY_LEN], encrypt: u8, decrypt: u8) -> Self {
+        let _ = stream.set_nodelay(true);
         Self {
             stream: Arc::new(stream),
             writer: BackedWriter::new(CryptoHandler::new(key, encrypt), true),
@@ -166,6 +167,65 @@ impl Connection {
             }),
             WriterOutcome::BufferedOnly => Ok(PreparedWrite { live: None }),
             WriterOutcome::Skipped => Err(WritePacketError::BeforeReplay(ConnError::Backpressure)),
+        }
+    }
+
+    pub fn prepare_write_packet_unprobed(
+        &mut self,
+        header: u8,
+        payload: &[u8],
+    ) -> Result<PreparedWrite, WritePacketError> {
+        if self.pending_live.is_some() {
+            return Err(WritePacketError::BeforeReplay(ConnError::Backpressure));
+        }
+        let live_stream = self.writer.connected().then(|| Arc::clone(&self.stream));
+        match self
+            .writer
+            .write_packet(header, payload)
+            .map_err(ConnError::Encrypt)
+            .map_err(WritePacketError::BeforeReplay)?
+        {
+            WriterOutcome::Send(frame) => Ok(PreparedWrite {
+                live: live_stream.map(|stream| (stream, frame, self.live_write_timeout)),
+            }),
+            WriterOutcome::BufferedOnly => Ok(PreparedWrite { live: None }),
+            WriterOutcome::Skipped => Err(WritePacketError::BeforeReplay(ConnError::Backpressure)),
+        }
+    }
+
+    pub fn reserve_write_packet(
+        &mut self,
+        header: u8,
+        payload_len: usize,
+    ) -> Result<et_core::backed_writer::ReservedWrite, WritePacketError> {
+        if self.pending_live.is_some() {
+            return Err(WritePacketError::BeforeReplay(ConnError::Backpressure));
+        }
+        #[cfg(unix)]
+        if self.refresh_connectivity().is_err() {
+            self.disconnect();
+        }
+        #[cfg(windows)]
+        if let Err(error) = self.refresh_connectivity() {
+            self.disconnect();
+            return Err(WritePacketError::BeforeReplay(error));
+        }
+        self.writer
+            .reserve_write(header, payload_len)
+            .ok_or(WritePacketError::BeforeReplay(ConnError::Backpressure))
+    }
+
+    pub fn commit_write_packet(
+        &mut self,
+        reserved: et_core::backed_writer::ReservedWrite,
+        frame: Arc<Vec<u8>>,
+    ) -> PreparedWrite {
+        let live_stream = self.writer.connected().then(|| Arc::clone(&self.stream));
+        match self.writer.commit_write(reserved, frame) {
+            WriterOutcome::Send(frame) => PreparedWrite {
+                live: live_stream.map(|stream| (stream, frame, self.live_write_timeout)),
+            },
+            WriterOutcome::BufferedOnly | WriterOutcome::Skipped => PreparedWrite { live: None },
         }
     }
 
@@ -344,6 +404,9 @@ impl Connection {
             }
         }
     }
+    pub fn has_buffered_read(&self) -> bool {
+        self.reader.has_buffered_data()
+    }
 
     pub fn write_terminal(&mut self, bytes: &[u8]) -> Result<(), ConnError> {
         self.write_packet(0, bytes)
@@ -412,7 +475,7 @@ impl Connection {
             .map_err(ConnError::Io)?;
         #[cfg(target_os = "linux")]
         socket
-            .set_tcp_notsent_lowat(FLOW_CONTROL_SOCKET_BUFFER_BYTES as u32)
+            .set_tcp_notsent_lowat((FLOW_CONTROL_SOCKET_BUFFER_BYTES / 4) as u32)
             .map_err(ConnError::Io)?;
         Ok(())
     }

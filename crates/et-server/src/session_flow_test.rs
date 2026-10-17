@@ -25,7 +25,7 @@ fn stalled_live_writer_releases_connection_lock_but_retains_write_serialization(
     server.minimize_output_buffering().unwrap();
     let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
     let session = Arc::new(ActiveSession::new(server, &terminal, None).unwrap());
-    let packet = Packet::new(46, vec![0x93; 1024 * 1024]);
+    let packet = Packet::new(46, vec![0x93; 4 * 1024 * 1024]);
     let (reached_tx, reached_rx) = mpsc::sync_channel(1);
     let (release_tx, release_rx) = mpsc::sync_channel(1);
     *session.prepared_write_hook.lock().unwrap() = Some((reached_tx, release_rx));

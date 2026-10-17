@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   release:
-    runs-on: instabox-k3s
+    runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
     steps:
@@ -165,7 +165,7 @@ jobs:
   homebrew:
     needs: [release, binaries]
     if: needs.release.outputs.tag != ''
-    runs-on: instabox-k3s
+    runs-on: ubuntu-latest
     env:
       TAG: ${{ needs.release.outputs.tag }}
     steps:
@@ -192,7 +192,7 @@ jobs:
   aur:
     needs: [release, binaries]
     if: needs.release.outputs.tag != ''
-    runs-on: instabox-k3s
+    runs-on: ubuntu-latest
     # AUR publishing must not block a release (e.g. AUR maintenance windows).
     continue-on-error: true
     env:

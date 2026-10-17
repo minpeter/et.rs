@@ -143,6 +143,27 @@ impl Endpoint {
         }
     }
 
+    pub(crate) fn can_connect_inline(&self, user: Option<(u32, u32)>) -> bool {
+        #[cfg(unix)]
+        if let Some((uid, gid)) = user {
+            if !crate::user_socket_ops::already_session_user(uid, gid) {
+                return false;
+            }
+        }
+        #[cfg(windows)]
+        let _ = user;
+        match self {
+            Self::Tcp { host, .. } => {
+                host.is_empty()
+                    || host.eq_ignore_ascii_case("localhost")
+                    || host == "127.0.0.1"
+                    || host == "::1"
+            }
+            #[cfg(unix)]
+            Self::Unix(_) => false,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn resolve_for_bind(&self) -> io::Result<ResolvedEndpoint> {
         match self {
@@ -208,6 +229,14 @@ impl Endpoint {
 pub(crate) fn connect_tcp(host: &str, port: u16) -> io::Result<TcpStream> {
     // Preserve upstream's dual-stack localhost ordering while allowing
     // explicitly configured destination names under the session identity.
+    if host == "127.0.0.1" {
+        let v4 = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+        return TcpStream::connect_timeout(&v4, CONNECT_TIMEOUT);
+    }
+    if host == "::1" {
+        let v6 = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
+        return TcpStream::connect_timeout(&v6, CONNECT_TIMEOUT);
+    }
     if host.eq_ignore_ascii_case("localhost") {
         let v6 = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
         match TcpStream::connect_timeout(&v6, CONNECT_TIMEOUT) {
@@ -630,6 +659,22 @@ impl ForwardStream {
         }
     }
 
+    #[cfg(unix)]
+    pub(crate) fn write_shared(&self, buffer: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => (&mut &*stream).write(buffer),
+            Self::Unix(stream) => (&mut &*stream).write(buffer),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn read_shared(&self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => (&mut &*stream).read(buffer),
+            Self::Unix(stream) => (&mut &*stream).read(buffer),
+        }
+    }
+
     #[cfg(windows)]
     pub(crate) fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         match self {
@@ -656,6 +701,14 @@ impl Write for ForwardStream {
             Self::Tcp(stream) => stream.write(buffer),
             #[cfg(unix)]
             Self::Unix(stream) => stream.write(buffer),
+        }
+    }
+
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.write_vectored(bufs),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.write_vectored(bufs),
         }
     }
 

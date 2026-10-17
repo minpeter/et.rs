@@ -41,6 +41,7 @@ pub struct BackedReader {
     crypto: CryptoHandler,
     partial: Vec<u8>,
     offset: usize,
+    filled: usize,
     replay: VecDeque<Packet>,
     sequence: i64,
     connected: bool,
@@ -52,6 +53,7 @@ impl BackedReader {
             crypto,
             partial: Vec::new(),
             offset: 0,
+            filled: 0,
             replay: VecDeque::new(),
             sequence: 0,
             connected,
@@ -59,7 +61,37 @@ impl BackedReader {
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
-        self.partial.extend_from_slice(bytes);
+        if bytes.is_empty() {
+            return;
+        }
+        let slice = self.prepare_read_slice(bytes.len());
+        slice[..bytes.len()].copy_from_slice(bytes);
+        self.commit_read(bytes.len());
+    }
+
+    pub fn prepare_read_slice(&mut self, min_space: usize) -> &mut [u8] {
+        if self.offset == self.filled {
+            self.offset = 0;
+            self.filled = 0;
+        } else if self.offset > 0 && self.partial.len().saturating_sub(self.filled) < min_space {
+            let remaining = self.filled - self.offset;
+            self.partial.copy_within(self.offset..self.filled, 0);
+            self.offset = 0;
+            self.filled = remaining;
+        }
+        let required = self.filled + min_space;
+        if self.partial.len() < required {
+            self.partial.resize(required, 0);
+        }
+        &mut self.partial[self.filled..]
+    }
+
+    pub fn commit_read(&mut self, count: usize) {
+        self.filled += count;
+    }
+
+    pub fn has_buffered_data(&self) -> bool {
+        self.connected && (!self.replay.is_empty() || self.filled > self.offset)
     }
 
     pub fn pop(&mut self) -> Result<ReadItem, ReadError> {
@@ -76,7 +108,7 @@ impl BackedReader {
         if !self.connected {
             return Ok(ReadItem::NeedMore);
         }
-        let available = &self.partial[self.offset..];
+        let available = &self.partial[self.offset..self.filled];
         if available.len() < 4 {
             return Ok(ReadItem::NeedMore);
         }
@@ -93,12 +125,9 @@ impl BackedReader {
         let end = start + len;
         self.offset = end;
         let result = Self::decode_packet(&mut self.crypto, &self.partial[start..end]);
-        if self.offset == self.partial.len() {
-            self.partial.clear();
+        if self.offset == self.filled {
             self.offset = 0;
-        } else if self.offset >= 64 * 1024 {
-            self.partial.drain(0..self.offset);
-            self.offset = 0;
+            self.filled = 0;
         }
         let packet = result?;
         self.sequence += 1;
@@ -112,9 +141,8 @@ impl BackedReader {
         if serialized[0] == 0 {
             return Err(ReadError::Unencrypted);
         }
-        let plaintext = crypto
-            .decrypt(&serialized[crate::packet::HEADER_LEN..])
-            .map_err(ReadError::Crypto)?;
+        let ciphertext = &serialized[crate::packet::HEADER_LEN..];
+        let plaintext = crypto.decrypt(ciphertext).map_err(ReadError::Crypto)?;
         Ok(Packet::raw(false, serialized[1], plaintext))
     }
 
@@ -123,6 +151,7 @@ impl BackedReader {
         self.crypto.rekey(salt)?;
         self.partial.clear();
         self.offset = 0;
+        self.filled = 0;
         self.replay.clear();
         self.sequence = 0;
         self.connected = false;
@@ -139,6 +168,7 @@ impl BackedReader {
         let n = catchup.len();
         self.partial.clear();
         self.offset = 0;
+        self.filled = 0;
         self.crypto = crypto;
         self.replay.append(&mut decoded);
         self.sequence += n as i64;
@@ -158,6 +188,7 @@ impl BackedReader {
     pub fn invalidate(&mut self) {
         self.partial.clear();
         self.offset = 0;
+        self.filled = 0;
         self.connected = false;
     }
 

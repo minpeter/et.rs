@@ -398,6 +398,52 @@ impl Drop for LocalListener {
     }
 }
 
+#[cfg(unix)]
+pub struct FastPollState {
+    routes: Vec<Arc<crate::forward_worker::UnixFastRoute>>,
+    revents: std::cell::RefCell<Vec<rustix::event::PollFlags>>,
+    scratch: Box<[u8; crate::forward_io::READ_CHUNK]>,
+}
+
+#[cfg(unix)]
+impl Default for FastPollState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(unix)]
+impl FastPollState {
+    pub fn new() -> Self {
+        Self {
+            routes: Vec::new(),
+            revents: std::cell::RefCell::new(Vec::new()),
+            scratch: Box::new([0u8; crate::forward_io::READ_CHUNK]),
+        }
+    }
+
+    pub fn push_descriptors<'a>(&'a self, descriptors: &mut Vec<rustix::event::PollFd<'a>>) {
+        for route in &self.routes {
+            let flags = if route.read_interest() {
+                rustix::event::PollFlags::IN
+                    | rustix::event::PollFlags::HUP
+                    | rustix::event::PollFlags::ERR
+            } else {
+                rustix::event::PollFlags::HUP | rustix::event::PollFlags::ERR
+            };
+            descriptors.push(rustix::event::PollFd::new(&route.stream, flags));
+        }
+    }
+
+    pub fn record_revents(&self, slice: &[rustix::event::PollFd<'_>]) {
+        let mut revents = self.revents.borrow_mut();
+        revents.clear();
+        for fd in slice {
+            revents.push(fd.revents());
+        }
+    }
+}
+
 pub struct Forwarder {
     commands: CommandSender,
     outbound: channel::Receiver<Outbound>,
@@ -413,6 +459,12 @@ pub struct Forwarder {
     wake_writer: Arc<UnixStream>,
     #[cfg(unix)]
     wake_signalled: Arc<AtomicBool>,
+    #[cfg(unix)]
+    routes: crate::forward_worker::UnixFastRoutes,
+    #[cfg(unix)]
+    session_polls_reads: Arc<AtomicBool>,
+    #[cfg(unix)]
+    fast_outbound: std::sync::Mutex<VecDeque<Packet>>,
     #[cfg(windows)]
     routes: crate::forward_worker::FastRoutes,
     shutdown: Arc<AtomicBool>,
@@ -548,6 +600,15 @@ fn start_forwarder_hook(
     };
     #[cfg(unix)]
     let worker_wake_signalled = wake_signalled.clone();
+    #[cfg(unix)]
+    let routes: crate::forward_worker::UnixFastRoutes =
+        Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    #[cfg(unix)]
+    let worker_routes = routes.clone();
+    #[cfg(unix)]
+    let session_polls_reads = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    let worker_session_polls = session_polls_reads.clone();
     #[cfg(windows)]
     let routes: crate::forward_worker::FastRoutes =
         Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
@@ -603,6 +664,10 @@ fn start_forwarder_hook(
                     #[cfg(windows)]
                     routes: worker_routes,
                     #[cfg(unix)]
+                    routes: worker_routes,
+                    #[cfg(unix)]
+                    session_polls_reads: worker_session_polls,
+                    #[cfg(unix)]
                     wake_signalled: worker_wake_signalled,
                 },
                 #[cfg(unix)]
@@ -627,6 +692,12 @@ fn start_forwarder_hook(
         wake_writer: forwarder_wake_writer,
         #[cfg(unix)]
         wake_signalled,
+        #[cfg(unix)]
+        routes,
+        #[cfg(unix)]
+        session_polls_reads,
+        #[cfg(unix)]
+        fast_outbound: std::sync::Mutex::new(VecDeque::with_capacity(128)),
         #[cfg(windows)]
         routes,
         shutdown,
@@ -872,6 +943,226 @@ impl Forwarder {
         }
     }
 
+    #[cfg(unix)]
+    pub fn collect_fast_poll_routes(&self, state: &mut FastPollState) {
+        if !self.session_polls_reads.swap(true, Ordering::AcqRel) {
+            self.commands.force_wake();
+        }
+        state.routes.clear();
+        let routes = self.routes.read().unwrap();
+        for route in routes.values() {
+            if route.direct_read_ok.load(Ordering::Acquire) {
+                state.routes.push(Arc::clone(route));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn has_fast_outbound(&self) -> bool {
+        !self.fast_outbound.lock().unwrap().is_empty()
+    }
+
+    #[cfg(unix)]
+    pub fn service_fast_poll(&self, state: &mut FastPollState) -> bool {
+        use rustix::event::PollFlags;
+        let mut produced = false;
+        let mut out_guard = self.fast_outbound.lock().unwrap();
+        let revents = state.revents.borrow();
+        for (idx, route) in state.routes.iter().enumerate() {
+            let ev = revents.get(idx).copied().unwrap_or(PollFlags::empty());
+            if ev.intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL) {
+                route.direct_read_ok.store(false, Ordering::Release);
+                self.commands.force_wake();
+                continue;
+            }
+            if !ev.contains(PollFlags::IN) {
+                continue;
+            }
+            let mut reads = 0;
+            while route.read_interest() && reads < 32 && out_guard.len() < 128 {
+                let limit = if route.windowed {
+                    let rem = route
+                        .window_bytes
+                        .saturating_sub(route.in_flight_bytes.load(Ordering::Acquire));
+                    usize::try_from(rem.min(state.scratch.len() as i64)).unwrap_or(0)
+                } else {
+                    state.scratch.len()
+                };
+                if limit == 0 {
+                    break;
+                }
+                match route.stream.read_shared(&mut state.scratch[..limit]) {
+                    Ok(0) => {
+                        route.direct_read_ok.store(false, Ordering::Release);
+                        self.commands.force_wake();
+                        break;
+                    }
+                    Ok(count) => {
+                        route.note_sent(count);
+                        let payload = crate::forward_worker::state::encode_data_packet(
+                            route.role == crate::forward_worker::Role::Source,
+                            route.socket_id,
+                            &state.scratch[..count],
+                        );
+                        out_guard.push_back(Packet::new(
+                            et_core::proto::TerminalPacketType::PortForwardData as u8,
+                            payload,
+                        ));
+                        produced = true;
+                        reads += 1;
+                        if count <= 4096 {
+                            break;
+                        }
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) => {
+                        route.direct_read_ok.store(false, Ordering::Release);
+                        self.commands.force_wake();
+                        break;
+                    }
+                }
+            }
+        }
+        produced || !out_guard.is_empty()
+    }
+
+    #[cfg(unix)]
+    pub fn try_receive_queue(&self, queue: &mut VecDeque<Packet>) -> Result<(), ForwardError> {
+        while !queue.is_empty() && self.commands.is_idle() {
+            let Some(packet) = queue.front() else {
+                break;
+            };
+            if packet.header() != et_core::proto::TerminalPacketType::PortForwardData as u8 {
+                break;
+            }
+            let Some((source_to_dest, socket_id, start, len)) =
+                crate::forward_worker::state::try_fast_parse_data(packet.payload())
+            else {
+                use prost::Message;
+                if let Ok(data) = et_core::proto::PortForwardData::decode(packet.payload()) {
+                    let role = if data.sourcetodestination.unwrap_or(false) {
+                        crate::forward_worker::Role::Destination
+                    } else {
+                        crate::forward_worker::Role::Source
+                    };
+                    let socket_id = data.socketid.unwrap_or(0);
+                    if data.error.is_none()
+                        && !data.closed.unwrap_or(false)
+                        && !data.half_close.unwrap_or(false)
+                        && data.buffer.as_deref().unwrap_or_default().is_empty()
+                    {
+                        if let Some(delivered) =
+                            crate::forward_worker::state::decode_window(data.window)
+                        {
+                            let route =
+                                self.routes.read().unwrap().get(&(role, socket_id)).cloned();
+                            if let Some(route) = route {
+                                let was_blocked = route.windowed
+                                    && (route.in_flight_bytes.load(Ordering::Acquire)
+                                        >= route.window_bytes
+                                        || route.in_flight_packets.load(Ordering::Acquire)
+                                            >= route.window_packets);
+                                route.apply_delivery(delivered);
+                                if was_blocked && !route.direct_read_ok.load(Ordering::Acquire) {
+                                    self.commands.force_wake();
+                                }
+                                queue.pop_front();
+                                continue;
+                            }
+                        }
+                    } else if let Some(route) = self.routes.read().unwrap().get(&(role, socket_id))
+                    {
+                        route.direct_ok.store(false, Ordering::Release);
+                        route.direct_read_ok.store(false, Ordering::Release);
+                    }
+                }
+                break;
+            };
+            if len == 0 || len > crate::forward_worker::MAX_DATA_PACKET {
+                break;
+            }
+            let role = if source_to_dest {
+                crate::forward_worker::Role::Destination
+            } else {
+                crate::forward_worker::Role::Source
+            };
+            let route = {
+                let routes = self.routes.read().unwrap();
+                routes.get(&(role, socket_id)).cloned()
+            };
+            let Some(route) = route else {
+                break;
+            };
+            if !route.direct_ok.load(Ordering::Acquire) {
+                break;
+            }
+            match route
+                .stream
+                .write_shared(&packet.payload()[start..start + len])
+            {
+                Ok(written) if written == len => {
+                    queue.pop_front();
+                    if route.windowed {
+                        let cb =
+                            route.credit_bytes.fetch_add(len as i64, Ordering::AcqRel) + len as i64;
+                        let cp = route.credit_packets.fetch_add(1, Ordering::AcqRel) + 1;
+                        if cb >= crate::forward_worker::state::CREDIT_RETURN_THRESHOLD
+                            || cp >= crate::forward_worker::state::PACKET_CREDIT_RETURN_THRESHOLD
+                        {
+                            let cb = route.credit_bytes.swap(0, Ordering::AcqRel);
+                            let cp = route.credit_packets.swap(0, Ordering::AcqRel);
+                            if cb > 0 && cp > 0 {
+                                use prost::Message;
+                                let credit_pkt = Packet::new(
+                                    et_core::proto::TerminalPacketType::PortForwardData as u8,
+                                    et_core::proto::PortForwardData {
+                                        sourcetodestination: Some(
+                                            role == crate::forward_worker::Role::Source,
+                                        ),
+                                        socketid: Some(socket_id),
+                                        buffer: None,
+                                        error: None,
+                                        closed: None,
+                                        half_close: None,
+                                        window: Some(et_core::proto::PortForwardWindow {
+                                            bytes: Some(cb),
+                                            packets: Some(i32::try_from(cp).unwrap_or(i32::MAX)),
+                                        }),
+                                    }
+                                    .encode_to_vec(),
+                                );
+                                self.fast_outbound.lock().unwrap().push_front(credit_pkt);
+                            }
+                        }
+                    }
+                }
+                Ok(written) if written > 0 => {
+                    route.direct_ok.store(false, Ordering::Release);
+                    let packet = queue.pop_front().expect("checked front");
+                    let rem = crate::forward_worker::state::encode_data_packet(
+                        source_to_dest,
+                        socket_id,
+                        &packet.payload()[start + written..start + len],
+                    );
+                    queue.push_front(Packet::new(
+                        et_core::proto::TerminalPacketType::PortForwardData as u8,
+                        rem,
+                    ));
+                    break;
+                }
+                _ => {
+                    route.direct_ok.store(false, Ordering::Release);
+                    break;
+                }
+            }
+        }
+        if queue.is_empty() {
+            return Ok(());
+        }
+        self.commands.try_send_queue(queue)
+    }
+
     /// Wake the forwarding worker after a batch of [`Forwarder::try_receive`]
     /// calls if it was not already woken mid-batch.
     pub fn flush_receive(&self) {
@@ -885,11 +1176,15 @@ impl Forwarder {
         if let Ok(result) = self.priority.try_recv() {
             result.map(Some)
         } else {
+            #[cfg(unix)]
+            if let Some(packet) = self.fast_outbound.lock().unwrap().pop_front() {
+                return Ok(Some(packet));
+            }
             match self.outbound.try_recv() {
                 Ok(result) => result.map(Some),
                 Err(channel::TryRecvError::Empty) => {
                     #[cfg(unix)]
-                    {
+                    if self.wake_signalled.load(Ordering::Acquire) {
                         // Drain any old wake bytes first, then clear the flag,
                         // then re-check the queues. If the worker pushed a
                         // packet at any point, the re-check sees it and writes

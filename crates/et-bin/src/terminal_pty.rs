@@ -18,8 +18,10 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use prost::Message;
 #[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags};
-#[cfg(unix)]
-use sysinfo::{Pid as SystemPid, ProcessesToUpdate, Signal as SystemSignal, System};
+#[cfg(all(unix, not(target_os = "linux")))]
+use sysinfo::{
+    Pid as SystemPid, ProcessRefreshKind, ProcessesToUpdate, Signal as SystemSignal, System,
+};
 
 const MAX_OUTPUT_CHUNK: usize = 16 * 1024;
 const FINAL_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -850,14 +852,43 @@ fn kill_process_group(process_id: Option<u32>) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+fn kill_process_group(process_id: Option<u32>) {
+    let Some(process_id) = process_id.and_then(|value| i32::try_from(value).ok()) else {
+        return;
+    };
+    let _ = kill(Pid::from_raw(-process_id), Signal::SIGKILL);
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let session = stat
+            .rfind(')')
+            .and_then(|end| stat[end + 1..].split_whitespace().nth(3))
+            .and_then(|field| field.parse::<i32>().ok());
+        if session == Some(process_id) {
+            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+        }
+    }
+}
+#[cfg(all(unix, not(target_os = "linux")))]
 fn kill_process_group(process_id: Option<u32>) {
     let Some(process_id) = process_id.and_then(|value| i32::try_from(value).ok()) else {
         return;
     };
     let _ = kill(Pid::from_raw(-process_id), Signal::SIGKILL);
     let mut system = System::new();
-    system.refresh_processes(ProcessesToUpdate::All, true);
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
     let session = SystemPid::from_u32(process_id.cast_unsigned());
     for process in system
         .processes()

@@ -267,6 +267,81 @@ impl CryptoHandler {
         Ok(())
     }
 
+    pub fn encrypt_into(
+        &mut self,
+        out: &mut [u8],
+        plaintext: &[u8],
+    ) -> Result<usize, EncryptError> {
+        if out.len() < plaintext.len() + MAC_LEN {
+            return Err(EncryptError);
+        }
+        self.bump();
+        Ok(et_sodium::secretbox_into(
+            out,
+            plaintext,
+            &self.nonce,
+            &self.base_key,
+        ))
+    }
+
+    pub fn decrypt_into(&mut self, out: &mut [u8], ciphertext: &[u8]) -> Option<usize> {
+        if ciphertext.len() < MAC_LEN || out.len() < ciphertext.len() - MAC_LEN {
+            return None;
+        }
+        let saved = self.nonce;
+        self.bump();
+        match et_sodium::secretbox_open_into(out, ciphertext, &self.nonce, &self.base_key) {
+            Some(len) => Some(len),
+            None => {
+                self.nonce = saved;
+                None
+            }
+        }
+    }
+
+    pub fn decrypt_in_place(&mut self, buffer: &mut [u8]) -> Option<usize> {
+        if buffer.len() < MAC_LEN {
+            return None;
+        }
+        let saved = self.nonce;
+        self.bump();
+        match et_sodium::secretbox_open_in_place(buffer, &self.nonce, &self.base_key) {
+            Some(len) => Some(len),
+            None => {
+                self.nonce = saved;
+                None
+            }
+        }
+    }
+
+    pub fn next_nonce_and_key(&mut self) -> ([u8; NONCE_LEN], [u8; KEY_LEN]) {
+        self.bump();
+        (self.nonce, self.base_key)
+    }
+
+    pub fn encrypt_detached(
+        prefix: &[u8],
+        plaintext: &[u8],
+        nonce: &[u8; NONCE_LEN],
+        key: &[u8; KEY_LEN],
+    ) -> Vec<u8> {
+        et_sodium::secretbox_with_prefix(prefix, plaintext, nonce, key)
+    }
+
+    pub fn encrypt_with_prefix(
+        &mut self,
+        prefix: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, EncryptError> {
+        self.bump();
+        Ok(et_sodium::secretbox_with_prefix(
+            prefix,
+            plaintext,
+            &self.nonce,
+            &self.base_key,
+        ))
+    }
+
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, EncryptError> {
         self.bump();
         Ok(et_sodium::secretbox(plaintext, &self.nonce, &self.base_key))
@@ -276,13 +351,10 @@ impl CryptoHandler {
         if ciphertext.len() < MAC_LEN {
             return Err(DecryptError::Short);
         }
-        // Advance the nonce only after the packet authenticates. A rejected
-        // packet must leave this side in step with the sender's retransmission
-        // (upstream #890 / de5dbd9).
         let saved = self.nonce;
         self.bump();
         match et_sodium::secretbox_open(ciphertext, &self.nonce, &self.base_key) {
-            Some(plaintext) => Ok(plaintext),
+            Some(out) => Ok(out),
             None => {
                 self.nonce = saved;
                 Err(DecryptError::BadMac)
@@ -313,6 +385,37 @@ mod tests {
         assert_eq!(dec.decrypt(&enc.encrypt(pt).unwrap()).unwrap(), pt);
         assert_eq!(dec.decrypt(&enc.encrypt(b"").unwrap()).unwrap(), b"");
         assert_eq!(dec.decrypt(&enc.encrypt(pt).unwrap()).unwrap(), pt);
+    }
+
+    #[test]
+    fn into_and_in_place_roundtrip() {
+        let key = [0x42u8; KEY_LEN];
+        let pt = b"the quick brown fox";
+        let mut enc = CryptoHandler::new(&key, DIR_CLIENT_TO_SERVER);
+        let mut dec = CryptoHandler::new(&key, DIR_CLIENT_TO_SERVER);
+
+        // encrypt_into with too small buffer fails without bumping nonce
+        let mut small = [0u8; 10];
+        assert!(enc.encrypt_into(&mut small, pt).is_err());
+
+        // encrypt_into and decrypt_into
+        let mut ct = vec![0u8; pt.len() + MAC_LEN];
+        assert!(enc.encrypt_into(&mut ct, pt).is_ok());
+        let mut recovered = vec![0u8; pt.len()];
+        assert_eq!(dec.decrypt_into(&mut recovered, &ct), Some(pt.len()));
+        assert_eq!(&recovered, pt);
+
+        // decrypt_into with too small buffer returns None without consuming nonce
+        let mut small_out = [0u8; 5];
+        assert_eq!(dec.decrypt_into(&mut small_out, &ct), None);
+
+        // decrypt_in_place
+        let mut enc2 = CryptoHandler::new(&key, DIR_CLIENT_TO_SERVER);
+        let mut dec2 = CryptoHandler::new(&key, DIR_CLIENT_TO_SERVER);
+        let mut in_place_buf = vec![0u8; pt.len() + MAC_LEN];
+        assert!(enc2.encrypt_into(&mut in_place_buf, pt).is_ok());
+        assert_eq!(dec2.decrypt_in_place(&mut in_place_buf), Some(pt.len()));
+        assert_eq!(&in_place_buf[..pt.len()], pt);
     }
 
     #[test]

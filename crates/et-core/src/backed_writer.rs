@@ -16,7 +16,6 @@
 use std::collections::VecDeque;
 
 use crate::crypto::{CryptoHandler, EncryptError, MAC_LEN};
-use crate::packet::Packet;
 
 pub const MAX_BACKUP_BYTES: i64 = 64 * 1024 * 1024;
 pub const DISCONNECT_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
@@ -41,7 +40,25 @@ pub const ACK_RETAIN_SLACK_PACKETS: usize = 1024;
 pub enum WriterOutcome {
     Skipped,
     BufferedOnly,
-    Send(Vec<u8>),
+    Send(std::sync::Arc<Vec<u8>>),
+}
+
+pub struct ReservedWrite {
+    prefix: [u8; 6],
+    nonce: [u8; crate::crypto::NONCE_LEN],
+    key: [u8; crate::crypto::KEY_LEN],
+    packet_wire_len: usize,
+}
+
+impl ReservedWrite {
+    pub fn encrypt(&self, payload: &[u8]) -> std::sync::Arc<Vec<u8>> {
+        std::sync::Arc::new(CryptoHandler::encrypt_detached(
+            &self.prefix,
+            payload,
+            &self.nonce,
+            &self.key,
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +81,7 @@ impl std::error::Error for RecoverError {}
 #[derive(Clone)]
 pub struct BackedWriter {
     crypto: CryptoHandler,
-    backup: VecDeque<Packet>,
+    backup: VecDeque<std::sync::Arc<Vec<u8>>>,
     backup_size: i64,
     disconnected_bytes: i64,
     disconnected_packets: usize,
@@ -85,12 +102,8 @@ impl BackedWriter {
         }
     }
 
-    pub fn write_packet(
-        &mut self,
-        header: u8,
-        payload: &[u8],
-    ) -> Result<WriterOutcome, EncryptError> {
-        let packet_len = 2 + payload.len();
+    pub fn reserve_write(&mut self, header: u8, payload_len: usize) -> Option<ReservedWrite> {
+        let packet_len = 2 + payload_len;
         let wire_len = i64::try_from(packet_len + MAC_LEN).unwrap_or(i64::MAX);
         let disconnected_fits = i64::try_from(packet_len)
             .ok()
@@ -105,38 +118,61 @@ impl BackedWriter {
                 || self.disconnected_packets >= MAX_DISCONNECT_PACKETS
                 || !recovery_fits)
         {
-            return Ok(WriterOutcome::Skipped);
+            return None;
         }
-        let ciphertext = self.crypto.encrypt(payload)?;
-        let packet = Packet::raw(true, header, ciphertext);
-        let packet_wire_len = packet.wire_len();
+        let packet_wire_len = 2 + payload_len + MAC_LEN;
+        let mut prefix = [0u8; 6];
+        prefix[0..4].copy_from_slice(&(packet_wire_len as u32).to_be_bytes());
+        prefix[4] = 1;
+        prefix[5] = header;
+        let (nonce, key) = self.crypto.next_nonce_and_key();
+        Some(ReservedWrite {
+            prefix,
+            nonce,
+            key,
+            packet_wire_len,
+        })
+    }
+
+    pub fn commit_write(
+        &mut self,
+        reserved: ReservedWrite,
+        frame: std::sync::Arc<Vec<u8>>,
+    ) -> WriterOutcome {
+        let packet_wire_len = reserved.packet_wire_len;
         if !self.connected {
-            self.backup.push_front(packet);
+            self.backup.push_front(frame);
             self.backup_size += packet_wire_len as i64;
             self.sequence += 1;
             self.disconnected_bytes += packet_wire_len as i64;
             self.disconnected_packets += 1;
-            return Ok(WriterOutcome::BufferedOnly);
+            return WriterOutcome::BufferedOnly;
         }
-        let mut framed = Vec::with_capacity(4 + packet_wire_len);
-        framed.extend_from_slice(&(packet_wire_len as u32).to_be_bytes());
-        framed.push(1);
-        framed.push(header);
-        framed.extend_from_slice(packet.payload());
-        self.backup.push_front(packet);
+        self.backup.push_front(std::sync::Arc::clone(&frame));
         self.backup_size += packet_wire_len as i64;
         self.sequence += 1;
         while self.backup_size > CONNECTED_BACKUP_BYTES
             || self.backup.len() > CONNECTED_BACKUP_PACKETS
         {
             if let Some(old) = self.backup.pop_back() {
-                self.backup_size -= old.wire_len() as i64;
+                self.backup_size -= (old.len() - 4) as i64;
             }
         }
         self.release_slack_capacity();
-        Ok(WriterOutcome::Send(framed))
+        WriterOutcome::Send(frame)
     }
 
+    pub fn write_packet(
+        &mut self,
+        header: u8,
+        payload: &[u8],
+    ) -> Result<WriterOutcome, EncryptError> {
+        let Some(reserved) = self.reserve_write(header, payload.len()) else {
+            return Ok(WriterOutcome::Skipped);
+        };
+        let frame = reserved.encrypt(payload);
+        Ok(self.commit_write(reserved, frame))
+    }
     pub fn recover(&self, last_valid_sequence: i64) -> Result<Vec<Vec<u8>>, RecoverError> {
         let messages_to_recover = self.sequence - last_valid_sequence;
         if messages_to_recover < 0 {
@@ -150,8 +186,8 @@ impl BackedWriter {
             return Err(RecoverError::TooFarBehind);
         }
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(count);
-        for packet in self.backup.iter().take(count) {
-            out.push(packet.serialize());
+        for frame in self.backup.iter().take(count) {
+            out.push(frame[4..].to_vec());
         }
         out.reverse();
         Ok(out)
@@ -173,7 +209,7 @@ impl BackedWriter {
         let keep = unacknowledged.saturating_add(ACK_RETAIN_SLACK_PACKETS);
         while self.backup.len() > keep {
             if let Some(old) = self.backup.pop_back() {
-                self.backup_size -= old.wire_len() as i64;
+                self.backup_size -= (old.len() - 4) as i64;
             }
         }
         self.release_slack_capacity();
@@ -200,7 +236,7 @@ impl BackedWriter {
             let Some(old) = self.backup.pop_back() else {
                 break;
             };
-            self.backup_size -= old.wire_len() as i64;
+            self.backup_size -= (old.len() - 4) as i64;
         }
         self.release_slack_capacity();
     }

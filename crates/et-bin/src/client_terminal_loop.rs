@@ -206,6 +206,7 @@ where
     // the transport permanently pending and starve them.
     let mut local_turn = false;
     let mut interrupt_input = et_core::output_interrupt::InterruptInput::default();
+    let mut fast_poll = et_net::forward::FastPollState::new();
     let forward_wake = forwarder
         .wake()
         .map_err(|error| terminal_text(error.to_string()))?;
@@ -360,7 +361,10 @@ where
         // poll(2) reports HUP/ERR even for an empty event mask, so a hung-up
         // wake fd would spin this loop until the frame deadline.
         let producers_polled = !connection.write_pending();
-        let (network, resize, output_ready, output_status, input) = {
+        if producers_polled {
+            forwarder.collect_fast_poll_routes(&mut fast_poll);
+        }
+        let (network, resize, output_ready, output_status, forward_events, input) = {
             let mut descriptors = vec![
                 PollFd::new(&stream, network_flags),
                 PollFd::new(console_output.wake(), PollFlags::IN | PollFlags::HUP),
@@ -375,6 +379,10 @@ where
                         PollFlags::IN | PollFlags::HUP | PollFlags::ERR,
                     ));
                 }
+            }
+            let fast_offset = descriptors.len();
+            if producers_polled {
+                fast_poll.push_descriptors(&mut descriptors);
             }
             // poll() is never auto-restarted by SA_RESTART, so any signal
             // delivered to this thread (e.g. SIGWINCH from a window resize,
@@ -404,6 +412,9 @@ where
                     }
                 }
             }
+            if producers_polled {
+                fast_poll.record_revents(&descriptors[fast_offset..]);
+            }
             let revents = |index: usize| {
                 descriptors
                     .get(index)
@@ -411,7 +422,18 @@ where
                     .unwrap_or(PollFlags::empty())
             };
             // Index 4 is the forwarding wake; try_outbound drains it below.
-            (revents(0), revents(3), revents(1), revents(2), revents(5))
+            (
+                revents(0),
+                revents(3),
+                revents(1),
+                revents(2),
+                revents(4),
+                if producers_polled && read_stdin {
+                    revents(5)
+                } else {
+                    PollFlags::empty()
+                },
+            )
         };
         #[cfg(test)]
         tests::note_poll_return();
@@ -486,11 +508,21 @@ where
         }
         // Ready input gets the interrupt onto the wire before another flood
         // batch is read. Output remains bounded even with --flow-control none.
+        let network_ready = inbound_ready
+            || connection.has_buffered_read()
+            || network.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
+            || (cfg!(target_vendor = "apple")
+                && resize.is_empty()
+                && output_ready.is_empty()
+                && output_status.is_empty()
+                && forward_events.is_empty()
+                && input.is_empty());
         let mut read_batch = 0;
-        while (!input.contains(PollFlags::IN) || connection.write_pending())
+        while network_ready
+            && (!input.contains(PollFlags::IN) || connection.write_pending())
             && pending_forward.len() < FORWARD_BACKLOG_CAPACITY
             && pending_output.is_none()
-            && read_batch < 64
+            && read_batch < 128
         {
             read_batch += 1;
             match connection.try_read_packet() {
@@ -502,7 +534,10 @@ where
                         }
                     }
                     if is_forward_packet(packet.header()) {
-                        enqueue_forwarding(forwarder, &mut pending_forward, packet)?;
+                        pending_forward.push_back(packet);
+                        if pending_forward.len() >= 16 {
+                            flush_forwarding(forwarder, &mut pending_forward)?;
+                        }
                     } else {
                         match route_server_packet(
                             packet,
@@ -562,8 +597,13 @@ where
                 Err(error) => return Err(terminal_error(error)),
             }
         }
-        forwarder.flush_receive();
-        inbound_ready = read_batch == 64;
+        flush_forwarding(forwarder, &mut pending_forward)?;
+        inbound_ready = read_batch == 128 || connection.has_buffered_read();
+        if (producers_polled && forwarder.service_fast_poll(&mut fast_poll))
+            || forwarder.has_fast_outbound()
+        {
+            outbound_ready = true;
+        }
         if connection.write_pending() {
             match connection.advance_write() {
                 Ok(true) => local_turn = true,
@@ -577,10 +617,17 @@ where
                 }
             }
         }
-        if !reconnect_needed && !connection.write_pending() && !local_turn {
+        if producers_polled && !input.contains(PollFlags::IN) && Instant::now() < next_keepalive {
+            local_turn = false;
+        }
+        if !reconnect_needed
+            && !connection.write_pending()
+            && !local_turn
+            && (outbound_ready || forward_events.intersects(PollFlags::IN | PollFlags::HUP))
+        {
             // try_outbound drains its wake socket even when queue entries
             // remain. Remember that readiness until the queue is empty.
-            for _ in 0..64 {
+            for _ in 0..128 {
                 let Some(packet) = forwarder
                     .try_outbound()
                     .map_err(|error| terminal_text(error.to_string()))?
@@ -767,6 +814,7 @@ where
 }
 
 #[cfg(unix)]
+#[allow(dead_code)]
 fn enqueue_forwarding(
     forwarder: &Forwarder,
     pending: &mut VecDeque<et_core::packet::Packet>,
@@ -791,17 +839,9 @@ fn flush_forwarding(
     forwarder: &Forwarder,
     pending: &mut VecDeque<et_core::packet::Packet>,
 ) -> Result<(), ClientError> {
-    while let Some(packet) = pending.pop_front() {
-        if let Some(packet) = forwarder
-            .try_receive(packet)
-            .map_err(|error| terminal_text(error.to_string()))?
-        {
-            pending.push_front(packet);
-            break;
-        }
-    }
-    forwarder.flush_receive();
-    Ok(())
+    forwarder
+        .try_receive_queue(pending)
+        .map_err(|error| terminal_text(error.to_string()))
 }
 
 #[cfg(unix)]
@@ -1068,7 +1108,7 @@ where
         TerminalPacketType::TerminalInfo as u8,
         payload,
         OwnedWritePolicy::ReplaceableTerminalSize,
-        Connection::start_write_packet_owned,
+        Connection::start_write_packet_owned_unprobed,
         |connection, _| recover_transport(connection, reconnect, true),
     )?;
     if matches!(outcome, OwnedWriteOutcome::Recovered) {
@@ -1095,7 +1135,7 @@ where
         payload,
         reconnect,
         send_terminal_size,
-        Connection::start_write_packet_owned,
+        Connection::start_write_packet_owned_unprobed,
     )?;
     if matches!(outcome, OwnedWriteOutcome::Recovered) {
         *stream = connection.try_clone_stream().map_err(terminal_error)?;

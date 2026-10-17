@@ -136,7 +136,19 @@ pub struct TerminalStream {
 
 impl TerminalStream {
     pub fn observe(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
+        let mut i = 0;
+        while i < bytes.len() {
+            if !self.control && (self.token_done || self.token.len() >= 32) {
+                if let Some(rel) = bytes[i..].iter().position(|&b| b == b'\n') {
+                    i += rel;
+                } else {
+                    self.midline = true;
+                    self.escape = bytes.last() == Some(&b'\x1b');
+                    break;
+                }
+            }
+            let byte = bytes[i];
+            i += 1;
             if self.control && !self.block && self.escape && byte == b'\\' {
                 self.control = false;
                 self.token.clear();

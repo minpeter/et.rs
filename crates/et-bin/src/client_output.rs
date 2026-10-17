@@ -72,6 +72,7 @@ struct State {
     worker_progress: usize,
     stream: et_core::output_interrupt::TerminalStream,
     skip_until_newline: bool,
+    waiting_for_capacity: bool,
 }
 
 struct Shared {
@@ -202,6 +203,7 @@ impl ConsoleOutput {
                 worker_progress: 0,
                 stream: et_core::output_interrupt::TerminalStream::default(),
                 skip_until_newline: false,
+                waiting_for_capacity: false,
             }),
             wake: Condvar::new(),
         });
@@ -284,6 +286,7 @@ impl ConsoleOutput {
                 if state.bytes.saturating_add(retained.len()) > OUTPUT_BYTES
                     || state.queue.len() >= OUTPUT_PACKETS =>
             {
+                state.waiting_for_capacity = true;
                 return Ok(false);
             }
             FlowControlMode::None | FlowControlMode::Backpressure => {}
@@ -300,6 +303,7 @@ impl ConsoleOutput {
         }
         // Only commit the terminator after admission; a held packet must
         // retry with the same skip state when the queue is still full.
+        let was_empty = state.queue.is_empty();
         state.skip_until_newline = false;
         state.bytes += retained.len();
         state.queue.push_back(OutputEntry {
@@ -307,7 +311,9 @@ impl ConsoleOutput {
             terminal_modes: terminal_modes.clone(),
         });
         drop(state);
-        shared.wake.notify_one();
+        if was_empty {
+            shared.wake.notify_one();
+        }
         Ok(true)
     }
 
@@ -502,7 +508,7 @@ fn run_writer(
 ) {
     let _done = WorkerDone(shared);
     loop {
-        let entries = {
+        let (entries, notify_capacity) = {
             let Ok(state) = shared.state.lock() else {
                 return;
             };
@@ -520,17 +526,23 @@ fn run_writer(
             // be observed before interrupt filtering can inspect the next queue.
             let entries: Vec<_> = state.queue.drain(..).collect();
             state.bytes = 0;
+            let notify_capacity = std::mem::replace(&mut state.waiting_for_capacity, false);
             for entry in &entries {
                 state.stream.observe(&entry.bytes);
             }
-            entries
+            (entries, notify_capacity)
         };
         #[cfg(unix)]
-        signal_capacity(capacity_signal);
-        let bytes: Vec<u8> = entries
-            .iter()
-            .flat_map(|entry| entry.bytes.iter().copied())
-            .collect();
+        if notify_capacity {
+            signal_capacity(capacity_signal);
+        }
+        #[cfg(not(unix))]
+        let _ = notify_capacity;
+        let total_len: usize = entries.iter().map(|entry| entry.bytes.len()).sum();
+        let mut bytes = Vec::with_capacity(total_len);
+        for entry in &entries {
+            bytes.extend_from_slice(&entry.bytes);
+        }
         let mut entries = entries.into_iter().peekable();
         let mut confirmed = 0;
         let result = write_all_with_progress(shared, writer, &bytes, &mut |count| {
@@ -594,7 +606,9 @@ fn report_worker_progress(shared: &Shared) -> io::Result<()> {
         .lock()
         .map_err(|_| io::Error::other("console output worker unavailable"))?;
     state.worker_progress = state.worker_progress.wrapping_add(1);
-    shared.wake.notify_all();
+    if state.stopping {
+        shared.wake.notify_all();
+    }
     Ok(())
 }
 

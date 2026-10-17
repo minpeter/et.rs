@@ -32,43 +32,52 @@ impl ActiveSession {
         Ok((stream, generation))
     }
 
+    pub(crate) fn has_buffered_read(&self) -> bool {
+        self.connection
+            .try_lock()
+            .is_ok_and(|connection| connection.has_buffered_read())
+    }
+
     pub(crate) fn try_read_packet(&self) -> Result<Option<et_core::packet::Packet>, SessionError> {
-        if let Some(flow) = self.output_flow() {
-            flow.set_reader_waiting(true);
-        }
-        let result = (|| {
-            let packet = self
-                .connection
-                .lock()
-                .map_err(|_| SessionError::Unavailable)?
+        let packet = {
+            let mut connection = match self.connection.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if let Some(flow) = self.output_flow() {
+                        flow.set_reader_waiting(true);
+                    }
+                    let guard = self.connection.lock();
+                    if let Some(flow) = self.output_flow() {
+                        flow.set_reader_waiting(false);
+                    }
+                    guard.map_err(|_| SessionError::Unavailable)?
+                }
+                Err(_) => return Err(SessionError::Unavailable),
+            };
+            connection
                 .try_read_packet()
-                .map_err(SessionError::Connection)?;
-            if let (Some(flow), Some(packet)) = (self.output_flow(), packet.as_ref()) {
-                if packet.header() == et_core::proto::TerminalPacketType::TerminalBuffer as u8 {
-                    use prost::Message;
-                    let input = et_core::proto::TerminalBuffer::decode(packet.payload()).map_err(
-                        |error| {
-                            SessionError::Io(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                error,
-                            ))
-                        },
-                    )?;
-                    if let Some(bytes) = input.buffer {
-                        // Pipe stdin is an opaque byte stream. Ctrl+C and tmux
-                        // control bytes must not discard remote output.
-                        if !self.pipe_mode {
-                            flow.observe_input(&bytes)?;
-                        }
+                .map_err(SessionError::Connection)?
+        };
+        if let (Some(flow), Some(packet)) = (self.output_flow(), packet.as_ref()) {
+            if packet.header() == et_core::proto::TerminalPacketType::TerminalBuffer as u8 {
+                use prost::Message;
+                let input =
+                    et_core::proto::TerminalBuffer::decode(packet.payload()).map_err(|error| {
+                        SessionError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            error,
+                        ))
+                    })?;
+                if let Some(bytes) = input.buffer {
+                    // Pipe stdin is an opaque byte stream. Ctrl+C and tmux
+                    // control bytes must not discard remote output.
+                    if !self.pipe_mode {
+                        flow.observe_input(&bytes)?;
                     }
                 }
             }
-            Ok(packet)
-        })();
-        if let Some(flow) = self.output_flow() {
-            flow.set_reader_waiting(false);
         }
-        result
+        Ok(packet)
     }
 
     pub(crate) fn note_bridge_generation(&self, generation: u64) -> Result<(), SessionError> {

@@ -19,7 +19,7 @@ packages:
 - In-place fast-path data serialization in `et-net`: encode forwarding data
   packets in one step and parse incoming data packets directly into queued
   buffer spans, bypassing protobuf intermediate copies.
-- Single-lock batch command drain in `CommandReceiver`: drain all pending
+- On Unix, single-lock batch command drain in `CommandReceiver`: drain all pending
   commands per lock acquisition and batch forward packets during session read
   loops, slashing mutex contention and worker wake thrashing.
 - Enable `TCP_NODELAY` on the client connection and forward listeners, cutting

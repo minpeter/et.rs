@@ -459,19 +459,7 @@ impl CommandReceiver {
         // the next poll does not spin on a stale byte.
         if state.commands.is_empty() {
             self.queue.wake_signalled.store(false, Ordering::Release);
-            if let Some(reader) = &self.wake_reader {
-                use std::io::Read;
-                let mut buffer = [0u8; 64];
-                loop {
-                    match (&mut &*reader).read(&mut buffer) {
-                        Ok(0) => break,
-                        Ok(_) => continue,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
-                    }
-                }
-            }
+            self.drain_wake();
         } else if !self.queue.wake_signalled.swap(true, Ordering::AcqRel) {
             // If the queue still has packets but the flag was cleared by a
             // racing session pop, re-write the wake byte so the next poll
@@ -490,12 +478,6 @@ impl CommandReceiver {
             return;
         }
         self.queue.in_flight.fetch_sub(count, Ordering::AcqRel);
-        // If the worker had to queue commands because the queue was empty,
-        // we must re-arm the wake flag so `has_pending()` is false and the
-        // worker sleeps until new work arrives.
-        if self.queue.in_flight.load(Ordering::Acquire) == 0 {
-            self.queue.wake_signalled.store(false, Ordering::Release);
-        }
     }
     /// Non-blocking pop for the Unix poll loop. Like `recv_until`, shutdown
     /// (or all senders leaving) short-circuits even a full queue: graceful

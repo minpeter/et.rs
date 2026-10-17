@@ -48,6 +48,12 @@ impl Default for TmuxCcFilter {
 
 impl TmuxCcFilter {
     pub(super) fn apply(&mut self, chunk: &[u8]) -> Vec<u8> {
+        if !self.control && self.pending.is_empty() && !chunk.contains(&DCS[0]) {
+            if let Some(&last) = chunk.last() {
+                self.line_start = last == b'\n';
+            }
+            return chunk.to_vec();
+        }
         // A wall write can end without a newline before tmux's next write.
         // Do not apply this heuristic inside a %begin response: arbitrary
         // response bytes, including a split '%' or ESC, belong to the client.

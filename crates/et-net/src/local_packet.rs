@@ -15,7 +15,7 @@ pub const MAX_STATUS_MESSAGE: usize = 8 * 1024;
 const PREFIX_LEN: usize = std::mem::size_of::<i64>();
 /// How long a writer naps before retrying a `WouldBlock` write. Matches the
 /// 10ms cadence the Windows pump loops already use.
-const BACKPRESSURE_RETRY: Duration = Duration::from_millis(10);
+const BACKPRESSURE_RETRY: Duration = Duration::from_millis(1);
 
 #[derive(Debug)]
 pub enum LocalPacketError {

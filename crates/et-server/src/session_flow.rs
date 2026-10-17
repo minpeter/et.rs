@@ -161,12 +161,17 @@ impl FlowControl {
             state.bridge_waiting = true;
             return Err((packet, SessionError::Connection(ConnError::Backpressure)));
         }
+        let is_forward_data = matches!(
+            packet.header(),
+            h if h == et_core::proto::TerminalPacketType::PortForwardData as u8
+                || h == et_core::proto::TerminalPacketType::TerminalBuffer as u8
+        );
         let was_empty = state.queue.is_empty();
         if was_empty
             && !state.in_flight
+            && state.pending_live_in_flight.is_none()
             && state.connected
             && !state.paused
-            && packet.payload().len() <= 16 * 1024
             && packet.header() != et_core::proto::TerminalPacketType::TerminalExitStatus as u8
         {
             if let Ok(_write_serial) = session.write_serial.try_lock() {
@@ -205,10 +210,12 @@ impl FlowControl {
                             Ok(()) => {
                                 drop(connection);
                                 drop(_write_serial);
-                                state.in_flight = true;
                                 state.pending_live_in_flight = Some(packet);
-                                drop(state);
-                                self.wake.notify_one();
+                                if !is_forward_data {
+                                    state.in_flight = true;
+                                    drop(state);
+                                    self.wake.notify_one();
+                                }
                                 return Ok(());
                             }
                             Err(et_net::connection::WritePacketError::BeforeReplay(
@@ -235,7 +242,7 @@ impl FlowControl {
         }
         match state.queue.push(packet) {
             Ok(()) => {
-                let should_wake = was_empty && !state.in_flight;
+                let should_wake = !state.in_flight && (!is_forward_data && was_empty);
                 drop(state);
                 if should_wake {
                     self.wake.notify_one();
@@ -248,6 +255,19 @@ impl FlowControl {
             }
             Err(QueuePushError::Oversized(packet)) => {
                 Err((packet, SessionError::Connection(ConnError::PacketTooLarge)))
+            }
+        }
+    }
+
+    pub(super) fn flush_bridge_wake(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.pending_live_in_flight.is_some() {
+                state.in_flight = true;
+                drop(state);
+                self.wake.notify_one();
+            } else if !state.queue.is_empty() && !state.in_flight {
+                drop(state);
+                self.wake.notify_one();
             }
         }
     }
@@ -498,8 +518,11 @@ impl FlowControl {
                 state.stop = StopMode::Hard;
             }
         }
-        let should_signal = std::mem::replace(&mut state.bridge_waiting, false)
-            || !connected
+        let capacity_ready = state.queue.is_empty() || state.queue.can_accept_terminal(32 * 1024);
+        let should_signal = (state.bridge_waiting && capacity_ready && {
+            state.bridge_waiting = false;
+            true
+        }) || !connected
             || !matches!(result, writer::FlowWriteResult::Delivered)
             || state.stop == StopMode::Hard;
         if state.paused

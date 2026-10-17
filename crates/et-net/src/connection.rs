@@ -475,7 +475,7 @@ impl Connection {
             .map_err(ConnError::Io)?;
         #[cfg(target_os = "linux")]
         socket
-            .set_tcp_notsent_lowat(FLOW_CONTROL_SOCKET_BUFFER_BYTES as u32)
+            .set_tcp_notsent_lowat((FLOW_CONTROL_SOCKET_BUFFER_BYTES / 4) as u32)
             .map_err(ConnError::Io)?;
         Ok(())
     }

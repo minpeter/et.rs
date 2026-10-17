@@ -449,9 +449,10 @@ where
 }
 
 pub(crate) fn contains_cursor_report_request(bytes: &[u8]) -> bool {
-    bytes
-        .windows(CURSOR_REPORT_REQUEST.len())
-        .any(|window| window == CURSOR_REPORT_REQUEST)
+    bytes.contains(&b'\x1b')
+        && bytes
+            .windows(CURSOR_REPORT_REQUEST.len())
+            .any(|window| window == CURSOR_REPORT_REQUEST)
 }
 
 fn command_payload(
@@ -759,6 +760,9 @@ impl TerminalModeState {
         let Ok(mut state) = self.0.lock() else {
             return;
         };
+        if state.alternate_prefix_len == 0 && !bytes.contains(&b'\x1b') {
+            return;
+        }
         for &byte in bytes {
             if state.alternate_prefix_len == PREFIX.len() {
                 match byte {

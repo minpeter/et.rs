@@ -391,6 +391,12 @@ impl ActiveSession {
         }
     }
 
+    pub(crate) fn flush_bridge_outbound(&self) {
+        if let Some(state) = self.output_flow() {
+            state.flush_bridge_wake();
+        }
+    }
+
     fn send_packet_owned_with<W>(
         &self,
         header: u8,

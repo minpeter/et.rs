@@ -595,7 +595,9 @@ where
         }
         flush_forwarding(forwarder, &mut pending_forward)?;
         inbound_ready = read_batch == 128 || connection.has_buffered_read();
-        if producers_polled && forwarder.service_fast_poll(&mut fast_poll) {
+        if (producers_polled && forwarder.service_fast_poll(&mut fast_poll))
+            || forwarder.has_fast_outbound()
+        {
             outbound_ready = true;
         }
         if connection.write_pending() {
@@ -610,6 +612,9 @@ where
                     reconnect_needed = true;
                 }
             }
+        }
+        if producers_polled && !input.contains(PollFlags::IN) && Instant::now() < next_keepalive {
+            local_turn = false;
         }
         if !reconnect_needed
             && !connection.write_pending()

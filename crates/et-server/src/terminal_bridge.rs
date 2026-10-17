@@ -140,6 +140,7 @@ fn run_mode_poll(
             if let Some(packet) = pending_terminal.take() {
                 pending_terminal =
                     send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
+                session.flush_bridge_outbound();
             }
         }
         if !connected {
@@ -170,7 +171,6 @@ fn run_mode_poll(
         );
         // When the client is down, poll with a short timeout so recovery wakes
         // (via the wake pipe) are still processed promptly and we re-check
-        // `session.connected()` after recover installs a new stream.
         if pending_outbound.is_empty() {
             forwarder.collect_fast_poll_routes(&mut fast_poll);
         }
@@ -227,7 +227,10 @@ fn run_mode_poll(
         }
         if pending_terminal.is_none()
             && !terminal_eof
-            && (terminal_closing || terminal_events.contains(PollFlags::IN))
+            && (terminal_closing
+                || terminal_events.contains(PollFlags::IN)
+                || (client_events_are_stale
+                    && session.can_buffer_write((READ_BUFFER * 2) as i64)?))
         {
             for _ in 0..32 {
                 match read_terminal_packet(&mut terminal, &mut decoder) {
@@ -259,6 +262,7 @@ fn run_mode_poll(
                     Err(error) => return Err(error),
                 }
             }
+            session.flush_bridge_outbound();
         }
         if terminal_eof && pending_terminal.is_none() {
             finish_killed_session(&session);
@@ -390,7 +394,8 @@ fn run_mode_poll(
                 observed_generation,
             )?;
         }
-        let fast_ready = pending_outbound.is_empty() && forwarder.service_fast_poll(&mut fast_poll);
+        let fast_ready = pending_outbound.is_empty()
+            && (forwarder.service_fast_poll(&mut fast_poll) || forwarder.has_fast_outbound());
         if pending_outbound.is_empty()
             && (resume_outbound_drain
                 || fast_ready
@@ -408,6 +413,7 @@ fn run_mode_poll(
                     break;
                 }
             }
+            session.flush_bridge_outbound();
         }
     }
 }
@@ -625,7 +631,7 @@ fn run_mode_windows(
                 break;
             }
         }
-
+        session.flush_bridge_outbound();
         if !progress {
             std::thread::sleep(IDLE);
         }
@@ -724,6 +730,7 @@ fn flush_outbound(
             break;
         }
     }
+    session.flush_bridge_outbound();
     Ok(())
 }
 

@@ -465,8 +465,6 @@ pub struct Forwarder {
     session_polls_reads: Arc<AtomicBool>,
     #[cfg(unix)]
     fast_outbound: std::sync::Mutex<VecDeque<Packet>>,
-    #[cfg(unix)]
-    priority_tx: channel::Sender<Outbound>,
     #[cfg(windows)]
     routes: crate::forward_worker::FastRoutes,
     shutdown: Arc<AtomicBool>,
@@ -611,8 +609,6 @@ fn start_forwarder_hook(
     let session_polls_reads = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
     let worker_session_polls = session_polls_reads.clone();
-    #[cfg(unix)]
-    let forwarder_priority_tx = priority_tx.clone();
     #[cfg(windows)]
     let routes: crate::forward_worker::FastRoutes =
         Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
@@ -702,8 +698,6 @@ fn start_forwarder_hook(
         session_polls_reads,
         #[cfg(unix)]
         fast_outbound: std::sync::Mutex::new(VecDeque::with_capacity(128)),
-        #[cfg(unix)]
-        priority_tx: forwarder_priority_tx,
         #[cfg(windows)]
         routes,
         shutdown,
@@ -964,6 +958,11 @@ impl Forwarder {
     }
 
     #[cfg(unix)]
+    pub fn has_fast_outbound(&self) -> bool {
+        !self.fast_outbound.lock().unwrap().is_empty()
+    }
+
+    #[cfg(unix)]
     pub fn service_fast_poll(&self, state: &mut FastPollState) -> bool {
         use rustix::event::PollFlags;
         let mut produced = false;
@@ -979,7 +978,8 @@ impl Forwarder {
             if !ev.contains(PollFlags::IN) {
                 continue;
             }
-            while route.read_interest() && out_guard.len() < 256 {
+            let mut reads = 0;
+            while route.read_interest() && reads < 32 && out_guard.len() < 128 {
                 let limit = if route.windowed {
                     let rem = route
                         .window_bytes
@@ -1009,13 +1009,10 @@ impl Forwarder {
                             payload,
                         ));
                         produced = true;
-                        if count > 4096 {
-                            // Bulk stream: hand sustained reads to the worker thread
-                            // so socket reads run in parallel with session crypto.
-                            route.direct_read_ok.store(false, Ordering::Release);
-                            self.commands.force_wake();
+                        reads += 1;
+                        if count <= 4096 {
+                            break;
                         }
-                        break;
                     }
                     Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
@@ -1060,10 +1057,16 @@ impl Forwarder {
                         {
                             let route =
                                 self.routes.read().unwrap().get(&(role, socket_id)).cloned();
-                            if let Some(route) =
-                                route.filter(|r| r.direct_read_ok.load(Ordering::Acquire))
-                            {
+                            if let Some(route) = route {
+                                let was_blocked = route.windowed
+                                    && (route.in_flight_bytes.load(Ordering::Acquire)
+                                        >= route.window_bytes
+                                        || route.in_flight_packets.load(Ordering::Acquire)
+                                            >= route.window_packets);
                                 route.apply_delivery(delivered);
+                                if was_blocked && !route.direct_read_ok.load(Ordering::Acquire) {
+                                    self.commands.force_wake();
+                                }
                                 queue.pop_front();
                                 continue;
                             }
@@ -1129,11 +1132,7 @@ impl Forwarder {
                                     }
                                     .encode_to_vec(),
                                 );
-                                if self.priority_tx.try_send(Ok(credit_pkt)).is_ok()
-                                    && !self.wake_signalled.swap(true, Ordering::AcqRel)
-                                {
-                                    let _ = (&*self.wake_writer).write(&[1]);
-                                }
+                                self.fast_outbound.lock().unwrap().push_front(credit_pkt);
                             }
                         }
                     }

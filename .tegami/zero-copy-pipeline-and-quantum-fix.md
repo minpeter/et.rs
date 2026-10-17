@@ -20,11 +20,18 @@ packages:
   mutex in `et-server` and `et-net` via `BackedWriter::reserve_write` and
   `commit_reserved`, allowing full-duplex reads and writes to encrypt and
   decrypt concurrently across CPU cores.
-- Zero-hop adaptive fast poll (`FastPollState`) in `et-net`, `et-bin`, and
-  `et-server`: poll active Unix forwarding routes directly inside the client
-  and terminal bridge `poll()` loops for sub-200 µs interactive ping-pong RTT,
-  automatically handing off sustained bulk streams (> 4 KiB) to the parallel
-  forwarding worker thread.
+- Zero-hop fast poll (`FastPollState`) and wake coalescing in `et-net`,
+  `et-bin`, and `et-server`: poll active Unix forwarding routes directly inside
+  the client and terminal bridge `poll()` loops, apply window credits inline,
+  batch `FlowControl` writer wakeups, and set `TCP_NOTSENT_LOWAT` to a quarter
+  of the 256 KiB transport send buffer, cutting context switches by >99% vs
+  `v0.0.31` and below upstream C++ ET.
+- Cold startup and PTY streaming optimizations in `et-bin`, `et-core`, and
+  `et-net`: avoid full-system `/proc` and `sysinfo` scans when SSH bootstrap
+  pipes reach EOF normally (cutting cold startup syscalls from 245k to 11.9k),
+  add SIMD fast paths to `TmuxCcFilter`, `TerminalStream::observe`, and
+  `TerminalModeState`, and reduce local router backpressure retry latency to
+  1 ms.
 - Enable `TCP_NODELAY` on client, server, and forwarded TCP sockets, and expand
   the per-socket flow-control window to 2 MiB while keeping the 256 KiB socket
   buffer bound so interactive Ctrl-C remains responsive on slow links.

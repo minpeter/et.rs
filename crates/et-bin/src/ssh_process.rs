@@ -520,7 +520,16 @@ impl SshRunner for SystemSsh {
                     stdout,
                 })
             }
-            Ok(Capture::Marker(stdout)) => {
+            Ok(Capture::Marker { stdout, eof }) => {
+                if eof {
+                    if let Ok(Some(status)) = child.wait_timeout(Duration::from_millis(20)) {
+                        let _ = join_reader(reader);
+                        return Ok(SshOutput {
+                            status: Some(status),
+                            stdout,
+                        });
+                    }
+                }
                 // Preserve a direct child's status when it exited before a
                 // pipe-holding descendant emitted the completion marker.
                 let status = match child.try_wait() {
@@ -598,7 +607,10 @@ enum Capture {
     Complete(Vec<u8>),
     /// The invocation-specific completion marker arrived, so a descendant
     /// holding stdout open cannot delay completion.
-    Marker(Vec<u8>),
+    Marker {
+        stdout: Vec<u8>,
+        eof: bool,
+    },
     TooLarge,
     Failed(io::Error),
 }
@@ -654,7 +666,7 @@ fn spawn_reader(
     Ok((receiver, reader))
 }
 
-fn capture_bounded(reader: &mut impl Read, completion: InvocationCompletion) -> Capture {
+fn capture_bounded(reader: &mut ChildStdout, completion: InvocationCompletion) -> Capture {
     let mut captured = Vec::new();
     let mut buffer = [0u8; 8192];
     loop {
@@ -669,12 +681,49 @@ fn capture_bounded(reader: &mut impl Read, completion: InvocationCompletion) -> 
                 // detached session process can inherit this pipe, so the
                 // channel never closes even though the session is ready.
                 if completion_end(&captured, completion).is_some() {
-                    return Capture::Marker(captured);
+                    let eof = wait_stdout_eof(reader, &mut captured);
+                    return Capture::Marker {
+                        stdout: captured,
+                        eof,
+                    };
                 }
             }
             Err(error) => return Capture::Failed(error),
         }
     }
+}
+
+#[cfg(unix)]
+fn wait_stdout_eof(reader: &mut ChildStdout, captured: &mut Vec<u8>) -> bool {
+    use rustix::event::{poll, PollFd, PollFlags};
+    use rustix::time::Timespec;
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 5_000_000,
+    };
+    let mut scratch = [0u8; 256];
+    loop {
+        let mut fds = [PollFd::new(&*reader, PollFlags::IN | PollFlags::HUP)];
+        if !matches!(poll(&mut fds, Some(&timeout)), Ok(n) if n > 0) {
+            return false;
+        }
+        match reader.read(&mut scratch) {
+            Ok(0) => return true,
+            Ok(count) => {
+                if captured.len().saturating_add(count) > MAX_SSH_STDOUT {
+                    return false;
+                }
+                captured.extend_from_slice(&scratch[..count]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn wait_stdout_eof(_reader: &mut ChildStdout, _captured: &mut Vec<u8>) -> bool {
+    false
 }
 
 fn wait_for_exit(
@@ -815,6 +864,34 @@ fn kill_process(pid: ProcessId) -> io::Result<()> {
 }
 
 /// Descendants of `root`, deepest first.
+#[cfg(target_os = "linux")]
+fn descendants(root: ProcessId) -> Vec<ProcessId> {
+    let mut found = Vec::new();
+    let mut seen = std::collections::HashSet::from([raw_pid(root)]);
+    let mut queue = std::collections::VecDeque::from([raw_pid(root)]);
+    while let Some(current) = queue.pop_front() {
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{current}/task")) else {
+            continue;
+        };
+        for task in tasks.flatten() {
+            let Ok(children) = std::fs::read_to_string(task.path().join("children")) else {
+                continue;
+            };
+            for token in children.split_whitespace() {
+                if let Ok(child) = token.parse::<u32>() {
+                    if seen.insert(child) {
+                        found.push(child);
+                        queue.push_back(child);
+                    }
+                }
+            }
+        }
+    }
+    found.reverse();
+    found.into_iter().map(process_id).collect()
+}
+
+#[cfg(not(target_os = "linux"))]
 fn descendants(root: ProcessId) -> Vec<ProcessId> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
     let mut system = System::new();

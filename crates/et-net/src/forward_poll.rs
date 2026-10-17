@@ -99,6 +99,9 @@ impl SocketIo {
         stream.set_nonblocking(true)?;
         if let ForwardStream::Tcp(tcp) = &stream {
             let _ = tcp.set_nodelay(true);
+            let sock = socket2::SockRef::from(tcp);
+            let _ = sock.set_send_buffer_size(2 * 1024 * 1024);
+            let _ = sock.set_recv_buffer_size(2 * 1024 * 1024);
         }
         Ok(Self {
             role,

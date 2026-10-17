@@ -774,7 +774,7 @@ impl Worker {
 
     #[cfg(unix)]
     pub(super) fn note_outbound_emitted(&mut self) {
-        if !self.defer_outbound_wake || self.outbound.len() >= 4 {
+        if !self.defer_outbound_wake || self.outbound.len() >= 32 {
             self.flush_outbound_wake();
         } else {
             self.outbound_wake_needed = true;

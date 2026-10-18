@@ -182,3 +182,66 @@ fn tampered_live_frame_keeps_the_nonce_for_the_genuine_packet() {
     assert_eq!(packet.payload(), b"real");
     assert_eq!(reader.sequence(), 1);
 }
+
+/// Copies as much of `stream` as the next socket read asks for, like `recv`.
+fn socket_read(reader: &mut BackedReader, stream: &mut &[u8]) -> usize {
+    let slice = reader.prepare_socket_read();
+    let count = slice.len().min(stream.len());
+    slice[..count].copy_from_slice(&stream[..count]);
+    *stream = &stream[count..];
+    reader.commit_socket_read(count);
+    count
+}
+
+fn drain_packets(reader: &mut BackedReader) {
+    while let ReadItem::Packet(_) = reader.pop().unwrap() {}
+}
+
+#[test]
+fn socket_reads_grow_for_bulk_and_release_the_buffer_once_traffic_is_small() {
+    let (mut writer, mut reader) = pair();
+    let mut bulk = Vec::new();
+    while bulk.len() < 2 * 1024 * 1024 {
+        let WriterOutcome::Send(frame) = writer.write_packet(1, &[7; 60 * 1024]).unwrap() else {
+            panic!();
+        };
+        bulk.extend_from_slice(&frame);
+    }
+
+    // A fresh connection asks for little; a stream that fills every read
+    // reaches the bulk size after two reads.
+    let mut stream = bulk.as_slice();
+    let sizes: Vec<usize> = (0..4)
+        .map(|_| {
+            let size = socket_read(&mut reader, &mut stream);
+            drain_packets(&mut reader);
+            size
+        })
+        .collect();
+    assert_eq!(
+        sizes,
+        [
+            MIN_SOCKET_READ,
+            4 * MIN_SOCKET_READ,
+            MAX_SOCKET_READ,
+            MAX_SOCKET_READ
+        ]
+    );
+    while !stream.is_empty() {
+        socket_read(&mut reader, &mut stream);
+        drain_packets(&mut reader);
+    }
+    assert!(reader.partial.capacity() >= MAX_SOCKET_READ);
+
+    // Keep-alive-sized reads shrink the request back and release the bulk
+    // buffer, so an idle connection does not keep it resident.
+    for _ in 0..5 {
+        let WriterOutcome::Send(frame) = writer.write_packet(0, b"ka").unwrap() else {
+            panic!();
+        };
+        socket_read(&mut reader, &mut frame.as_slice());
+        drain_packets(&mut reader);
+    }
+    assert_eq!(reader.prepare_socket_read().len(), MIN_SOCKET_READ);
+    assert!(reader.partial.capacity() <= 2 * MIN_SOCKET_READ);
+}

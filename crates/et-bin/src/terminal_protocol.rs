@@ -1,5 +1,5 @@
 use et_net::local::LocalStream;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 
 use et_core::packet::Packet;
 use et_core::proto::{
@@ -11,7 +11,6 @@ use prost::Message;
 
 pub(crate) const MAX_ENVIRONMENT: usize = 128;
 pub(crate) const MAX_ENV_VALUE: usize = 4096;
-const READ_BUFFER: usize = 16 * 1024;
 
 #[derive(Debug)]
 pub struct TerminalInitialization {
@@ -108,23 +107,17 @@ pub fn read_ready_packet(
     router: &mut LocalStream,
     decoder: &mut LocalPacketDecoder,
 ) -> Result<Option<Packet>, String> {
-    let mut buffer = [0u8; READ_BUFFER];
-    loop {
-        let wanted = decoder.required_bytes().min(buffer.len());
-        match router.read(&mut buffer[..wanted]) {
-            Ok(0) => return Err("terminal router disconnected".to_owned()),
-            Ok(count) => {
-                if let Some(packet) = decoder
-                    .feed(&buffer[..count])
-                    .map_err(|error| format!("malformed terminal packet: {error}"))?
-                {
-                    return Ok(Some(packet));
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(format!("could not read terminal router: {error}")),
+    match decoder.read_from(router) {
+        Ok(packet) => Ok(packet),
+        Err(et_net::local_packet::LocalPacketError::Io(error))
+            if error.kind() == io::ErrorKind::UnexpectedEof =>
+        {
+            Err("terminal router disconnected".to_owned())
         }
+        Err(et_net::local_packet::LocalPacketError::Io(error)) => {
+            Err(format!("could not read terminal router: {error}"))
+        }
+        Err(error) => Err(format!("malformed terminal packet: {error}")),
     }
 }
 
@@ -183,6 +176,13 @@ pub fn handle_packet(
     }
     match packet.header() {
         header if header == TerminalPacketType::TerminalBuffer as u8 => {
+            if let Some((bytes, _)) = et_core::packet::decode_terminal_buffer(packet.payload()) {
+                writer
+                    .write_all(bytes)
+                    .and_then(|()| writer.flush())
+                    .map_err(TerminalPacketError::Pty)?;
+                return Ok(LocalPacketEffect::Continue);
+            }
             let message = TerminalBuffer::decode(packet.payload()).map_err(|_| {
                 TerminalPacketError::Protocol("TERMINAL_BUFFER protobuf is malformed".to_owned())
             })?;

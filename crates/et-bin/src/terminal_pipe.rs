@@ -16,7 +16,7 @@ use std::time::Duration;
 use et_core::packet::Packet;
 use et_core::proto::{TerminalBuffer, TerminalPacketType};
 use et_net::local::LocalStream;
-use et_net::local_packet::{write_local_packet_until_cancelled, LocalPacketDecoder};
+use et_net::local_packet::{write_local_terminal_buffer_until_cancelled, LocalPacketDecoder};
 use prost::Message;
 
 #[cfg(unix)]
@@ -26,7 +26,7 @@ use crate::terminal_protocol::{
     TerminalInitialization,
 };
 
-const MAX_OUTPUT_CHUNK: usize = 16 * 1024;
+const MAX_OUTPUT_CHUNK: usize = 65_472;
 const MAX_PENDING_INPUT: usize = 256 * 1024;
 
 enum PipeEvent {
@@ -264,20 +264,10 @@ fn write_output(
     if output.is_empty() {
         return Ok(());
     }
-    let message = TerminalBuffer {
-        buffer: Some(output.to_vec()),
-        // Absent means stdout. Encoding Some(false) would add a field upstream
-        // leaves off the wire.
-        is_stderr: is_stderr.then_some(true),
-    };
-    let packet = Packet::new(
-        TerminalPacketType::TerminalBuffer as u8,
-        message.encode_to_vec(),
-    );
     let mut router = router
         .lock()
         .map_err(|_| "pipe router writer is unavailable".to_owned())?;
-    write_local_packet_until_cancelled(&mut *router, &packet, cancelled)
+    write_local_terminal_buffer_until_cancelled(&mut router, output, is_stderr, cancelled, None)
         .map_err(|error| format!("could not forward pipe output: {error}"))
 }
 
@@ -373,8 +363,14 @@ fn pump(
             }
         }
         if accept_input {
-            if let Some(packet) = read_ready_packet(router, &mut decoder)? {
-                if take_input(packet, &mut pending)? {
+            for _ in 0..32 {
+                if pending.len() >= MAX_PENDING_INPUT {
+                    break;
+                }
+                let Some(packet) = read_ready_packet(router, &mut decoder)? else {
+                    break;
+                };
+                if take_input(packet, stdin, &mut pending)? {
                     // TERMINAL_CLOSE ends the pipe session successfully.
                     // Cleanup kills the child; its signal status is not the
                     // session status.
@@ -409,7 +405,11 @@ fn apply_events(
     Ok(saw)
 }
 
-fn take_input(packet: Packet, pending: &mut Vec<u8>) -> Result<bool, String> {
+fn take_input(
+    packet: Packet,
+    stdin: &mut Option<ChildStdin>,
+    pending: &mut Vec<u8>,
+) -> Result<bool, String> {
     if local_packet_effect(&packet)? == LocalPacketEffect::Close {
         return Ok(true);
     }
@@ -417,14 +417,45 @@ fn take_input(packet: Packet, pending: &mut Vec<u8>) -> Result<bool, String> {
         return Ok(false);
     }
     if packet.header() == TerminalPacketType::TerminalBuffer as u8 {
+        if let Some((bytes, _)) = et_core::packet::decode_terminal_buffer(packet.payload()) {
+            write_or_stage(stdin, pending, bytes)?;
+            return Ok(false);
+        }
         let message = TerminalBuffer::decode(packet.payload())
             .map_err(|_| "TERMINAL_BUFFER protobuf is malformed".to_owned())?;
         if let Some(bytes) = message.buffer {
-            pending.extend(bytes);
+            write_or_stage(stdin, pending, &bytes)?;
         }
         return Ok(false);
     }
     Err("unsupported local terminal packet type".to_owned())
+}
+
+fn write_or_stage(
+    stdin: &mut Option<ChildStdin>,
+    pending: &mut Vec<u8>,
+    mut bytes: &[u8],
+) -> Result<(), String> {
+    if pending.is_empty() {
+        if let Some(input) = stdin.as_mut() {
+            while !bytes.is_empty() {
+                match input.write(bytes) {
+                    Ok(0) => return Err("pipe stdin closed".to_owned()),
+                    Ok(count) => bytes = &bytes[count..],
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                        return Ok(());
+                    }
+                    Err(error) => return Err(format!("could not write pipe stdin: {error}")),
+                }
+            }
+        }
+    }
+    if !bytes.is_empty() {
+        pending.extend_from_slice(bytes);
+    }
+    Ok(())
 }
 
 fn write_pending(stdin: &mut ChildStdin, pending: &mut Vec<u8>) -> Result<(), String> {

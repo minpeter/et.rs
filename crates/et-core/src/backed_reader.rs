@@ -73,7 +73,11 @@ impl BackedReader {
         if self.offset == self.filled {
             self.offset = 0;
             self.filled = 0;
-        } else if self.offset > 0 && self.partial.len().saturating_sub(self.filled) < min_space {
+        } else if self.offset > 0
+            && (self.partial.len().saturating_sub(self.filled) < min_space
+                || self.offset >= 64 * 1024
+                || (self.filled - self.offset) <= 16 * 1024)
+        {
             let remaining = self.filled - self.offset;
             self.partial.copy_within(self.offset..self.filled, 0);
             self.offset = 0;
@@ -91,7 +95,20 @@ impl BackedReader {
     }
 
     pub fn has_buffered_data(&self) -> bool {
-        self.connected && (!self.replay.is_empty() || self.filled > self.offset)
+        if !self.connected {
+            return false;
+        }
+        if !self.replay.is_empty() {
+            return true;
+        }
+        let available = &self.partial[self.offset..self.filled];
+        if available.len() < 4 {
+            return false;
+        }
+        match crate::framing::parse_be_u32_len(available) {
+            Ok(len) => len < crate::packet::HEADER_LEN || available.len() >= 4 + len,
+            Err(_) => true,
+        }
     }
 
     pub fn pop(&mut self) -> Result<ReadItem, ReadError> {

@@ -488,6 +488,32 @@ impl Worker {
             .map_err(ForwardError::Io)?;
         if let Some(route) = fast_route {
             socket.fast_route = Some(std::sync::Arc::clone(&route));
+            if role == Role::Source
+                && self
+                    .session_polls_reads
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                let mut reads = 0;
+                while socket.read_interest() && !self.outbound.is_full() && reads < 4 {
+                    match socket.read_encoded_chunk(&mut self.read_scratch[..]) {
+                        Ok(ReadOutcome::Data(payload)) => {
+                            let is_small = payload.len() <= 4096;
+                            self.emit_raw(TerminalPacketType::PortForwardData as u8, payload)?;
+                            reads += 1;
+                            if is_small {
+                                break;
+                            }
+                        }
+                        Ok(ReadOutcome::Idle) => break,
+                        Ok(ReadOutcome::Eof) | Err(_) => {
+                            route
+                                .direct_read_ok
+                                .store(false, std::sync::atomic::Ordering::Release);
+                            break;
+                        }
+                    }
+                }
+            }
             self.routes
                 .write()
                 .unwrap()
@@ -498,7 +524,7 @@ impl Worker {
             .session_polls_reads
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            self.flush_outbound_wake();
+            self.note_outbound_emitted();
         }
         Ok(())
     }

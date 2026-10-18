@@ -609,6 +609,8 @@ fn start_forwarder_hook(
     let session_polls_reads = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
     let worker_session_polls = session_polls_reads.clone();
+    #[cfg(unix)]
+    let fast_outbound = std::sync::Mutex::new(VecDeque::with_capacity(128));
     #[cfg(windows)]
     let routes: crate::forward_worker::FastRoutes =
         Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
@@ -697,7 +699,7 @@ fn start_forwarder_hook(
         #[cfg(unix)]
         session_polls_reads,
         #[cfg(unix)]
-        fast_outbound: std::sync::Mutex::new(VecDeque::with_capacity(128)),
+        fast_outbound,
         #[cfg(windows)]
         routes,
         shutdown,
@@ -979,7 +981,7 @@ impl Forwarder {
                 continue;
             }
             let mut reads = 0;
-            while route.read_interest() && reads < 32 && out_guard.len() < 128 {
+            while route.read_interest() && reads < 16 && out_guard.len() < 128 {
                 let limit = if route.windowed {
                     let rem = route
                         .window_bytes
@@ -1192,7 +1194,9 @@ impl Forwarder {
                         // drained by a stale drain.
                         drain_wake(&self.wake)?;
                         self.wake_signalled.store(false, Ordering::Release);
-                        if (!self.priority.is_empty() || !self.outbound.is_empty())
+                        if (!self.priority.is_empty()
+                            || !self.outbound.is_empty()
+                            || !self.fast_outbound.lock().unwrap().is_empty())
                             && !self.wake_signalled.swap(true, Ordering::AcqRel)
                         {
                             let _ = (&*self.wake_writer).write(&[1]);
@@ -1250,6 +1254,14 @@ impl Forwarder {
         }
         while self.priority.try_recv().is_ok() {
             abandoned = true;
+        }
+        #[cfg(unix)]
+        {
+            let mut fast = self.fast_outbound.lock().unwrap();
+            if !fast.is_empty() {
+                abandoned = true;
+                fast.clear();
+            }
         }
         if !self.commands.is_empty() {
             abandoned = true;

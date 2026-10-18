@@ -135,8 +135,51 @@ pub struct TerminalStream {
 }
 
 impl TerminalStream {
+    fn token_may_be_control(&self) -> bool {
+        if self.token.is_empty() {
+            return false;
+        }
+        if TMUX_DCS.starts_with(&self.token) {
+            return true;
+        }
+        let token = self.token.strip_prefix(TMUX_DCS).unwrap_or(&self.token);
+        token == b"%"
+            || (token.starts_with(b"%") && token.get(1).is_some_and(u8::is_ascii_lowercase))
+    }
+
+    pub fn may_contain_control(&self, bytes: &[u8]) -> bool {
+        if self.control || (!self.token_done && self.token_may_be_control()) {
+            return true;
+        }
+        let tail_start = bytes.len().saturating_sub(3);
+        bytes[tail_start..].contains(&b'%')
+            || bytes[tail_start..].contains(&b'\x1b')
+            || bytes
+                .windows(2)
+                .any(|w| (w[0] == b'%' && w[1].is_ascii_lowercase()) || w == b"\x1bP")
+    }
+
     pub fn observe(&mut self, bytes: &[u8]) {
         let mut i = 0;
+        if !self.control
+            && (self.token_done || !self.token_may_be_control())
+            && !bytes.contains(&b'%')
+            && !bytes.contains(&b'\x1b')
+        {
+            if let Some(last_nl) = bytes.iter().rposition(|&b| b == b'\n') {
+                self.token.clear();
+                self.token_done = false;
+                self.midline = false;
+                self.escape = false;
+                i = last_nl + 1;
+            } else if self.token_done || self.token.len() >= 32 {
+                if !bytes.is_empty() {
+                    self.midline = true;
+                    self.escape = false;
+                }
+                return;
+            }
+        }
         while i < bytes.len() {
             if !self.control && (self.token_done || self.token.len() >= 32) {
                 if let Some(rel) = bytes[i..].iter().position(|&b| b == b'\n') {

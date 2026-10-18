@@ -722,6 +722,8 @@ fn partial_writes_report_progress_before_completion_and_drain_every_byte() {
             waiting_for_capacity: false,
         }),
         wake: Condvar::new(),
+        worker_progress: std::sync::atomic::AtomicUsize::new(0),
+        stopping_fast: std::sync::atomic::AtomicBool::new(false),
     });
     let output = Arc::new(Mutex::new(Vec::new()));
     let (second_entered_tx, second_entered_rx) = mpsc::sync_channel(0);
@@ -740,11 +742,21 @@ fn partial_writes_report_progress_before_completion_and_drain_every_byte() {
 
     second_entered_rx.recv().unwrap();
     assert_eq!(*output.lock().unwrap(), b"o");
-    assert_eq!(shared.state.lock().unwrap().worker_progress, 1);
+    assert_eq!(
+        shared
+            .worker_progress
+            .load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
     release_second_tx.send(()).unwrap();
     worker.join().unwrap().unwrap();
     assert_eq!(*output.lock().unwrap(), b"ok");
-    assert_eq!(shared.state.lock().unwrap().worker_progress, 2);
+    assert_eq!(
+        shared
+            .worker_progress
+            .load(std::sync::atomic::Ordering::Acquire),
+        2
+    );
 }
 
 #[test]
@@ -794,6 +806,9 @@ fn cancellable_stdout_accepts_null_output_but_still_honors_cancellation() {
         file,
         cancel,
         discard_device: None,
+        nonblocking: false,
+        #[cfg(target_os = "linux")]
+        stdout_kind: None,
     };
     let (done_tx, done_rx) = mpsc::sync_channel(0);
     std::thread::spawn(move || {
@@ -823,6 +838,9 @@ fn cancellable_stdout_fails_when_output_is_closed() {
         file,
         cancel,
         discard_device: None,
+        nonblocking: false,
+        #[cfg(target_os = "linux")]
+        stdout_kind: None,
     };
 
     let (done_tx, done_rx) = mpsc::sync_channel(0);

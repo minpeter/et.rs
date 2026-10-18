@@ -41,6 +41,20 @@ impl Packet {
         })
     }
 
+    pub fn from_serialized_vec(mut bytes: Vec<u8>) -> Result<Self, PacketError> {
+        if bytes.len() < HEADER_LEN {
+            return Err(PacketError::Short);
+        }
+        let encrypted = bytes[0] != 0;
+        let header = bytes[1];
+        bytes.drain(..HEADER_LEN);
+        Ok(Self {
+            encrypted,
+            header,
+            payload: bytes,
+        })
+    }
+
     pub fn encrypt(
         &mut self,
         crypto: &mut CryptoHandler,
@@ -107,6 +121,66 @@ impl std::fmt::Display for PacketError {
 
 impl std::error::Error for PacketError {}
 
+/// Zero-copy slice decoder for canonical `TerminalBuffer` payloads
+/// (`tag 0x0a` length-delimited `buffer` + optional `tag 0x10` `is_stderr`).
+/// Returns `None` if unknown/repeated fields or non-canonical wire tags appear,
+/// allowing the caller to fall back to `prost::Message::decode`.
+pub fn decode_terminal_buffer(payload: &[u8]) -> Option<(&[u8], bool)> {
+    if payload.is_empty() {
+        return None;
+    }
+    if payload[0] != 0x0a {
+        return None;
+    }
+    let mut len: usize = 0;
+    let mut shift = 0u32;
+    let mut idx = 1;
+    loop {
+        let b = *payload.get(idx)?;
+        idx += 1;
+        len |= usize::from(b & 0x7f).checked_shl(shift)?;
+        if b & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+        if shift >= 35 {
+            return None;
+        }
+    }
+    let end = idx.checked_add(len)?;
+    let buf = payload.get(idx..end)?;
+    match &payload[end..] {
+        [] => Some((buf, false)),
+        [0x10, 0] => Some((buf, false)),
+        [0x10, 1] => Some((buf, true)),
+        _ => None,
+    }
+}
+
+/// Encode a `TerminalBuffer` protobuf payload directly from a byte slice
+/// without allocating an intermediate `Vec<u8>` for `TerminalBuffer.buffer`.
+pub fn encode_terminal_buffer(bytes: &[u8], is_stderr: bool) -> Vec<u8> {
+    let mut len_varint = [0u8; 10];
+    let mut v = bytes.len();
+    let mut v_len = 0;
+    while v >= 0x80 {
+        len_varint[v_len] = (v as u8) | 0x80;
+        v >>= 7;
+        v_len += 1;
+    }
+    len_varint[v_len] = v as u8;
+    v_len += 1;
+    let stderr_len = if is_stderr { 2 } else { 0 };
+    let mut out = Vec::with_capacity(1 + v_len + bytes.len() + stderr_len);
+    out.push(0x0a);
+    out.extend_from_slice(&len_varint[..v_len]);
+    out.extend_from_slice(bytes);
+    if is_stderr {
+        out.push(0x10);
+        out.push(0x01);
+    }
+    out
+}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -78,6 +78,8 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     wake: Condvar,
+    worker_progress: std::sync::atomic::AtomicUsize,
+    stopping_fast: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -103,7 +105,31 @@ impl ConsoleOutput {
     pub(crate) fn stdout(mode: FlowControlMode) -> io::Result<Self> {
         #[cfg(unix)]
         {
-            let file = File::from(rustix::io::dup(io::stdout().lock().as_fd())?);
+            #[cfg(target_os = "linux")]
+            let (file, nonblocking) = {
+                use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+                use std::os::unix::io::AsRawFd;
+                let dup_file = File::from(rustix::io::dup(io::stdout().lock().as_fd())?);
+                let is_fifo = dup_file.metadata().is_ok_and(|m| m.file_type().is_fifo());
+                if is_fifo {
+                    let raw = io::stdout().lock().as_raw_fd();
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+                        .open(format!("/proc/self/fd/{raw}"))
+                    {
+                        Ok(file) => (file, true),
+                        Err(_) => (dup_file, false),
+                    }
+                } else {
+                    (dup_file, false)
+                }
+            };
+            #[cfg(not(target_os = "linux"))]
+            let (file, nonblocking) = (
+                File::from(rustix::io::dup(io::stdout().lock().as_fd())?),
+                false,
+            );
             let (cancel_reader, mut cancel_writer) = et_net::local::wake_pair()?;
             let cancel = Box::new(move || {
                 let _ = cancel_writer.write_all(&[1]);
@@ -114,6 +140,9 @@ impl ConsoleOutput {
                     file,
                     cancel: cancel_reader,
                     discard_device: None,
+                    nonblocking,
+                    #[cfg(target_os = "linux")]
+                    stdout_kind: None,
                 }),
                 cancel,
                 Box::new(|| Ok(())),
@@ -206,6 +235,8 @@ impl ConsoleOutput {
                 waiting_for_capacity: false,
             }),
             wake: Condvar::new(),
+            worker_progress: std::sync::atomic::AtomicUsize::new(0),
+            stopping_fast: std::sync::atomic::AtomicBool::new(false),
         });
         let mut writer = writer(&shared);
         let worker_shared = Arc::clone(&shared);
@@ -384,6 +415,9 @@ impl ConsoleOutput {
                 .lock()
                 .map_err(|_| io::Error::other("console output worker unavailable"))?;
             state.stopping = true;
+            shared
+                .stopping_fast
+                .store(true, std::sync::atomic::Ordering::Release);
             shared.wake.notify_all();
         }
         let stalled = already_stalled || wait_for_graceful_drain(&shared)?;
@@ -435,11 +469,9 @@ impl ConsoleOutput {
         let Some(shared) = &self.shared else {
             return Ok(0);
         };
-        let state = shared
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("console output worker unavailable"))?;
-        Ok(state.worker_progress)
+        Ok(shared
+            .worker_progress
+            .load(std::sync::atomic::Ordering::Acquire))
     }
 
     #[cfg(unix)]
@@ -469,6 +501,9 @@ impl Drop for ConsoleOutput {
         if let Some(shared) = &shared {
             if let Ok(mut state) = shared.state.lock() {
                 state.stopping = true;
+                shared
+                    .stopping_fast
+                    .store(true, std::sync::atomic::Ordering::Release);
                 shared.wake.notify_all();
             }
         }
@@ -567,6 +602,14 @@ fn run_writer(
                 signal_capacity(capacity_signal);
             }
         });
+        #[cfg(unix)]
+        if shared
+            .state
+            .lock()
+            .is_ok_and(|mut state| std::mem::replace(&mut state.waiting_for_capacity, false))
+        {
+            signal_capacity(capacity_signal);
+        }
         if let Err(error) = result {
             if let Ok(mut state) = shared.state.lock() {
                 state.error = Some(error);
@@ -601,23 +644,35 @@ fn write_all_with_progress(
 }
 
 fn report_worker_progress(shared: &Shared) -> io::Result<()> {
-    let mut state = shared
-        .state
-        .lock()
-        .map_err(|_| io::Error::other("console output worker unavailable"))?;
-    state.worker_progress = state.worker_progress.wrapping_add(1);
-    if state.stopping {
+    let next = shared
+        .worker_progress
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+        .wrapping_add(1);
+    if shared
+        .stopping_fast
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        let mut state = shared
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("console output worker unavailable"))?;
+        state.worker_progress = next;
         shared.wake.notify_all();
     }
     Ok(())
 }
 
 fn wait_for_graceful_drain(shared: &Shared) -> io::Result<bool> {
+    shared
+        .stopping_fast
+        .store(true, std::sync::atomic::Ordering::Release);
     let mut state = shared
         .state
         .lock()
         .map_err(|_| io::Error::other("console output worker unavailable"))?;
-    let mut progress = state.worker_progress;
+    let mut progress = shared
+        .worker_progress
+        .load(std::sync::atomic::Ordering::Acquire);
     let mut deadline = Instant::now() + GRACEFUL_DRAIN_STALL_TIMEOUT;
     while !state.worker_done {
         let now = Instant::now();
@@ -629,8 +684,11 @@ fn wait_for_graceful_drain(shared: &Shared) -> io::Result<bool> {
             .wait_timeout(state, deadline.saturating_duration_since(now))
             .map_err(|_| io::Error::other("console output worker unavailable"))?;
         state = next;
-        if state.worker_progress != progress {
-            progress = state.worker_progress;
+        let cur_progress = shared
+            .worker_progress
+            .load(std::sync::atomic::Ordering::Acquire);
+        if cur_progress != progress {
+            progress = cur_progress;
             deadline = Instant::now() + GRACEFUL_DRAIN_STALL_TIMEOUT;
         } else if timeout.timed_out() {
             return Ok(true);
@@ -782,18 +840,34 @@ fn drain_stream(stream: &mut LocalStream) -> io::Result<()> {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum StdoutKind {
+    Regular,
+    Other,
+}
+
 #[cfg(unix)]
 struct CancellableStdout {
     file: File,
     cancel: LocalStream,
     discard_device: Option<bool>,
+    nonblocking: bool,
+    #[cfg(target_os = "linux")]
+    stdout_kind: Option<StdoutKind>,
 }
-
 #[cfg(unix)]
 impl Write for CancellableStdout {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         use rustix::event::{poll, PollFd, PollFlags};
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        if self.nonblocking {
+            match rustix::io::write(&self.file, bytes) {
+                Ok(count) => return Ok(count),
+                Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => {}
+                Err(error) => return Err(io::Error::from(error)),
+            }
+        }
         let mut descriptors = [
             PollFd::new(&self.file, PollFlags::OUT),
             PollFd::new(&self.cancel, PollFlags::IN | PollFlags::HUP),
@@ -841,7 +915,31 @@ impl Write for CancellableStdout {
                     ));
                 }
                 Ok(_) if descriptors[0].revents().contains(PollFlags::OUT) => {
-                    return rustix::io::write(&self.file, &bytes[..bytes.len().min(4096)])
+                    if self.nonblocking {
+                        match rustix::io::write(&self.file, bytes) {
+                            Ok(count) => return Ok(count),
+                            Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => continue,
+                            Err(error) => return Err(io::Error::from(error)),
+                        }
+                    }
+                    let mut max_chunk = 4096usize;
+                    #[cfg(target_os = "linux")]
+                    if bytes.len() > 4096 {
+                        let kind = *self.stdout_kind.get_or_insert_with(|| {
+                            let Ok(meta) = self.file.metadata() else {
+                                return StdoutKind::Other;
+                            };
+                            if meta.file_type().is_file() {
+                                StdoutKind::Regular
+                            } else {
+                                StdoutKind::Other
+                            }
+                        });
+                        if matches!(kind, StdoutKind::Regular) {
+                            max_chunk = 65536;
+                        }
+                    }
+                    return rustix::io::write(&self.file, &bytes[..bytes.len().min(max_chunk)])
                         .map_err(io::Error::from);
                 }
                 Ok(_) => {}

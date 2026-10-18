@@ -1,21 +1,19 @@
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use et_core::packet::Packet;
-use et_core::proto::{FlowControlMode, TerminalBuffer, TerminalPacketType};
+use et_core::proto::FlowControlMode;
 use et_net::local::LocalStream;
-use et_net::local_packet::{write_local_packet_until_cancelled, LocalPacketDecoder};
+use et_net::local_packet::LocalPacketDecoder;
 #[cfg(unix)]
 use nix::sys::signal::{kill, Signal};
 #[cfg(unix)]
 use nix::unistd::Pid;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use prost::Message;
 #[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags};
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -23,7 +21,7 @@ use sysinfo::{
     Pid as SystemPid, ProcessRefreshKind, ProcessesToUpdate, Signal as SystemSignal, System,
 };
 
-const MAX_OUTPUT_CHUNK: usize = 16 * 1024;
+const MAX_OUTPUT_CHUNK: usize = 32 * 1024;
 const FINAL_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[path = "terminal_tmux_filter.rs"]
@@ -175,6 +173,9 @@ where
     let worker_writer = router_writer.clone();
     let worker_gate = output_gate.clone();
     let worker_cancelled = cancelled.clone();
+    let output_progress = Arc::new(AtomicUsize::new(0));
+    let worker_progress = output_progress.clone();
+    let can_resume = resume.is_some();
     let output_worker = match thread::Builder::new()
         .name("et-pty-output".to_owned())
         .spawn(move || {
@@ -186,7 +187,14 @@ where
                 let prefix = motd.as_deref();
                 #[cfg(not(unix))]
                 let prefix = None;
-                forward_output(&mut pty_reader, &worker_writer, &worker_cancelled, prefix)
+                forward_output_with_progress(
+                    &mut pty_reader,
+                    &worker_writer,
+                    &worker_cancelled,
+                    prefix,
+                    Some(&worker_progress),
+                    can_resume,
+                )
             });
             let _ = output_tx.send(WorkerEvent::Output(result));
             signal(output_wake);
@@ -269,8 +277,15 @@ where
             &events_rx,
             resume.as_ref(),
             &router_writer,
+            &output_progress,
         )
     });
+    let graceful_drain = result.as_ref().is_ok_and(|completion| completion.drained);
+    kill_process_group(child_pid);
+    // Preserve normal output through PTY EOF. If the bounded fallback elapsed,
+    // cancel the output worker before writing exit status so it releases
+    // router_writer instead of blocking forever on a full socket buffer.
+    cancelled.store(!graceful_drain, Ordering::Release);
     if let Ok(completion) = result.as_ref() {
         if completion.reaped {
             if let Ok(mut writer) = router_writer.lock() {
@@ -283,11 +298,6 @@ where
             }
         }
     }
-    let graceful_drain = result.as_ref().is_ok_and(|completion| completion.drained);
-    kill_process_group(child_pid);
-    // Preserve normal output through PTY EOF. If the bounded fallback elapsed,
-    // cancel and close the writer even though the shell itself exited normally.
-    cancelled.store(!graceful_drain, Ordering::Release);
     let (ready, changed) = &*output_gate;
     if let Ok(mut ready) = ready.lock() {
         *ready = true;
@@ -365,15 +375,27 @@ fn wait_for_output_gate(
     }
 }
 
+#[cfg(test)]
 fn forward_output(
     reader: &mut dyn Read,
     router: &Mutex<LocalStream>,
     cancelled: &AtomicBool,
     prefix: Option<&[u8]>,
 ) -> Result<(), String> {
+    forward_output_with_progress(reader, router, cancelled, prefix, None, false)
+}
+
+fn forward_output_with_progress(
+    reader: &mut dyn Read,
+    router: &Mutex<LocalStream>,
+    cancelled: &AtomicBool,
+    prefix: Option<&[u8]>,
+    progress: Option<&AtomicUsize>,
+    can_resume: bool,
+) -> Result<(), String> {
     if let Some(prefix) = prefix {
         for chunk in prefix.chunks(MAX_OUTPUT_CHUNK) {
-            write_output(router, cancelled, chunk)?;
+            write_output(router, cancelled, chunk, progress, can_resume)?;
         }
     }
     let mut buffer = [0u8; MAX_OUTPUT_CHUNK];
@@ -385,9 +407,15 @@ fn forward_output(
             .map_err(|error| format!("could not read PTY output: {error}"))?;
         if count == 0 {
             if let Some(startup) = startup {
-                write_output(router, cancelled, &filter.apply(&startup))?;
+                write_output(
+                    router,
+                    cancelled,
+                    &filter.apply(&startup),
+                    progress,
+                    can_resume,
+                )?;
             }
-            write_output(router, cancelled, &filter.finish())?;
+            write_output(router, cancelled, &filter.finish(), progress, can_resume)?;
             return Ok(());
         }
         if let Some(mut pending) = startup.take() {
@@ -412,12 +440,30 @@ fn forward_output(
                     continue;
                 }
             } else {
-                write_output(router, cancelled, &filter.apply(&pending))?;
+                write_output(
+                    router,
+                    cancelled,
+                    &filter.apply_slice(&pending),
+                    progress,
+                    can_resume,
+                )?;
             }
-            write_output(router, cancelled, &filter.apply(&buffer[consumed..count]))?;
+            write_output(
+                router,
+                cancelled,
+                &filter.apply_slice(&buffer[consumed..count]),
+                progress,
+                can_resume,
+            )?;
             continue;
         }
-        write_output(router, cancelled, &filter.apply(&buffer[..count]))?;
+        write_output(
+            router,
+            cancelled,
+            &filter.apply_slice(&buffer[..count]),
+            progress,
+            can_resume,
+        )?;
     }
 }
 
@@ -425,23 +471,38 @@ fn write_output(
     router: &Mutex<LocalStream>,
     cancelled: &AtomicBool,
     output: &[u8],
+    progress: Option<&AtomicUsize>,
+    can_resume: bool,
 ) -> Result<(), String> {
-    let mut router = router
-        .lock()
-        .map_err(|_| "terminal router writer is unavailable".to_owned())?;
     // A filtered protocol line can span several reads. Keep local packets
     // bounded even when releasing a previously incomplete line.
     for chunk in output.chunks(MAX_OUTPUT_CHUNK) {
-        let message = TerminalBuffer {
-            buffer: Some(chunk.to_vec()),
-            is_stderr: None,
-        };
-        let packet = Packet::new(
-            TerminalPacketType::TerminalBuffer as u8,
-            message.encode_to_vec(),
-        );
-        write_local_packet_until_cancelled(&mut *router, &packet, cancelled)
-            .map_err(|error| format!("could not forward PTY output: {error}"))?;
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let mut guard = router
+                .lock()
+                .map_err(|_| "terminal router writer is unavailable".to_owned())?;
+            match et_net::local_packet::write_local_terminal_buffer_until_cancelled(
+                &mut guard, chunk, false, cancelled, progress,
+            ) {
+                Ok(()) => break,
+                Err(error)
+                    if can_resume
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::BrokenPipe
+                                | io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::NotConnected
+                        ) =>
+                {
+                    drop(guard);
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(format!("could not forward PTY output: {error}")),
+            }
+        }
     }
     Ok(())
 }
@@ -459,6 +520,8 @@ struct CompletionState {
     child_status: Option<u32>,
     output_done: bool,
     drain_deadline: Option<Instant>,
+    max_drain_deadline: Option<Instant>,
+    last_progress: usize,
 }
 
 impl CompletionState {
@@ -467,7 +530,9 @@ impl CompletionState {
             WorkerEvent::Output(Err(error)) | WorkerEvent::Child(Err(error)) => Err(error),
             WorkerEvent::Child(Ok(status)) => {
                 self.child_status = Some(status);
-                self.drain_deadline = Some(Instant::now() + FINAL_OUTPUT_DRAIN_TIMEOUT);
+                let now = Instant::now();
+                self.drain_deadline = Some(now + FINAL_OUTPUT_DRAIN_TIMEOUT);
+                self.max_drain_deadline = Some(now + Duration::from_secs(30));
                 Ok(self.output_done.then_some(PumpCompletion {
                     status,
                     drained: true,
@@ -485,20 +550,37 @@ impl CompletionState {
         }
     }
 
-    fn expired_status(&self) -> Option<PumpCompletion> {
-        self.child_status
-            .filter(|_| {
-                self.drain_deadline
-                    .is_some_and(|deadline| Instant::now() >= deadline)
-            })
-            .map(|status| PumpCompletion {
+    fn expired_status(&mut self, progress: &AtomicUsize) -> Option<PumpCompletion> {
+        let status = self.child_status?;
+        let deadline = self.drain_deadline?;
+        let max_deadline = self.max_drain_deadline.unwrap_or(deadline);
+        let now = Instant::now();
+        if now >= max_deadline {
+            return Some(PumpCompletion {
+                status,
+                drained: false,
+                reaped: true,
+            });
+        }
+        let cur_progress = progress.load(Ordering::Acquire);
+        if cur_progress != self.last_progress {
+            self.last_progress = cur_progress;
+            self.drain_deadline = Some((now + FINAL_OUTPUT_DRAIN_TIMEOUT).min(max_deadline));
+            return None;
+        }
+        if now >= deadline {
+            Some(PumpCompletion {
                 status,
                 drained: false,
                 reaped: true,
             })
+        } else {
+            None
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pump(
     router: &mut LocalStream,
     wake_reader: LocalStream,
@@ -507,6 +589,7 @@ fn pump(
     events: &mpsc::Receiver<WorkerEvent>,
     resume: Option<&RouterResume>,
     router_writer: &Arc<Mutex<LocalStream>>,
+    progress: &AtomicUsize,
 ) -> Result<PumpCompletion, String> {
     #[cfg(unix)]
     return pump_poll(
@@ -517,6 +600,7 @@ fn pump(
         events,
         resume,
         router_writer,
+        progress,
     );
     #[cfg(windows)]
     return pump_windows(
@@ -527,10 +611,12 @@ fn pump(
         events,
         resume,
         router_writer,
+        progress,
     );
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn pump_poll(
     router: &mut LocalStream,
     mut wake_reader: LocalStream,
@@ -539,9 +625,13 @@ fn pump_poll(
     events: &mpsc::Receiver<WorkerEvent>,
     resume: Option<&RouterResume>,
     router_writer: &Arc<Mutex<LocalStream>>,
+    progress: &AtomicUsize,
 ) -> Result<PumpCompletion, String> {
     let mut decoder = LocalPacketDecoder::new();
-    let mut completion = CompletionState::default();
+    let mut completion = CompletionState {
+        last_progress: progress.load(Ordering::Acquire),
+        ..CompletionState::default()
+    };
     loop {
         let (router_events, wake_events) = {
             let mut descriptors = [
@@ -567,17 +657,6 @@ fn pump_poll(
             }
             (descriptors[0].revents(), descriptors[1].revents())
         };
-        if wake_events.intersects(PollFlags::IN | PollFlags::HUP) {
-            while let Ok(event) = events.try_recv() {
-                if let Some(status) = completion.observe(event)? {
-                    return Ok(status);
-                }
-            }
-            drain_wakeup(&mut wake_reader)?;
-        }
-        if let Some(status) = completion.expired_status() {
-            return Ok(status);
-        }
         if router_events.intersects(PollFlags::HUP | PollFlags::ERR) {
             if let Some(resume) = resume {
                 *router = reconnect_router(resume, router_writer)?;
@@ -586,8 +665,20 @@ fn pump_poll(
             }
             return Err("terminal router disconnected".to_owned());
         }
+        if wake_events.intersects(PollFlags::IN | PollFlags::HUP) {
+            while let Ok(event) = events.try_recv() {
+                if let Some(status) = completion.observe(event)? {
+                    return Ok(status);
+                }
+                completion.last_progress = progress.load(Ordering::Acquire);
+            }
+            drain_wakeup(&mut wake_reader)?;
+        }
+        if let Some(status) = completion.expired_status(progress) {
+            return Ok(status);
+        }
         if router_events.contains(PollFlags::IN) {
-            if let Some(packet) = read_ready_packet(router, &mut decoder)? {
+            while let Some(packet) = read_ready_packet(router, &mut decoder)? {
                 match handle_packet(packet, master, pty_writer) {
                     Ok(LocalPacketEffect::Close) => return Ok(terminal_close_completion()),
                     Ok(LocalPacketEffect::Continue) => {}
@@ -612,25 +703,30 @@ fn pump_windows(
     events: &mpsc::Receiver<WorkerEvent>,
     resume: Option<&RouterResume>,
     router_writer: &Arc<Mutex<LocalStream>>,
+    progress: &AtomicUsize,
 ) -> Result<PumpCompletion, String> {
     const IDLE: std::time::Duration = std::time::Duration::from_millis(10);
     let mut decoder = LocalPacketDecoder::new();
-    let mut completion = CompletionState::default();
+    let mut completion = CompletionState {
+        last_progress: progress.load(Ordering::Acquire),
+        ..CompletionState::default()
+    };
     loop {
-        let mut progress = false;
+        let mut progressed = false;
         while let Ok(event) = events.try_recv() {
-            progress = true;
+            progressed = true;
             if let Some(status) = completion.observe(event)? {
                 return Ok(status);
             }
+            completion.last_progress = progress.load(Ordering::Acquire);
         }
-        if let Some(status) = completion.expired_status() {
+        if let Some(status) = completion.expired_status(progress) {
             return Ok(status);
         }
         drain_wakeup(&mut wake_reader)?;
         match read_ready_packet(router, &mut decoder) {
             Ok(Some(packet)) => {
-                progress = true;
+                progressed = true;
                 match handle_packet(packet, master, pty_writer) {
                     Ok(LocalPacketEffect::Close) => return Ok(terminal_close_completion()),
                     Ok(LocalPacketEffect::Continue) => {}
@@ -650,7 +746,7 @@ fn pump_windows(
             }
             Err(error) => return Err(error),
         }
-        if !progress {
+        if !progressed {
             std::thread::sleep(IDLE);
         }
     }
@@ -902,7 +998,8 @@ fn kill_process_group(process_id: Option<u32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use et_core::proto::TermInit;
+    use et_core::packet::Packet;
+    use et_core::proto::{TermInit, TerminalBuffer, TerminalPacketType};
     use et_net::local_packet::{
         read_local_packet, status_packet, write_local_packet, STARTUP_STATUS,
     };

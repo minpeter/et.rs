@@ -207,7 +207,10 @@ impl BackedWriter {
         }
         let unacknowledged = usize::try_from(self.sequence - acknowledged).unwrap_or(usize::MAX);
         let keep = unacknowledged.saturating_add(ACK_RETAIN_SLACK_PACKETS);
-        while self.backup.len() > keep {
+        while self.backup.len() > keep
+            || (self.backup.len() > unacknowledged.saturating_add(4)
+                && self.backup_size > 256 * 1024)
+        {
             if let Some(old) = self.backup.pop_back() {
                 self.backup_size -= (old.len() - 4) as i64;
             }

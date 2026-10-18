@@ -8,7 +8,7 @@ use et_core::packet::Packet;
 use et_core::proto::{TerminalInfo, TerminalPacketType};
 use et_net::connection::ConnError;
 use et_net::forward::{is_forward_packet, Forwarder};
-use et_net::local_packet::{encode_local_packet, LocalPacketDecoder};
+use et_net::local_packet::{LocalPacketDecoder, MAX_LOCAL_PACKET_LEN};
 use prost::Message;
 #[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags};
@@ -21,23 +21,50 @@ const READ_BUFFER: usize = 16 * 1024;
 const CLIENT_READ_BATCH: usize = 128;
 const FORWARD_BACKLOG_CAPACITY: usize = 513;
 
+const LOCAL_HEADER_LEN: usize = std::mem::size_of::<i64>() + 2;
+
 struct PendingLocalFrame {
-    bytes: Vec<u8>,
+    header: [u8; LOCAL_HEADER_LEN],
+    payload: Vec<u8>,
     offset: usize,
 }
 
 impl PendingLocalFrame {
-    fn new(packet: &Packet) -> io::Result<Self> {
+    fn from_packet(packet: Packet) -> io::Result<Self> {
+        let wire_len = packet.wire_len();
+        if wire_len > MAX_LOCAL_PACKET_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "local packet exceeds 64 KiB",
+            ));
+        }
+        let length = i64::try_from(wire_len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "local packet too large"))?;
+        let mut header = [0u8; LOCAL_HEADER_LEN];
+        header[..8].copy_from_slice(&length.to_ne_bytes());
+        header[8] = packet.is_encrypted() as u8;
+        header[9] = packet.header();
         Ok(Self {
-            bytes: encode_local_packet(packet)?,
+            header,
+            payload: packet.into_payload(),
             offset: 0,
         })
     }
 
     /// Write as much as the non-blocking local stream currently accepts.
     fn try_write<W: Write>(&mut self, terminal: &mut W) -> io::Result<bool> {
-        while self.offset < self.bytes.len() {
-            match terminal.write(&self.bytes[self.offset..]) {
+        let total = LOCAL_HEADER_LEN + self.payload.len();
+        while self.offset < total {
+            let res = if self.offset < LOCAL_HEADER_LEN {
+                let slices = [
+                    io::IoSlice::new(&self.header[self.offset..]),
+                    io::IoSlice::new(&self.payload),
+                ];
+                terminal.write_vectored(&slices)
+            } else {
+                terminal.write(&self.payload[self.offset - LOCAL_HEADER_LEN..])
+            };
+            match res {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(count) => self.offset += count,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -110,6 +137,7 @@ fn run_mode_poll(
     // A complete terminal packet already read from the local stream. Retain
     // ownership across backpressure instead of dropping it or reading ahead.
     let mut pending_terminal: Option<Packet> = None;
+    let mut lookahead_terminal: Option<Packet> = None;
     // A partially written client packet. Its frame and offset must survive
     // local-stream backpressure, and ordered client reads pause behind it.
     let mut pending_local: Option<PendingLocalFrame> = None;
@@ -166,7 +194,9 @@ fn run_mode_poll(
         }
         let polled_generation = cached_client.as_ref().map(|(_, gen)| *gen);
         let terminal_flags = terminal_poll_flags(
-            pending_terminal.is_none() && session.can_buffer_write((READ_BUFFER * 2) as i64)?,
+            pending_terminal.is_none()
+                && lookahead_terminal.is_none()
+                && session.can_buffer_write((READ_BUFFER * 2) as i64)?,
             pending_local.is_some(),
         );
         // When the client is down, poll with a short timeout so recovery wakes
@@ -188,7 +218,10 @@ fn run_mode_poll(
                     || pending_forward.len() >= FORWARD_BACKLOG_CAPACITY
                     || !connected,
                 !pending_forward.is_empty() || !connected,
-                client_buffered,
+                client_buffered
+                    || (pending_terminal.is_none()
+                        && lookahead_terminal.is_some()
+                        && session.can_buffer_write((READ_BUFFER * 2) as i64)?),
             ),
             pending_outbound.is_empty().then_some(&fast_poll),
         )?;
@@ -226,45 +259,109 @@ fn run_mode_poll(
             }
         }
         if pending_terminal.is_none()
-            && !terminal_eof
-            && (terminal_closing
+            && (!terminal_eof || lookahead_terminal.is_some())
+            && ((lookahead_terminal.is_some()
+                && session.can_buffer_write((READ_BUFFER * 2) as i64)?)
+                || terminal_closing
                 || terminal_events.contains(PollFlags::IN)
                 || (client_events_are_stale
                     && session.can_buffer_write((READ_BUFFER * 2) as i64)?))
         {
             for _ in 0..32 {
-                match read_terminal_packet(&mut terminal, &mut decoder) {
-                    Ok(Some(packet)) => {
-                        let Some(packet) = accept_terminal_packet(&session, mode, packet)? else {
+                let next = match lookahead_terminal.take() {
+                    Some(packet) => Ok(Some(packet)),
+                    None => match read_terminal_packet(&mut terminal, &mut decoder) {
+                        Ok(Some(packet)) => {
                             decoder = LocalPacketDecoder::new();
-                            continue;
-                        };
-                        decoder = LocalPacketDecoder::new();
-                        pending_terminal = send_or_hold(
-                            &session,
-                            packet,
-                            &mut connected,
-                            &mut connection_generation,
-                        )?;
-                        if pending_terminal.is_some()
-                            || !session.can_buffer_write((READ_BUFFER * 2) as i64)?
+                            accept_terminal_packet(&session, mode, packet)
+                        }
+                        Ok(None) => break,
+                        Err(SessionError::Io(error))
+                            if (terminal_closing || decoder.is_empty())
+                                && error.kind() == io::ErrorKind::UnexpectedEof =>
                         {
+                            terminal_eof = true;
                             break;
                         }
-                    }
-                    Ok(None) => break,
-                    Err(SessionError::Io(error))
-                        if terminal_closing && error.kind() == io::ErrorKind::UnexpectedEof =>
+                        Err(error) => return Err(error),
+                    },
+                };
+                let Some(mut packet) = next? else {
+                    continue;
+                };
+                if mode == BridgeMode::Terminal
+                    && packet.header() == TerminalPacketType::TerminalBuffer as u8
+                {
+                    if let Some((first_bytes, false)) =
+                        et_core::packet::decode_terminal_buffer(packet.payload())
                     {
-                        terminal_eof = true;
-                        break;
+                        if (2048..=8 * 1024).contains(&first_bytes.len()) {
+                            let mut coalesced: Option<Vec<u8>> = None;
+                            while coalesced.as_ref().map_or(first_bytes.len(), Vec::len) < 16 * 1024
+                            {
+                                match read_terminal_packet(&mut terminal, &mut decoder) {
+                                    Ok(Some(raw)) => {
+                                        decoder = LocalPacketDecoder::new();
+                                        let Some(accepted) =
+                                            accept_terminal_packet(&session, mode, raw)?
+                                        else {
+                                            continue;
+                                        };
+                                        let cur_len =
+                                            coalesced.as_ref().map_or(first_bytes.len(), Vec::len);
+                                        if accepted.header()
+                                            == TerminalPacketType::TerminalBuffer as u8
+                                        {
+                                            if let Some((more, false)) =
+                                                et_core::packet::decode_terminal_buffer(
+                                                    accepted.payload(),
+                                                )
+                                            {
+                                                if cur_len + more.len() <= 16 * 1024 {
+                                                    let buf = coalesced.get_or_insert_with(|| {
+                                                        let mut v = Vec::with_capacity(16 * 1024);
+                                                        v.extend_from_slice(first_bytes);
+                                                        v
+                                                    });
+                                                    buf.extend_from_slice(more);
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        lookahead_terminal = Some(accepted);
+                                        break;
+                                    }
+                                    Ok(None) => break,
+                                    Err(SessionError::Io(error))
+                                        if (terminal_closing || decoder.is_empty())
+                                            && error.kind() == io::ErrorKind::UnexpectedEof =>
+                                    {
+                                        terminal_eof = true;
+                                        break;
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            if let Some(buf) = coalesced {
+                                packet = Packet::new(
+                                    TerminalPacketType::TerminalBuffer as u8,
+                                    et_core::packet::encode_terminal_buffer(&buf, false),
+                                );
+                            }
+                        }
                     }
-                    Err(error) => return Err(error),
+                }
+                pending_terminal =
+                    send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
+                if pending_terminal.is_some()
+                    || !session.can_buffer_write((READ_BUFFER * 2) as i64)?
+                {
+                    break;
                 }
             }
             session.flush_bridge_outbound();
         }
-        if terminal_eof && pending_terminal.is_none() {
+        if terminal_eof && pending_terminal.is_none() && lookahead_terminal.is_none() {
             finish_killed_session(&session);
             return Ok(());
         }
@@ -289,14 +386,26 @@ fn run_mode_poll(
                     // terminal, which owns the destination connection.
                     Ok(Some(packet)) if mode == BridgeMode::Jumphost => {
                         let packet = jumphost_client_packet(&session, packet)?;
-                        pending_local =
-                            Some(PendingLocalFrame::new(&packet).map_err(SessionError::Io)?);
+                        let mut frame =
+                            PendingLocalFrame::from_packet(packet).map_err(SessionError::Io)?;
+                        match frame.try_write(&mut terminal) {
+                            Ok(true) => {}
+                            Ok(false) => pending_local = Some(frame),
+                            Err(error) if terminal_input_gone(&error) => {
+                                terminal_input_closed = true;
+                            }
+                            Err(error) => return Err(SessionError::Io(error)),
+                        }
                         true
                     }
                     Ok(Some(packet)) if is_forward_packet(packet.header()) => {
                         pending_forward.push_back(packet);
-                        if pending_forward.len() >= 16 {
+                        if pending_forward.len() >= 4 {
                             flush_forwarding(&forwarder, &mut pending_forward)?;
+                            if pending_outbound.is_empty() && forwarder.has_fast_outbound() {
+                                client_buffered = true;
+                                break;
+                            }
                         }
                         true
                     }
@@ -322,10 +431,16 @@ fn run_mode_poll(
                                     if terminal_input_closed {
                                         continue;
                                     }
-                                    pending_local = Some(
-                                        PendingLocalFrame::new(&packet)
-                                            .map_err(SessionError::Io)?,
-                                    );
+                                    let mut frame = PendingLocalFrame::from_packet(packet)
+                                        .map_err(SessionError::Io)?;
+                                    match frame.try_write(&mut terminal) {
+                                        Ok(true) => {}
+                                        Ok(false) => pending_local = Some(frame),
+                                        Err(error) if terminal_input_gone(&error) => {
+                                            terminal_input_closed = true;
+                                        }
+                                        Err(error) => return Err(SessionError::Io(error)),
+                                    }
                                 }
                                 ClientForward::KeepAlive(control) => {
                                     enqueue_outbound(
@@ -377,11 +492,14 @@ fn run_mode_poll(
                     client_buffered = true;
                     break;
                 }
-                if index + 1 == CLIENT_READ_BATCH || session.has_buffered_read() {
-                    // `try_read_packet` can leave complete packets in its
-                    // userspace decoder after the kernel socket is drained.
+                if index + 1 == CLIENT_READ_BATCH {
                     client_buffered = true;
                 }
+            }
+            if !client_buffered && session.has_buffered_read() {
+                // `try_read_packet` can leave complete packets in its
+                // userspace decoder after the kernel socket is drained.
+                client_buffered = true;
             }
         }
         flush_forwarding(&forwarder, &mut pending_forward)?;
@@ -539,8 +657,9 @@ fn run_mode_windows(
                         progress = true;
                         if mode == BridgeMode::Jumphost {
                             let packet = jumphost_client_packet(&session, packet)?;
-                            pending_local =
-                                Some(PendingLocalFrame::new(&packet).map_err(SessionError::Io)?);
+                            pending_local = Some(
+                                PendingLocalFrame::from_packet(packet).map_err(SessionError::Io)?,
+                            );
                         } else if is_forward_packet(packet.header()) {
                             enqueue_forwarding(&forwarder, &mut pending_forward, packet)?;
                         } else {
@@ -568,7 +687,7 @@ fn run_mode_windows(
                                         continue;
                                     }
                                     pending_local = Some(
-                                        PendingLocalFrame::new(&packet)
+                                        PendingLocalFrame::from_packet(packet)
                                             .map_err(SessionError::Io)?,
                                     );
                                 }
@@ -924,25 +1043,13 @@ fn read_terminal_packet(
     terminal: &mut LocalStream,
     decoder: &mut LocalPacketDecoder,
 ) -> Result<Option<Packet>, SessionError> {
-    let mut buffer = [0u8; READ_BUFFER];
-    loop {
-        let wanted = decoder.required_bytes().min(buffer.len());
-        match terminal.read(&mut buffer[..wanted]) {
-            Ok(0) => return Err(SessionError::Io(io::ErrorKind::UnexpectedEof.into())),
-            Ok(count) => match decoder.feed(&buffer[..count]) {
-                Ok(Some(packet)) => return Ok(Some(packet)),
-                Ok(None) => {}
-                Err(error) => {
-                    return Err(SessionError::Io(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        error,
-                    )));
-                }
-            },
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(SessionError::Io(error)),
-        }
+    match decoder.read_from(terminal) {
+        Ok(packet) => Ok(packet),
+        Err(et_net::local_packet::LocalPacketError::Io(error)) => Err(SessionError::Io(error)),
+        Err(error) => Err(SessionError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            error,
+        ))),
     }
 }
 
@@ -1138,7 +1245,7 @@ fn write_local_terminal_close(
     pending_local: &mut Option<PendingLocalFrame>,
 ) -> Result<LocalClose, SessionError> {
     let packet = Packet::new(TerminalPacketType::TerminalClose as u8, Vec::new());
-    let mut frame = PendingLocalFrame::new(&packet).map_err(SessionError::Io)?;
+    let mut frame = PendingLocalFrame::from_packet(packet).map_err(SessionError::Io)?;
     match frame.try_write(terminal) {
         Ok(true) => Ok(LocalClose::Done),
         Ok(false) => {
@@ -1268,6 +1375,25 @@ mod tests {
             }
         }
 
+        fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+            match self.steps.pop_front().expect("unexpected write") {
+                WriteStep::Accept(limit) => {
+                    let mut written = 0usize;
+                    for buf in bufs {
+                        let rem = limit.saturating_sub(written);
+                        if rem == 0 {
+                            break;
+                        }
+                        let n = buf.len().min(rem);
+                        self.bytes.extend_from_slice(&buf[..n]);
+                        written += n;
+                    }
+                    Ok(written)
+                }
+                WriteStep::WouldBlock => Err(io::ErrorKind::WouldBlock.into()),
+            }
+        }
+
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
@@ -1279,8 +1405,8 @@ mod tests {
             TerminalPacketType::TerminalBuffer as u8,
             b"ordered".to_vec(),
         );
-        let expected = encode_local_packet(&packet).unwrap();
-        let mut pending = PendingLocalFrame::new(&packet).unwrap();
+        let expected = et_net::local_packet::encode_local_packet(&packet).unwrap();
+        let mut pending = PendingLocalFrame::from_packet(packet).unwrap();
         let mut writer = ScriptedWriter {
             steps: VecDeque::from([
                 WriteStep::Accept(5),

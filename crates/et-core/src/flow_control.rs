@@ -105,8 +105,10 @@ impl OutputQueue {
         }
         self.terminal_bytes += wanted;
         self.terminal_packets += 1;
+        if self.stream.may_contain_control(packet.payload()) {
+            self.promotion_pending = true;
+        }
         self.terminal.push_back(packet);
-        self.promotion_pending = true;
         Ok(())
     }
 
@@ -140,7 +142,9 @@ impl OutputQueue {
         self.prefer_terminal = !self.prefer_terminal;
         if is_terminal_output(&packet) {
             self.before_take = Some(self.stream.clone());
-            if let Ok(message) = TerminalBuffer::decode(packet.payload()) {
+            if let Some((bytes, _)) = crate::packet::decode_terminal_buffer(packet.payload()) {
+                self.stream.observe(bytes);
+            } else if let Ok(message) = TerminalBuffer::decode(packet.payload()) {
                 self.stream
                     .observe(message.buffer.as_deref().unwrap_or_default());
             }

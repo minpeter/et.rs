@@ -464,7 +464,7 @@ pub struct Forwarder {
     #[cfg(unix)]
     session_polls_reads: Arc<AtomicBool>,
     #[cfg(unix)]
-    fast_outbound: std::sync::Mutex<VecDeque<Packet>>,
+    fast_outbound: Arc<std::sync::Mutex<VecDeque<Packet>>>,
     #[cfg(windows)]
     routes: crate::forward_worker::FastRoutes,
     shutdown: Arc<AtomicBool>,
@@ -609,6 +609,10 @@ fn start_forwarder_hook(
     let session_polls_reads = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
     let worker_session_polls = session_polls_reads.clone();
+    #[cfg(unix)]
+    let fast_outbound = Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(128)));
+    #[cfg(unix)]
+    let worker_fast_outbound = fast_outbound.clone();
     #[cfg(windows)]
     let routes: crate::forward_worker::FastRoutes =
         Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
@@ -669,6 +673,8 @@ fn start_forwarder_hook(
                     session_polls_reads: worker_session_polls,
                     #[cfg(unix)]
                     wake_signalled: worker_wake_signalled,
+                    #[cfg(unix)]
+                    fast_outbound: worker_fast_outbound,
                 },
                 #[cfg(unix)]
                 wake_writer,
@@ -697,7 +703,7 @@ fn start_forwarder_hook(
         #[cfg(unix)]
         session_polls_reads,
         #[cfg(unix)]
-        fast_outbound: std::sync::Mutex::new(VecDeque::with_capacity(128)),
+        fast_outbound,
         #[cfg(windows)]
         routes,
         shutdown,
@@ -979,7 +985,7 @@ impl Forwarder {
                 continue;
             }
             let mut reads = 0;
-            while route.read_interest() && reads < 32 && out_guard.len() < 128 {
+            while route.read_interest() && reads < 16 && out_guard.len() < 128 {
                 let limit = if route.windowed {
                     let rem = route
                         .window_bytes
@@ -1192,7 +1198,9 @@ impl Forwarder {
                         // drained by a stale drain.
                         drain_wake(&self.wake)?;
                         self.wake_signalled.store(false, Ordering::Release);
-                        if (!self.priority.is_empty() || !self.outbound.is_empty())
+                        if (!self.priority.is_empty()
+                            || !self.outbound.is_empty()
+                            || !self.fast_outbound.lock().unwrap().is_empty())
                             && !self.wake_signalled.swap(true, Ordering::AcqRel)
                         {
                             let _ = (&*self.wake_writer).write(&[1]);

@@ -34,7 +34,7 @@ impl ActiveSession {
 
     pub(crate) fn has_buffered_read(&self) -> bool {
         self.connection
-            .try_lock()
+            .lock()
             .is_ok_and(|connection| connection.has_buffered_read())
     }
 
@@ -58,21 +58,25 @@ impl ActiveSession {
                 .try_read_packet()
                 .map_err(SessionError::Connection)?
         };
-        if let (Some(flow), Some(packet)) = (self.output_flow(), packet.as_ref()) {
-            if packet.header() == et_core::proto::TerminalPacketType::TerminalBuffer as u8 {
-                use prost::Message;
-                let input =
-                    et_core::proto::TerminalBuffer::decode(packet.payload()).map_err(|error| {
-                        SessionError::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            error,
-                        ))
-                    })?;
-                if let Some(bytes) = input.buffer {
-                    // Pipe stdin is an opaque byte stream. Ctrl+C and tmux
-                    // control bytes must not discard remote output.
-                    if !self.pipe_mode {
-                        flow.observe_input(&bytes)?;
+        if !self.pipe_mode {
+            if let (Some(flow), Some(packet)) = (self.output_flow(), packet.as_ref()) {
+                if packet.header() == et_core::proto::TerminalPacketType::TerminalBuffer as u8 {
+                    if let Some((bytes, _)) =
+                        et_core::packet::decode_terminal_buffer(packet.payload())
+                    {
+                        flow.observe_input(bytes)?;
+                    } else {
+                        use prost::Message;
+                        let input = et_core::proto::TerminalBuffer::decode(packet.payload())
+                            .map_err(|error| {
+                                SessionError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    error,
+                                ))
+                            })?;
+                        if let Some(bytes) = input.buffer {
+                            flow.observe_input(&bytes)?;
+                        }
                     }
                 }
             }

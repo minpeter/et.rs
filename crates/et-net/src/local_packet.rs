@@ -15,7 +15,7 @@ pub const MAX_STATUS_MESSAGE: usize = 8 * 1024;
 const PREFIX_LEN: usize = std::mem::size_of::<i64>();
 /// How long a writer naps before retrying a `WouldBlock` write. Matches the
 /// 10ms cadence the Windows pump loops already use.
-const BACKPRESSURE_RETRY: Duration = Duration::from_millis(1);
+const BACKPRESSURE_RETRY: Duration = Duration::from_micros(100);
 
 #[derive(Debug)]
 pub enum LocalPacketError {
@@ -66,18 +66,20 @@ pub fn read_local_packet<R: Read>(reader: &mut R) -> Result<Packet, LocalPacketE
 }
 
 pub fn encode_local_packet(packet: &Packet) -> io::Result<Vec<u8>> {
-    let serialized = packet.serialize();
-    if serialized.len() > MAX_LOCAL_PACKET_LEN {
+    let wire_len = packet.wire_len();
+    if wire_len > MAX_LOCAL_PACKET_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "local packet exceeds 64 KiB",
         ));
     }
-    let length = i64::try_from(serialized.len())
+    let length = i64::try_from(wire_len)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "local packet too large"))?;
-    let mut frame = Vec::with_capacity(PREFIX_LEN + serialized.len());
+    let mut frame = Vec::with_capacity(PREFIX_LEN + wire_len);
     frame.extend_from_slice(&length.to_ne_bytes());
-    frame.extend_from_slice(&serialized);
+    frame.push(packet.is_encrypted() as u8);
+    frame.push(packet.header());
+    frame.extend_from_slice(packet.payload());
     Ok(frame)
 }
 
@@ -133,6 +135,183 @@ pub fn write_local_packet_until_cancelled<W: Write>(
     cancelled: &AtomicBool,
 ) -> io::Result<()> {
     write_local_packet_with(writer, packet, || cancelled.load(Ordering::Acquire))
+}
+
+pub fn write_local_stream_until_cancelled(
+    writer: &mut crate::local::LocalStream,
+    packet: &Packet,
+    cancelled: &AtomicBool,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use rustix::event::{poll, PollFd, PollFlags, Timespec};
+        let wire_len = packet.wire_len();
+        if wire_len > MAX_LOCAL_PACKET_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "local packet exceeds 64 KiB",
+            ));
+        }
+        let length = i64::try_from(wire_len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "local packet too large"))?;
+        let mut prefix_hdr = [0u8; PREFIX_LEN + 2];
+        prefix_hdr[..PREFIX_LEN].copy_from_slice(&length.to_ne_bytes());
+        prefix_hdr[PREFIX_LEN] = packet.is_encrypted() as u8;
+        prefix_hdr[PREFIX_LEN + 1] = packet.header();
+        let payload = packet.payload();
+        let total = prefix_hdr.len() + payload.len();
+        let mut written = 0usize;
+        while written < total {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "local packet write cancelled",
+                ));
+            }
+            let res = if written < prefix_hdr.len() {
+                let slices = [
+                    io::IoSlice::new(&prefix_hdr[written..]),
+                    io::IoSlice::new(payload),
+                ];
+                writer.write_vectored(&slices)
+            } else {
+                writer.write(&payload[written - prefix_hdr.len()..])
+            };
+            match res {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(count) => written += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let mut fds = [PollFd::new(&*writer, PollFlags::OUT)];
+                    let _ = poll(
+                        &mut fds,
+                        Some(&Timespec {
+                            tv_sec: 0,
+                            tv_nsec: 5_000_000,
+                        }),
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        write_local_packet_until_cancelled(writer, packet, cancelled)
+    }
+}
+
+pub fn write_local_terminal_buffer_until_cancelled(
+    writer: &mut crate::local::LocalStream,
+    output: &[u8],
+    is_stderr: bool,
+    cancelled: &AtomicBool,
+    progress: Option<&std::sync::atomic::AtomicUsize>,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use rustix::event::{poll, PollFd, PollFlags, Timespec};
+        let mut varint = [0u8; 10];
+        let mut varint_len = 0usize;
+        let mut val = output.len();
+        while val >= 0x80 {
+            varint[varint_len] = (val as u8) | 0x80;
+            val >>= 7;
+            varint_len += 1;
+        }
+        varint[varint_len] = val as u8;
+        varint_len += 1;
+        let suffix: &[u8] = if is_stderr { &[0x10, 0x01] } else { &[] };
+        let payload_len = if output.is_empty() {
+            suffix.len()
+        } else {
+            1 + varint_len + output.len() + suffix.len()
+        };
+        let wire_len = et_core::packet::HEADER_LEN + payload_len;
+        if wire_len > MAX_LOCAL_PACKET_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "local packet exceeds 64 KiB",
+            ));
+        }
+        let length = i64::try_from(wire_len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "local packet too large"))?;
+        let mut head = [0u8; PREFIX_LEN + 2 + 1 + 10];
+        head[..PREFIX_LEN].copy_from_slice(&length.to_ne_bytes());
+        head[PREFIX_LEN] = 0;
+        head[PREFIX_LEN + 1] = et_core::proto::TerminalPacketType::TerminalBuffer as u8;
+        let head_len = if output.is_empty() {
+            PREFIX_LEN + 2
+        } else {
+            head[PREFIX_LEN + 2] = 0x0a;
+            head[PREFIX_LEN + 3..PREFIX_LEN + 3 + varint_len]
+                .copy_from_slice(&varint[..varint_len]);
+            PREFIX_LEN + 3 + varint_len
+        };
+        let total = head_len + output.len() + suffix.len();
+        let mut written = 0usize;
+        while written < total {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "local packet write cancelled",
+                ));
+            }
+            let res = if written < head_len {
+                let slices = [
+                    io::IoSlice::new(&head[written..head_len]),
+                    io::IoSlice::new(output),
+                    io::IoSlice::new(suffix),
+                ];
+                writer.write_vectored(&slices)
+            } else if written < head_len + output.len() {
+                let slices = [
+                    io::IoSlice::new(&output[written - head_len..]),
+                    io::IoSlice::new(suffix),
+                ];
+                writer.write_vectored(&slices)
+            } else {
+                writer.write(&suffix[written - head_len - output.len()..])
+            };
+            match res {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(count) => {
+                    written += count;
+                    if let Some(progress) = progress {
+                        progress.fetch_add(1, Ordering::Release);
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let mut fds = [PollFd::new(&*writer, PollFlags::OUT)];
+                    let _ = poll(
+                        &mut fds,
+                        Some(&Timespec {
+                            tv_sec: 0,
+                            tv_nsec: 5_000_000,
+                        }),
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let packet = Packet::new(
+            et_core::proto::TerminalPacketType::TerminalBuffer as u8,
+            et_core::packet::encode_terminal_buffer(output, is_stderr),
+        );
+        let res = write_local_packet_until_cancelled(writer, &packet, cancelled);
+        if res.is_ok() {
+            if let Some(progress) = progress {
+                progress.fetch_add(1, Ordering::Release);
+            }
+        }
+        res
+    }
 }
 
 fn write_local_packet_with<W: Write>(
@@ -206,7 +385,10 @@ pub struct LocalPacketDecoder {
     prefix: [u8; PREFIX_LEN],
     prefix_len: usize,
     expected: Option<usize>,
+    header: [u8; et_core::packet::HEADER_LEN],
+    header_len: usize,
     payload: Vec<u8>,
+    filled: usize,
     complete: bool,
 }
 
@@ -222,15 +404,22 @@ impl LocalPacketDecoder {
             prefix: [0; PREFIX_LEN],
             prefix_len: 0,
             expected: None,
+            header: [0; et_core::packet::HEADER_LEN],
+            header_len: 0,
             payload: Vec::new(),
-            complete: false,
+            filled: 0,
+            complete: bool::default(),
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.prefix_len == 0 && self.expected.is_none()
     }
 
     pub fn required_bytes(&self) -> usize {
         match self.expected {
             None => PREFIX_LEN - self.prefix_len,
-            Some(expected) => expected.saturating_sub(self.payload.len()),
+            Some(expected) => expected.saturating_sub(self.header_len + self.filled),
         }
     }
 
@@ -240,34 +429,126 @@ impl LocalPacketDecoder {
         }
         let mut offset = 0;
         if self.expected.is_none() {
-            let count = self.required_bytes().min(input.len());
+            let count = (PREFIX_LEN - self.prefix_len).min(input.len());
             self.prefix[self.prefix_len..self.prefix_len + count].copy_from_slice(&input[..count]);
             self.prefix_len += count;
             offset += count;
             if self.prefix_len == PREFIX_LEN {
                 let expected = parse_length(self.prefix)?;
-                self.payload.reserve(expected);
+                self.payload
+                    .reserve(expected.saturating_sub(et_core::packet::HEADER_LEN));
                 self.expected = Some(expected);
             }
         }
         if let Some(expected) = self.expected {
-            let remaining = expected.saturating_sub(self.payload.len());
-            let count = remaining.min(input.len().saturating_sub(offset));
-            self.payload
-                .extend_from_slice(&input[offset..offset + count]);
-            offset += count;
-            if self.payload.len() == expected {
-                if offset != input.len() {
-                    return Err(LocalPacketError::TrailingData);
+            let hdr_target = expected.min(et_core::packet::HEADER_LEN);
+            if self.header_len < hdr_target {
+                let count = (hdr_target - self.header_len).min(input.len().saturating_sub(offset));
+                self.header[self.header_len..self.header_len + count]
+                    .copy_from_slice(&input[offset..offset + count]);
+                self.header_len += count;
+                offset += count;
+            }
+            if self.header_len == hdr_target {
+                let body_len = expected.saturating_sub(et_core::packet::HEADER_LEN);
+                let remaining = body_len.saturating_sub(self.filled);
+                let count = remaining.min(input.len().saturating_sub(offset));
+                if self.payload.len() == self.filled {
+                    self.payload
+                        .extend_from_slice(&input[offset..offset + count]);
+                } else {
+                    self.payload[self.filled..self.filled + count]
+                        .copy_from_slice(&input[offset..offset + count]);
                 }
-                self.complete = true;
-                return Packet::from_serialized(&self.payload)
-                    .map(Some)
-                    .map_err(LocalPacketError::MalformedPacket);
+                self.filled += count;
+                offset += count;
+                if self.header_len + self.filled == expected {
+                    if offset != input.len() {
+                        return Err(LocalPacketError::TrailingData);
+                    }
+                    self.complete = true;
+                    if expected < et_core::packet::HEADER_LEN {
+                        return Err(LocalPacketError::MalformedPacket(PacketError::Short));
+                    }
+                    return Ok(Some(Packet::raw(
+                        self.header[0] != 0,
+                        self.header[1],
+                        std::mem::take(&mut self.payload),
+                    )));
+                }
             }
         }
         if offset != input.len() {
             return Err(LocalPacketError::TrailingData);
+        }
+        Ok(None)
+    }
+
+    pub fn read_from<R: Read>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<Option<Packet>, LocalPacketError> {
+        if self.complete {
+            return Err(LocalPacketError::AlreadyComplete);
+        }
+        while self.expected.is_none() {
+            match reader.read(&mut self.prefix[self.prefix_len..PREFIX_LEN]) {
+                Ok(0) => {
+                    return Err(LocalPacketError::Io(io::ErrorKind::UnexpectedEof.into()));
+                }
+                Ok(count) => {
+                    self.prefix_len += count;
+                    if self.prefix_len == PREFIX_LEN {
+                        let expected = parse_length(self.prefix)?;
+                        self.payload
+                            .resize(expected.saturating_sub(et_core::packet::HEADER_LEN), 0);
+                        self.expected = Some(expected);
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(LocalPacketError::Io(error)),
+            }
+        }
+        if let Some(expected) = self.expected {
+            let hdr_target = expected.min(et_core::packet::HEADER_LEN);
+            while self.header_len < hdr_target {
+                match reader.read(&mut self.header[self.header_len..hdr_target]) {
+                    Ok(0) => {
+                        return Err(LocalPacketError::Io(io::ErrorKind::UnexpectedEof.into()));
+                    }
+                    Ok(count) => {
+                        self.header_len += count;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(LocalPacketError::Io(error)),
+                }
+            }
+            if expected < et_core::packet::HEADER_LEN {
+                self.complete = true;
+                return Err(LocalPacketError::MalformedPacket(PacketError::Short));
+            }
+            let body_len = expected - et_core::packet::HEADER_LEN;
+            while self.filled < body_len {
+                match reader.read(&mut self.payload[self.filled..body_len]) {
+                    Ok(0) => {
+                        return Err(LocalPacketError::Io(io::ErrorKind::UnexpectedEof.into()));
+                    }
+                    Ok(count) => {
+                        self.filled += count;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(LocalPacketError::Io(error)),
+                }
+            }
+            self.complete = true;
+            return Ok(Some(Packet::raw(
+                self.header[0] != 0,
+                self.header[1],
+                std::mem::take(&mut self.payload),
+            )));
         }
         Ok(None)
     }

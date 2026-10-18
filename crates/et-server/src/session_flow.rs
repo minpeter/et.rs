@@ -335,27 +335,6 @@ impl FlowControl {
         }
     }
 
-    fn wait_for_reader(&self) -> bool {
-        if !self.reader_waiting.load(Ordering::Acquire) {
-            return !self.is_hard_stopped();
-        }
-        let Ok(state) = self.state.lock() else {
-            return false;
-        };
-        let Ok(state) = self.wake.wait_while(state, |state| {
-            if self.reader_waiting.load(Ordering::Acquire) && state.stop != StopMode::Hard {
-                self.writer_waiting_for_reader
-                    .store(true, Ordering::Release);
-                true
-            } else {
-                false
-            }
-        }) else {
-            return false;
-        };
-        state.stop != StopMode::Hard
-    }
-
     pub(super) fn stop_gracefully(&self) {
         if let Ok(mut state) = self.state.lock() {
             // A recovery pause owns the connection snapshot until its permit
@@ -436,11 +415,29 @@ impl FlowControl {
                         || (state.queue.is_empty()
                             && state.pending_live_in_flight.is_none()
                             && state.in_flight)
+                        || {
+                            if self.reader_waiting.load(Ordering::Acquire) {
+                                self.writer_waiting_for_reader
+                                    .store(true, Ordering::Release);
+                                true
+                            } else {
+                                false
+                            }
+                        }
                 }
                 StopMode::Running => {
                     state.paused
                         || !state.connected
                         || (state.queue.is_empty() && state.pending_live_in_flight.is_none())
+                        || {
+                            if self.reader_waiting.load(Ordering::Acquire) {
+                                self.writer_waiting_for_reader
+                                    .store(true, Ordering::Release);
+                                true
+                            } else {
+                                false
+                            }
+                        }
                 }
             })
             .ok()?;
@@ -539,7 +536,7 @@ impl FlowControl {
 
 pub(super) fn run_writer(session: Weak<ActiveSession>, flow: Arc<FlowControl>) {
     while let Some((packet, is_pending_live)) = flow.next_item() {
-        if !flow.wait_for_reader() {
+        if flow.is_hard_stopped() {
             return;
         }
         let Some(session) = session.upgrade() else {

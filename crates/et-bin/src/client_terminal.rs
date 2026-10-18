@@ -415,6 +415,16 @@ where
 {
     match packet.header() {
         value if value == TerminalPacketType::TerminalBuffer as u8 => {
+            if let Some((bytes, is_stderr)) =
+                et_core::packet::decode_terminal_buffer(packet.payload())
+            {
+                if !output(bytes, is_stderr)? {
+                    return Ok(DisplayOutcome::Pending(packet));
+                }
+                return Ok(DisplayOutcome::Displayed {
+                    cursor_report: !is_stderr && contains_cursor_report_request(bytes),
+                });
+            }
             let message = match TerminalBuffer::decode(packet.payload()) {
                 Ok(message) => message,
                 Err(error) => {
@@ -480,23 +490,47 @@ fn command_payload(
 }
 
 pub(crate) fn encoded_buffer(bytes: &[u8]) -> Vec<u8> {
-    TerminalBuffer {
-        buffer: Some(bytes.to_vec()),
-        is_stderr: None,
-    }
-    .encode_to_vec()
+    et_core::packet::encode_terminal_buffer(bytes, false)
 }
 
 pub(crate) fn write_binary_stdio(is_stderr: bool, bytes: &[u8]) -> Result<bool, ClientError> {
-    let write = |output: &mut dyn Write| output.write_all(bytes).and_then(|()| output.flush());
-    let result = if is_stderr {
-        write(&mut io::stderr().lock())
-    } else {
-        write(&mut io::stdout().lock())
-    };
-    result
-        .map(|()| true)
-        .map_err(|error| terminal_io("writing binary stdio", error))
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+        let write_fd = |fd: std::os::fd::BorrowedFd<'_>, mut rem: &[u8]| -> io::Result<()> {
+            while !rem.is_empty() {
+                match rustix::io::write(fd, rem) {
+                    Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                    Ok(n) => rem = &rem[n..],
+                    Err(rustix::io::Errno::INTR) => continue,
+                    Err(err) => return Err(io::Error::from(err)),
+                }
+            }
+            Ok(())
+        };
+        let result = if is_stderr {
+            let stderr = io::stderr();
+            write_fd(stderr.as_fd(), bytes)
+        } else {
+            let stdout = io::stdout();
+            write_fd(stdout.as_fd(), bytes)
+        };
+        result
+            .map(|()| true)
+            .map_err(|error| terminal_io("writing binary stdio", error))
+    }
+    #[cfg(not(unix))]
+    {
+        let write = |output: &mut dyn Write| output.write_all(bytes).and_then(|()| output.flush());
+        let result = if is_stderr {
+            write(&mut io::stderr().lock())
+        } else {
+            write(&mut io::stdout().lock())
+        };
+        result
+            .map(|()| true)
+            .map_err(|error| terminal_io("writing binary stdio", error))
+    }
 }
 
 #[cfg(test)]

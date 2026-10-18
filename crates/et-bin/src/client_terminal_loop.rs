@@ -145,17 +145,44 @@ pub fn pump<F>(
 where
     F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
 {
-    pump_with_stdin(connection, wake, options, forwarder, reconnect, io::stdin())
+    pump_with_stdin_mode(
+        connection,
+        wake,
+        options,
+        forwarder,
+        reconnect,
+        io::stdin(),
+        true,
+    )
+}
+
+#[cfg(all(unix, test))]
+fn pump_with_stdin<F, R>(
+    connection: &mut Connection,
+    wake: &mut UnixStream,
+    options: PumpOptions<'_>,
+    forwarder: &mut Forwarder,
+    reconnect: F,
+    stdin: R,
+) -> Result<i32, ClientError>
+where
+    F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
+    R: Read + std::os::fd::AsFd,
+{
+    pump_with_stdin_mode(
+        connection, wake, options, forwarder, reconnect, stdin, false,
+    )
 }
 
 #[cfg(unix)]
-fn pump_with_stdin<F, R>(
+fn pump_with_stdin_mode<F, R>(
     connection: &mut Connection,
     wake: &mut UnixStream,
     options: PumpOptions<'_>,
     forwarder: &mut Forwarder,
     mut reconnect: F,
     mut stdin: R,
+    unbuffered_fd: bool,
 ) -> Result<i32, ClientError>
 where
     F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
@@ -205,6 +232,7 @@ where
     // keepalive) have been polled once, so a saturated upload cannot keep
     // the transport permanently pending and starve them.
     let mut local_turn = false;
+    let mut bytes_since_ack: usize = 0;
     let mut interrupt_input = et_core::output_interrupt::InterruptInput::default();
     let mut fast_poll = et_net::forward::FastPollState::new();
     let forward_wake = forwarder
@@ -476,6 +504,46 @@ where
                     }
                 }
             }
+            if let Some(packet) = pending_output.take() {
+                match route_server_packet(
+                    packet,
+                    terminal_enabled,
+                    binary_stdio,
+                    terminal_modes,
+                    &console_output,
+                    remote_exit,
+                )? {
+                    DisplayOutcome::Displayed { cursor_report }
+                        if cursor_report && auto_cursor_report && !console_output.is_async() =>
+                    {
+                        if connection.write_pending() {
+                            pending_cursor_reports += 1;
+                        } else if matches!(
+                            write_cursor_report(
+                                connection,
+                                &mut reconnect,
+                                &mut stream,
+                                terminal_enabled,
+                            )?,
+                            OwnedWriteOutcome::SessionEnded
+                        ) {
+                            return finish_remote_completion(
+                                console_output,
+                                pending_output,
+                                pending_forward,
+                                terminal_enabled,
+                                binary_stdio,
+                                terminal_modes,
+                                forwarder,
+                                None,
+                                remote_exit,
+                            );
+                        }
+                    }
+                    DisplayOutcome::Displayed { .. } => {}
+                    DisplayOutcome::Pending(packet) => pending_output = Some(packet),
+                }
+            }
         }
         if output_status.intersects(PollFlags::IN | PollFlags::HUP) {
             console_output
@@ -511,6 +579,8 @@ where
         let network_ready = inbound_ready
             || connection.has_buffered_read()
             || network.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
+            || (output_ready.intersects(PollFlags::IN | PollFlags::HUP)
+                && pending_output.is_none())
             || (cfg!(target_vendor = "apple")
                 && resize.is_empty()
                 && output_ready.is_empty()
@@ -518,11 +588,23 @@ where
                 && forward_events.is_empty()
                 && input.is_empty());
         let mut read_batch = 0;
+        let mut broke_for_credit = false;
+        let read_limit = if binary_stdio
+            && terminal_enabled
+            && input.contains(PollFlags::IN)
+            && !connection.write_pending()
+        {
+            16
+        } else {
+            128
+        };
         while network_ready
-            && (!input.contains(PollFlags::IN) || connection.write_pending())
+            && (!input.contains(PollFlags::IN)
+                || (binary_stdio && terminal_enabled)
+                || connection.write_pending())
             && pending_forward.len() < FORWARD_BACKLOG_CAPACITY
             && pending_output.is_none()
-            && read_batch < 128
+            && read_batch < read_limit
         {
             read_batch += 1;
             match connection.try_read_packet() {
@@ -532,11 +614,17 @@ where
                         if let Some(ack) = et_core::keepalive::decode_ack(packet.payload()) {
                             connection.acknowledge_delivery(ack);
                         }
+                    } else if is_forward_packet(packet.header()) || binary_stdio {
+                        bytes_since_ack = bytes_since_ack.saturating_add(packet.payload().len());
                     }
                     if is_forward_packet(packet.header()) {
                         pending_forward.push_back(packet);
-                        if pending_forward.len() >= 16 {
+                        if pending_forward.len() >= 4 {
                             flush_forwarding(forwarder, &mut pending_forward)?;
+                            if !connection.write_pending() && forwarder.has_fast_outbound() {
+                                broke_for_credit = true;
+                                break;
+                            }
                         }
                     } else {
                         match route_server_packet(
@@ -598,7 +686,8 @@ where
             }
         }
         flush_forwarding(forwarder, &mut pending_forward)?;
-        inbound_ready = read_batch == 128 || connection.has_buffered_read();
+        inbound_ready =
+            read_batch == read_limit || broke_for_credit || connection.has_buffered_read();
         if (producers_polled && forwarder.service_fast_poll(&mut fast_poll))
             || forwarder.has_fast_outbound()
         {
@@ -646,7 +735,9 @@ where
                     &mut stream,
                     terminal_enabled,
                 )? {
-                    OwnedWriteOutcome::Written => {}
+                    OwnedWriteOutcome::Written => {
+                        bytes_since_ack = bytes_since_ack.saturating_add(packet.payload().len());
+                    }
                     OwnedWriteOutcome::Recovered => {
                         last_received = Instant::now();
                         next_keepalive = last_received + interval;
@@ -696,8 +787,17 @@ where
             continue;
         }
         if !connection.write_pending() && input.contains(PollFlags::IN) {
-            let mut bytes = [0u8; INPUT_CHUNK];
-            let count = match stdin.read(&mut bytes) {
+            let mut bytes = [0u8; 65_472];
+            let read_len = if binary_stdio {
+                bytes.len()
+            } else {
+                INPUT_CHUNK
+            };
+            let count = match if unbuffered_fd && binary_stdio {
+                rustix::io::read(stdin.as_fd(), &mut bytes[..read_len]).map_err(io::Error::from)
+            } else {
+                stdin.read(&mut bytes[..read_len])
+            } {
                 Ok(count) => count,
                 Err(error)
                     if matches!(
@@ -737,7 +837,9 @@ where
                 &mut stream,
                 terminal_enabled,
             )? {
-                OwnedWriteOutcome::Written => {}
+                OwnedWriteOutcome::Written => {
+                    bytes_since_ack = bytes_since_ack.saturating_add(payload.len());
+                }
                 OwnedWriteOutcome::Recovered => {
                     last_received = Instant::now();
                     next_keepalive = last_received + interval;
@@ -778,7 +880,14 @@ where
             read_stdin = false;
         }
         let now = Instant::now();
-        if !connection.write_pending() && now >= next_keepalive {
+        if !connection.write_pending()
+            && (now >= next_keepalive
+                || (pending_output.is_none()
+                    && !inbound_ready
+                    && !remote_exit.session_ended()
+                    && bytes_since_ack >= 2 * 1024 * 1024))
+        {
+            bytes_since_ack = 0;
             // The payload acknowledges everything read so far, so the server
             // can trim its replay backup; legacy servers ignore it.
             let ack = connection.keepalive_ack();
@@ -1108,7 +1217,7 @@ where
         TerminalPacketType::TerminalInfo as u8,
         payload,
         OwnedWritePolicy::ReplaceableTerminalSize,
-        Connection::start_write_packet_owned_unprobed,
+        Connection::start_write_packet_owned,
         |connection, _| recover_transport(connection, reconnect, true),
     )?;
     if matches!(outcome, OwnedWriteOutcome::Recovered) {
@@ -1135,7 +1244,13 @@ where
         payload,
         reconnect,
         send_terminal_size,
-        Connection::start_write_packet_owned_unprobed,
+        if header == TerminalPacketType::PortForwardData as u8
+            || header == TerminalPacketType::TerminalBuffer as u8
+        {
+            Connection::start_write_packet_owned_unprobed
+        } else {
+            Connection::start_write_packet_owned
+        },
     )?;
     if matches!(outcome, OwnedWriteOutcome::Recovered) {
         *stream = connection.try_clone_stream().map_err(terminal_error)?;

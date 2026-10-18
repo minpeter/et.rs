@@ -47,6 +47,16 @@ impl Default for TmuxCcFilter {
 }
 
 impl TmuxCcFilter {
+    pub(super) fn apply_slice<'a>(&mut self, chunk: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        if !self.control && self.pending.is_empty() && !chunk.contains(&DCS[0]) {
+            if let Some(&last) = chunk.last() {
+                self.line_start = last == b'\n';
+            }
+            return std::borrow::Cow::Borrowed(chunk);
+        }
+        std::borrow::Cow::Owned(self.apply(chunk))
+    }
+
     pub(super) fn apply(&mut self, chunk: &[u8]) -> Vec<u8> {
         if !self.control && self.pending.is_empty() && !chunk.contains(&DCS[0]) {
             if let Some(&last) = chunk.last() {

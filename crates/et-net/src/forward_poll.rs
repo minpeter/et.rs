@@ -494,16 +494,11 @@ impl Worker {
                     .load(std::sync::atomic::Ordering::Acquire)
             {
                 let mut reads = 0;
-                while socket.read_interest() && reads < 4 {
+                while socket.read_interest() && !self.outbound.is_full() && reads < 4 {
                     match socket.read_encoded_chunk(&mut self.read_scratch[..]) {
                         Ok(ReadOutcome::Data(payload)) => {
                             let is_small = payload.len() <= 4096;
-                            self.fast_outbound.lock().unwrap().push_back(
-                                et_core::packet::Packet::new(
-                                    TerminalPacketType::PortForwardData as u8,
-                                    payload,
-                                ),
-                            );
+                            self.emit_raw(TerminalPacketType::PortForwardData as u8, payload)?;
                             reads += 1;
                             if is_small {
                                 break;

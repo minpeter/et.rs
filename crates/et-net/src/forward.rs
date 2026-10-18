@@ -464,7 +464,7 @@ pub struct Forwarder {
     #[cfg(unix)]
     session_polls_reads: Arc<AtomicBool>,
     #[cfg(unix)]
-    fast_outbound: Arc<std::sync::Mutex<VecDeque<Packet>>>,
+    fast_outbound: std::sync::Mutex<VecDeque<Packet>>,
     #[cfg(windows)]
     routes: crate::forward_worker::FastRoutes,
     shutdown: Arc<AtomicBool>,
@@ -610,9 +610,7 @@ fn start_forwarder_hook(
     #[cfg(unix)]
     let worker_session_polls = session_polls_reads.clone();
     #[cfg(unix)]
-    let fast_outbound = Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(128)));
-    #[cfg(unix)]
-    let worker_fast_outbound = fast_outbound.clone();
+    let fast_outbound = std::sync::Mutex::new(VecDeque::with_capacity(128));
     #[cfg(windows)]
     let routes: crate::forward_worker::FastRoutes =
         Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
@@ -673,8 +671,6 @@ fn start_forwarder_hook(
                     session_polls_reads: worker_session_polls,
                     #[cfg(unix)]
                     wake_signalled: worker_wake_signalled,
-                    #[cfg(unix)]
-                    fast_outbound: worker_fast_outbound,
                 },
                 #[cfg(unix)]
                 wake_writer,
@@ -1258,6 +1254,14 @@ impl Forwarder {
         }
         while self.priority.try_recv().is_ok() {
             abandoned = true;
+        }
+        #[cfg(unix)]
+        {
+            let mut fast = self.fast_outbound.lock().unwrap();
+            if !fast.is_empty() {
+                abandoned = true;
+                fast.clear();
+            }
         }
         if !self.commands.is_empty() {
             abandoned = true;

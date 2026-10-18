@@ -105,7 +105,16 @@ impl OutputQueue {
         }
         self.terminal_bytes += wanted;
         self.terminal_packets += 1;
-        if self.stream.may_contain_control(packet.payload()) {
+        let may_contain_control =
+            if let Some((bytes, _)) = crate::packet::decode_terminal_buffer(packet.payload()) {
+                self.stream.may_contain_control(bytes)
+            } else if let Ok(message) = TerminalBuffer::decode(packet.payload()) {
+                self.stream
+                    .may_contain_control(message.buffer.as_deref().unwrap_or_default())
+            } else {
+                true
+            };
+        if may_contain_control {
             self.promotion_pending = true;
         }
         self.terminal.push_back(packet);

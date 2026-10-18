@@ -844,7 +844,6 @@ fn drain_stream(stream: &mut LocalStream) -> io::Result<()> {
 #[derive(Clone, Copy)]
 enum StdoutKind {
     Regular,
-    Pipe(usize),
     Other,
 }
 
@@ -932,21 +931,12 @@ impl Write for CancellableStdout {
                             };
                             if meta.file_type().is_file() {
                                 StdoutKind::Regular
-                            } else if meta.file_type().is_fifo() {
-                                StdoutKind::Pipe(65536)
                             } else {
                                 StdoutKind::Other
                             }
                         });
-                        match kind {
-                            StdoutKind::Regular => max_chunk = 65536,
-                            StdoutKind::Pipe(sz) => {
-                                if let Ok(unread) = rustix::io::ioctl_fionread(&self.file) {
-                                    let unread = usize::try_from(unread).unwrap_or(0);
-                                    max_chunk = sz.saturating_sub(unread).clamp(4096, 65536);
-                                }
-                            }
-                            StdoutKind::Other => {}
+                        if matches!(kind, StdoutKind::Regular) {
+                            max_chunk = 65536;
                         }
                     }
                     return rustix::io::write(&self.file, &bytes[..bytes.len().min(max_chunk)])

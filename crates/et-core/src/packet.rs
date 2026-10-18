@@ -127,7 +127,7 @@ impl std::error::Error for PacketError {}
 /// allowing the caller to fall back to `prost::Message::decode`.
 pub fn decode_terminal_buffer(payload: &[u8]) -> Option<(&[u8], bool)> {
     if payload.is_empty() {
-        return Some((&[], false));
+        return None;
     }
     if payload[0] != 0x0a {
         return None;

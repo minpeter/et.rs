@@ -363,7 +363,10 @@ fn pump(
             }
         }
         if accept_input {
-            while pending.len() < MAX_PENDING_INPUT {
+            for _ in 0..32 {
+                if pending.len() >= MAX_PENDING_INPUT {
+                    break;
+                }
                 let Some(packet) = read_ready_packet(router, &mut decoder)? else {
                     break;
                 };

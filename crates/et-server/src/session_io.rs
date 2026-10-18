@@ -34,7 +34,7 @@ impl ActiveSession {
 
     pub(crate) fn has_buffered_read(&self) -> bool {
         self.connection
-            .lock()
+            .try_lock()
             .is_ok_and(|connection| connection.has_buffered_read())
     }
 

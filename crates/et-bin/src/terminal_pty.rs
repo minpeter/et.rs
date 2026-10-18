@@ -520,6 +520,7 @@ struct CompletionState {
     child_status: Option<u32>,
     output_done: bool,
     drain_deadline: Option<Instant>,
+    max_drain_deadline: Option<Instant>,
     last_progress: usize,
 }
 
@@ -529,7 +530,9 @@ impl CompletionState {
             WorkerEvent::Output(Err(error)) | WorkerEvent::Child(Err(error)) => Err(error),
             WorkerEvent::Child(Ok(status)) => {
                 self.child_status = Some(status);
-                self.drain_deadline = Some(Instant::now() + FINAL_OUTPUT_DRAIN_TIMEOUT);
+                let now = Instant::now();
+                self.drain_deadline = Some(now + FINAL_OUTPUT_DRAIN_TIMEOUT);
+                self.max_drain_deadline = Some(now + Duration::from_secs(30));
                 Ok(self.output_done.then_some(PumpCompletion {
                     status,
                     drained: true,
@@ -550,13 +553,22 @@ impl CompletionState {
     fn expired_status(&mut self, progress: &AtomicUsize) -> Option<PumpCompletion> {
         let status = self.child_status?;
         let deadline = self.drain_deadline?;
+        let max_deadline = self.max_drain_deadline.unwrap_or(deadline);
+        let now = Instant::now();
+        if now >= max_deadline {
+            return Some(PumpCompletion {
+                status,
+                drained: false,
+                reaped: true,
+            });
+        }
         let cur_progress = progress.load(Ordering::Acquire);
         if cur_progress != self.last_progress {
             self.last_progress = cur_progress;
-            self.drain_deadline = Some(Instant::now() + FINAL_OUTPUT_DRAIN_TIMEOUT);
+            self.drain_deadline = Some((now + FINAL_OUTPUT_DRAIN_TIMEOUT).min(max_deadline));
             return None;
         }
-        if Instant::now() >= deadline {
+        if now >= deadline {
             Some(PumpCompletion {
                 status,
                 drained: false,

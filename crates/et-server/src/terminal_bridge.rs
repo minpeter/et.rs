@@ -297,7 +297,10 @@ fn run_mode_poll(
                     {
                         if (2048..=8 * 1024).contains(&first_bytes.len()) {
                             let mut coalesced: Option<Vec<u8>> = None;
-                            while coalesced.as_ref().map_or(first_bytes.len(), Vec::len) < 16 * 1024
+                            let mut coalesced_packets = 0usize;
+                            while coalesced_packets < 8
+                                && coalesced.as_ref().map_or(first_bytes.len(), Vec::len)
+                                    < 16 * 1024
                             {
                                 match read_terminal_packet(&mut terminal, &mut decoder) {
                                     Ok(Some(raw)) => {
@@ -324,6 +327,7 @@ fn run_mode_poll(
                                                         v
                                                     });
                                                     buf.extend_from_slice(more);
+                                                    coalesced_packets += 1;
                                                     continue;
                                                 }
                                             }

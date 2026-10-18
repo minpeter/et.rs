@@ -13,8 +13,8 @@ pub const REGISTRATION_STATUS: u8 = 254;
 pub const STARTUP_STATUS: u8 = 255;
 pub const MAX_STATUS_MESSAGE: usize = 8 * 1024;
 const PREFIX_LEN: usize = std::mem::size_of::<i64>();
-/// How long a writer naps before retrying a `WouldBlock` write. Matches the
-/// 10ms cadence the Windows pump loops already use.
+/// How long a blocking local packet writer naps before retrying a `WouldBlock`
+/// write on non-Unix or generic `Write` streams.
 const BACKPRESSURE_RETRY: Duration = Duration::from_micros(100);
 
 #[derive(Debug)]
@@ -135,71 +135,6 @@ pub fn write_local_packet_until_cancelled<W: Write>(
     cancelled: &AtomicBool,
 ) -> io::Result<()> {
     write_local_packet_with(writer, packet, || cancelled.load(Ordering::Acquire))
-}
-
-pub fn write_local_stream_until_cancelled(
-    writer: &mut crate::local::LocalStream,
-    packet: &Packet,
-    cancelled: &AtomicBool,
-) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use rustix::event::{poll, PollFd, PollFlags, Timespec};
-        let wire_len = packet.wire_len();
-        if wire_len > MAX_LOCAL_PACKET_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "local packet exceeds 64 KiB",
-            ));
-        }
-        let length = i64::try_from(wire_len)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "local packet too large"))?;
-        let mut prefix_hdr = [0u8; PREFIX_LEN + 2];
-        prefix_hdr[..PREFIX_LEN].copy_from_slice(&length.to_ne_bytes());
-        prefix_hdr[PREFIX_LEN] = packet.is_encrypted() as u8;
-        prefix_hdr[PREFIX_LEN + 1] = packet.header();
-        let payload = packet.payload();
-        let total = prefix_hdr.len() + payload.len();
-        let mut written = 0usize;
-        while written < total {
-            if cancelled.load(Ordering::Acquire) {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "local packet write cancelled",
-                ));
-            }
-            let res = if written < prefix_hdr.len() {
-                let slices = [
-                    io::IoSlice::new(&prefix_hdr[written..]),
-                    io::IoSlice::new(payload),
-                ];
-                writer.write_vectored(&slices)
-            } else {
-                writer.write(&payload[written - prefix_hdr.len()..])
-            };
-            match res {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(count) => written += count,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    let mut fds = [PollFd::new(&*writer, PollFlags::OUT)];
-                    let _ = poll(
-                        &mut fds,
-                        Some(&Timespec {
-                            tv_sec: 0,
-                            tv_nsec: 5_000_000,
-                        }),
-                    );
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        write_local_packet_until_cancelled(writer, packet, cancelled)
-    }
 }
 
 pub fn write_local_terminal_buffer_until_cancelled(

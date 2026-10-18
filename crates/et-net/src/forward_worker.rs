@@ -661,8 +661,6 @@ pub(crate) struct WorkerChannels {
     pub(crate) session_polls_reads: Arc<AtomicBool>,
     #[cfg(unix)]
     pub(crate) wake_signalled: Arc<AtomicBool>,
-    #[cfg(unix)]
-    pub(crate) fast_outbound: Arc<std::sync::Mutex<std::collections::VecDeque<Packet>>>,
 }
 
 pub(crate) fn run(
@@ -688,8 +686,6 @@ pub(crate) fn run(
         session_polls_reads,
         #[cfg(unix)]
         wake_signalled,
-        #[cfg(unix)]
-        fast_outbound,
     } = channels;
     let (listener_stop, session_user, shutdown) = control;
     #[cfg(unix)]
@@ -705,7 +701,6 @@ pub(crate) fn run(
         worker.routes = routes;
         worker.session_polls_reads = session_polls_reads;
         worker.wake_signalled = wake_signalled.clone();
-        worker.fast_outbound = fast_outbound;
         worker.run(
             sources,
             commands,
@@ -775,8 +770,6 @@ struct Worker {
     outbound_spill: std::collections::VecDeque<crate::forward::Outbound>,
     #[cfg(unix)]
     wake_signalled: Arc<AtomicBool>,
-    #[cfg(unix)]
-    fast_outbound: Arc<std::sync::Mutex<std::collections::VecDeque<Packet>>>,
     #[cfg(unix)]
     pub(super) defer_outbound_wake: bool,
     #[cfg(unix)]
@@ -878,8 +871,6 @@ impl Worker {
             outbound_spill: std::collections::VecDeque::new(),
             #[cfg(unix)]
             wake_signalled: Arc::new(AtomicBool::new(false)),
-            #[cfg(unix)]
-            fast_outbound: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             #[cfg(unix)]
             defer_outbound_wake: false,
             #[cfg(unix)]

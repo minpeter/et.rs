@@ -152,21 +152,28 @@ impl TerminalStream {
             return true;
         }
         let tail_start = bytes.len().saturating_sub(3);
-        bytes[tail_start..].contains(&b'%')
-            || bytes[tail_start..].contains(&b'\x1b')
-            || bytes
-                .windows(2)
-                .any(|w| (w[0] == b'%' && w[1].is_ascii_lowercase()) || w == b"\x1bP")
+        if memchr::memchr2(b'%', b'\x1b', &bytes[tail_start..]).is_some() {
+            return true;
+        }
+        // A `%` before a lowercase letter or `ESC P`, found with SIMD scans:
+        // pane floods rarely contain either byte.
+        memchr::memchr2_iter(b'%', b'\x1b', bytes).any(|index| {
+            let next = bytes.get(index + 1);
+            if bytes[index] == b'%' {
+                next.is_some_and(u8::is_ascii_lowercase)
+            } else {
+                next == Some(&b'P')
+            }
+        })
     }
 
     pub fn observe(&mut self, bytes: &[u8]) {
         let mut i = 0;
         if !self.control
             && (self.token_done || !self.token_may_be_control())
-            && !bytes.contains(&b'%')
-            && !bytes.contains(&b'\x1b')
+            && memchr::memchr2(b'%', b'\x1b', bytes).is_none()
         {
-            if let Some(last_nl) = bytes.iter().rposition(|&b| b == b'\n') {
+            if let Some(last_nl) = memchr::memrchr(b'\n', bytes) {
                 self.token.clear();
                 self.token_done = false;
                 self.midline = false;
@@ -182,7 +189,7 @@ impl TerminalStream {
         }
         while i < bytes.len() {
             if !self.control && (self.token_done || self.token.len() >= 32) {
-                if let Some(rel) = bytes[i..].iter().position(|&b| b == b'\n') {
+                if let Some(rel) = memchr::memchr(b'\n', &bytes[i..]) {
                     i += rel;
                 } else {
                     self.midline = true;

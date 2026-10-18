@@ -442,6 +442,7 @@ dependencies = [
  "blake2",
  "et-sodium",
  "hex",
+ "memchr",
  "prost",
  "prost-build",
  "rand",

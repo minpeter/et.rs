@@ -113,15 +113,16 @@ impl ConsoleOutput {
         #[cfg(unix)]
         {
             #[cfg(target_os = "linux")]
-            let (file, nonblocking) = {
+            let (file, nonblocking, terminal) = {
                 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
                 use std::os::unix::io::AsRawFd;
                 let dup_file = File::from(rustix::io::dup(io::stdout().lock().as_fd())?);
                 let is_fifo = dup_file.metadata().is_ok_and(|m| m.file_type().is_fifo());
+                let is_terminal = rustix::termios::isatty(&dup_file);
                 // A FIFO or terminal reopened through /proc is a separate open
                 // file description, so O_NONBLOCK never leaks into the
                 // inherited stdout the parent shell keeps using.
-                if is_fifo || rustix::termios::isatty(&dup_file) {
+                if is_fifo || is_terminal {
                     let raw = io::stdout().lock().as_raw_fd();
                     match std::fs::OpenOptions::new()
                         .write(true)
@@ -131,11 +132,13 @@ impl ConsoleOutput {
                         )
                         .open(format!("/proc/self/fd/{raw}"))
                     {
-                        Ok(file) => (file, true),
-                        Err(_) => (dup_file, false),
+                        // The worker writes a terminal through the inherited
+                        // blocking description (see `write_terminal`).
+                        Ok(file) => (file, true, is_terminal.then_some(dup_file)),
+                        Err(_) => (dup_file, false, None),
                     }
                 } else {
-                    (dup_file, false)
+                    (dup_file, false, None)
                 }
             };
             #[cfg(not(target_os = "linux"))]
@@ -165,6 +168,8 @@ impl ConsoleOutput {
                     nonblocking,
                     #[cfg(target_os = "linux")]
                     stdout_kind: None,
+                    #[cfg(target_os = "linux")]
+                    terminal,
                 }),
                 cancel,
                 Box::new(|| Ok(())),
@@ -596,6 +601,9 @@ fn run_writer(
     #[cfg(unix)] status_signal: &mut LocalStream,
 ) {
     let _done = WorkerDone(shared);
+    // Reused across batches: a fresh multi-packet join per batch is a large
+    // allocation whose pages the kernel zero-fills again after decay.
+    let mut joined: Vec<u8> = Vec::new();
     loop {
         let (entries, notify_capacity) = {
             let Ok(state) = shared.state.lock() else {
@@ -628,16 +636,13 @@ fn run_writer(
         }
         #[cfg(not(unix))]
         let _ = notify_capacity;
-        let joined: Vec<u8>;
         let bytes: &[u8] = match entries.as_slice() {
             [entry] => &entry.bytes,
             _ => {
-                let total_len: usize = entries.iter().map(|entry| entry.bytes.len()).sum();
-                let mut all = Vec::with_capacity(total_len);
+                joined.clear();
                 for entry in &entries {
-                    all.extend_from_slice(&entry.bytes);
+                    joined.extend_from_slice(&entry.bytes);
                 }
-                joined = all;
                 &joined
             }
         };
@@ -920,12 +925,19 @@ struct CancellableStdout {
     nonblocking: bool,
     #[cfg(target_os = "linux")]
     stdout_kind: Option<StdoutKind>,
+    /// Blocking descriptor of a terminal stdout, written by `write_terminal`.
+    #[cfg(target_os = "linux")]
+    terminal: Option<File>,
 }
 #[cfg(unix)]
 impl Write for CancellableStdout {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         use rustix::event::{poll, PollFd, PollFlags};
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        #[cfg(target_os = "linux")]
+        if let Some(terminal) = &self.terminal {
+            return write_terminal(terminal, &self.cancel, bytes);
+        }
         if self.nonblocking {
             match rustix::io::write(&self.file, bytes) {
                 Ok(count) => return Ok(count),
@@ -1017,6 +1029,58 @@ impl Write for CancellableStdout {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// One worker write to a terminal. A PTY takes output only as fast as its
+/// reader drains the line discipline, 4 KiB at a time, so non-blocking writes
+/// cost a poll and a write per 4 KiB (16 syscalls and wakeups per 64 KiB
+/// batch). Wait for room while staying cancellable, then let one blocking
+/// write on the inherited description move the whole batch (at most
+/// `OUTPUT_BYTES`); a stalled terminal delays cancellation by at most that
+/// write, which the bounded graceful drain already tolerates. If another
+/// process left the shared description non-blocking, this degrades to
+/// partial writes, never to a wrong result.
+#[cfg(target_os = "linux")]
+fn write_terminal(terminal: &File, cancel: &LocalStream, bytes: &[u8]) -> io::Result<usize> {
+    use rustix::event::{poll, PollFd, PollFlags};
+    let mut descriptors = [
+        PollFd::new(terminal, PollFlags::OUT),
+        PollFd::new(cancel, PollFlags::IN | PollFlags::HUP),
+    ];
+    loop {
+        match poll(&mut descriptors, None) {
+            Ok(_)
+                if descriptors[1]
+                    .revents()
+                    .intersects(PollFlags::IN | PollFlags::HUP) =>
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "console output cancelled",
+                ));
+            }
+            Ok(_)
+                if descriptors[0]
+                    .revents()
+                    .intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) =>
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "console output is unavailable",
+                ));
+            }
+            Ok(_) if descriptors[0].revents().contains(PollFlags::OUT) => {
+                match rustix::io::write(terminal, bytes) {
+                    Ok(count) => return Ok(count),
+                    Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => {}
+                    Err(error) => return Err(io::Error::from(error)),
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(error) => return Err(io::Error::from(error)),
+        }
     }
 }
 

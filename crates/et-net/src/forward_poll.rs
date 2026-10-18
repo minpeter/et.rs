@@ -719,6 +719,12 @@ impl Worker {
         }
     }
 
+    fn has_held(&self, role: Role, socket_id: i32) -> bool {
+        self.held
+            .iter()
+            .any(|(held_role, held_id, _)| *held_role == role && *held_id == socket_id)
+    }
+
     fn send_credit(
         &mut self,
         role: Role,
@@ -899,6 +905,13 @@ impl Worker {
                 socket.write_closed = true;
                 shutdown_write(&socket.stream);
             }
+            if !socket.write_closed() && !self.has_held(socket.role, socket.socket_id) {
+                if let Some(route) = &socket.fast_route {
+                    route
+                        .direct_ok
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
         }
         if event.error && !event.readable {
             self.send_data(
@@ -1075,7 +1088,7 @@ impl Worker {
                         socket.write_closed = true;
                         shutdown_write(&socket.stream);
                     }
-                    if self.held.is_empty() && !socket.write_closed() {
+                    if !socket.write_closed() && !self.has_held(role, socket_id) {
                         if let Some(route) = &socket.fast_route {
                             route
                                 .direct_ok

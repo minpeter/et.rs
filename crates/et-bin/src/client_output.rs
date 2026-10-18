@@ -922,6 +922,7 @@ impl Write for CancellableStdout {
                             Err(error) => return Err(io::Error::from(error)),
                         }
                     }
+                    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
                     let mut max_chunk = 4096usize;
                     #[cfg(target_os = "linux")]
                     if bytes.len() > 4096 {

@@ -87,19 +87,40 @@ impl PreparedWrite {
 
 impl Connection {
     pub fn new_client(stream: TcpStream, key: &[u8; KEY_LEN]) -> Self {
-        Self::new(stream, key, DIR_CLIENT_TO_SERVER, DIR_SERVER_TO_CLIENT)
+        Self::new(
+            stream,
+            key,
+            DIR_CLIENT_TO_SERVER,
+            DIR_SERVER_TO_CLIENT,
+            et_core::backed_reader::MAX_SOCKET_READ,
+        )
     }
 
+    /// A server connection reads with a smaller cap: a server holds one per
+    /// session (see [`et_core::backed_reader::SERVER_MAX_SOCKET_READ`]).
     pub fn new_server(stream: TcpStream, key: &[u8; KEY_LEN]) -> Self {
-        Self::new(stream, key, DIR_SERVER_TO_CLIENT, DIR_CLIENT_TO_SERVER)
+        Self::new(
+            stream,
+            key,
+            DIR_SERVER_TO_CLIENT,
+            DIR_CLIENT_TO_SERVER,
+            et_core::backed_reader::SERVER_MAX_SOCKET_READ,
+        )
     }
 
-    fn new(stream: TcpStream, key: &[u8; KEY_LEN], encrypt: u8, decrypt: u8) -> Self {
+    fn new(
+        stream: TcpStream,
+        key: &[u8; KEY_LEN],
+        encrypt: u8,
+        decrypt: u8,
+        max_socket_read: usize,
+    ) -> Self {
         let _ = stream.set_nodelay(true);
         Self {
             stream: Arc::new(stream),
             writer: BackedWriter::new(CryptoHandler::new(key, encrypt), true),
-            reader: BackedReader::new(CryptoHandler::new(key, decrypt), true),
+            reader: BackedReader::new(CryptoHandler::new(key, decrypt), true)
+                .with_max_socket_read(max_socket_read),
             live_write_timeout: DEFAULT_LIVE_WRITE_TIMEOUT,
             pending_live: None,
         }

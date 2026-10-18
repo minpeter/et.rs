@@ -882,6 +882,7 @@ fn reap_unix_pid(pid: u32) -> Result<u32, String> {
             Ok(nix::sys::wait::WaitStatus::Stopped(_, _))
             | Ok(nix::sys::wait::WaitStatus::Continued(_))
             | Ok(nix::sys::wait::WaitStatus::StillAlive) => {}
+            #[allow(unreachable_patterns)]
             Ok(status) => return Err(format!("unexpected terminal wait status: {status:?}")),
             Err(nix::errno::Errno::EINTR) => {}
             Err(nix::errno::Errno::ECHILD) => return Ok(0),

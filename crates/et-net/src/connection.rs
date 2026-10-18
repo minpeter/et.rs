@@ -452,6 +452,12 @@ impl Connection {
         self.writer.acknowledge(sequence);
     }
 
+    /// Latest peer acknowledgement and the wire bytes written since; `None`
+    /// for a peer that has never acknowledged delivery (legacy peers).
+    pub fn delivery_backlog(&self) -> Option<(i64, i64)> {
+        self.writer.delivery_backlog()
+    }
+
     /// Keep-alive payload acknowledging everything read so far.
     pub fn keepalive_ack(&self) -> [u8; et_core::keepalive::ACK_PAYLOAD_LEN] {
         et_core::keepalive::encode_ack(self.reader.sequence())

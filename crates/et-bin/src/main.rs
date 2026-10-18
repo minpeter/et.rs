@@ -96,6 +96,7 @@ mod client_terminal_loop;
 #[cfg(windows)]
 mod client_terminal_windows;
 mod deadline;
+mod delivery_gate;
 mod detach;
 mod error;
 mod forward_config;

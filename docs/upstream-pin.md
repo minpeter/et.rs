@@ -603,6 +603,34 @@ classified. Ported behavior:
 et.rs still claims **protocol v6**. EternalTerminal’s latest product release is
 **v7.0.0**, and the reviewed tip is one hundred nine classified commits past that tag.
 
+### Single-loop runtimes (et.rs performance work, 2026-10-19)
+
+Reviewed against upstream master
+[`7eb237e`](https://github.com/MisterTea/EternalTerminal/commit/7eb237e6d9822b674f4a527924b5f09117659321).
+Upstream `UserTerminalHandlerUnix.cpp` drives the PTY master, the command's
+stderr and the router from one `select()` loop with a 10 ms timeout and one
+16 KiB `read` per wakeup; `TerminalServer::run` polls every listener and the
+router from one loop (100 ms) and expires unclaimed resumes there;
+`PortForwardHandler::update` runs from the terminal loop's `select()`.
+
+et.rs now follows that single-loop shape with these deliberate differences:
+
+- Linux `etterminal` (PTY and `-T` pipes) learns about the shell's exit from a
+  pidfd in the same `poll(2)` set, so there is no 10 ms tick or `waitpid`
+  probing; kernels without `pidfd_open` keep the threaded runtime, as do
+  macOS (whose `poll` is unreliable on PTYs) and Windows.
+- PTY reads continue while the master returns full `N_TTY_BUF_SIZE - 1`
+  reads and are sent as one local `TERMINAL_BUFFER` of up to 32 KiB; upstream
+  sends one frame per read.
+- Forwarding moves onto the session thread only after the session loop first
+  polls it; before that (and on Windows) the forwarding worker thread runs the
+  same engine.
+- `etserver` keeps the router on its own thread; one `et-runtime` thread
+  accepts on all TCP listeners and applies terminal lifecycle events plus the
+  1 s resume sweep from its poll timeout.
+
+No wire, handshake, crypto or `PROTOCOL_VERSION` change.
+
 ## Ledger (classified 2026-10-14)
 
 Twenty commits after [`e02aefa`](https://github.com/MisterTea/EternalTerminal/commit/e02aefa2301a9544fe7a40564e612dcf122291e1).

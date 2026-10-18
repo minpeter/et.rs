@@ -4,10 +4,14 @@ use std::io::Write;
 use std::io::{self};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering};
+#[cfg(windows)]
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 #[cfg(all(test, unix))]
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+#[cfg(windows)]
+use std::sync::RwLock;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -17,9 +21,9 @@ use crate::forward::{ForwardError, Outbound};
 use crate::forward_endpoint::ForwardStream;
 #[cfg(windows)]
 use crate::forward_io::{abort_io, commit_reservation, stop_io, ActiveIo};
-use crate::forward_io::{
-    spawn_connector, spawn_listener, spawn_socks_listener, BoundSource, FlowWindow, ListenerStop,
-};
+use crate::forward_io::{spawn_connector, BoundSource, FlowWindow};
+#[cfg(windows)]
+use crate::forward_io::{spawn_listener, spawn_socks_listener, ListenerStop};
 use et_core::packet::Packet;
 use et_core::proto::SocketEndpoint;
 
@@ -50,60 +54,6 @@ pub(crate) struct FastRoute {
 
 #[cfg(windows)]
 pub(crate) type FastRoutes = Arc<RwLock<HashMap<(Role, i32), FastRoute>>>;
-
-#[cfg(unix)]
-pub(crate) struct UnixFastRoute {
-    pub(crate) role: Role,
-    pub(crate) socket_id: i32,
-    pub(crate) stream: ForwardStream,
-    pub(crate) direct_ok: AtomicBool,
-    pub(crate) direct_read_ok: AtomicBool,
-    pub(crate) windowed: bool,
-    pub(crate) window_bytes: i64,
-    pub(crate) window_packets: i64,
-    pub(crate) in_flight_bytes: AtomicI64,
-    pub(crate) in_flight_packets: AtomicI64,
-    pub(crate) credit_bytes: AtomicI64,
-    pub(crate) credit_packets: AtomicI64,
-}
-
-#[cfg(unix)]
-impl UnixFastRoute {
-    pub(crate) fn read_interest(&self) -> bool {
-        self.direct_read_ok.load(Ordering::Acquire)
-            && (!self.windowed
-                || (self.in_flight_bytes.load(Ordering::Acquire) < self.window_bytes
-                    && self.in_flight_packets.load(Ordering::Acquire) < self.window_packets))
-    }
-
-    pub(crate) fn note_sent(&self, bytes: usize) {
-        if !self.windowed {
-            return;
-        }
-        let add = i64::try_from(bytes).unwrap_or(i64::MAX);
-        self.in_flight_bytes.fetch_add(add, Ordering::AcqRel);
-        self.in_flight_packets.fetch_add(1, Ordering::AcqRel);
-    }
-
-    pub(crate) fn apply_delivery(&self, delivered: FlowWindow) {
-        if delivered.bytes > 0 {
-            let _ = self
-                .in_flight_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                    Some(cur.saturating_sub(delivered.bytes).max(0))
-                });
-        }
-        if delivered.packets > 0 {
-            let _ =
-                self.in_flight_packets
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                        Some(cur.saturating_sub(delivered.packets).max(0))
-                    });
-        }
-    }
-}
-#[cfg(unix)]
-pub(crate) type UnixFastRoutes = Arc<RwLock<HashMap<(Role, i32), Arc<UnixFastRoute>>>>;
 
 pub(crate) enum Command {
     Packet(Packet),
@@ -188,7 +138,7 @@ pub(crate) struct CommandSender {
 pub(crate) struct CommandReceiver {
     queue: Arc<CommandQueue>,
     #[cfg(unix)]
-    wake_reader: Option<std::os::unix::net::UnixStream>,
+    wake_reader: Option<Arc<std::os::unix::net::UnixStream>>,
 }
 
 pub(crate) enum TryCommandError {
@@ -213,7 +163,7 @@ pub(crate) fn command_channel(capacity: usize) -> (CommandSender, CommandReceive
             writer.set_nonblocking(true).ok()?;
             Some((reader, writer))
         })
-        .map(|(reader, writer)| (Some(reader), Some(writer)))
+        .map(|(reader, writer)| (Some(Arc::new(reader)), Some(writer)))
         .unwrap_or((None, None));
     let queue = Arc::new(CommandQueue {
         capacity,
@@ -429,9 +379,11 @@ impl CommandSender {
             .map_or(true, |state| state.commands.is_empty())
     }
 
+    #[cfg(windows)]
     pub(crate) fn is_idle(&self) -> bool {
         self.queue.in_flight.load(Ordering::Acquire) == 0
     }
+
     #[cfg(all(test, unix))]
     pub(crate) fn wait_shutdown_timeout(&self, timeout: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
@@ -466,6 +418,13 @@ impl CommandReceiver {
             .expect("command wake pipe unavailable")
     }
 
+    /// Shared handle to the wake pipe for callers that poll it outside the
+    /// receiver's borrow (the session-driven engine).
+    #[cfg(unix)]
+    pub(crate) fn wake_reader_shared(&self) -> Option<Arc<std::os::unix::net::UnixStream>> {
+        self.wake_reader.clone()
+    }
+
     #[cfg(unix)]
     pub(crate) fn has_pending(&self) -> bool {
         self.queue.in_flight.load(Ordering::Acquire) > 0
@@ -480,7 +439,7 @@ impl CommandReceiver {
         };
         let mut buffer = [0u8; 64];
         loop {
-            match (&mut &*reader).read(&mut buffer) {
+            match (&mut &**reader).read(&mut buffer) {
                 Ok(0) => return,
                 Ok(_) => continue,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
@@ -656,18 +615,22 @@ pub(crate) struct WorkerChannels {
     #[cfg(windows)]
     pub(crate) routes: FastRoutes,
     #[cfg(unix)]
-    pub(crate) routes: UnixFastRoutes,
+    pub(crate) listeners: poll::ListenerRegistry,
     #[cfg(unix)]
-    pub(crate) session_polls_reads: Arc<AtomicBool>,
+    pub(crate) handover: poll::HandoverLink,
     #[cfg(unix)]
     pub(crate) wake_signalled: Arc<AtomicBool>,
 }
 
+/// Run the forwarding worker until shutdown. On Unix the worker may instead
+/// hand its whole state to the session loop (see [`poll::Engine`]); the
+/// thread then ends without tearing anything down.
 pub(crate) fn run(
     sources: Vec<BoundSource>,
     channels: WorkerChannels,
     #[cfg(unix)] outbound_wake: UnixStream,
-    control: (ListenerStop, Option<(u32, u32)>, Arc<AtomicBool>),
+    #[cfg(unix)] control: (Option<(u32, u32)>, Arc<AtomicBool>),
+    #[cfg(windows)] control: (ListenerStop, Option<(u32, u32)>, Arc<AtomicBool>),
 ) {
     let WorkerChannels {
         receiver: commands,
@@ -681,12 +644,15 @@ pub(crate) fn run(
         #[cfg(windows)]
         routes,
         #[cfg(unix)]
-        routes,
+        listeners,
         #[cfg(unix)]
-        session_polls_reads,
+        handover,
         #[cfg(unix)]
         wake_signalled,
     } = channels;
+    #[cfg(unix)]
+    let (session_user, shutdown) = control;
+    #[cfg(windows)]
     let (listener_stop, session_user, shutdown) = control;
     #[cfg(unix)]
     let result = Worker::new(
@@ -698,18 +664,26 @@ pub(crate) fn run(
         abandoned,
     )
     .and_then(|mut worker| {
-        worker.routes = routes;
-        worker.session_polls_reads = session_polls_reads;
+        worker.listeners = listeners;
+        worker.next_client_fd = next_client_fd;
         worker.wake_signalled = wake_signalled.clone();
-        worker.run(
-            sources,
-            commands,
-            listener_stop,
-            session_user,
-            stdio_open,
-            next_client_fd,
-        )
+        worker.handover_request = handover.request;
+        match worker.run(sources, commands, session_user, stdio_open)? {
+            Some(commands) => {
+                // The session loop now owns every socket and listener. If it
+                // already went away, dropping the engine closes them.
+                let _ = handover
+                    .reply
+                    .send(Box::new(poll::Engine::new(worker, commands)));
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     });
+    #[cfg(unix)]
+    if matches!(result, Ok(true)) {
+        return;
+    }
     #[cfg(windows)]
     let result = Worker::new(
         command_sender,
@@ -730,6 +704,7 @@ pub(crate) fn run(
             next_client_fd,
         )
     });
+    let result = result.map(|_| ());
     // Stop externally owned listeners even if publishing the failure is
     // blocked by a full outbound queue.
     let was_shutdown = shutdown.swap(true, Ordering::AcqRel);
@@ -758,10 +733,35 @@ struct Worker {
     routes: FastRoutes,
     #[cfg(windows)]
     direct_enabled: bool,
+    /// Every listener this forwarder accepts on, shared with the
+    /// [`crate::forward::Forwarder`] so runtime add/cancel never waits on
+    /// the command queue.
     #[cfg(unix)]
-    routes: UnixFastRoutes,
+    listeners: poll::ListenerRegistry,
     #[cfg(unix)]
-    session_polls_reads: Arc<AtomicBool>,
+    next_client_fd: Arc<AtomicI32>,
+    /// Session-driven mode: the session thread owns this worker and drains
+    /// `engine_priority`/`engine_outbound` directly, so emission never
+    /// blocks and never writes a wake byte.
+    #[cfg(unix)]
+    pub(super) engine: bool,
+    #[cfg(unix)]
+    pub(super) engine_priority: VecDeque<Outbound>,
+    #[cfg(unix)]
+    pub(super) engine_outbound: VecDeque<Outbound>,
+    /// Payload bytes queued in `engine_outbound`.
+    #[cfg(unix)]
+    pub(super) engine_outbound_bytes: usize,
+    /// Sources activated by the current packet batch, read immediately in
+    /// engine mode: their application data usually arrived while the
+    /// destination request was in flight.
+    #[cfg(unix)]
+    pub(super) fresh_sources: Vec<i32>,
+    /// Session request to take over this worker (see `poll::Engine`).
+    #[cfg(unix)]
+    handover_request: channel::Receiver<()>,
+    #[cfg(unix)]
+    pub(super) handover_pending: bool,
     #[cfg(unix)]
     outbound_wake: Arc<UnixStream>,
     /// Outbound packets the poll loop could not hand to the session because
@@ -862,9 +862,23 @@ impl Worker {
             #[cfg(windows)]
             direct_enabled: false,
             #[cfg(unix)]
-            routes: Arc::new(RwLock::new(HashMap::new())),
+            listeners: poll::ListenerRegistry::default(),
             #[cfg(unix)]
-            session_polls_reads: Arc::new(AtomicBool::new(false)),
+            next_client_fd: Arc::new(AtomicI32::new(1)),
+            #[cfg(unix)]
+            engine: false,
+            #[cfg(unix)]
+            engine_priority: VecDeque::new(),
+            #[cfg(unix)]
+            engine_outbound: VecDeque::new(),
+            #[cfg(unix)]
+            engine_outbound_bytes: 0,
+            #[cfg(unix)]
+            fresh_sources: Vec::new(),
+            #[cfg(unix)]
+            handover_request: channel::never(),
+            #[cfg(unix)]
+            handover_pending: false,
             #[cfg(unix)]
             outbound_wake,
             #[cfg(unix)]
@@ -895,6 +909,52 @@ impl Worker {
         })
     }
 
+    /// Unix: start the `-W` stdio bridge, then run the poll loop. Returns
+    /// the command receiver instead of tearing down when the session loop
+    /// asked to take this worker over.
+    #[cfg(unix)]
+    fn run(
+        &mut self,
+        sources: Vec<BoundSource>,
+        commands: CommandReceiver,
+        session_user: Option<(u32, u32)>,
+        stdio_open: Option<Arc<AtomicBool>>,
+    ) -> Result<Option<CommandReceiver>, ForwardError> {
+        self.session_user = session_user;
+        self.stdio_open = stdio_open;
+        let result = self
+            .start_sources(sources)
+            .and_then(|()| self.run_poll(&commands));
+        if matches!(result, Ok(true)) {
+            return Ok(Some(commands));
+        }
+        let hard_cancelled = !matches!(self.cancel.try_recv(), Err(channel::TryRecvError::Empty));
+        self.finish(hard_cancelled);
+        result.map(|_| None)
+    }
+
+    #[cfg(unix)]
+    fn start_sources(&mut self, sources: Vec<BoundSource>) -> Result<(), ForwardError> {
+        for source in sources {
+            if source.stdio {
+                self.threads.push(
+                    crate::forward_io::spawn_stdio(
+                        source.destination,
+                        self.commands.clone(),
+                        self.cancel.clone(),
+                        self.next_client_fd.clone(),
+                        (self.stdio_open.clone(), self.outbound_wake.try_clone().ok()),
+                    )
+                    .map_err(ForwardError::Io)?,
+                );
+            } else {
+                self.listeners.push(poll::ListenerEntry::new(source));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
     fn run(
         &mut self,
         sources: Vec<BoundSource>,
@@ -908,32 +968,11 @@ impl Worker {
         self.stdio_open = stdio_open;
         for source in sources {
             if source.stdio {
-                #[cfg(unix)]
-                {
-                    let destination = source.destination;
-                    self.threads.push(
-                        crate::forward_io::spawn_stdio(
-                            destination,
-                            self.commands.clone(),
-                            self.cancel.clone(),
-                            next_client_fd.clone(),
-                            (self.stdio_open.clone(), self.outbound_wake.try_clone().ok()),
-                        )
-                        .map_err(ForwardError::Io)?,
-                    );
-                    continue;
-                }
-                #[cfg(windows)]
-                {
-                    let _ = source;
-                    return Err(ForwardError::Protocol(
-                        "-W/--stdio-forward is not supported on Windows",
-                    ));
-                }
+                let _ = source;
+                return Err(ForwardError::Protocol(
+                    "-W/--stdio-forward is not supported on Windows",
+                ));
             }
-            #[cfg(unix)]
-            let stop = listener_stop.try_clone().map_err(ForwardError::Io)?;
-            #[cfg(windows)]
             let stop = listener_stop.clone();
             let thread = if source.socks {
                 spawn_socks_listener(
@@ -957,17 +996,11 @@ impl Worker {
         }
         let result = self.run_loop(commands);
         self.routes.write().unwrap().clear();
-        #[cfg(unix)]
-        let _ = listener_stop.shutdown(std::net::Shutdown::Both);
-        #[cfg(windows)]
         listener_stop.store(true, std::sync::atomic::Ordering::Release);
         for (_, pending) in self.pending.drain() {
             pending.stream.shutdown();
         }
         let hard_cancelled = !matches!(self.cancel.try_recv(), Err(channel::TryRecvError::Empty));
-        #[cfg(unix)]
-        self.stop_sockets(hard_cancelled);
-        #[cfg(windows)]
         for (_, io) in self.sources.drain().chain(self.destinations.drain()) {
             if hard_cancelled {
                 abort_io(io);
@@ -996,11 +1029,6 @@ impl Worker {
                 break Err(error);
             }
         }
-    }
-
-    #[cfg(unix)]
-    fn run_loop(&mut self, commands: CommandReceiver) -> Result<(), ForwardError> {
-        self.run_poll(&commands)
     }
 
     fn handle_command(&mut self, command: Command) -> Result<(), ForwardError> {

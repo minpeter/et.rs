@@ -8,9 +8,6 @@ use std::thread::{self, JoinHandle};
 
 use crossbeam_channel as channel;
 
-#[cfg(unix)]
-use rustix::event::{poll, PollFd, PollFlags};
-
 use crate::forward_endpoint::{Endpoint, ForwardListener, ForwardStream};
 #[cfg(windows)]
 use crate::ssh_agent_session_bind::AgentSessionBindReplies;
@@ -18,9 +15,17 @@ use et_core::proto::SocketEndpoint;
 
 #[cfg(windows)]
 use super::forward_worker::Role;
-use super::forward_worker::{Command, CommandSender, TryCommandError};
+#[cfg(windows)]
+use super::forward_worker::TryCommandError;
+use super::forward_worker::{Command, CommandSender};
 
 pub(crate) const READ_CHUNK: usize = 64 * 1024;
+/// Bytes read from a forwarded socket per data packet. A whole read encodes
+/// to a `PortForwardData` frame that still fits the allocator's 64 KiB size
+/// class (like the terminal pipe's 65,472-byte chunks); the receive bound
+/// stays `MAX_DATA_PACKET` for compatibility with peers that send 64 KiB.
+#[cfg(unix)]
+pub(crate) const FORWARD_READ_LEN: usize = READ_CHUNK - 64;
 
 #[cfg(windows)]
 const IO_CANCEL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -144,15 +149,10 @@ pub(crate) struct ActiveIo {
     pub(crate) packet_credit_to_return: i64,
 }
 
-/// Signal used to stop listener threads.
-///
-/// On Unix this is the read end of a socket pair so the accept loop can block
-/// in `poll(2)` exactly like upstream's `select()`. Windows cannot poll a
+/// Signal used to stop Windows listener threads. Windows cannot poll a
 /// socket pair created this way, so the loop uses a non-blocking accept with
 /// the same 10ms cadence upstream's `select()` timeout provides, driven by a
-/// shared flag.
-#[cfg(unix)]
-pub(crate) type ListenerStop = std::os::unix::net::UnixStream;
+/// shared flag. Unix polls listeners from the forwarding loop instead.
 #[cfg(windows)]
 pub(crate) type ListenerStop = Arc<AtomicBool>;
 
@@ -161,6 +161,7 @@ pub(crate) type ListenerStop = Arc<AtomicBool>;
 #[cfg(windows)]
 const ACCEPT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
+#[cfg(windows)]
 pub(crate) fn spawn_listener(
     source: BoundSource,
     commands: CommandSender,
@@ -181,43 +182,8 @@ pub(crate) fn spawn_listener(
             return;
         };
         loop {
-            #[cfg(unix)]
-            {
-                let mut descriptors = [
-                    PollFd::new(&listener, PollFlags::IN),
-                    PollFd::new(&stop, PollFlags::IN),
-                ];
-                // poll() is never restarted by SA_RESTART; retry on EINTR so
-                // a stray signal cannot silently stop the forward acceptor.
-                match poll(
-                    &mut descriptors,
-                    Some(&rustix::event::Timespec {
-                        tv_sec: 0,
-                        tv_nsec: 100_000_000,
-                    }),
-                ) {
-                    Ok(_) => {}
-                    Err(error) if error == rustix::io::Errno::INTR => continue,
-                    Err(_) => return,
-                }
-                if descriptors[1]
-                    .revents()
-                    .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
-                {
-                    return;
-                }
-                if worker_stopped.load(Ordering::Acquire) {
-                    return;
-                }
-                if !descriptors[0].revents().contains(PollFlags::IN) {
-                    continue;
-                }
-            }
-            #[cfg(windows)]
-            {
-                if stop.load(Ordering::Acquire) || worker_stopped.load(Ordering::Acquire) {
-                    return;
-                }
+            if stop.load(Ordering::Acquire) || worker_stopped.load(Ordering::Acquire) {
+                return;
             }
             let mut accepted_any = false;
             loop {
@@ -250,12 +216,9 @@ pub(crate) fn spawn_listener(
                     Err(_) => return,
                 }
             }
-            #[cfg(windows)]
             if !accepted_any {
                 thread::sleep(ACCEPT_INTERVAL);
             }
-            #[cfg(unix)]
-            let _ = accepted_any;
         }
     })
 }
@@ -263,6 +226,7 @@ pub(crate) fn spawn_listener(
 // Listener cancellation must not wait for the transport pump to drain a full
 // worker queue. A stream is admitted only once its Accepted command is queued;
 // those already-admitted streams remain owned by the worker.
+#[cfg(windows)]
 fn send_accepted_until_stopped(
     commands: &CommandSender,
     cancel: &channel::Receiver<()>,
@@ -270,21 +234,8 @@ fn send_accepted_until_stopped(
     mut command: Command,
 ) -> bool {
     loop {
-        if cancellation_requested(cancel) {
+        if cancellation_requested(cancel) || stop.load(Ordering::Acquire) {
             return false;
-        }
-        #[cfg(windows)]
-        if stop.load(Ordering::Acquire) {
-            return false;
-        }
-        #[cfg(unix)]
-        {
-            let mut descriptors = [PollFd::new(stop, PollFlags::IN)];
-            match poll(&mut descriptors, Some(&rustix::event::Timespec::default())) {
-                Ok(0) => {}
-                Err(rustix::io::Errno::INTR) => continue,
-                _ => return false,
-            }
         }
         match commands.try_send(command) {
             Ok(()) => return true,
@@ -295,6 +246,7 @@ fn send_accepted_until_stopped(
     }
 }
 
+#[cfg(windows)]
 pub(crate) fn spawn_socks_listener(
     source: BoundSource,
     commands: CommandSender,
@@ -309,28 +261,6 @@ pub(crate) fn spawn_socks_listener(
             return;
         };
         loop {
-            #[cfg(unix)]
-            {
-                let mut descriptors = [
-                    PollFd::new(&listener, PollFlags::IN),
-                    PollFd::new(&stop, PollFlags::IN),
-                ];
-                match poll(&mut descriptors, None) {
-                    Ok(_) => {}
-                    Err(error) if error == rustix::io::Errno::INTR => continue,
-                    Err(_) => return,
-                }
-                if descriptors[1]
-                    .revents()
-                    .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
-                {
-                    return;
-                }
-                if !descriptors[0].revents().contains(PollFlags::IN) {
-                    continue;
-                }
-            }
-            #[cfg(windows)]
             if stop.load(Ordering::Acquire) {
                 return;
             }
@@ -341,31 +271,45 @@ pub(crate) fn spawn_socks_listener(
                         stream.shutdown();
                         return;
                     }
-                    if !try_admit_socks(&pending_socks) {
-                        stream.shutdown();
-                        continue;
-                    }
-                    let commands = commands.clone();
-                    let cancel = cancel.clone();
-                    let admit = SocksAdmit(pending_socks.clone());
-                    thread::spawn(move || {
-                        let _admit = admit;
-                        let deadline = std::time::Instant::now() + SOCKS_HANDSHAKE_TIMEOUT;
-                        if let Some(accepted) =
-                            finish_socks_handshake(client_fd, stream, &cancel, deadline)
-                        {
-                            let _ = commands.send(accepted);
-                        }
-                    });
+                    spawn_socks_handshake(
+                        client_fd,
+                        stream,
+                        &pending_socks,
+                        commands.clone(),
+                        cancel.clone(),
+                    );
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => return,
             }
-            #[cfg(windows)]
             thread::sleep(ACCEPT_INTERVAL);
         }
     })
+}
+
+/// Finish one accepted SOCKS client's handshake on its own thread (it reads
+/// with timeouts), then hand the stream to the worker as `Accepted`.
+/// Incomplete handshakes beyond `MAX_PENDING_SOCKS` are closed at once.
+pub(crate) fn spawn_socks_handshake(
+    client_fd: i32,
+    stream: ForwardStream,
+    pending_socks: &Arc<AtomicUsize>,
+    commands: CommandSender,
+    cancel: channel::Receiver<()>,
+) {
+    if cancellation_requested(&cancel) || !try_admit_socks(pending_socks) {
+        stream.shutdown();
+        return;
+    }
+    let admit = SocksAdmit(pending_socks.clone());
+    thread::spawn(move || {
+        let _admit = admit;
+        let deadline = std::time::Instant::now() + SOCKS_HANDSHAKE_TIMEOUT;
+        if let Some(accepted) = finish_socks_handshake(client_fd, stream, &cancel, deadline) {
+            let _ = commands.send(accepted);
+        }
+    });
 }
 
 fn finish_socks_handshake(

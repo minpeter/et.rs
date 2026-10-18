@@ -391,6 +391,11 @@ where
         let producers_polled = !connection.write_pending();
         if producers_polled {
             forwarder.collect_fast_poll_routes(&mut fast_poll);
+            // Forwarding timers (idle window credit, parked accepts) and
+            // packets it already holds bound how long this poll may sleep.
+            if let Some(at) = fast_poll.deadline() {
+                deadline = deadline.min(at);
+            }
         }
         let (network, resize, output_ready, output_status, forward_events, input) = {
             let mut descriptors = vec![

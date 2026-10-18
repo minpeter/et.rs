@@ -8,28 +8,46 @@
 //! wake pipe and every socket, with reads, writes, half-closes, and window
 //! credit handled inline. Windows keeps the threaded model (`poll` does not
 //! cover arbitrary handles there), so this file is Unix-only.
+//!
+//! Listeners are polled from the same loop (upstream `ForwardSourceHandler::
+//! listen` runs inside `update` too), so an accept costs no thread hop.
+//! Once a session loop attaches, the worker thread hands its whole state to
+//! that loop as an [`Engine`]: the session's own `poll(2)` then covers the
+//! forwarding descriptors, and setup, data, and teardown run on one thread
+//! exactly like upstream's single `select()` loop.
 
 use std::collections::VecDeque;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use et_core::proto::{PortForwardData, PortForwardWindow, TerminalPacketType};
+use crossbeam_channel as channel;
+use et_core::packet::Packet;
+use et_core::proto::{
+    PortForwardData, PortForwardSourceRequest, PortForwardWindow, SocketEndpoint,
+    TerminalPacketType,
+};
 use rustix::event::{poll, PollFd, PollFlags};
 
-use crate::forward_endpoint::ForwardStream;
-use crate::forward_io::{cancellation_requested, shutdown_write, FlowWindow};
+use crate::forward_endpoint::{ForwardListener, ForwardStream};
+use crate::forward_io::{cancellation_requested, shutdown_write, BoundSource, FlowWindow};
 use crate::ssh_agent_session_bind::AgentSessionBindReplies;
 
 use super::state::{CREDIT_RETURN_THRESHOLD, PACKET_CREDIT_RETURN_THRESHOLD};
-use super::{ForwardError, Role, Worker, MAX_DATA_PACKET};
+use super::{Command, CommandReceiver, ForwardError, PendingAccept, Role, Worker, MAX_DATA_PACKET};
 
 /// Queued network-to-socket buffers per socket, matching the bound of the
 /// writer channel the threaded model used.
 const OUT_QUEUE_PACKETS: usize = 64;
-/// Idle sockets flush sub-threshold window credit after this delay, the same
-/// cadence the writer thread's `default(2ms)` select arm provided.
-const IDLE_CREDIT_FLUSH: Duration = Duration::from_millis(2);
+/// Idle sockets flush sub-threshold window credit after this delay. Liveness
+/// never waits on it: the return thresholds are a quarter of the advertised
+/// window, so a stalled sender always has threshold credit pending. It only
+/// returns the remainder of a stream that paused, so it is long enough that
+/// a request/response exchange does not pay an extra credit packet (and a
+/// peer wake-up) every couple of milliseconds.
+const IDLE_CREDIT_FLUSH: Duration = Duration::from_millis(50);
 /// Reads serviced per socket per poll cycle before moving to the next socket.
 /// Large enough to drain a saturated socket buffer in one cycle, so a bulk
 /// transfer does not return to poll once per handful of packets.
@@ -43,7 +61,9 @@ pub(crate) struct QueuedBuffer {
 }
 
 pub(crate) struct SocketIo {
-    pub(crate) stream: ForwardStream,
+    /// Shared so the session-driven engine can hand the descriptor to the
+    /// session's `poll(2)` set without borrowing the worker.
+    pub(crate) stream: Arc<ForwardStream>,
     pub(crate) role: Role,
     pub(crate) socket_id: i32,
     /// Network data queued for the local socket.
@@ -69,7 +89,6 @@ pub(crate) struct SocketIo {
     credit_bytes: i64,
     credit_packets: i64,
     credit_flush_at: Option<Instant>,
-    pub(super) fast_route: Option<std::sync::Arc<super::UnixFastRoute>>,
 }
 
 pub(crate) enum ReadOutcome {
@@ -106,7 +125,7 @@ impl SocketIo {
         Ok(Self {
             role,
             socket_id,
-            stream,
+            stream: Arc::new(stream),
             out: VecDeque::new(),
             out_offset: 0,
             read_open: true,
@@ -122,7 +141,6 @@ impl SocketIo {
             credit_bytes: 0,
             credit_packets: 0,
             credit_flush_at: None,
-            fast_route: None,
         })
     }
 
@@ -137,19 +155,7 @@ impl SocketIo {
         if !self.windowed() {
             return true;
         }
-        let (in_b, in_p) = if let Some(route) = &self.fast_route {
-            (
-                route
-                    .in_flight_bytes
-                    .load(std::sync::atomic::Ordering::Acquire),
-                route
-                    .in_flight_packets
-                    .load(std::sync::atomic::Ordering::Acquire),
-            )
-        } else {
-            (self.in_flight_bytes, self.in_flight_packets)
-        };
-        in_b < self.window_bytes && in_p < self.window_packets
+        self.in_flight_bytes < self.window_bytes && self.in_flight_packets < self.window_packets
     }
 
     fn write_interest(&self) -> bool {
@@ -161,11 +167,6 @@ impl SocketIo {
     /// before popping new commands, mirroring the backpressure the bounded
     /// writer channel provided.
     fn queue_write(&mut self, buffer: Vec<u8>) -> Result<(), Vec<u8>> {
-        if let Some(route) = &self.fast_route {
-            route
-                .direct_ok
-                .store(false, std::sync::atomic::Ordering::Release);
-        }
         if self.out.len() >= OUT_QUEUE_PACKETS {
             return Err(buffer);
         }
@@ -182,11 +183,6 @@ impl SocketIo {
         if len == 0 {
             return Ok(());
         }
-        if let Some(route) = &self.fast_route {
-            route
-                .direct_ok
-                .store(false, std::sync::atomic::Ordering::Release);
-        }
         if len > MAX_DATA_PACKET || self.out.len() >= OUT_QUEUE_PACKETS {
             return Err(data);
         }
@@ -202,10 +198,6 @@ impl SocketIo {
     }
 
     fn apply_delivery(&mut self, delivered: FlowWindow) {
-        if let Some(route) = &self.fast_route {
-            route.apply_delivery(delivered);
-            return;
-        }
         if delivered.bytes > 0 {
             self.in_flight_bytes = self.in_flight_bytes.saturating_sub(delivered.bytes).max(0);
         }
@@ -219,10 +211,6 @@ impl SocketIo {
 
     fn note_sent(&mut self, bytes: usize) {
         if !self.windowed() {
-            return;
-        }
-        if let Some(route) = &self.fast_route {
-            route.note_sent(bytes);
             return;
         }
         self.in_flight_bytes = self
@@ -245,7 +233,7 @@ impl SocketIo {
             return Ok(ReadOutcome::Idle);
         }
         loop {
-            match self.stream.read(&mut scratch[..limit]) {
+            match self.stream.read_shared(&mut scratch[..limit]) {
                 Ok(0) => return Ok(ReadOutcome::Eof),
                 Ok(count) => {
                     if let Some(replies) = self.bind_replies.as_mut() {
@@ -275,10 +263,7 @@ impl SocketIo {
     /// without an intermediate `Vec<u8>` copy.
     fn read_encoded_chunk(&mut self, scratch: &mut [u8]) -> io::Result<ReadOutcome> {
         let limit = if self.windowed() {
-            let in_b = self.fast_route.as_ref().map_or(self.in_flight_bytes, |r| {
-                r.in_flight_bytes.load(std::sync::atomic::Ordering::Acquire)
-            });
-            let remaining = self.window_bytes.saturating_sub(in_b);
+            let remaining = self.window_bytes.saturating_sub(self.in_flight_bytes);
             usize::try_from(remaining.min(scratch.len() as i64)).unwrap_or(0)
         } else {
             scratch.len()
@@ -287,7 +272,7 @@ impl SocketIo {
             return Ok(ReadOutcome::Idle);
         }
         loop {
-            match self.stream.read(&mut scratch[..limit]) {
+            match self.stream.read_shared(&mut scratch[..limit]) {
                 Ok(0) => return Ok(ReadOutcome::Eof),
                 Ok(count) => {
                     if let Some(replies) = self.bind_replies.as_mut() {
@@ -333,7 +318,7 @@ impl SocketIo {
             let result = if self.out.len() == 1 {
                 let front = self.out.front().unwrap();
                 let pending = &front.data[front.start + self.out_offset..front.start + front.len];
-                self.stream.write(pending)
+                self.stream.write_shared(pending)
             } else {
                 let mut slices = [io::IoSlice::new(&[]); 16];
                 let mut count = 0;
@@ -343,7 +328,7 @@ impl SocketIo {
                         io::IoSlice::new(&buf.data[buf.start + offset..buf.start + buf.len]);
                     count += 1;
                 }
-                self.stream.write_vectored(&slices[..count])
+                self.stream.write_vectored_shared(&slices[..count])
             };
             match result {
                 Ok(0) => {
@@ -384,23 +369,6 @@ impl SocketIo {
         Ok(())
     }
 
-    fn sync_fast_credit(&mut self) {
-        if let Some(route) = &self.fast_route {
-            let cb = route
-                .credit_bytes
-                .swap(0, std::sync::atomic::Ordering::AcqRel);
-            let cp = route
-                .credit_packets
-                .swap(0, std::sync::atomic::Ordering::AcqRel);
-            if cb > 0 || cp > 0 {
-                self.credit_bytes = self.credit_bytes.saturating_add(cb);
-                self.credit_packets = self.credit_packets.saturating_add(cp);
-                if self.out.is_empty() && self.credit_flush_at.is_none() {
-                    self.credit_flush_at = Some(Instant::now());
-                }
-            }
-        }
-    }
     fn credit_due(&self, now: Instant) -> bool {
         if self.credit_bytes <= 0 || self.credit_packets <= 0 {
             return false;
@@ -455,42 +423,9 @@ impl Worker {
         peer_window: Option<FlowWindow>,
         bind_replies: Option<AgentSessionBindReplies>,
     ) -> Result<(), ForwardError> {
-        let fast_route = if bind_replies.is_none() {
-            stream.try_clone().ok().map(|cloned| {
-                std::sync::Arc::new(super::UnixFastRoute {
-                    role,
-                    socket_id,
-                    stream: cloned,
-                    direct_ok: std::sync::atomic::AtomicBool::new(true),
-                    direct_read_ok: std::sync::atomic::AtomicBool::new(true),
-                    windowed: peer_window.is_some(),
-                    window_bytes: peer_window.map_or(-1, |w| w.bytes),
-                    window_packets: peer_window.map_or(-1, |w| w.packets),
-                    in_flight_bytes: std::sync::atomic::AtomicI64::new(0),
-                    in_flight_packets: std::sync::atomic::AtomicI64::new(0),
-                    credit_bytes: std::sync::atomic::AtomicI64::new(0),
-                    credit_packets: std::sync::atomic::AtomicI64::new(0),
-                })
-            })
-        } else {
-            None
-        };
-        let mut socket = SocketIo::new(role, socket_id, stream, peer_window, bind_replies)
+        let socket = SocketIo::new(role, socket_id, stream, peer_window, bind_replies)
             .map_err(ForwardError::Io)?;
-        if let Some(route) = fast_route {
-            socket.fast_route = Some(std::sync::Arc::clone(&route));
-            self.routes
-                .write()
-                .unwrap()
-                .insert((role, socket_id), route);
-        }
         self.map_mut(role).insert(socket_id, socket);
-        if self
-            .session_polls_reads
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            self.note_outbound_emitted();
-        }
         Ok(())
     }
 
@@ -514,7 +449,6 @@ impl Worker {
             // is flushed, so `et -W` cannot exit ahead of its trailing output.
             self.stdio_socket = None;
         }
-        self.routes.write().unwrap().remove(&(role, socket_id));
         // Dropping the socket closes the local descriptor in full.
         self.map_mut(role).remove(&socket_id);
     }
@@ -539,11 +473,6 @@ impl Worker {
         let Some(socket) = map.get_mut(&socket_id) else {
             return Ok(());
         };
-        if let Some(route) = &socket.fast_route {
-            route
-                .direct_ok
-                .store(false, std::sync::atomic::Ordering::Release);
-        }
         socket.shutdown_write_when_drained = true;
         if socket.out.is_empty() && !socket.write_closed {
             socket.shutdown_write_when_drained = false;
@@ -621,18 +550,14 @@ impl Worker {
             };
             match map.get_mut(&socket_id) {
                 Some(socket) => {
-                    if let Some(route) = &socket.fast_route {
-                        route
-                            .direct_ok
-                            .store(false, std::sync::atomic::Ordering::Release);
-                        route
-                            .direct_read_ok
-                            .store(false, std::sync::atomic::Ordering::Release);
-                    }
                     socket.close_when_drained = true;
                     socket.read_open = false;
-                    socket.stream.shutdown_read();
-                    socket.out.is_empty()
+                    let drained = socket.out.is_empty();
+                    if !drained {
+                        // Stay open only to flush; nothing more is read.
+                        socket.stream.shutdown_read();
+                    }
+                    drained
                 }
                 None => true,
             }
@@ -719,12 +644,6 @@ impl Worker {
         }
     }
 
-    fn has_held(&self, role: Role, socket_id: i32) -> bool {
-        self.held
-            .iter()
-            .any(|(held_role, held_id, _)| *held_role == role && *held_id == socket_id)
-    }
-
     fn send_credit(
         &mut self,
         role: Role,
@@ -757,9 +676,6 @@ impl Worker {
     fn flush_due_credits(&mut self) -> Result<(), ForwardError> {
         let now = Instant::now();
         for role in [Role::Source, Role::Destination] {
-            for socket in self.map_mut(role).values_mut() {
-                socket.sync_fast_credit();
-            }
             let due: Vec<i32> = self
                 .map_ref(role)
                 .iter()
@@ -780,59 +696,74 @@ impl Worker {
         Ok(())
     }
 
-    fn next_poll_timeout(&self) -> Option<Duration> {
-        let now = Instant::now();
+    pub(super) fn next_poll_deadline(&self) -> Option<Instant> {
         let credit = [Role::Source, Role::Destination]
             .into_iter()
             .flat_map(|role| self.map_ref(role).values())
             .filter_map(SocketIo::credit_deadline)
             .min();
-        let deadline = match (self.next_park_deadline(), credit) {
+        match (self.next_park_deadline(), credit) {
             (Some(park), Some(credit)) => Some(park.min(credit)),
             (Some(park), None) => Some(park),
             (None, Some(credit)) => Some(credit),
             (None, None) => None,
-        };
-        deadline.map(|deadline| deadline.saturating_duration_since(now))
+        }
     }
 
-    /// Poll the command wake pipe (when given) and every socket once.
-    /// Returns whether the wake pipe fired plus the ready socket events,
-    /// copied out so the maps can be mutated while servicing them.
+    fn next_poll_timeout(&self) -> Option<Duration> {
+        self.next_poll_deadline()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    /// Engine mode bounds what the session has not drained yet: past this,
+    /// sockets and listeners stop being read until the session catches up
+    /// and the data waits in the kernel socket buffer, the way OpenSSH stops
+    /// reading channel input while its outgoing packet buffer is full. Bytes,
+    /// not packets, bound it so a few bulk tunnels cannot queue tens of MiB.
+    pub(super) fn outbound_backlog_full(&self) -> bool {
+        self.engine
+            && (self.engine_outbound_bytes >= ENGINE_OUTBOUND_BYTES
+                || self.engine_outbound.len() >= ENGINE_OUTBOUND_LIMIT)
+    }
+
+    /// Poll the command wake pipe (when given), every listener, and every
+    /// socket once. Returns whether the wake pipe fired, the ready socket
+    /// events (copied out so the maps can be mutated while servicing them),
+    /// and the connections accepted from ready listeners. The listener
+    /// snapshot is released before returning, so a concurrent cancel can
+    /// close the listener without waiting on whatever this worker does next.
     fn poll_cycle(
         &mut self,
         wake: Option<&UnixStream>,
         timeout: Option<Duration>,
-    ) -> Result<(bool, Vec<ReadySocket>), ForwardError> {
+    ) -> Result<(bool, Vec<ReadySocket>, Vec<AcceptedStream>), ForwardError> {
+        let listeners = self.listeners.snapshot(true);
+        let result = self.poll_snapshot(wake, timeout, &listeners);
+        drop(listeners);
+        self.listeners.release();
+        result
+    }
+
+    fn poll_snapshot(
+        &mut self,
+        wake: Option<&UnixStream>,
+        timeout: Option<Duration>,
+        listeners: &[Arc<ListenerEntry>],
+    ) -> Result<(bool, Vec<ReadySocket>, Vec<AcceptedStream>), ForwardError> {
         let mut index: Vec<(Role, i32)> = Vec::new();
         let mut descriptors: Vec<PollFd> = Vec::new();
         if let Some(wake) = wake {
             descriptors.push(PollFd::new(wake, PollFlags::IN));
         }
-        let session_polls = wake.is_some()
-            && self
-                .session_polls_reads
-                .load(std::sync::atomic::Ordering::Acquire);
+        for entry in listeners {
+            descriptors.push(PollFd::new(&entry.listener, PollFlags::IN));
+        }
         for role in [Role::Source, Role::Destination] {
             for (socket_id, socket) in self.map_ref(role).iter() {
-                let delegated_read = session_polls
-                    && socket.fast_route.as_ref().is_some_and(|r| {
-                        r.direct_read_ok.load(std::sync::atomic::Ordering::Acquire)
-                    });
-                if delegated_read && !socket.write_interest() {
-                    continue;
-                }
-                let mut flags = PollFlags::empty();
-                if !delegated_read && socket.read_interest() {
-                    flags |= PollFlags::IN;
-                }
-                if socket.write_interest() {
-                    flags |= PollFlags::OUT;
-                }
                 // HUP/ERR are reported even with no requested events, so a
                 // window-parked socket still surfaces a dead peer.
                 index.push((role, *socket_id));
-                descriptors.push(PollFd::new(&socket.stream, flags));
+                descriptors.push(PollFd::new(&*socket.stream, socket.poll_flags(true)));
             }
         }
         let timespec = timeout.map(|timeout| rustix::event::Timespec {
@@ -850,32 +781,25 @@ impl Worker {
                 }
             }
         }
-        let wake_ready = wake
-            .map(|_| {
-                descriptors[0]
-                    .revents()
-                    .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
-            })
-            .unwrap_or(false);
+        let revents: Vec<PollFlags> = descriptors.iter().map(PollFd::revents).collect();
+        drop(descriptors);
+        let wake_ready = wake.is_some()
+            && revents[0].intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR);
         let offset = usize::from(wake.is_some());
+        let socket_offset = offset + listeners.len();
+        let mut accepted = Vec::new();
+        for (entry, revents) in listeners.iter().zip(&revents[offset..socket_offset]) {
+            if !revents.is_empty() {
+                accept_streams(entry, ACCEPTS_PER_CYCLE, &mut accepted);
+            }
+        }
         let ready = index
             .into_iter()
-            .zip(descriptors[offset..].iter())
-            .filter_map(|((role, socket_id), descriptor)| {
-                let revents = descriptor.revents();
-                if revents.is_empty() {
-                    return None;
-                }
-                Some(ReadySocket {
-                    role,
-                    socket_id,
-                    readable: revents.intersects(PollFlags::IN | PollFlags::HUP),
-                    writable: revents.contains(PollFlags::OUT),
-                    error: revents.intersects(PollFlags::ERR | PollFlags::NVAL),
-                })
-            })
+            .zip(&revents[socket_offset..])
+            .filter(|(_, revents)| !revents.is_empty())
+            .map(|((role, socket_id), revents)| ReadySocket::new(role, socket_id, *revents))
             .collect();
-        Ok((wake_ready, ready))
+        Ok((wake_ready, ready, accepted))
     }
 
     /// Service one ready socket: flush queued writes, then read and emit.
@@ -905,13 +829,6 @@ impl Worker {
                 socket.write_closed = true;
                 shutdown_write(&socket.stream);
             }
-            if !socket.write_closed() && !self.has_held(socket.role, socket.socket_id) {
-                if let Some(route) = &socket.fast_route {
-                    route
-                        .direct_ok
-                        .store(true, std::sync::atomic::Ordering::Release);
-                }
-            }
         }
         if event.error && !event.readable {
             self.send_data(
@@ -924,24 +841,11 @@ impl Worker {
             return Ok(SocketVerdict::Drop);
         }
         if event.readable {
-            if let Some(route) = &socket.fast_route {
-                if self
-                    .session_polls_reads
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    && route
-                        .direct_read_ok
-                        .load(std::sync::atomic::Ordering::Acquire)
-                {
-                    return Ok(SocketVerdict::Keep);
-                }
-                route
-                    .direct_read_ok
-                    .store(false, std::sync::atomic::Ordering::Release);
-            }
             let mut reads = 0;
-            while socket.read_interest() && reads < READS_PER_CYCLE {
+            while socket.read_interest() && reads < READS_PER_CYCLE && !self.outbound_backlog_full()
+            {
                 let outcome = {
-                    let scratch = &mut self.read_scratch[..];
+                    let scratch = &mut self.read_scratch[..crate::forward_io::FORWARD_READ_LEN];
                     socket.read_encoded_chunk(scratch)
                 };
                 match outcome {
@@ -1003,7 +907,7 @@ impl Worker {
     pub(crate) fn poll_once(&mut self, timeout: Duration) -> Result<bool, ForwardError> {
         self.flush_held();
         self.flush_due_credits()?;
-        let (_, ready) = self.poll_cycle(None, Some(timeout))?;
+        let (_, ready, _) = self.poll_cycle(None, Some(timeout))?;
         let serviced = !ready.is_empty();
         for event in &ready {
             self.service_event(event)?;
@@ -1014,6 +918,9 @@ impl Worker {
     /// Hand spilled outbound packets back to the session. Stops at the first
     /// one that still does not fit, keeping emission order.
     pub(super) fn flush_outbound_spill(&mut self) -> Result<(), ForwardError> {
+        if self.engine {
+            return Ok(());
+        }
         while let Some(packet) = self.outbound_spill.pop_front() {
             match self.outbound.try_send(packet) {
                 Ok(()) => {}
@@ -1038,7 +945,7 @@ impl Worker {
 
     /// Flush writes queued by a command batch immediately, without waiting
     /// for a second `poll(2)` cycle to report `POLLOUT`.
-    fn flush_queued_writes(&mut self) -> Result<(), ForwardError> {
+    pub(super) fn flush_queued_writes(&mut self) -> Result<(), ForwardError> {
         loop {
             self.flush_held();
             let pending: Vec<(Role, i32)> = self
@@ -1088,13 +995,6 @@ impl Worker {
                         socket.write_closed = true;
                         shutdown_write(&socket.stream);
                     }
-                    if !socket.write_closed() && !self.has_held(role, socket_id) {
-                        if let Some(route) = &socket.fast_route {
-                            route
-                                .direct_ok
-                                .store(true, std::sync::atomic::Ordering::Release);
-                        }
-                    }
                 }
                 self.map_mut(role).insert(socket_id, socket);
                 if let Some((credit, packet_credit)) = credit_to_flush {
@@ -1108,17 +1008,18 @@ impl Worker {
         Ok(())
     }
 
-    /// Unix worker loop: one poll over the command wake pipe and all
-    /// sockets. Commands and socket I/O are handled inline, so a saturated
-    /// worker never sleeps mid-batch.
-    pub(crate) fn run_poll(
-        &mut self,
-        commands: &super::CommandReceiver,
-    ) -> Result<(), ForwardError> {
+    /// Unix worker loop: one poll over the command wake pipe, every
+    /// listener, and every socket. Commands and socket I/O are handled
+    /// inline, so a saturated worker never sleeps mid-batch. Returns true
+    /// when the session loop took the worker over.
+    pub(crate) fn run_poll(&mut self, commands: &CommandReceiver) -> Result<bool, ForwardError> {
         let mut batch = Vec::with_capacity(128);
         loop {
             if cancellation_requested(&self.cancel) {
-                return Ok(());
+                return Ok(false);
+            }
+            if self.handover_requested() {
+                return Ok(true);
             }
             self.defer_outbound_wake = true;
             self.flush_outbound_spill()?;
@@ -1129,13 +1030,22 @@ impl Worker {
             if self.outbound_wake_needed {
                 self.flush_outbound_wake();
             }
-            let (wake_ready, ready) =
+            let (wake_ready, ready, accepted) =
                 self.poll_cycle(Some(commands.wake_reader()), self.next_poll_timeout())?;
+            self.defer_outbound_wake = true;
+            for stream in accepted {
+                self.admit_accepted(stream)?;
+            }
+            // Socket readiness is level-triggered, so whatever this cycle saw
+            // is reported again to the session's own poll after a handover.
+            if self.handover_requested() {
+                return Ok(true);
+            }
             self.defer_outbound_wake = true;
             if wake_ready || commands.has_pending() {
                 batch.clear();
                 if !commands.drain_batch(&mut batch) {
-                    return Ok(());
+                    return Ok(false);
                 }
                 let count = batch.len();
                 for command in batch.drain(..) {
@@ -1157,20 +1067,76 @@ impl Worker {
         }
     }
 
+    fn handover_requested(&mut self) -> bool {
+        if !self.handover_pending && self.handover_request.try_recv().is_ok() {
+            self.handover_pending = true;
+        }
+        self.handover_pending
+    }
+
+    /// Hand one accepted connection to forwarding: SOCKS clients finish
+    /// their handshake on a helper thread, plain forwards request their
+    /// destination right away.
+    fn admit_accepted(&mut self, accepted: AcceptedStream) -> Result<(), ForwardError> {
+        let AcceptedStream {
+            listener,
+            destination,
+            socks,
+            stream,
+        } = accepted;
+        let client_fd = self.next_client_fd.fetch_add(1, Ordering::Relaxed);
+        if client_fd <= 0 {
+            // Client ids are exhausted: stop accepting, as upstream would
+            // once its request ids could collide.
+            stream.shutdown();
+            if let Some(listener) = listener.upgrade() {
+                listener.retire();
+            }
+            self.listeners.prune();
+            return Ok(());
+        }
+        if let Some(pending_socks) = socks {
+            crate::forward_io::spawn_socks_handshake(
+                client_fd,
+                stream,
+                &pending_socks,
+                self.commands.clone(),
+                self.cancel.clone(),
+            );
+            return Ok(());
+        }
+        self.accepted(
+            client_fd,
+            destination,
+            PendingAccept::park(stream, Vec::new(), None, false, false),
+        )
+    }
+
+    /// Tear down: close listeners and parked accepts, stop every socket,
+    /// and join helper threads.
+    pub(super) fn finish(&mut self, hard: bool) {
+        self.listeners.retire_all();
+        for (_, pending) in self.pending.drain() {
+            pending.stream.shutdown();
+        }
+        self.stop_sockets(hard);
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+
     /// Graceful or hard stop for every remaining socket. Graceful mirrors
     /// `stop_io`: the read side is discarded, queued writes flush fully, then
     /// the socket closes. Hard mirrors `abort_io`: close immediately and
     /// report abandoned bytes.
     pub(crate) fn stop_sockets(&mut self, hard: bool) {
-        self.routes.write().unwrap().clear();
         if hard {
             if !self.held.is_empty() {
                 self.abandoned
                     .store(true, std::sync::atomic::Ordering::Release);
             }
             self.held.clear();
-            for (_, mut socket) in self.sources.drain().chain(self.destinations.drain()) {
-                socket.fast_route = None;
+            for (_, socket) in self.sources.drain().chain(self.destinations.drain()) {
                 if !socket.out.is_empty() {
                     self.abandoned
                         .store(true, std::sync::atomic::Ordering::Release);
@@ -1184,7 +1150,6 @@ impl Worker {
             .values_mut()
             .chain(self.destinations.values_mut())
         {
-            socket.fast_route = None;
             socket.stream.shutdown_read();
         }
         // Drain held data into queues, then flush every queue to completion.
@@ -1246,6 +1211,569 @@ impl Worker {
         self.sources.clear();
         self.destinations.clear();
     }
+}
+
+impl SocketIo {
+    /// Poll interest; `reads` is false while the engine's outbound backlog
+    /// is full, so a readable socket cannot spin the loop.
+    fn poll_flags(&self, reads: bool) -> PollFlags {
+        let mut flags = PollFlags::empty();
+        if reads && self.read_interest() {
+            flags |= PollFlags::IN;
+        }
+        if self.write_interest() {
+            flags |= PollFlags::OUT;
+        }
+        flags
+    }
+}
+
+impl ReadySocket {
+    fn new(role: Role, socket_id: i32, revents: PollFlags) -> Self {
+        Self {
+            role,
+            socket_id,
+            readable: revents.intersects(PollFlags::IN | PollFlags::HUP),
+            writable: revents.contains(PollFlags::OUT),
+            error: revents.intersects(PollFlags::ERR | PollFlags::NVAL),
+        }
+    }
+}
+
+/// Packets the session has not drained yet before the engine stops reading
+/// sockets and listeners; the bound the outbound channel gives the thread.
+const ENGINE_OUTBOUND_LIMIT: usize = crate::forward::CHANNEL_SPILL_LIMIT;
+/// Bytes of undrained data packets before the engine pauses socket reads.
+/// One socket window's worth keeps a bulk transfer streaming while the
+/// session encrypts, without queueing tens of MiB per session.
+const ENGINE_OUTBOUND_BYTES: usize = 2 * 1024 * 1024;
+/// Connections accepted from one ready listener per cycle, so a connect
+/// storm cannot starve established sockets.
+const ACCEPTS_PER_CYCLE: usize = 64;
+
+/// One bound listener (TCP, Unix, or SOCKS). Shared between the forwarder
+/// (runtime add/cancel) and whichever thread polls it.
+pub(crate) struct ListenerEntry {
+    pub(crate) listener: ForwardListener,
+    destination: SocketEndpoint,
+    socks: bool,
+    pub(crate) request: Option<PortForwardSourceRequest>,
+    retired: AtomicBool,
+    pending_socks: Arc<AtomicUsize>,
+}
+
+impl ListenerEntry {
+    pub(crate) fn new(source: BoundSource) -> Option<Arc<Self>> {
+        let BoundSource {
+            listener,
+            destination,
+            socks,
+            stdio: _,
+            request,
+        } = source;
+        Some(Arc::new(Self {
+            listener: listener?,
+            destination,
+            socks,
+            request,
+            retired: AtomicBool::new(false),
+            pending_socks: Arc::new(AtomicUsize::new(0)),
+        }))
+    }
+
+    /// Stop accepting. The descriptor closes once the last poll snapshot
+    /// holding it is dropped.
+    pub(crate) fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
+
+    /// A runtime `-L` listener for exactly `request` (what mux add/cancel
+    /// address); SOCKS and named-pipe listeners are not cancellable.
+    pub(crate) fn is_local_forward(&self, request: &PortForwardSourceRequest) -> bool {
+        !self.socks && self.request.as_ref() == Some(request)
+    }
+
+    pub(crate) fn is_local_forward_any(&self) -> bool {
+        !self.socks && self.request.is_some()
+    }
+}
+
+/// A connection taken off a ready listener, admitted once the listener
+/// snapshot is released. Holds the listener only weakly so a cancel can
+/// close it in the meantime.
+pub(crate) struct AcceptedStream {
+    listener: std::sync::Weak<ListenerEntry>,
+    destination: SocketEndpoint,
+    socks: Option<Arc<AtomicUsize>>,
+    stream: ForwardStream,
+}
+
+/// Accept up to `limit` queued connections from `entry`. Accepting never
+/// blocks (listeners are non-blocking); a failed listener is retired, as
+/// its own thread used to end.
+fn accept_streams(entry: &Arc<ListenerEntry>, limit: usize, out: &mut Vec<AcceptedStream>) {
+    for _ in 0..limit {
+        if entry.retired() {
+            return;
+        }
+        match entry.listener.accept() {
+            Ok(stream) => out.push(AcceptedStream {
+                listener: Arc::downgrade(entry),
+                destination: entry.destination.clone(),
+                socks: entry.socks.then(|| entry.pending_socks.clone()),
+                stream,
+            }),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                entry.retire();
+                return;
+            }
+        }
+    }
+}
+
+/// Every listener a forwarder accepts on, shared by the forwarder (runtime
+/// add/cancel) and whichever thread polls them.
+#[derive(Clone, Default)]
+pub(crate) struct ListenerRegistry(Arc<RegistryShared>);
+
+#[derive(Default)]
+struct RegistryShared {
+    state: Mutex<RegistryState>,
+    released: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct RegistryState {
+    entries: Vec<Arc<ListenerEntry>>,
+    /// A worker thread is inside `poll(2)` holding snapshot `epoch`.
+    polling: bool,
+    epoch: u64,
+}
+
+impl ListenerRegistry {
+    pub(crate) fn push(&self, entries: impl IntoIterator<Item = Arc<ListenerEntry>>) {
+        self.0.state.lock().unwrap().entries.extend(entries);
+    }
+
+    /// Live listeners. A worker thread passes `for_poll` and must call
+    /// [`ListenerRegistry::release`] once it dropped the snapshot.
+    pub(crate) fn snapshot(&self, for_poll: bool) -> Vec<Arc<ListenerEntry>> {
+        let mut state = self.0.state.lock().unwrap();
+        state.entries.retain(|entry| !entry.retired());
+        if for_poll {
+            state.polling = true;
+            state.epoch = state.epoch.wrapping_add(1);
+        }
+        state.entries.clone()
+    }
+
+    pub(crate) fn release(&self) {
+        self.0.state.lock().unwrap().polling = false;
+        self.0.released.notify_all();
+    }
+
+    /// Drop retired listeners.
+    pub(crate) fn prune(&self) {
+        self.0
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .retain(|entry| !entry.retired());
+    }
+
+    /// Runtime `-L` listeners: whether `request` is already open, and how
+    /// many are.
+    pub(crate) fn local_forwards(&self, request: &PortForwardSourceRequest) -> (bool, usize) {
+        let mut state = self.0.state.lock().unwrap();
+        state.entries.retain(|entry| !entry.retired());
+        let open = state
+            .entries
+            .iter()
+            .any(|entry| entry.is_local_forward(request));
+        let count = state
+            .entries
+            .iter()
+            .filter(|entry| entry.is_local_forward_any())
+            .count();
+        (open, count)
+    }
+
+    /// Retire and remove the runtime `-L` listeners for `request`; returns
+    /// whether any existed. A worker thread polling an older snapshot is
+    /// woken (`wake` never blocks) and waited for, so the listening
+    /// address is released before this returns. The wait is bounded: the
+    /// snapshot is released right after `poll(2)` returns.
+    pub(crate) fn cancel(&self, request: &PortForwardSourceRequest, wake: impl FnOnce()) -> bool {
+        let mut state = self.0.state.lock().unwrap();
+        let mut removed = Vec::new();
+        state.entries.retain(|entry| {
+            if entry.is_local_forward(request) {
+                entry.retire();
+                removed.push(entry.clone());
+                return false;
+            }
+            true
+        });
+        if !removed.is_empty() && state.polling {
+            let epoch = state.epoch;
+            wake();
+            while state.polling && state.epoch == epoch {
+                state = self.0.released.wait(state).unwrap();
+            }
+        }
+        drop(state);
+        !removed.is_empty()
+    }
+
+    pub(crate) fn retire_all(&self) {
+        let removed = std::mem::take(&mut self.0.state.lock().unwrap().entries);
+        for entry in removed {
+            entry.retire();
+        }
+    }
+}
+
+/// Session → worker request to take the worker over, and the reply that
+/// carries it.
+pub(crate) struct HandoverLink {
+    pub(crate) request: channel::Receiver<()>,
+    pub(crate) reply: channel::Sender<Box<Engine>>,
+}
+
+/// One descriptor of the session-driven engine, owned so the session can
+/// poll it without borrowing the engine.
+pub(crate) enum EngineFd {
+    Wake(Arc<UnixStream>),
+    Listener(Arc<ListenerEntry>),
+    Socket {
+        role: Role,
+        socket_id: i32,
+        stream: Arc<ForwardStream>,
+        flags: PollFlags,
+    },
+}
+
+impl EngineFd {
+    pub(crate) fn poll_fd(&self) -> PollFd<'_> {
+        match self {
+            Self::Wake(wake) => PollFd::new(&**wake, PollFlags::IN),
+            Self::Listener(entry) => PollFd::new(&entry.listener, PollFlags::IN),
+            Self::Socket { stream, flags, .. } => PollFd::new(&**stream, *flags),
+        }
+    }
+}
+
+/// The forwarding worker driven by the session thread.
+///
+/// Upstream runs `PortForwardHandler::update` from the terminal loop's own
+/// `select()`, so accepting, destination setup, data, and close all happen
+/// on one thread. The Unix worker thread hands itself over as an `Engine`
+/// once a session loop polls forwarding, which removes the thread hop (two
+/// context switches) every lifecycle event used to pay.
+pub(crate) struct Engine {
+    worker: Worker,
+    commands: CommandReceiver,
+    wake: Option<Arc<UnixStream>>,
+    batch: Vec<Command>,
+    failed: bool,
+    /// First failure, reported once through `pop_outbound`.
+    error: Option<ForwardError>,
+}
+
+impl Engine {
+    pub(super) fn new(mut worker: Worker, commands: CommandReceiver) -> Self {
+        worker.engine = true;
+        worker.handover_pending = false;
+        worker.handover_request = channel::never();
+        worker.defer_outbound_wake = false;
+        worker.outbound_wake_needed = false;
+        let wake = commands.wake_reader_shared();
+        Self {
+            worker,
+            commands,
+            wake,
+            batch: Vec::with_capacity(128),
+            failed: false,
+            error: None,
+        }
+    }
+
+    /// Put packets the thread already published ahead of everything it
+    /// queued while handing over, keeping emission order per lane.
+    pub(crate) fn adopt_channels(
+        &mut self,
+        priority: &channel::Receiver<super::Outbound>,
+        outbound: &channel::Receiver<super::Outbound>,
+    ) {
+        let worker = &mut self.worker;
+        let mut lane: VecDeque<super::Outbound> = priority.try_iter().collect();
+        lane.append(&mut worker.engine_priority);
+        worker.engine_priority = lane;
+        let mut lane: VecDeque<super::Outbound> = outbound.try_iter().collect();
+        lane.append(&mut worker.outbound_spill);
+        lane.append(&mut worker.engine_outbound);
+        worker.engine_outbound_bytes = lane.iter().map(outbound_len).sum();
+        worker.engine_outbound = lane;
+    }
+
+    /// Run `step`; a failure tears the engine down hard, as the worker
+    /// thread's exit did, and every later call reports `Unavailable`.
+    fn guard<T>(
+        &mut self,
+        step: impl FnOnce(&mut Self) -> Result<T, ForwardError>,
+    ) -> Result<T, ForwardError> {
+        if self.failed {
+            return Err(ForwardError::Unavailable);
+        }
+        let result = step(self);
+        if result.is_err() {
+            // Packets already emitted still reach the session first, like
+            // the thread's channel contents ahead of its published error.
+            self.failed = true;
+            self.worker.finish(true);
+        }
+        result
+    }
+
+    pub(crate) fn failed(&self) -> bool {
+        self.failed
+    }
+
+    /// Commands from helper threads (connectors, SOCKS handshakes, stdio)
+    /// and anything queued before the handover.
+    fn drain_commands(&mut self, woken: bool) -> Result<(), ForwardError> {
+        if woken || self.commands.has_pending() {
+            let mut batch = std::mem::take(&mut self.batch);
+            batch.clear();
+            if !self.commands.drain_batch(&mut batch) {
+                self.batch = batch;
+                return Err(ForwardError::Unavailable);
+            }
+            let count = batch.len();
+            let mut result = Ok(());
+            for command in batch.drain(..) {
+                if result.is_ok() {
+                    result = self.worker.handle_command(command);
+                }
+            }
+            self.batch = batch;
+            self.commands.complete_count(count);
+            self.commands.arm_wake();
+            result?;
+            if count > 0 {
+                self.worker.flush_queued_writes()?;
+            }
+        }
+        self.read_fresh_sources()
+    }
+
+    fn read_fresh_sources(&mut self) -> Result<(), ForwardError> {
+        while let Some(socket_id) = self.worker.fresh_sources.pop() {
+            self.worker.service_event(&ReadySocket {
+                role: Role::Source,
+                socket_id,
+                readable: true,
+                writable: false,
+                error: false,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Timers and held data, then the descriptors the session should poll.
+    /// Returns when the session must come back even without readiness.
+    pub(crate) fn collect(&mut self, entries: &mut Vec<EngineFd>) -> Option<Instant> {
+        entries.clear();
+        let prepared = self.guard(|engine| {
+            engine.drain_commands(false)?;
+            engine.worker.expire_parked();
+            engine.worker.flush_held();
+            engine.worker.flush_due_credits()
+        });
+        if let Err(error) = prepared {
+            self.record(error);
+            return Some(Instant::now());
+        }
+        if let Some(wake) = &self.wake {
+            entries.push(EngineFd::Wake(wake.clone()));
+        }
+        let reads = !self.worker.outbound_backlog_full();
+        if reads {
+            for entry in self.worker.listeners.snapshot(false) {
+                entries.push(EngineFd::Listener(entry));
+            }
+        }
+        for role in [Role::Source, Role::Destination] {
+            for (socket_id, socket) in self.worker.map_ref(role) {
+                entries.push(EngineFd::Socket {
+                    role,
+                    socket_id: *socket_id,
+                    stream: socket.stream.clone(),
+                    flags: socket.poll_flags(reads),
+                });
+            }
+        }
+        if self.has_outbound() {
+            return Some(Instant::now());
+        }
+        self.worker.next_poll_deadline()
+    }
+
+    /// Service what the session's poll reported for `entries`.
+    pub(crate) fn service(
+        &mut self,
+        entries: &[EngineFd],
+        revents: &[PollFlags],
+    ) -> Result<(), ForwardError> {
+        self.guard(|engine| {
+            let woken = entries
+                .iter()
+                .zip(revents)
+                .any(|(entry, revents)| matches!(entry, EngineFd::Wake(_)) && !revents.is_empty());
+            engine.drain_commands(woken)?;
+            for (entry, revents) in entries.iter().zip(revents) {
+                if revents.is_empty() {
+                    continue;
+                }
+                match entry {
+                    EngineFd::Wake(_) => {}
+                    EngineFd::Listener(listener) => {
+                        let mut accepted = Vec::new();
+                        if !engine.worker.outbound_backlog_full() {
+                            accept_streams(listener, ACCEPTS_PER_CYCLE, &mut accepted);
+                        }
+                        for stream in accepted {
+                            engine.worker.admit_accepted(stream)?;
+                        }
+                    }
+                    EngineFd::Socket {
+                        role,
+                        socket_id,
+                        stream,
+                        ..
+                    } => {
+                        // A socket closed and replaced since the poll set
+                        // was built must not receive the stale readiness.
+                        let current = engine
+                            .worker
+                            .map_ref(*role)
+                            .get(socket_id)
+                            .is_some_and(|socket| Arc::ptr_eq(&socket.stream, stream));
+                        if current {
+                            engine
+                                .worker
+                                .service_event(&ReadySocket::new(*role, *socket_id, *revents))?;
+                        }
+                    }
+                }
+            }
+            engine.worker.flush_due_credits()
+        })
+    }
+
+    /// Handle session packets inline. Stops (leaving the rest queued) while
+    /// the outbound backlog is full, which stops the session reading the
+    /// transport exactly like a full command queue did.
+    pub(crate) fn receive(
+        &mut self,
+        queue: &mut VecDeque<Packet>,
+        bounded: bool,
+    ) -> Result<(), ForwardError> {
+        self.guard(|engine| {
+            engine.drain_commands(false)?;
+            let mut handled = false;
+            while !(bounded && engine.worker.outbound_backlog_full()) {
+                let Some(packet) = queue.pop_front() else {
+                    break;
+                };
+                engine.worker.handle_packet(packet)?;
+                handled = true;
+            }
+            if handled {
+                engine.worker.flush_queued_writes()?;
+                engine.read_fresh_sources()?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn set_ssh_agent_session_binds(
+        &mut self,
+        agent_socket_path: String,
+        binds: Vec<Vec<u8>>,
+    ) -> Result<(), ForwardError> {
+        self.guard(|engine| {
+            engine.drain_commands(false)?;
+            engine
+                .worker
+                .handle_command(Command::SetSshAgentSessionBinds {
+                    agent_socket_path,
+                    binds,
+                })
+        })
+    }
+
+    /// Whether the session should call `pop_outbound`: packets are queued
+    /// or a failure waits to be reported.
+    pub(crate) fn has_outbound(&self) -> bool {
+        self.failed || self.queued()
+    }
+
+    fn queued(&self) -> bool {
+        !self.worker.engine_priority.is_empty() || !self.worker.engine_outbound.is_empty()
+    }
+
+    /// Keep a failure from a call that cannot return it (servicing poll
+    /// readiness) for the session's next `pop_outbound`.
+    pub(crate) fn record(&mut self, error: ForwardError) {
+        if self.error.is_none() {
+            self.error = Some(error);
+        }
+    }
+
+    /// Next packet for the session, credit (priority) lane first. After a
+    /// failure, the error (then `Unavailable`) ends the session's forwarding
+    /// as the worker thread's published error did.
+    pub(crate) fn pop_outbound(&mut self) -> Option<super::Outbound> {
+        let next = self.worker.engine_priority.pop_front().or_else(|| {
+            let packet = self.worker.engine_outbound.pop_front()?;
+            self.worker.engine_outbound_bytes = self
+                .worker
+                .engine_outbound_bytes
+                .saturating_sub(outbound_len(&packet));
+            Some(packet)
+        });
+        if next.is_none() && self.failed {
+            return Some(Err(self.error.take().unwrap_or(ForwardError::Unavailable)));
+        }
+        next
+    }
+
+    /// Stop everything. Returns whether packets the session never drained
+    /// were abandoned.
+    pub(crate) fn finish(&mut self, hard: bool) -> bool {
+        let abandoned = self.queued();
+        self.worker.engine_priority.clear();
+        self.worker.engine_outbound.clear();
+        self.worker.engine_outbound_bytes = 0;
+        if !self.failed {
+            self.failed = true;
+            self.worker.finish(hard);
+        }
+        abandoned || self.worker.abandoned.load(Ordering::Acquire)
+    }
+}
+
+/// Payload bytes an outbound entry holds.
+pub(super) fn outbound_len(packet: &super::Outbound) -> usize {
+    packet.as_ref().map_or(0, |packet| packet.payload().len())
 }
 
 #[cfg(test)]

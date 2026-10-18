@@ -15,7 +15,13 @@ use et_core::packet::Packet;
 use et_core::proto::{PortForwardSourceRequest, TerminalPacketType};
 
 use crate::forward_endpoint::{Endpoint, ResolvedEndpoint};
-use crate::forward_io::{spawn_listener, BoundSource, ListenerStop};
+use crate::forward_io::BoundSource;
+#[cfg(windows)]
+use crate::forward_io::{spawn_listener, ListenerStop};
+#[cfg(unix)]
+use crate::forward_worker::poll::{
+    Engine, EngineFd, HandoverLink, ListenerEntry, ListenerRegistry,
+};
 use crate::forward_worker::{
     command_channel, run, Command, CommandSender, TryCommandError, WorkerChannels,
 };
@@ -23,6 +29,7 @@ use crate::forward_worker::{
 const CHANNEL_CAPACITY: usize = 256;
 /// How many outbound packets the Unix poll worker holds itself when the
 /// session has not drained the channel yet, before it blocks.
+#[cfg(unix)]
 pub(crate) const CHANNEL_SPILL_LIMIT: usize = CHANNEL_CAPACITY;
 /// Maximum reverse listeners owned by one terminal session, after DNS fanout
 /// and address deduplication.
@@ -346,12 +353,15 @@ pub struct SkippedForward {
 // A local listener can end independently of its already accepted streams.
 // Keeping ownership here avoids waiting for a busy worker to service a mux
 // control request (that same caller may be responsible for draining output).
+// Unix keeps the same independence through the shared listener registry.
+#[cfg(windows)]
 struct LocalListener {
     request: PortForwardSourceRequest,
     stop: ListenerStop,
     thread: Option<JoinHandle<()>>,
 }
 
+#[cfg(windows)]
 impl LocalListener {
     fn spawn(
         mut source: BoundSource,
@@ -364,11 +374,7 @@ impl LocalListener {
             .request
             .take()
             .expect("local listener has an identity");
-        #[cfg(unix)]
-        let (stop, reader) = UnixStream::pair()?;
-        #[cfg(windows)]
         let stop = Arc::new(AtomicBool::new(false));
-        #[cfg(windows)]
         let reader = stop.clone();
         let thread = spawn_listener(
             source,
@@ -386,11 +392,9 @@ impl LocalListener {
     }
 }
 
+#[cfg(windows)]
 impl Drop for LocalListener {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        let _ = self.stop.shutdown(std::net::Shutdown::Both);
-        #[cfg(windows)]
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -398,11 +402,14 @@ impl Drop for LocalListener {
     }
 }
 
+/// The forwarding descriptors a session loop adds to its own `poll(2)` set,
+/// rebuilt every iteration by [`Forwarder::collect_fast_poll_routes`] and
+/// serviced by [`Forwarder::service_fast_poll`].
 #[cfg(unix)]
 pub struct FastPollState {
-    routes: Vec<Arc<crate::forward_worker::UnixFastRoute>>,
+    entries: Vec<EngineFd>,
     revents: std::cell::RefCell<Vec<rustix::event::PollFlags>>,
-    scratch: Box<[u8; crate::forward_io::READ_CHUNK]>,
+    deadline: Option<Instant>,
 }
 
 #[cfg(unix)]
@@ -416,31 +423,26 @@ impl Default for FastPollState {
 impl FastPollState {
     pub fn new() -> Self {
         Self {
-            routes: Vec::new(),
+            entries: Vec::new(),
             revents: std::cell::RefCell::new(Vec::new()),
-            scratch: Box::new([0u8; crate::forward_io::READ_CHUNK]),
+            deadline: None,
         }
     }
 
     pub fn push_descriptors<'a>(&'a self, descriptors: &mut Vec<rustix::event::PollFd<'a>>) {
-        for route in &self.routes {
-            let flags = if route.read_interest() {
-                rustix::event::PollFlags::IN
-                    | rustix::event::PollFlags::HUP
-                    | rustix::event::PollFlags::ERR
-            } else {
-                rustix::event::PollFlags::HUP | rustix::event::PollFlags::ERR
-            };
-            descriptors.push(rustix::event::PollFd::new(&route.stream, flags));
-        }
+        descriptors.extend(self.entries.iter().map(EngineFd::poll_fd));
     }
 
     pub fn record_revents(&self, slice: &[rustix::event::PollFd<'_>]) {
         let mut revents = self.revents.borrow_mut();
         revents.clear();
-        for fd in slice {
-            revents.push(fd.revents());
-        }
+        revents.extend(slice.iter().map(rustix::event::PollFd::revents));
+    }
+
+    /// Latest time the session's poll may sleep: forwarding timers (idle
+    /// window credit, parked accepts) or packets waiting to be drained.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
     }
 }
 
@@ -459,12 +461,19 @@ pub struct Forwarder {
     wake_writer: Arc<UnixStream>,
     #[cfg(unix)]
     wake_signalled: Arc<AtomicBool>,
+    /// The worker, once a session loop took it over (see `Engine`).
     #[cfg(unix)]
-    routes: crate::forward_worker::UnixFastRoutes,
+    engine: Mutex<Option<Box<Engine>>>,
     #[cfg(unix)]
-    session_polls_reads: Arc<AtomicBool>,
+    engine_active: AtomicBool,
     #[cfg(unix)]
-    fast_outbound: std::sync::Mutex<VecDeque<Packet>>,
+    handover_attempted: AtomicBool,
+    #[cfg(unix)]
+    handover_request: channel::Sender<()>,
+    #[cfg(unix)]
+    handover_reply: channel::Receiver<Box<Engine>>,
+    #[cfg(unix)]
+    listeners: ListenerRegistry,
     #[cfg(windows)]
     routes: crate::forward_worker::FastRoutes,
     shutdown: Arc<AtomicBool>,
@@ -472,8 +481,11 @@ pub struct Forwarder {
     abandoned: Arc<AtomicBool>,
     /// Set while an `et -W` stdio bridge still has its local socket.
     stdio_open: Option<Arc<AtomicBool>>,
+    #[cfg(windows)]
     local_listeners: Vec<LocalListener>,
+    #[cfg(windows)]
     listener_cancel: channel::Receiver<()>,
+    #[cfg(windows)]
     next_client_fd: Arc<AtomicI32>,
     resolver: Arc<dyn ForwardResolver>,
     local_mutation_allowed: bool,
@@ -601,23 +613,14 @@ fn start_forwarder_hook(
     #[cfg(unix)]
     let worker_wake_signalled = wake_signalled.clone();
     #[cfg(unix)]
-    let routes: crate::forward_worker::UnixFastRoutes =
-        Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    let (handover_request, handover_request_rx) = channel::bounded(1);
     #[cfg(unix)]
-    let worker_routes = routes.clone();
-    #[cfg(unix)]
-    let session_polls_reads = Arc::new(AtomicBool::new(false));
-    #[cfg(unix)]
-    let worker_session_polls = session_polls_reads.clone();
-    #[cfg(unix)]
-    let fast_outbound = std::sync::Mutex::new(VecDeque::with_capacity(128));
+    let (handover_reply_tx, handover_reply) = channel::bounded(1);
     #[cfg(windows)]
     let routes: crate::forward_worker::FastRoutes =
         Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
     #[cfg(windows)]
     let worker_routes = routes.clone();
-    #[cfg(unix)]
-    let (listener_stop, listener_stop_reader) = UnixStream::pair()?;
     #[cfg(windows)]
     let listener_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     #[cfg(windows)]
@@ -632,10 +635,22 @@ fn start_forwarder_hook(
     let worker_shutdown = shutdown.clone();
     let next_client_fd = Arc::new(AtomicI32::new(1));
     let worker_next_client_fd = next_client_fd.clone();
+    #[cfg(windows)]
     let listener_cancel = cancel_rx.clone();
+    #[cfg(windows)]
     let mut local_listeners = Vec::new();
+    #[cfg(unix)]
+    let listeners = ListenerRegistry::default();
     let mut worker_sources = Vec::new();
     for source in sources {
+        // Unix: every listener is polled by the forwarding loop itself (the
+        // worker thread, then the session loop), never by its own thread.
+        #[cfg(unix)]
+        if !source.stdio {
+            listeners.push(ListenerEntry::new(source));
+            continue;
+        }
+        #[cfg(windows)]
         if owner.is_none() && source.request.is_some() && !source.socks && !source.stdio {
             local_listeners.push(LocalListener::spawn(
                 source,
@@ -644,45 +659,65 @@ fn start_forwarder_hook(
                 shutdown.clone(),
                 next_client_fd.clone(),
             )?);
-        } else {
-            worker_sources.push(source);
+            continue;
         }
+        worker_sources.push(source);
     }
+    #[cfg(unix)]
+    let worker_listeners = listeners.clone();
     let worker = std::thread::Builder::new()
         .name("et-forwarding".to_owned())
         .spawn(move || {
             worker_start();
-            run(
-                worker_sources,
-                WorkerChannels {
-                    receiver: commands_rx,
-                    sender: worker_commands,
-                    outbound: outbound_tx,
-                    priority: priority_tx,
-                    cancel: cancel_rx,
-                    abandoned: worker_abandoned,
-                    stdio_open: worker_stdio.clone(),
-                    next_client_fd: worker_next_client_fd,
-                    #[cfg(windows)]
-                    routes: worker_routes,
-                    #[cfg(unix)]
-                    routes: worker_routes,
-                    #[cfg(unix)]
-                    session_polls_reads: worker_session_polls,
-                    #[cfg(unix)]
-                    wake_signalled: worker_wake_signalled,
-                },
-                #[cfg(unix)]
-                wake_writer,
-                (listener_stop_reader, session_user, worker_shutdown.clone()),
-            );
-            worker_shutdown.store(true, Ordering::Release);
             #[cfg(unix)]
-            drop(listener_stop);
+            {
+                let reply = handover_reply_tx;
+                run(
+                    worker_sources,
+                    WorkerChannels {
+                        receiver: commands_rx,
+                        sender: worker_commands,
+                        outbound: outbound_tx,
+                        priority: priority_tx,
+                        cancel: cancel_rx,
+                        abandoned: worker_abandoned,
+                        stdio_open: worker_stdio.clone(),
+                        next_client_fd: worker_next_client_fd,
+                        listeners: worker_listeners,
+                        handover: HandoverLink {
+                            request: handover_request_rx,
+                            reply,
+                        },
+                        wake_signalled: worker_wake_signalled,
+                    },
+                    wake_writer,
+                    (session_user, worker_shutdown.clone()),
+                );
+            }
             #[cfg(windows)]
-            listener_stop.store(true, std::sync::atomic::Ordering::Release);
+            {
+                run(
+                    worker_sources,
+                    WorkerChannels {
+                        receiver: commands_rx,
+                        sender: worker_commands,
+                        outbound: outbound_tx,
+                        priority: priority_tx,
+                        cancel: cancel_rx,
+                        abandoned: worker_abandoned,
+                        stdio_open: worker_stdio.clone(),
+                        next_client_fd: worker_next_client_fd,
+                        routes: worker_routes,
+                    },
+                    (listener_stop_reader, session_user, worker_shutdown.clone()),
+                );
+                worker_shutdown.store(true, Ordering::Release);
+                listener_stop.store(true, std::sync::atomic::Ordering::Release);
+            }
         })
         .map_err(ForwardError::Io)?;
+    #[cfg(unix)]
+    let _ = next_client_fd;
     let forwarder = Forwarder {
         commands: commands_tx,
         outbound: outbound_rx,
@@ -695,19 +730,28 @@ fn start_forwarder_hook(
         #[cfg(unix)]
         wake_signalled,
         #[cfg(unix)]
-        routes,
+        engine: Mutex::new(None),
         #[cfg(unix)]
-        session_polls_reads,
+        engine_active: AtomicBool::new(false),
         #[cfg(unix)]
-        fast_outbound,
+        handover_attempted: AtomicBool::new(false),
+        #[cfg(unix)]
+        handover_request,
+        #[cfg(unix)]
+        handover_reply,
+        #[cfg(unix)]
+        listeners,
         #[cfg(windows)]
         routes,
         shutdown,
         worker: Some(worker),
         abandoned,
         stdio_open,
+        #[cfg(windows)]
         local_listeners,
+        #[cfg(windows)]
         listener_cancel,
+        #[cfg(windows)]
         next_client_fd,
         resolver,
         local_mutation_allowed: owner.is_none(),
@@ -728,6 +772,63 @@ impl Forwarder {
         self.add_local_forward_deadline(request, Instant::now() + Duration::from_secs(1))
     }
 
+    #[cfg(unix)]
+    pub fn add_local_forward_deadline(
+        &mut self,
+        request: PortForwardSourceRequest,
+        deadline: Instant,
+    ) -> Result<(), ForwardError> {
+        self.check_local_mutation(&request)?;
+        ensure_setup_deadline(deadline)?;
+        let (open, local) = self.listeners.local_forwards(&request);
+        if open {
+            return Ok(());
+        }
+        let remaining = MAX_SESSION_LISTENERS.saturating_sub(local);
+        let (sources, _, _) = bind_sources(
+            vec![ForwardSource::explicit(request)],
+            None,
+            deadline,
+            self.resolver.clone(),
+            remaining,
+        )?;
+        ensure_setup_deadline(deadline)?;
+        self.listeners
+            .push(sources.into_iter().filter_map(ListenerEntry::new));
+        // A worker thread rebuilds its poll set on wake; the session-driven
+        // engine does every iteration anyway.
+        if !self.engine_active.load(Ordering::Acquire) {
+            self.commands.force_wake();
+        }
+        Ok(())
+    }
+
+    /// Stop accepting on an exact local source/destination request. Existing
+    /// admitted streams keep running. Unknown requests return NotFound.
+    #[cfg(unix)]
+    pub fn cancel_local_forward(
+        &mut self,
+        request: &PortForwardSourceRequest,
+    ) -> Result<(), ForwardError> {
+        self.check_local_mutation(request)?;
+        let engine_active = self.engine_active.load(Ordering::Acquire);
+        let commands = &self.commands;
+        let found = self.listeners.cancel(request, || {
+            if !engine_active {
+                commands.force_wake();
+            }
+        });
+        if !found {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "local forwarding listener not found",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
     pub fn add_local_forward_deadline(
         &mut self,
         request: PortForwardSourceRequest,
@@ -775,6 +876,7 @@ impl Forwarder {
     /// worker-admitted streams keep running. A concurrently accepted stream
     /// still waiting for bounded queue admission is dropped. Unknown requests
     /// return NotFound.
+    #[cfg(windows)]
     pub fn cancel_local_forward(
         &mut self,
         request: &PortForwardSourceRequest,
@@ -799,9 +901,7 @@ impl Forwarder {
                 "cannot mutate user-owned reverse listeners",
             ));
         }
-        if self.worker.as_ref().is_none_or(JoinHandle::is_finished)
-            || self.shutdown.load(Ordering::Acquire)
-        {
+        if !self.forwarding_alive() || self.shutdown.load(Ordering::Acquire) {
             return Err(ForwardError::Unavailable);
         }
         if request.source.is_none()
@@ -815,10 +915,64 @@ impl Forwarder {
         Ok(())
     }
 
+    fn forwarding_alive(&self) -> bool {
+        #[cfg(unix)]
+        if self.engine_active.load(Ordering::Acquire) {
+            return self
+                .engine
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|engine| !engine.failed());
+        }
+        self.worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+    }
+
+    /// Run `step` on the session-driven engine, if a session took the
+    /// worker over.
+    #[cfg(unix)]
+    fn with_engine<T>(&self, step: impl FnOnce(&mut Engine) -> T) -> Option<T> {
+        if !self.engine_active.load(Ordering::Acquire) {
+            return None;
+        }
+        self.engine.lock().unwrap().as_deref_mut().map(step)
+    }
+
+    /// Take the worker over from its thread (once). Blocks only until the
+    /// worker reaches its next loop boundary; it never waits on a full
+    /// outbound channel while a handover is pending.
+    #[cfg(unix)]
+    fn take_over(&self) -> bool {
+        if self.handover_attempted.swap(true, Ordering::AcqRel)
+            || self.shutdown.load(Ordering::Acquire)
+            || self.handover_request.try_send(()).is_err()
+        {
+            return false;
+        }
+        self.commands.force_wake();
+        let Ok(mut engine) = self.handover_reply.recv() else {
+            // The worker already stopped; its outcome is in the channels.
+            return false;
+        };
+        engine.adopt_channels(&self.priority, &self.outbound);
+        // Wake bytes the thread wrote for packets now held by the engine.
+        if self.wake_signalled.load(Ordering::Acquire) {
+            let _ = drain_wake(&self.wake);
+            self.wake_signalled.store(false, Ordering::Release);
+        }
+        *self.engine.lock().unwrap() = Some(engine);
+        self.engine_active.store(true, Ordering::Release);
+        true
+    }
+
     /// Pollable readiness handle for outbound forwarding packets (Unix only).
     #[cfg(unix)]
     pub fn wake(&self) -> Result<&UnixStream, ForwardError> {
-        self.commands.flush_wake();
+        if !self.engine_active.load(Ordering::Acquire) {
+            self.commands.flush_wake();
+        }
         Ok(&self.wake)
     }
 
@@ -840,6 +994,13 @@ impl Forwarder {
     /// blocking send from the session loop closes a cycle and deadlocks the
     /// session permanently.
     pub fn receive(&self, packet: Packet) -> Result<(), ForwardError> {
+        #[cfg(unix)]
+        if self.engine_active.load(Ordering::Acquire) {
+            let mut queue = VecDeque::from([packet]);
+            return self
+                .with_engine(|engine| engine.receive(&mut queue, false))
+                .unwrap_or(Err(ForwardError::Unavailable));
+        }
         self.commands
             .send(Command::Packet(packet))
             .map_err(|_| ForwardError::Unavailable)
@@ -852,6 +1013,13 @@ impl Forwarder {
     /// and retry later. Callers must not read further session packets while
     /// holding a returned packet, or forwarding data would be reordered.
     pub fn try_receive(&self, packet: Packet) -> Result<Option<Packet>, ForwardError> {
+        // A session-driven engine handles the packet inline.
+        #[cfg(unix)]
+        if self.engine_active.load(Ordering::Acquire) {
+            let mut queue = VecDeque::from([packet]);
+            self.try_receive_queue(&mut queue)?;
+            return Ok(queue.pop_front());
+        }
         // The Windows threaded model lets the session loop hand data straight
         // to the writer channel, skipping the worker hop. The Unix poll
         // worker instead wakes once per batch and writes sockets inline, so
@@ -945,222 +1113,62 @@ impl Forwarder {
         }
     }
 
+    /// Build the forwarding descriptors for the session's next poll. The
+    /// first call takes the worker over from its thread, so from then on
+    /// accepting, destination setup, data, and teardown all run on the
+    /// session thread with no wake-up hops.
     #[cfg(unix)]
     pub fn collect_fast_poll_routes(&self, state: &mut FastPollState) {
-        if !self.session_polls_reads.swap(true, Ordering::AcqRel) {
-            self.commands.force_wake();
+        state.entries.clear();
+        state.deadline = None;
+        if !self.engine_active.load(Ordering::Acquire) && !self.take_over() {
+            return;
         }
-        state.routes.clear();
-        let routes = self.routes.read().unwrap();
-        for route in routes.values() {
-            if route.direct_read_ok.load(Ordering::Acquire) {
-                state.routes.push(Arc::clone(route));
-            }
-        }
+        state.deadline = self
+            .with_engine(|engine| engine.collect(&mut state.entries))
+            .flatten();
     }
 
+    /// True while the session-driven engine holds packets for the session.
     #[cfg(unix)]
     pub fn has_fast_outbound(&self) -> bool {
-        !self.fast_outbound.lock().unwrap().is_empty()
+        self.with_engine(|engine| engine.has_outbound())
+            .unwrap_or(false)
     }
 
+    /// Service the readiness the session's poll recorded for the
+    /// descriptors from [`Forwarder::collect_fast_poll_routes`]. Returns
+    /// whether packets wait in [`Forwarder::try_outbound`]; a failure is
+    /// reported there too.
     #[cfg(unix)]
     pub fn service_fast_poll(&self, state: &mut FastPollState) -> bool {
-        use rustix::event::PollFlags;
-        let mut produced = false;
-        let mut out_guard = self.fast_outbound.lock().unwrap();
-        let revents = state.revents.borrow();
-        for (idx, route) in state.routes.iter().enumerate() {
-            let ev = revents.get(idx).copied().unwrap_or(PollFlags::empty());
-            if ev.intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL) {
-                route.direct_read_ok.store(false, Ordering::Release);
-                self.commands.force_wake();
-                continue;
-            }
-            if !ev.contains(PollFlags::IN) {
-                continue;
-            }
-            let mut reads = 0;
-            while route.read_interest() && reads < 16 && out_guard.len() < 128 {
-                let limit = if route.windowed {
-                    let rem = route
-                        .window_bytes
-                        .saturating_sub(route.in_flight_bytes.load(Ordering::Acquire));
-                    usize::try_from(rem.min(state.scratch.len() as i64)).unwrap_or(0)
-                } else {
-                    state.scratch.len()
-                };
-                if limit == 0 {
-                    break;
-                }
-                match route.stream.read_shared(&mut state.scratch[..limit]) {
-                    Ok(0) => {
-                        route.direct_read_ok.store(false, Ordering::Release);
-                        self.commands.force_wake();
-                        break;
-                    }
-                    Ok(count) => {
-                        route.note_sent(count);
-                        let payload = crate::forward_worker::state::encode_data_packet(
-                            route.role == crate::forward_worker::Role::Source,
-                            route.socket_id,
-                            &state.scratch[..count],
-                        );
-                        out_guard.push_back(Packet::new(
-                            et_core::proto::TerminalPacketType::PortForwardData as u8,
-                            payload,
-                        ));
-                        produced = true;
-                        reads += 1;
-                        if count <= 4096 {
-                            break;
-                        }
-                    }
-                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(_) => {
-                        route.direct_read_ok.store(false, Ordering::Release);
-                        self.commands.force_wake();
-                        break;
+        let ready = {
+            let revents = state.revents.borrow();
+            self.with_engine(|engine| {
+                if !state.entries.is_empty() && revents.len() == state.entries.len() {
+                    if let Err(error) = engine.service(&state.entries, &revents) {
+                        engine.record(error);
                     }
                 }
-            }
-        }
-        produced || !out_guard.is_empty()
+                engine.has_outbound()
+            })
+            .unwrap_or(false)
+        };
+        // Release the shared descriptors so a closed socket really closes.
+        state.entries.clear();
+        ready
     }
 
+    /// Hand session packets to forwarding. A session-driven engine handles
+    /// them inline; otherwise they queue for the worker thread. Packets that
+    /// do not fit stay in `queue`, in order.
     #[cfg(unix)]
     pub fn try_receive_queue(&self, queue: &mut VecDeque<Packet>) -> Result<(), ForwardError> {
-        while !queue.is_empty() && self.commands.is_idle() {
-            let Some(packet) = queue.front() else {
-                break;
-            };
-            if packet.header() != et_core::proto::TerminalPacketType::PortForwardData as u8 {
-                break;
-            }
-            let Some((source_to_dest, socket_id, start, len)) =
-                crate::forward_worker::state::try_fast_parse_data(packet.payload())
-            else {
-                use prost::Message;
-                if let Ok(data) = et_core::proto::PortForwardData::decode(packet.payload()) {
-                    let role = if data.sourcetodestination.unwrap_or(false) {
-                        crate::forward_worker::Role::Destination
-                    } else {
-                        crate::forward_worker::Role::Source
-                    };
-                    let socket_id = data.socketid.unwrap_or(0);
-                    if data.error.is_none()
-                        && !data.closed.unwrap_or(false)
-                        && !data.half_close.unwrap_or(false)
-                        && data.buffer.as_deref().unwrap_or_default().is_empty()
-                    {
-                        if let Some(delivered) =
-                            crate::forward_worker::state::decode_window(data.window)
-                        {
-                            let route =
-                                self.routes.read().unwrap().get(&(role, socket_id)).cloned();
-                            if let Some(route) = route {
-                                let was_blocked = route.windowed
-                                    && (route.in_flight_bytes.load(Ordering::Acquire)
-                                        >= route.window_bytes
-                                        || route.in_flight_packets.load(Ordering::Acquire)
-                                            >= route.window_packets);
-                                route.apply_delivery(delivered);
-                                if was_blocked && !route.direct_read_ok.load(Ordering::Acquire) {
-                                    self.commands.force_wake();
-                                }
-                                queue.pop_front();
-                                continue;
-                            }
-                        }
-                    } else if let Some(route) = self.routes.read().unwrap().get(&(role, socket_id))
-                    {
-                        route.direct_ok.store(false, Ordering::Release);
-                        route.direct_read_ok.store(false, Ordering::Release);
-                    }
-                }
-                break;
-            };
-            if len == 0 || len > crate::forward_worker::MAX_DATA_PACKET {
-                break;
-            }
-            let role = if source_to_dest {
-                crate::forward_worker::Role::Destination
-            } else {
-                crate::forward_worker::Role::Source
-            };
-            let route = {
-                let routes = self.routes.read().unwrap();
-                routes.get(&(role, socket_id)).cloned()
-            };
-            let Some(route) = route else {
-                break;
-            };
-            if !route.direct_ok.load(Ordering::Acquire) {
-                break;
-            }
-            match route
-                .stream
-                .write_shared(&packet.payload()[start..start + len])
-            {
-                Ok(written) if written == len => {
-                    queue.pop_front();
-                    if route.windowed {
-                        let cb =
-                            route.credit_bytes.fetch_add(len as i64, Ordering::AcqRel) + len as i64;
-                        let cp = route.credit_packets.fetch_add(1, Ordering::AcqRel) + 1;
-                        if cb >= crate::forward_worker::state::CREDIT_RETURN_THRESHOLD
-                            || cp >= crate::forward_worker::state::PACKET_CREDIT_RETURN_THRESHOLD
-                        {
-                            let cb = route.credit_bytes.swap(0, Ordering::AcqRel);
-                            let cp = route.credit_packets.swap(0, Ordering::AcqRel);
-                            if cb > 0 && cp > 0 {
-                                use prost::Message;
-                                let credit_pkt = Packet::new(
-                                    et_core::proto::TerminalPacketType::PortForwardData as u8,
-                                    et_core::proto::PortForwardData {
-                                        sourcetodestination: Some(
-                                            role == crate::forward_worker::Role::Source,
-                                        ),
-                                        socketid: Some(socket_id),
-                                        buffer: None,
-                                        error: None,
-                                        closed: None,
-                                        half_close: None,
-                                        window: Some(et_core::proto::PortForwardWindow {
-                                            bytes: Some(cb),
-                                            packets: Some(i32::try_from(cp).unwrap_or(i32::MAX)),
-                                        }),
-                                    }
-                                    .encode_to_vec(),
-                                );
-                                self.fast_outbound.lock().unwrap().push_front(credit_pkt);
-                            }
-                        }
-                    }
-                }
-                Ok(written) if written > 0 => {
-                    route.direct_ok.store(false, Ordering::Release);
-                    let packet = queue.pop_front().expect("checked front");
-                    let rem = crate::forward_worker::state::encode_data_packet(
-                        source_to_dest,
-                        socket_id,
-                        &packet.payload()[start + written..start + len],
-                    );
-                    queue.push_front(Packet::new(
-                        et_core::proto::TerminalPacketType::PortForwardData as u8,
-                        rem,
-                    ));
-                    break;
-                }
-                _ => {
-                    route.direct_ok.store(false, Ordering::Release);
-                    break;
-                }
-            }
-        }
         if queue.is_empty() {
             return Ok(());
+        }
+        if let Some(result) = self.with_engine(|engine| engine.receive(queue, true)) {
+            return result;
         }
         self.commands.try_send_queue(queue)
     }
@@ -1169,19 +1177,21 @@ impl Forwarder {
     /// calls if it was not already woken mid-batch.
     pub fn flush_receive(&self) {
         #[cfg(unix)]
-        self.commands.flush_wake();
+        if !self.engine_active.load(Ordering::Acquire) {
+            self.commands.flush_wake();
+        }
     }
 
     pub fn try_outbound(&self) -> Result<Option<Packet>, ForwardError> {
+        #[cfg(unix)]
+        if let Some(next) = self.with_engine(Engine::pop_outbound) {
+            return next.transpose();
+        }
         #[cfg(unix)]
         self.commands.flush_wake();
         if let Ok(result) = self.priority.try_recv() {
             result.map(Some)
         } else {
-            #[cfg(unix)]
-            if let Some(packet) = self.fast_outbound.lock().unwrap().pop_front() {
-                return Ok(Some(packet));
-            }
             match self.outbound.try_recv() {
                 Ok(result) => result.map(Some),
                 Err(channel::TryRecvError::Empty) => {
@@ -1194,9 +1204,7 @@ impl Forwarder {
                         // drained by a stale drain.
                         drain_wake(&self.wake)?;
                         self.wake_signalled.store(false, Ordering::Release);
-                        if (!self.priority.is_empty()
-                            || !self.outbound.is_empty()
-                            || !self.fast_outbound.lock().unwrap().is_empty())
+                        if (!self.priority.is_empty() || !self.outbound.is_empty())
                             && !self.wake_signalled.swap(true, Ordering::AcqRel)
                         {
                             let _ = (&*self.wake_writer).write(&[1]);
@@ -1211,8 +1219,40 @@ impl Forwarder {
 
     pub fn wait_outbound(&self, timeout: Duration) -> Result<Packet, ForwardError> {
         #[cfg(unix)]
+        if self.engine_active.load(Ordering::Acquire) {
+            return self.wait_engine_outbound(Instant::now() + timeout);
+        }
+        #[cfg(unix)]
         self.commands.flush_wake();
         wait_outbound_from(&self.priority, &self.outbound, timeout)
+    }
+
+    /// `wait_outbound` for a session-driven engine: pump it on this thread.
+    #[cfg(unix)]
+    fn wait_engine_outbound(&self, deadline: Instant) -> Result<Packet, ForwardError> {
+        let mut state = FastPollState::new();
+        loop {
+            if let Some(next) = self.with_engine(Engine::pop_outbound).flatten() {
+                return next;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(ForwardError::Unavailable);
+            }
+            self.collect_fast_poll_routes(&mut state);
+            let wake_at = state.deadline.map_or(deadline, |at| at.min(deadline));
+            let timeout = rustix::event::Timespec::try_from(wake_at.saturating_duration_since(now))
+                .map_err(|_| ForwardError::Unavailable)?;
+            let mut descriptors = Vec::new();
+            state.push_descriptors(&mut descriptors);
+            match rustix::event::poll(&mut descriptors, Some(&timeout)) {
+                Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                Err(error) => return Err(ForwardError::Io(io::Error::from(error))),
+            }
+            state.record_revents(&descriptors);
+            drop(descriptors);
+            self.service_fast_poll(&mut state);
+        }
     }
 
     /// Replay `binds` (OpenSSH `session-bind@openssh.com` request bodies) on
@@ -1224,9 +1264,16 @@ impl Forwarder {
         agent_socket_path: impl Into<String>,
         binds: Vec<Vec<u8>>,
     ) -> Result<(), ForwardError> {
+        let agent_socket_path = agent_socket_path.into();
+        #[cfg(unix)]
+        if self.engine_active.load(Ordering::Acquire) {
+            return self
+                .with_engine(|engine| engine.set_ssh_agent_session_binds(agent_socket_path, binds))
+                .unwrap_or(Err(ForwardError::Unavailable));
+        }
         self.commands
             .send(Command::SetSshAgentSessionBinds {
-                agent_socket_path: agent_socket_path.into(),
+                agent_socket_path,
                 binds,
             })
             .map_err(|_| ForwardError::Unavailable)
@@ -1245,7 +1292,11 @@ impl Forwarder {
         let mut abandoned =
             !self.commands.is_empty() || !self.priority.is_empty() || !self.outbound.is_empty();
         self.commands.shutdown();
-        self.local_listeners.clear();
+        self.retire_listeners();
+        #[cfg(unix)]
+        if let Some(mut engine) = self.engine.get_mut().unwrap().take() {
+            abandoned |= engine.finish(true);
+        }
         if let Some(worker) = self.worker.take() {
             worker.join().map_err(|_| ForwardError::Unavailable)?;
         }
@@ -1255,14 +1306,6 @@ impl Forwarder {
         while self.priority.try_recv().is_ok() {
             abandoned = true;
         }
-        #[cfg(unix)]
-        {
-            let mut fast = self.fast_outbound.lock().unwrap();
-            if !fast.is_empty() {
-                abandoned = true;
-                fast.clear();
-            }
-        }
         if !self.commands.is_empty() {
             abandoned = true;
         }
@@ -1270,8 +1313,21 @@ impl Forwarder {
         Ok(abandoned)
     }
 
-    fn stop(&mut self) -> Result<(), ForwardError> {
+    fn retire_listeners(&mut self) {
+        #[cfg(unix)]
+        self.listeners.retire_all();
+        #[cfg(windows)]
         self.local_listeners.clear();
+    }
+
+    fn stop(&mut self) -> Result<(), ForwardError> {
+        self.retire_listeners();
+        #[cfg(unix)]
+        if let Some(mut engine) = self.engine.get_mut().unwrap().take() {
+            self.shutdown.store(true, Ordering::Release);
+            self.commands.shutdown();
+            engine.finish(false);
+        }
         if let Some(worker) = self.worker.take() {
             self.shutdown.store(true, Ordering::Release);
             self.commands.shutdown();
@@ -1693,26 +1749,27 @@ mod tests {
                 .try_send(Command::Packet(Packet::new(255, vec![])))
                 .is_ok());
         }
+        // A client is waiting in the listener backlog while the worker is
+        // busy and its queue is full.
         let _peer = UnixStream::connect(&path).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while forwarder.next_client_fd.load(Ordering::Acquire) == 1 && Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert_eq!(forwarder.next_client_fd.load(Ordering::Acquire), 2);
         let emergency = forwarder.commands.clone();
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         let cancelling = std::thread::spawn(move || {
             let result = forwarder.cancel_local_forward(&request);
-            done_tx.send(result).unwrap();
-            forwarder
+            let closed = !path.exists();
+            done_tx.send((result, closed)).unwrap();
+            (forwarder, path)
         });
         let result = done_rx.recv_timeout(Duration::from_secs(3));
         // Release both possible blockers even if the assertion will fail.
         emergency.shutdown();
         release.send(()).unwrap();
-        let mut forwarder = cancelling.join().unwrap();
+        let (mut forwarder, path) = cancelling.join().unwrap();
         forwarder.shutdown_hard().unwrap();
-        result.expect("cancel waited on full worker queue").unwrap();
+        let (result, closed) = result.expect("cancel waited on full worker queue");
+        result.unwrap();
+        // The busy worker held no reference, so the listener closed at once.
+        assert!(closed);
         assert!(!path.exists());
     }
 

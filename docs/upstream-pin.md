@@ -166,6 +166,9 @@ Unknown client packet types stay `SessionError` (session-local, same as the
 before assigning replay sequences, flushes unsent floods at the 64 KiB threshold,
 preserves small output and tmux response/control lines, and prioritizes tmux
 responses ahead of queued pane output. Native socket buffers remain small.
+The connected staging queue is capped at 2 MiB rather than upstream's 16 MB
+`WriteBuffer`: it only has to keep the bounded transport send buffer fed, and a
+larger cap just keeps more stale, interruptible output resident in etserver.
 The implementation reuses Rust's existing bounded queues and cancellation rather
 than copying the C++ event loop. Protocol v6 and generated wire fixtures are unchanged.
 

@@ -7,7 +7,14 @@ use et_net::connection::ConnError;
 
 use super::{ActiveSession, SessionError, FLOW_CONTROL_BUFFER_BYTES};
 
-const CONNECTED_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+/// Unsent output staged while the client is connected. Upstream's
+/// `TerminalServer` WriteBuffer caps this at 16 MB, but the queue only has to
+/// keep the bounded (256 KiB, `TCP_NOTSENT_LOWAT`) transport send buffer fed;
+/// anything beyond that is resident memory that only grows when the client is
+/// slower than the producer, and stale output Ctrl+C must discard. 2 MiB still
+/// spans many writer wakeups at full loopback speed while the producer is
+/// held back by terminal/pipe backpressure instead of the daemon heap.
+const CONNECTED_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const DISCONNECTED_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
 #[cfg(test)]
@@ -515,7 +522,12 @@ impl FlowControl {
                 state.stop = StopMode::Hard;
             }
         }
-        let capacity_ready = state.queue.is_empty() || state.queue.can_accept_terminal(32 * 1024);
+        // Wake a backpressured bridge once half the terminal lane is free,
+        // not after every delivered packet: a saturated stream then refills
+        // the queue in one batch per wake instead of one packet per wake.
+        let resume_bytes = (state.queue.limit() / 2).max(32 * 1024);
+        let capacity_ready =
+            state.queue.is_empty() || state.queue.can_accept_terminal(resume_bytes);
         let should_signal = (state.bridge_waiting && capacity_ready && {
             state.bridge_waiting = false;
             true

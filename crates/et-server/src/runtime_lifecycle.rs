@@ -58,21 +58,28 @@ fn release_idle_memory() -> Result<IdleMemoryAccounting, tikv_jemalloc_ctl::Erro
     })
 }
 
+/// Active-session decay: dirty pages return to the kernel after 1 s (the
+/// build-time default, see `.cargo/config.toml`, restated here so builds
+/// without that config keep it), and purged pages skip jemalloc's lazy
+/// `MADV_FREE` stage (`muzzy_decay_ms` 0, jemalloc's own default): lazily
+/// freed pages stay resident until the kernel is under memory pressure.
 #[cfg(target_os = "linux")]
 fn restore_active_decay() {
     use tikv_jemalloc_ctl::{Access, AsName};
 
-    let _ = b"arenas.dirty_decay_ms\0".name().write(1000_isize);
-    let _ = b"arenas.muzzy_decay_ms\0".name().write(1000_isize);
+    const DIRTY_DECAY_MS: isize = 1000;
+    const MUZZY_DECAY_MS: isize = 0;
+    let _ = b"arenas.dirty_decay_ms\0".name().write(DIRTY_DECAY_MS);
+    let _ = b"arenas.muzzy_decay_ms\0".name().write(MUZZY_DECAY_MS);
     if let Ok(limit) = b"arenas.narenas\0".name().read() {
         let limit: u32 = limit;
         for index in 0..limit {
             let dirty = format!("arena.{index}.dirty_decay_ms\0");
-            if dirty.as_bytes().name().write(1000_isize).is_err() {
+            if dirty.as_bytes().name().write(DIRTY_DECAY_MS).is_err() {
                 continue;
             }
             let muzzy = format!("arena.{index}.muzzy_decay_ms\0");
-            let _ = muzzy.as_bytes().name().write(1000_isize);
+            let _ = muzzy.as_bytes().name().write(MUZZY_DECAY_MS);
         }
     }
 }

@@ -1,0 +1,18 @@
+[env]
+# jemalloc is the Linux global allocator of the single `et` binary (see
+# crates/et-bin/src/main.rs). Its options can only be set before the first
+# allocation, and the safe Rust API offers no `malloc_conf` hook without an
+# exported symbol (forbidden by `unsafe_code = "forbid"`), so the policy is
+# baked in at build time through tikv-jemalloc-sys.
+#
+# - narenas:1 — every role runs a handful of threads whose large I/O buffers
+#   are allocated on one thread and freed on another; per-CPU arenas (4 x ncpu
+#   by default) strand each thread's freed pages in its own arena. One arena
+#   keeps a session's footprint at its live set for a few percent of extra
+#   lock traffic on >= 32 KiB allocations (small ones stay in the tcache).
+# - dirty_decay_ms:1000 — the server already switches to 1 s at runtime
+#   (et-server runtime_lifecycle.rs); apply the same 1 s to the client and
+#   terminal roles instead of jemalloc's 10 s default.
+#
+# An explicitly exported JEMALLOC_SYS_WITH_MALLOC_CONF still takes precedence.
+JEMALLOC_SYS_WITH_MALLOC_CONF = "narenas:1,dirty_decay_ms:1000"

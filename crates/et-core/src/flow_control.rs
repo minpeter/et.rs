@@ -292,6 +292,10 @@ impl OutputQueue {
     pub fn set_limit(&mut self, limit: usize) {
         self.limit = limit;
     }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
 }
 
 fn packet_cost(packet: &Packet) -> usize {

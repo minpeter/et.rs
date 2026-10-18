@@ -208,30 +208,28 @@ fn socket_reads_grow_for_bulk_and_release_the_buffer_once_traffic_is_small() {
         bulk.extend_from_slice(&frame);
     }
 
-    // A fresh connection asks for little; a stream that fills every read
-    // reaches the bulk size after two reads.
+    // A fresh connection asks for little and grows while reads fill up.
     let mut stream = bulk.as_slice();
-    let sizes: Vec<usize> = (0..4)
-        .map(|_| {
-            let size = socket_read(&mut reader, &mut stream);
-            drain_packets(&mut reader);
-            size
-        })
-        .collect();
-    assert_eq!(
-        sizes,
-        [
-            MIN_SOCKET_READ,
-            4 * MIN_SOCKET_READ,
-            MAX_SOCKET_READ,
-            MAX_SOCKET_READ
-        ]
-    );
+    assert_eq!(socket_read(&mut reader, &mut stream), MIN_SOCKET_READ);
+    drain_packets(&mut reader);
+    assert_eq!(socket_read(&mut reader, &mut stream), 4 * MIN_SOCKET_READ);
+    drain_packets(&mut reader);
+    // Once a frame has been decoded, bulk reads end on frame boundaries: no
+    // partial frame is left to move before the next read.
+    for _ in 0..4 {
+        let size = socket_read(&mut reader, &mut stream);
+        drain_packets(&mut reader);
+        assert!(
+            size > MAX_SOCKET_READ / 2 && size <= MAX_SOCKET_READ,
+            "{size}"
+        );
+        assert_eq!(reader.offset, reader.filled, "a bulk read split a frame");
+    }
     while !stream.is_empty() {
         socket_read(&mut reader, &mut stream);
         drain_packets(&mut reader);
     }
-    assert!(reader.partial.capacity() >= MAX_SOCKET_READ);
+    assert!(reader.partial.capacity() > 4 * MIN_SOCKET_READ);
 
     // Keep-alive-sized reads shrink the request back and release the bulk
     // buffer, so an idle connection does not keep it resident.

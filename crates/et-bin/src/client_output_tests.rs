@@ -810,6 +810,8 @@ fn cancellable_stdout_accepts_null_output_but_still_honors_cancellation() {
         nonblocking: false,
         #[cfg(target_os = "linux")]
         stdout_kind: None,
+        #[cfg(target_os = "linux")]
+        terminal: None,
     };
     let (done_tx, done_rx) = mpsc::sync_channel(0);
     std::thread::spawn(move || {
@@ -842,6 +844,8 @@ fn cancellable_stdout_fails_when_output_is_closed() {
         nonblocking: false,
         #[cfg(target_os = "linux")]
         stdout_kind: None,
+        #[cfg(target_os = "linux")]
+        terminal: None,
     };
 
     let (done_tx, done_rx) = mpsc::sync_channel(0);

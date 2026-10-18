@@ -39,11 +39,16 @@ impl std::error::Error for ReadError {}
 /// Smallest socket read [`BackedReader::prepare_socket_read`] asks for: all an
 /// idle or interactive connection ever zero-fills.
 pub const MIN_SOCKET_READ: usize = 16 * 1024;
-/// Largest socket read; a bulk stream reaches it after two full reads.
-/// Smaller bulk reads cost single-session CPU: a 64 KiB cap left a partial
-/// frame to compact after nearly every read (+8-17% CPU on one 512 MiB
-/// stream).
+/// Largest socket read; a bulk stream reaches it after two full reads. Reads
+/// align to frame boundaries (see `aligned_read_len`), so the cap only trades
+/// syscalls and wakeups against buffer memory: a client keeps it, a server
+/// connection uses [`SERVER_MAX_SOCKET_READ`].
 pub const MAX_SOCKET_READ: usize = 256 * 1024;
+/// Socket read cap of a server connection. A server multiplexes many
+/// sessions, so this buffer is what a bulk upload adds per session: one
+/// aligned 64 KiB-packet frame per read keeps 16 concurrent uploads at 17 MB
+/// of server RSS (ET-C++: 18 MB) for 2-3% more server CPU than 256 KiB reads.
+pub const SERVER_MAX_SOCKET_READ: usize = 96 * 1024;
 
 #[derive(Clone)]
 pub struct BackedReader {
@@ -58,6 +63,10 @@ pub struct BackedReader {
     read_hint: usize,
     /// Size of the socket read in flight, to tell a full read from a short one.
     read_requested: usize,
+    /// Wire length (with its prefix) of the last frame decoded, 0 before one.
+    last_frame_len: usize,
+    /// Upper bound for `read_hint`.
+    max_socket_read: usize,
 }
 
 impl BackedReader {
@@ -72,7 +81,15 @@ impl BackedReader {
             connected,
             read_hint: MIN_SOCKET_READ,
             read_requested: 0,
+            last_frame_len: 0,
+            max_socket_read: MAX_SOCKET_READ,
         }
+    }
+
+    /// Cap socket reads at `bytes` instead of [`MAX_SOCKET_READ`].
+    pub fn with_max_socket_read(mut self, bytes: usize) -> Self {
+        self.max_socket_read = bytes.max(MIN_SOCKET_READ);
+        self
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
@@ -124,9 +141,38 @@ impl BackedReader {
             self.offset = 0;
             self.filled = 0;
         }
-        let size = self.read_hint;
+        let size = self.aligned_read_len(self.read_hint);
         self.read_requested = size;
         &mut self.prepare_read_slice(size)[..size]
+    }
+
+    /// A read size near `limit` that ends on a frame boundary when the frames
+    /// that follow are as long as the last one: the rest of a pending frame
+    /// plus whole frames. Uniform bulk frames then never leave a partial frame
+    /// behind to move to the front of the buffer before the next read; small
+    /// (interactive) frames are not worth aligning.
+    fn aligned_read_len(&self, limit: usize) -> usize {
+        let frame = self.last_frame_len;
+        if frame < MIN_SOCKET_READ / 4 {
+            return limit;
+        }
+        let pending = &self.partial[self.offset..self.filled];
+        let rest = match pending.len() {
+            0 => 0,
+            1..=3 => return limit,
+            _ => match crate::framing::parse_be_u32_len(pending) {
+                Ok(len) => (4 + len).saturating_sub(pending.len()),
+                Err(_) => return limit,
+            },
+        };
+        if rest >= limit {
+            return rest;
+        }
+        let whole = (limit - rest) / frame;
+        if rest == 0 && whole == 0 {
+            return limit;
+        }
+        rest + whole * frame
     }
 
     /// Record `count` bytes read into the slice from
@@ -134,7 +180,7 @@ impl BackedReader {
     pub fn commit_socket_read(&mut self, count: usize) {
         self.commit_read(count);
         if count >= self.read_requested {
-            self.read_hint = (self.read_hint * 4).min(MAX_SOCKET_READ);
+            self.read_hint = (self.read_hint * 4).min(self.max_socket_read);
         } else if count < self.read_hint / 4 {
             self.read_hint = (self.read_hint / 2).max(MIN_SOCKET_READ);
         }
@@ -187,6 +233,7 @@ impl BackedReader {
         let start = self.offset + 4;
         let end = start + len;
         self.offset = end;
+        self.last_frame_len = 4 + len;
         let result = Self::decode_packet(&mut self.crypto, &self.partial[start..end]);
         if self.offset == self.filled {
             self.offset = 0;

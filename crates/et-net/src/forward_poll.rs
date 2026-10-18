@@ -52,6 +52,26 @@ const IDLE_CREDIT_FLUSH: Duration = Duration::from_millis(50);
 /// Large enough to drain a saturated socket buffer in one cycle, so a bulk
 /// transfer does not return to poll once per handful of packets.
 const READS_PER_CYCLE: usize = 128;
+/// Smallest piece a pending message is split into, see [`pipelined_split`].
+const PIPELINE_CHUNK: usize = 16 * 1024;
+
+/// How to read the bytes a socket had queued when it became readable: as
+/// `(split_bytes, split_len)`, read the first `split_bytes` in `split_len`
+/// pieces and anything after them in full packets. A message of at most four
+/// full packets is read in four parts (each at least [`PIPELINE_CHUNK`]), so
+/// the peer decrypts and forwards the first part while the rest is still
+/// being encrypted and sent; a 64 KiB request/response round trip otherwise
+/// pays the whole message's crypto serially at every hop. Larger or unknown
+/// backlogs (bulk transfers) and data arriving later use full packets.
+fn pipelined_split(available: Option<u64>) -> (usize, usize) {
+    let full = crate::forward_io::FORWARD_READ_LEN;
+    match available.and_then(|bytes| usize::try_from(bytes).ok()) {
+        Some(available) if available <= 4 * full => {
+            (available, available.div_ceil(4).clamp(PIPELINE_CHUNK, full))
+        }
+        _ => (0, full),
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct QueuedBuffer {
@@ -841,16 +861,24 @@ impl Worker {
             return Ok(SocketVerdict::Drop);
         }
         if event.readable {
+            let (mut split_bytes, split_len) =
+                pipelined_split(rustix::io::ioctl_fionread(&*socket.stream).ok());
             let mut reads = 0;
             while socket.read_interest() && reads < READS_PER_CYCLE && !self.outbound_backlog_full()
             {
+                let read_len = if split_bytes > 0 {
+                    split_len
+                } else {
+                    crate::forward_io::FORWARD_READ_LEN
+                };
                 let outcome = {
-                    let scratch = &mut self.read_scratch[..crate::forward_io::FORWARD_READ_LEN];
+                    let scratch = &mut self.read_scratch[..read_len];
                     socket.read_encoded_chunk(scratch)
                 };
                 match outcome {
                     Ok(ReadOutcome::Data(payload)) => {
                         let is_small = payload.len() <= 4096;
+                        split_bytes = split_bytes.saturating_sub(payload.len());
                         self.emit_raw(TerminalPacketType::PortForwardData as u8, payload)?;
                         reads += 1;
                         if is_small {

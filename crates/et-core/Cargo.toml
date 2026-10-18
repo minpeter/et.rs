@@ -17,6 +17,7 @@ workspace = true
 [dependencies]
 blake2 = "0.10"
 et-sodium = { path = "../et-sodium" }
+memchr = "2"
 prost = "0.13"
 rand = "0.8"
 

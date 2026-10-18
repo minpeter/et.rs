@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "et"
-version = "0.0.35"
+version = "0.0.36"
 dependencies = [
  "clap",
  "crossterm",
@@ -429,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "et-cli"
-version = "0.0.35"
+version = "0.0.36"
 dependencies = [
  "clap",
  "et-core",
@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "et-core"
-version = "0.0.35"
+version = "0.0.36"
 dependencies = [
  "blake2",
  "et-sodium",
@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "et-htm"
-version = "0.0.35"
+version = "0.0.36"
 dependencies = [
  "et-net",
  "filedescriptor",
@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "et-net"
-version = "0.0.35"
+version = "0.0.36"
 dependencies = [
  "base64",
  "crossbeam-channel",
@@ -484,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "et-server"
-version = "0.0.35"
+version = "0.0.36"
 dependencies = [
  "et-core",
  "et-net",
@@ -497,7 +497,7 @@ dependencies = [
 
 [[package]]
 name = "et-sodium"
-version = "0.0.35"
+version = "0.0.36"
 dependencies = [
  "libsodium-sys",
 ]

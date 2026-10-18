@@ -54,6 +54,8 @@ tokio = { version = "1", default-features = false, features = ["macros", "rt", "
 windows-spawn = "0.1.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# Safe duplication of portable-pty's raw master descriptor for the poll runtime.
+filedescriptor = "0.8.3"
 tikv-jemallocator = "0.7.0"
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]

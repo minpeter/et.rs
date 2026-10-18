@@ -137,31 +137,44 @@ pub fn write_local_packet_until_cancelled<W: Write>(
     write_local_packet_with(writer, packet, || cancelled.load(Ordering::Acquire))
 }
 
-pub fn write_local_terminal_buffer_until_cancelled(
-    writer: &mut crate::local::LocalStream,
-    output: &[u8],
-    is_stderr: bool,
-    cancelled: &AtomicBool,
-    progress: Option<&std::sync::atomic::AtomicUsize>,
-) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use rustix::event::{poll, PollFd, PollFlags, Timespec};
+/// One framed local `TERMINAL_BUFFER` packet, written without copying the
+/// output bytes.
+///
+/// The frame head (length prefix, packet header and protobuf tag/length) is
+/// built once; [`Self::write_some`] sends head, output and the optional
+/// `is_stderr` suffix with vectored writes. A readiness-driven loop keeps the
+/// frame across `WouldBlock` and resumes it with the same `output` slice, so a
+/// frame is never abandoned half-written and bytes never move through an
+/// intermediate buffer.
+pub struct TerminalBufferFrame {
+    head: [u8; TERMINAL_FRAME_HEAD_MAX],
+    head_len: usize,
+    output_len: usize,
+    suffix: &'static [u8],
+    written: usize,
+}
+
+const TERMINAL_FRAME_HEAD_MAX: usize = PREFIX_LEN + et_core::packet::HEADER_LEN + 1 + 10;
+const STDERR_SUFFIX: [u8; 2] = [0x10, 0x01];
+
+impl TerminalBufferFrame {
+    /// Frame `output_len` bytes of terminal output; rejects frames over 64 KiB.
+    pub fn new(output_len: usize, is_stderr: bool) -> io::Result<Self> {
         let mut varint = [0u8; 10];
         let mut varint_len = 0usize;
-        let mut val = output.len();
-        while val >= 0x80 {
-            varint[varint_len] = (val as u8) | 0x80;
-            val >>= 7;
+        let mut value = output_len;
+        while value >= 0x80 {
+            varint[varint_len] = (value as u8) | 0x80;
+            value >>= 7;
             varint_len += 1;
         }
-        varint[varint_len] = val as u8;
+        varint[varint_len] = value as u8;
         varint_len += 1;
-        let suffix: &[u8] = if is_stderr { &[0x10, 0x01] } else { &[] };
-        let payload_len = if output.is_empty() {
+        let suffix: &'static [u8] = if is_stderr { &STDERR_SUFFIX } else { &[] };
+        let payload_len = if output_len == 0 {
             suffix.len()
         } else {
-            1 + varint_len + output.len() + suffix.len()
+            1 + varint_len + output_len + suffix.len()
         };
         let wire_len = et_core::packet::HEADER_LEN + payload_len;
         if wire_len > MAX_LOCAL_PACKET_LEN {
@@ -172,11 +185,11 @@ pub fn write_local_terminal_buffer_until_cancelled(
         }
         let length = i64::try_from(wire_len)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "local packet too large"))?;
-        let mut head = [0u8; PREFIX_LEN + 2 + 1 + 10];
+        let mut head = [0u8; TERMINAL_FRAME_HEAD_MAX];
         head[..PREFIX_LEN].copy_from_slice(&length.to_ne_bytes());
         head[PREFIX_LEN] = 0;
         head[PREFIX_LEN + 1] = et_core::proto::TerminalPacketType::TerminalBuffer as u8;
-        let head_len = if output.is_empty() {
+        let head_len = if output_len == 0 {
             PREFIX_LEN + 2
         } else {
             head[PREFIX_LEN + 2] = 0x0a;
@@ -184,35 +197,81 @@ pub fn write_local_terminal_buffer_until_cancelled(
                 .copy_from_slice(&varint[..varint_len]);
             PREFIX_LEN + 3 + varint_len
         };
-        let total = head_len + output.len() + suffix.len();
-        let mut written = 0usize;
-        while written < total {
+        Ok(Self {
+            head,
+            head_len,
+            output_len,
+            suffix,
+            written: 0,
+        })
+    }
+
+    fn total_len(&self) -> usize {
+        self.head_len + self.output_len + self.suffix.len()
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.written == self.total_len()
+    }
+
+    /// True once any byte reached the stream: the frame must then finish.
+    pub fn is_started(&self) -> bool {
+        self.written != 0
+    }
+
+    /// Issue one write for the unsent remainder and return how many bytes the
+    /// stream accepted. `output` must be the slice the frame was created for.
+    /// `WouldBlock`/`Interrupted` are returned unchanged for the caller's loop.
+    pub fn write_some<W: Write + ?Sized>(
+        &mut self,
+        writer: &mut W,
+        output: &[u8],
+    ) -> io::Result<usize> {
+        debug_assert_eq!(output.len(), self.output_len);
+        let head_len = self.head_len;
+        let written = self.written;
+        let count = if written < head_len {
+            writer.write_vectored(&[
+                io::IoSlice::new(&self.head[written..head_len]),
+                io::IoSlice::new(output),
+                io::IoSlice::new(self.suffix),
+            ])?
+        } else if written < head_len + output.len() {
+            writer.write_vectored(&[
+                io::IoSlice::new(&output[written - head_len..]),
+                io::IoSlice::new(self.suffix),
+            ])?
+        } else {
+            writer.write(&self.suffix[written - head_len - output.len()..])?
+        };
+        if count == 0 && !self.is_complete() {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        self.written += count;
+        Ok(count)
+    }
+}
+
+pub fn write_local_terminal_buffer_until_cancelled(
+    writer: &mut crate::local::LocalStream,
+    output: &[u8],
+    is_stderr: bool,
+    cancelled: &AtomicBool,
+    progress: Option<&std::sync::atomic::AtomicUsize>,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use rustix::event::{poll, PollFd, PollFlags, Timespec};
+        let mut frame = TerminalBufferFrame::new(output.len(), is_stderr)?;
+        while !frame.is_complete() {
             if cancelled.load(Ordering::Acquire) {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "local packet write cancelled",
                 ));
             }
-            let res = if written < head_len {
-                let slices = [
-                    io::IoSlice::new(&head[written..head_len]),
-                    io::IoSlice::new(output),
-                    io::IoSlice::new(suffix),
-                ];
-                writer.write_vectored(&slices)
-            } else if written < head_len + output.len() {
-                let slices = [
-                    io::IoSlice::new(&output[written - head_len..]),
-                    io::IoSlice::new(suffix),
-                ];
-                writer.write_vectored(&slices)
-            } else {
-                writer.write(&suffix[written - head_len - output.len()..])
-            };
-            match res {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(count) => {
-                    written += count;
+            match frame.write_some(writer, output) {
+                Ok(_) => {
                     if let Some(progress) = progress {
                         progress.fetch_add(1, Ordering::Release);
                     }

@@ -27,6 +27,9 @@ const FINAL_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 #[path = "terminal_tmux_filter.rs"]
 mod terminal_tmux_filter;
 use terminal_tmux_filter::TmuxCcFilter;
+#[cfg(target_os = "linux")]
+#[path = "terminal_pty_poll.rs"]
+mod terminal_pty_poll;
 
 use crate::terminal_protocol::{
     handle_packet, read_initialization, read_ready_packet, write_terminal_exit_status,
@@ -138,6 +141,24 @@ where
         if let Some(name) = pair.master.tty_name() {
             command.env("SSH_TTY", name);
         }
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(pty) = terminal_pty_poll::PollPty::open(pair.master.as_ref()) {
+        let child = pair
+            .slave
+            .spawn_command(command)
+            .map_err(|error| format!("could not spawn terminal shell: {error}"))?;
+        drop(pair.slave);
+        return terminal_pty_poll::run(
+            router,
+            pair.master,
+            pty,
+            child,
+            motd,
+            output_delay,
+            resume,
+            started,
+        );
     }
     // Complete every fallible descriptor allocation before creating the shell.
     // Once the process exists, all returns below pass through one cleanup path.
@@ -385,43 +406,47 @@ fn forward_output(
     forward_output_with_progress(reader, router, cancelled, prefix, None, false)
 }
 
-fn forward_output_with_progress(
-    reader: &mut dyn Read,
-    router: &Mutex<LocalStream>,
-    cancelled: &AtomicBool,
-    prefix: Option<&[u8]>,
-    progress: Option<&AtomicUsize>,
-    can_resume: bool,
-) -> Result<(), String> {
-    if let Some(prefix) = prefix {
-        for chunk in prefix.chunks(MAX_OUTPUT_CHUNK) {
-            write_output(router, cancelled, chunk, progress, can_resume)?;
+/// PTY output shaping shared by every runtime: after a startup motd the
+/// shell's first newline (`\n`, `\r\n` or `\r\r\n`) is elided, independent of
+/// PTY read boundaries, and tmux control-mode protocol lines are filtered.
+struct OutputShaper {
+    /// Bytes held while the stream start may still be an elided newline;
+    /// `None` once decided, or from the start without a motd.
+    startup: Option<Vec<u8>>,
+    filter: TmuxCcFilter,
+}
+
+impl OutputShaper {
+    fn new(after_prefix: bool) -> Self {
+        Self {
+            startup: after_prefix.then(|| Vec::with_capacity(3)),
+            filter: TmuxCcFilter::default(),
         }
     }
-    let mut buffer = [0u8; MAX_OUTPUT_CHUNK];
-    let mut startup = prefix.map(|_| Vec::with_capacity(3));
-    let mut filter = TmuxCcFilter::default();
-    loop {
-        let count = reader
-            .read(&mut buffer)
-            .map_err(|error| format!("could not read PTY output: {error}"))?;
-        if count == 0 {
-            if let Some(startup) = startup {
-                write_output(
-                    router,
-                    cancelled,
-                    &filter.apply(&startup),
-                    progress,
-                    can_resume,
-                )?;
-            }
-            write_output(router, cancelled, &filter.finish(), progress, can_resume)?;
-            return Ok(());
+
+    /// Shape one PTY read. Plain output is returned as `input` itself; only
+    /// a held newline prefix or filtered control-mode bytes use `scratch`.
+    fn shape<'a>(&mut self, input: &'a [u8], scratch: &'a mut Vec<u8>) -> &'a [u8] {
+        if self.startup.is_none() {
+            return match self.filter.apply_slice(input) {
+                std::borrow::Cow::Borrowed(bytes) => bytes,
+                std::borrow::Cow::Owned(bytes) => {
+                    *scratch = bytes;
+                    scratch
+                }
+            };
         }
-        if let Some(mut pending) = startup.take() {
+        scratch.clear();
+        self.push(input, scratch);
+        scratch
+    }
+
+    /// Shape one PTY read and append the result to `out`.
+    fn push(&mut self, mut input: &[u8], out: &mut Vec<u8>) {
+        if let Some(mut pending) = self.startup.take() {
             let mut consumed = 0;
-            while consumed < count && pending.len() < 3 {
-                pending.push(buffer[consumed]);
+            while consumed < input.len() && pending.len() < 3 {
+                pending.push(input[consumed]);
                 consumed += 1;
                 if pending == b"\n" || pending == b"\r\n" || pending == b"\r\r\n" {
                     pending.clear();
@@ -435,35 +460,50 @@ fn forward_output_with_progress(
                 && (b"\r\r\n".starts_with(&pending) || b"\r\n".starts_with(&pending))
                 && pending.len() < 3
             {
-                startup = Some(pending);
-                if consumed == count {
-                    continue;
-                }
-            } else {
-                write_output(
-                    router,
-                    cancelled,
-                    &filter.apply_slice(&pending),
-                    progress,
-                    can_resume,
-                )?;
+                // The whole read is still a possible newline prefix.
+                self.startup = Some(pending);
+                return;
             }
-            write_output(
-                router,
-                cancelled,
-                &filter.apply_slice(&buffer[consumed..count]),
-                progress,
-                can_resume,
-            )?;
-            continue;
+            out.extend_from_slice(&self.filter.apply_slice(&pending));
+            input = &input[consumed..];
         }
-        write_output(
-            router,
-            cancelled,
-            &filter.apply_slice(&buffer[..count]),
-            progress,
-            can_resume,
-        )?;
+        out.extend_from_slice(&self.filter.apply_slice(input));
+    }
+
+    /// PTY EOF: release everything still held.
+    fn finish(&mut self, out: &mut Vec<u8>) {
+        if let Some(startup) = self.startup.take() {
+            out.extend(self.filter.apply(&startup));
+        }
+        out.extend(self.filter.finish());
+    }
+}
+
+fn forward_output_with_progress(
+    reader: &mut dyn Read,
+    router: &Mutex<LocalStream>,
+    cancelled: &AtomicBool,
+    prefix: Option<&[u8]>,
+    progress: Option<&AtomicUsize>,
+    can_resume: bool,
+) -> Result<(), String> {
+    if let Some(prefix) = prefix {
+        write_output(router, cancelled, prefix, progress, can_resume)?;
+    }
+    let mut buffer = [0u8; MAX_OUTPUT_CHUNK];
+    let mut scratch = Vec::new();
+    let mut shaper = OutputShaper::new(prefix.is_some());
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("could not read PTY output: {error}"))?;
+        if count == 0 {
+            scratch.clear();
+            shaper.finish(&mut scratch);
+            return write_output(router, cancelled, &scratch, progress, can_resume);
+        }
+        let shaped = shaper.shape(&buffer[..count], &mut scratch);
+        write_output(router, cancelled, shaped, progress, can_resume)?;
     }
 }
 
@@ -550,7 +590,7 @@ impl CompletionState {
         }
     }
 
-    fn expired_status(&mut self, progress: &AtomicUsize) -> Option<PumpCompletion> {
+    fn expired_status(&mut self, cur_progress: usize) -> Option<PumpCompletion> {
         let status = self.child_status?;
         let deadline = self.drain_deadline?;
         let max_deadline = self.max_drain_deadline.unwrap_or(deadline);
@@ -562,7 +602,6 @@ impl CompletionState {
                 reaped: true,
             });
         }
-        let cur_progress = progress.load(Ordering::Acquire);
         if cur_progress != self.last_progress {
             self.last_progress = cur_progress;
             self.drain_deadline = Some((now + FINAL_OUTPUT_DRAIN_TIMEOUT).min(max_deadline));
@@ -674,7 +713,7 @@ fn pump_poll(
             }
             drain_wakeup(&mut wake_reader)?;
         }
-        if let Some(status) = completion.expired_status(progress) {
+        if let Some(status) = completion.expired_status(progress.load(Ordering::Acquire)) {
             return Ok(status);
         }
         if router_events.contains(PollFlags::IN) {
@@ -720,7 +759,7 @@ fn pump_windows(
             }
             completion.last_progress = progress.load(Ordering::Acquire);
         }
-        if let Some(status) = completion.expired_status(progress) {
+        if let Some(status) = completion.expired_status(progress.load(Ordering::Acquire)) {
             return Ok(status);
         }
         drain_wakeup(&mut wake_reader)?;
@@ -756,18 +795,24 @@ fn reconnect_router(
     resume: &RouterResume,
     router_writer: &Arc<Mutex<LocalStream>>,
 ) -> Result<LocalStream, String> {
+    let stream = reconnect_router_stream(resume)?;
+    let cloned = stream
+        .try_clone()
+        .map_err(|error| format!("could not clone the recovered router: {error}"))?;
+    let mut writer = router_writer
+        .lock()
+        .map_err(|_| "terminal router writer is unavailable".to_owned())?;
+    *writer = cloned;
+    Ok(stream)
+}
+
+/// Re-register with the router, backing off between attempts, and return the
+/// recovered non-blocking stream.
+fn reconnect_router_stream(resume: &RouterResume) -> Result<LocalStream, String> {
     let mut delay = Duration::from_secs(1);
     loop {
         match try_reconnect(resume) {
             Ok(stream) => {
-                let cloned = stream
-                    .try_clone()
-                    .map_err(|error| format!("could not clone the recovered router: {error}"))?;
-                let mut writer = router_writer
-                    .lock()
-                    .map_err(|_| "terminal router writer is unavailable".to_owned())?;
-                *writer = cloned;
-                drop(writer);
                 stream.set_nonblocking(true).map_err(|error| {
                     format!("could not configure the recovered router: {error}")
                 })?;
@@ -833,10 +878,26 @@ where
                 }
                 decoder = LocalPacketDecoder::new();
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => wait_router_readable(&router),
             Err(error) if error.contains("disconnected") => return Ok(0),
             Err(error) => return Err(error),
         }
+    }
+}
+
+/// Park until the idle router has input (or hangs up). Windows cannot poll
+/// the router handle and keeps upstream's 10 ms `select()` cadence.
+fn wait_router_readable(router: &LocalStream) {
+    #[cfg(unix)]
+    {
+        let mut descriptors = [PollFd::new(router, PollFlags::IN)];
+        // EINTR only ends this wait early; the caller re-reads either way.
+        let _ = poll(&mut descriptors, None);
+    }
+    #[cfg(windows)]
+    {
+        let _ = router;
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 

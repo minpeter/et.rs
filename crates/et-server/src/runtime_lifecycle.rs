@@ -140,11 +140,13 @@ impl Lifecycle {
     }
 
     /// Readable when events are queued.
+    #[cfg(unix)]
     pub(crate) fn wake(&self) -> &LocalStream {
         &self.wake
     }
 
     /// When the next resume-expiry sweep is due.
+    #[cfg(unix)]
     pub(crate) fn next_sweep(&self) -> Instant {
         self.next_sweep
     }

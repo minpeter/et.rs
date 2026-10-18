@@ -14,6 +14,13 @@
 /// Wire length of an acknowledgement payload.
 pub const ACK_PAYLOAD_LEN: usize = 8;
 
+/// Payload bytes a client reads or writes before it sends an acknowledging
+/// keep-alive outside the idle interval. Each side's replay backup then holds
+/// roughly this much acknowledged-but-untrimmed data plus what is genuinely in
+/// flight, instead of the whole connected cap. The server's echo carries its
+/// own acknowledgement, so one client keep-alive trims both directions.
+pub const ACK_INTERVAL_BYTES: usize = 512 * 1024;
+
 /// Encode a reader sequence number as a keep-alive acknowledgement payload.
 pub fn encode_ack(sequence: i64) -> [u8; ACK_PAYLOAD_LEN] {
     // Sequences are non-negative; clamp defensively so the wire value can

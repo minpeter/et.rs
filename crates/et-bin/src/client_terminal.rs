@@ -2,8 +2,6 @@ use std::io::{self, IsTerminal, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::Mutex;
-#[cfg(unix)]
-use std::thread;
 
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use et_core::backed_reader::ReadError;
@@ -13,8 +11,6 @@ use et_net::forward::Forwarder;
 use prost::Message;
 #[cfg(unix)]
 use signal_hook::consts::SIGWINCH;
-#[cfg(unix)]
-use signal_hook::iterator::Signals;
 
 use crate::error::ClientError;
 use crate::initial_connect::ReconnectOutcome;
@@ -255,30 +251,15 @@ where
     // so resize arrives as a console event inside the Windows loop.
     #[cfg(unix)]
     let result = {
-        let (mut wake_reader, mut wake_writer) =
+        let (mut wake_reader, wake_writer) =
             UnixStream::pair().map_err(|error| terminal_io("creating resize wakeup", error))?;
         wake_reader
             .set_nonblocking(true)
             .map_err(|error| terminal_io("configuring resize wakeup", error))?;
-        wake_writer
-            .set_nonblocking(true)
-            .map_err(|error| terminal_io("configuring resize signal wakeup", error))?;
-        let mut signals = Signals::new([SIGWINCH])
+        // The handler itself sends one byte (MSG_DONTWAIT) to the session
+        // loop's resize wakeup, so no thread waits on the signal.
+        let resize_signal = signal_hook::low_level::pipe::register(SIGWINCH, wake_writer)
             .map_err(|error| terminal_io("installing resize signal handler", error))?;
-        let signal_handle = signals.handle();
-        let signal_worker = thread::Builder::new()
-            .name("et-client-resize".to_owned())
-            .spawn(move || {
-                for _ in signals.forever() {
-                    match wake_writer.write(&[1]) {
-                        Ok(_) => {}
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                        Err(_) => break,
-                    }
-                }
-            })
-            .map_err(|error| terminal_io("starting resize signal worker", error))?;
         let result = crate::client_terminal_loop::pump(
             &mut connection,
             &mut wake_reader,
@@ -297,8 +278,7 @@ where
             &mut forwarder,
             reconnect,
         );
-        signal_handle.close();
-        let _ = signal_worker.join();
+        signal_hook::low_level::unregister(resize_signal);
         result
     };
     #[cfg(windows)]

@@ -1,6 +1,8 @@
 use prost::Message;
 
-use crate::flow_control::{FlowControlMode, OutputQueue, QueuePushError, MAX_PACKETS_PER_LANE};
+use crate::flow_control::{
+    FlowControlMode, OutputLane, OutputQueue, QueuePushError, MAX_PACKETS_PER_LANE,
+};
 use crate::packet::Packet;
 use crate::proto::{TerminalBuffer, TerminalPacketType};
 
@@ -162,6 +164,30 @@ fn in_flight_packet_retains_exact_packet_count_capacity() {
     );
     queue.complete(&in_flight);
     assert!(queue.push(control(&[])).is_ok());
+}
+
+#[test]
+fn count_saturated_lane_resumes_only_after_half_its_slots_free() {
+    // Given: a control lane saturated by packet count with ample byte budget.
+    let limit = (MAX_PACKETS_PER_LANE + 1) * 8;
+    let mut queue = OutputQueue::new(FlowControlMode::Backpressure, limit);
+    let packet = control(&[]);
+    for _ in 0..MAX_PACKETS_PER_LANE {
+        queue.push(packet.clone()).unwrap();
+    }
+    assert_eq!(
+        queue.push(packet.clone()),
+        Err(QueuePushError::Full(packet))
+    );
+
+    // When/Then: single freed slots do not resume the producer; half do.
+    for _ in 0..MAX_PACKETS_PER_LANE / 2 - 1 {
+        queue.pop().unwrap();
+        assert!(!queue.can_resume(OutputLane::Control, 0));
+    }
+    queue.pop().unwrap();
+    assert!(queue.can_resume(OutputLane::Control, 0));
+    assert!(queue.can_resume(OutputLane::Terminal, 0));
 }
 
 #[test]

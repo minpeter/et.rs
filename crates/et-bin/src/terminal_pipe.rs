@@ -28,6 +28,9 @@ use crate::terminal_protocol::{
 
 const MAX_OUTPUT_CHUNK: usize = 65_472;
 const MAX_PENDING_INPUT: usize = 256 * 1024;
+#[cfg(target_os = "linux")]
+#[path = "terminal_pipe_poll.rs"]
+mod terminal_pipe_poll;
 
 enum PipeEvent {
     StdoutEof,
@@ -54,6 +57,10 @@ where
     }
 
     let mut child = spawn_command(&command, term, &initialization.environment)?;
+    #[cfg(target_os = "linux")]
+    if let Some(pidfd) = terminal_pipe_poll::watch(&child) {
+        return terminal_pipe_poll::run(router, child, pidfd, started);
+    }
     let stdin = child
         .stdin
         .take()

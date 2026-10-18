@@ -516,8 +516,9 @@ fn run_mode_poll(
                 observed_generation,
             )?;
         }
-        let fast_ready = pending_outbound.is_empty()
-            && (forwarder.service_fast_poll(&mut fast_poll) || forwarder.has_fast_outbound());
+        // Service whatever this iteration's poll recorded (it also releases
+        // the descriptors); drain only while the transport has room.
+        let fast_ready = forwarder.service_fast_poll(&mut fast_poll) && pending_outbound.is_empty();
         if pending_outbound.is_empty()
             && (resume_outbound_drain
                 || fast_ready
@@ -968,6 +969,15 @@ fn wait(
     fast_poll: Option<&et_net::forward::FastPollState>,
 ) -> Result<(PollFlags, PollFlags, PollFlags, PollFlags), SessionError> {
     let (client_flags, timeout) = client_policy;
+    // Forwarding timers (idle window credit, parked accepts) and packets it
+    // already holds bound the wait as well.
+    let timeout = match fast_poll.and_then(et_net::forward::FastPollState::deadline) {
+        Some(at) => {
+            let until = at.saturating_duration_since(std::time::Instant::now());
+            Some(timeout.map_or(until, |timeout| timeout.min(until)))
+        }
+        None => timeout,
+    };
     let timeout = timeout.map(|duration| {
         Timespec::try_from(duration).expect("forwarding retry duration fits timespec")
     });

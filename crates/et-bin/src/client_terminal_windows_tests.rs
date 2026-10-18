@@ -165,8 +165,10 @@ fn pending_local_input_yields_to_forwarding_before_more_local_input() {
         )
     });
     pending_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-    let first = peer.read_packet().unwrap();
-    let second = peer.read_packet().unwrap();
+    // Volume acknowledgements (one keep-alive per 512 KiB written) may sit
+    // between producer frames; they are not a producer turn.
+    let first = next_data_packet(&mut peer);
+    let second = next_data_packet(&mut peer);
     peer.write_packet(255, b"stop-after-producer-order-check")
         .unwrap();
     // The stop packet reconnects and the test callback ends the session.
@@ -188,4 +190,13 @@ fn pending_local_input_yields_to_forwarding_before_more_local_input() {
         TerminalPacketType::PortForwardDestinationResponse as u8,
         "forwarding must get a turn before the second queued input frame"
     );
+}
+
+fn next_data_packet(peer: &mut Connection) -> et_core::packet::Packet {
+    loop {
+        let packet = peer.read_packet().unwrap();
+        if packet.header() != TerminalPacketType::KeepAlive as u8 {
+            return packet;
+        }
+    }
 }

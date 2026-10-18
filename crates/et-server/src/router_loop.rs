@@ -1,7 +1,7 @@
 use et_net::local::LocalStream;
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Sender, SyncSender};
+use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,7 +21,7 @@ use crate::router::{
     RouterError, RouterEvent, RouterReject, MAX_PENDING_REGISTRATIONS, REGISTRATION_TIMEOUT,
 };
 use crate::router_registration;
-use crate::runtime_lifecycle::LifecycleEvent;
+use crate::runtime_lifecycle::{LifecycleEvent, LifecycleSender};
 #[cfg(unix)]
 use crate::socket_path::OwnedRouterListener;
 #[cfg(windows)]
@@ -55,7 +55,7 @@ pub(crate) fn run(
     wake_reader: LocalStream,
     registry: Registry,
     events: SyncSender<RouterEvent>,
-    lifecycle: Option<Sender<LifecycleEvent>>,
+    lifecycle: Option<LifecycleSender>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), RouterError> {
     #[cfg(unix)]
@@ -70,7 +70,7 @@ fn run_poll(
     mut wake_reader: LocalStream,
     registry: Registry,
     events: SyncSender<RouterEvent>,
-    lifecycle: Option<Sender<LifecycleEvent>>,
+    lifecycle: Option<LifecycleSender>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), RouterError> {
     let mut pending = Vec::<PendingConnection>::new();
@@ -219,7 +219,7 @@ fn run_windows(
     mut wake_reader: LocalStream,
     registry: Registry,
     events: SyncSender<RouterEvent>,
-    lifecycle: Option<Sender<LifecycleEvent>>,
+    lifecycle: Option<LifecycleSender>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), RouterError> {
     const IDLE: std::time::Duration = std::time::Duration::from_millis(10);
@@ -348,7 +348,7 @@ fn service_watched(
     watched: &mut Vec<WatchedRegistration>,
     registry: &Registry,
     events: &SyncSender<RouterEvent>,
-    lifecycle: Option<&Sender<LifecycleEvent>>,
+    lifecycle: Option<&LifecycleSender>,
 ) -> Result<(), RouterError> {
     for index in (0..watched.len()).rev() {
         let flags = readiness.get(index).copied().unwrap_or(PollFlags::empty());
@@ -393,7 +393,7 @@ fn disconnect_watched(
     watched: &mut Vec<WatchedRegistration>,
     registry: &Registry,
     events: &SyncSender<RouterEvent>,
-    lifecycle: Option<&Sender<LifecycleEvent>>,
+    lifecycle: Option<&LifecycleSender>,
 ) -> Result<(), RouterError> {
     let registration = watched.swap_remove(index);
     if registry
@@ -403,7 +403,7 @@ fn disconnect_watched(
         let id = registration.identity.id().to_owned();
         emit(events, RouterEvent::Disconnected { id });
         if let Some(sender) = lifecycle {
-            let _ = sender.send(LifecycleEvent::TerminalDisconnected(registration.identity));
+            sender.send(LifecycleEvent::TerminalDisconnected(registration.identity));
         }
     }
     Ok(())

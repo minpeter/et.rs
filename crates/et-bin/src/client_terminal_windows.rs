@@ -91,6 +91,8 @@ where
     // Keep the next producer's preference across partial-write completion.
     let mut local_turn = true;
     let mut interrupt_input = et_core::output_interrupt::InterruptInput::default();
+    let mut bytes_since_ack: usize = 0;
+    let mut delivery_gate = crate::delivery_gate::DeliveryGate::default();
     loop {
         #[cfg(test)]
         if connection.write_pending() {
@@ -243,7 +245,9 @@ where
         // 1. Redirected bytes, or console input and resize notifications.
         // Bound each batch so a full pipe cannot starve output or forwarding.
         let mut redirected_progress = false;
-        let producers_polled = !connection.write_pending() && local_turn;
+        let producers_polled = !connection.write_pending()
+            && local_turn
+            && !delivery_gate.blocked(connection, interval);
         if producers_polled {
             if let Some(input) = raw_input.as_ref() {
                 let mut disconnected = false;
@@ -270,7 +274,9 @@ where
                         &mut reconnect,
                         terminal_enabled,
                     )? {
-                        OwnedWriteOutcome::Written => {}
+                        OwnedWriteOutcome::Written => {
+                            bytes_since_ack = bytes_since_ack.saturating_add(payload.len());
+                        }
                         OwnedWriteOutcome::Recovered => {
                             reconnect_needed = false;
                             last_received = Instant::now();
@@ -327,7 +333,9 @@ where
                             &mut reconnect,
                             terminal_enabled,
                         )? {
-                            OwnedWriteOutcome::Written => {}
+                            OwnedWriteOutcome::Written => {
+                                bytes_since_ack = bytes_since_ack.saturating_add(payload.len());
+                            }
                             OwnedWriteOutcome::Recovered => reconnect_needed = false,
                             OwnedWriteOutcome::SessionEnded => {
                                 return finish_remote_completion(
@@ -393,6 +401,8 @@ where
                         if let Some(ack) = et_core::keepalive::decode_ack(packet.payload()) {
                             connection.acknowledge_delivery(ack);
                         }
+                    } else {
+                        bytes_since_ack = bytes_since_ack.saturating_add(packet.payload().len());
                     }
                     if is_forward_packet(packet.header()) {
                         if let Some(packet) = forwarder
@@ -474,7 +484,11 @@ where
         }
 
         // 3. Outbound forwarding packets.
-        if !connection.write_pending() && !local_turn && !reconnect_needed {
+        if !connection.write_pending()
+            && !local_turn
+            && !reconnect_needed
+            && !delivery_gate.blocked(connection, interval)
+        {
             local_turn = true;
             for _ in 0..64 {
                 let Some(packet) = forwarder
@@ -490,7 +504,9 @@ where
                     &mut reconnect,
                     terminal_enabled,
                 )? {
-                    OwnedWriteOutcome::Written => {}
+                    OwnedWriteOutcome::Written => {
+                        bytes_since_ack = bytes_since_ack.saturating_add(packet.payload().len());
+                    }
                     OwnedWriteOutcome::Recovered => reconnect_needed = false,
                     OwnedWriteOutcome::SessionEnded => {
                         return finish_remote_completion(
@@ -506,7 +522,15 @@ where
                         );
                     }
                 }
-                if connection.write_pending() {
+                // Yield after each written packet, never before the first one:
+                // a due acknowledgement or the delivery bound ends the batch,
+                // but cannot cost forwarding its turn while local input keeps
+                // refilling the acknowledgement counter.
+                if connection.write_pending()
+                    || (bytes_since_ack >= et_core::keepalive::ACK_INTERVAL_BYTES
+                        && !remote_exit.session_ended())
+                    || delivery_gate.blocked(connection, interval)
+                {
                     break;
                 }
             }
@@ -537,7 +561,14 @@ where
             next_keepalive = last_received + interval;
             continue;
         }
-        if !connection.write_pending() && Instant::now() >= next_keepalive {
+        // Acknowledge by volume as well as on the idle interval: the server
+        // trims its replay backup on the payload and its echo trims ours.
+        if !connection.write_pending()
+            && (Instant::now() >= next_keepalive
+                || (!remote_exit.session_ended()
+                    && bytes_since_ack >= et_core::keepalive::ACK_INTERVAL_BYTES))
+        {
+            bytes_since_ack = 0;
             // The payload acknowledges everything read so far, so the server
             // can trim its replay backup; legacy servers ignore it.
             let ack = connection.keepalive_ack();

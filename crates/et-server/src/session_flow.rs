@@ -1,13 +1,31 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
-use et_core::flow_control::{FlowControlMode, OutputQueue, QueuePushError};
+use et_core::flow_control::{
+    is_terminal_output, FlowControlMode, OutputLane, OutputQueue, QueuePushError,
+};
 use et_core::packet::Packet;
 use et_net::connection::ConnError;
 
 use super::{ActiveSession, SessionError, FLOW_CONTROL_BUFFER_BYTES};
 
-const CONNECTED_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+/// Unsent output staged while the client is connected, summed over both
+/// output lanes. Upstream's `TerminalServer` WriteBuffer caps this at 16 MB,
+/// but the queue only has to keep the bounded (256 KiB, `TCP_NOTSENT_LOWAT`)
+/// transport send buffer fed; anything beyond that is resident memory that
+/// only grows when the client is slower than the producer, and stale output
+/// Ctrl+C must discard. The producer is held back by terminal/pipe
+/// backpressure instead of the daemon heap. This bounds admission: output
+/// staged while disconnected drains after reconnection rather than being
+/// evicted.
+pub(super) const CONNECTED_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+/// `OutputQueue` bounds its terminal and control lanes independently, so
+/// terminal floods never starve keepalives or forwarding. Each connected lane
+/// gets half of [`CONNECTED_OUTPUT_BYTES`]; 1 MiB still spans several
+/// transport send-buffer refills.
+const CONNECTED_LANE_BYTES: usize = CONNECTED_OUTPUT_BYTES / 2;
+/// Per-lane bound while no client is connected; both lanes together may
+/// stage twice this until reconnection.
 const DISCONNECTED_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
 #[cfg(test)]
@@ -31,11 +49,23 @@ struct WriterState {
     paused: bool,
     in_flight: bool,
     pending_live_in_flight: Option<Packet>,
-    bridge_waiting: bool,
+    bridge_waiting: BridgeWait,
     stop: StopMode,
     unrecoverable: bool,
     default_buffering: bool,
     input: et_core::output_interrupt::InterruptInput,
+}
+
+/// Refusals the bridge is waiting on; a writer completion signals it once the
+/// matching condition clears.
+#[derive(Default)]
+struct BridgeWait {
+    /// The terminal lane refused output.
+    terminal: bool,
+    /// The control lane (forwarding, keepalive, ...) refused a packet.
+    control: bool,
+    /// Exit status is held until all preceding output has drained.
+    drain: bool,
 }
 
 impl WriterState {
@@ -43,11 +73,46 @@ impl WriterState {
         self.connected = connected;
         if self.default_buffering {
             self.queue.set_limit(if connected {
-                CONNECTED_OUTPUT_BYTES
+                CONNECTED_LANE_BYTES
             } else {
                 DISCONNECTED_OUTPUT_BYTES
             });
         }
+    }
+
+    fn wait_for_lane(&mut self, packet: &Packet) {
+        if is_terminal_output(packet) {
+            self.bridge_waiting.terminal = true;
+        } else {
+            self.bridge_waiting.control = true;
+        }
+    }
+
+    /// Clears the bridge waits whose refusal has cleared and reports whether
+    /// any did. Each refused lane resumes on its own occupancy: half of its
+    /// byte budget and packet slots free, so a saturated stream refills in
+    /// batches; a fully drained queue releases every wait.
+    fn take_ready_bridge_wait(&mut self) -> bool {
+        let resume_bytes = (self.queue.limit() / 2).max(32 * 1024);
+        let drained = self.queue.is_empty();
+        let mut ready = false;
+        if self.bridge_waiting.terminal
+            && (drained || self.queue.can_resume(OutputLane::Terminal, resume_bytes))
+        {
+            self.bridge_waiting.terminal = false;
+            ready = true;
+        }
+        if self.bridge_waiting.control
+            && (drained || self.queue.can_resume(OutputLane::Control, resume_bytes))
+        {
+            self.bridge_waiting.control = false;
+            ready = true;
+        }
+        if self.bridge_waiting.drain && drained {
+            self.bridge_waiting.drain = false;
+            ready = true;
+        }
+        ready
     }
 }
 
@@ -66,7 +131,7 @@ impl FlowControl {
     }
 
     pub(super) fn new_default() -> Self {
-        Self::with_limit(FlowControlMode::Backpressure, CONNECTED_OUTPUT_BYTES)
+        Self::with_limit(FlowControlMode::Backpressure, CONNECTED_LANE_BYTES)
     }
 
     fn with_limit(mode: FlowControlMode, limit: usize) -> Self {
@@ -77,10 +142,10 @@ impl FlowControl {
                 paused: false,
                 in_flight: false,
                 pending_live_in_flight: None,
-                bridge_waiting: false,
+                bridge_waiting: BridgeWait::default(),
                 stop: StopMode::Running,
                 unrecoverable: false,
-                default_buffering: limit == CONNECTED_OUTPUT_BYTES,
+                default_buffering: limit == CONNECTED_LANE_BYTES,
                 input: et_core::output_interrupt::InterruptInput::default(),
             }),
             wake: Condvar::new(),
@@ -109,7 +174,7 @@ impl FlowControl {
         if packet.header() == et_core::proto::TerminalPacketType::TerminalExitStatus as u8
             && (state.in_flight || !state.queue.is_empty())
         {
-            state.bridge_waiting = true;
+            state.bridge_waiting.drain = true;
             return Err((packet, SessionError::Connection(ConnError::Backpressure)));
         }
         let was_empty = state.queue.is_empty();
@@ -125,7 +190,7 @@ impl FlowControl {
                 Ok(())
             }
             Err(QueuePushError::Full(packet)) => {
-                state.bridge_waiting = true;
+                state.wait_for_lane(&packet);
                 Err((packet, SessionError::Connection(ConnError::Backpressure)))
             }
             Err(QueuePushError::Oversized(packet)) => {
@@ -158,7 +223,7 @@ impl FlowControl {
         if packet.header() == et_core::proto::TerminalPacketType::TerminalExitStatus as u8
             && (state.in_flight || !state.queue.is_empty())
         {
-            state.bridge_waiting = true;
+            state.bridge_waiting.drain = true;
             return Err((packet, SessionError::Connection(ConnError::Backpressure)));
         }
         let is_forward_data = matches!(
@@ -180,7 +245,7 @@ impl FlowControl {
                         match state.queue.push(packet) {
                             Ok(()) => {}
                             Err(QueuePushError::Full(packet)) => {
-                                state.bridge_waiting = true;
+                                state.wait_for_lane(&packet);
                                 return Err((
                                     packet,
                                     SessionError::Connection(ConnError::Backpressure),
@@ -250,7 +315,7 @@ impl FlowControl {
                 Ok(())
             }
             Err(QueuePushError::Full(packet)) => {
-                state.bridge_waiting = true;
+                state.wait_for_lane(&packet);
                 Err((packet, SessionError::Connection(ConnError::Backpressure)))
             }
             Err(QueuePushError::Oversized(packet)) => {
@@ -287,7 +352,7 @@ impl FlowControl {
         let mut state = self.state.lock().map_err(|_| SessionError::Unavailable)?;
         let ok = state.stop == StopMode::Running && state.queue.can_accept_terminal(bytes);
         if !ok {
-            state.bridge_waiting = true;
+            state.bridge_waiting.terminal = true;
         }
         Ok(ok)
     }
@@ -515,11 +580,11 @@ impl FlowControl {
                 state.stop = StopMode::Hard;
             }
         }
-        let capacity_ready = state.queue.is_empty() || state.queue.can_accept_terminal(32 * 1024);
-        let should_signal = (state.bridge_waiting && capacity_ready && {
-            state.bridge_waiting = false;
-            true
-        }) || !connected
+        // Wake a backpressured bridge once the lane that refused it has room
+        // for a batch (see `take_ready_bridge_wait`), not after every
+        // delivered packet.
+        let should_signal = state.take_ready_bridge_wait()
+            || !connected
             || !matches!(result, writer::FlowWriteResult::Delivered)
             || state.stop == StopMode::Hard;
         if state.paused

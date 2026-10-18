@@ -720,6 +720,7 @@ fn partial_writes_report_progress_before_completion_and_drain_every_byte() {
             stream: et_core::output_interrupt::TerminalStream::default(),
             skip_until_newline: false,
             waiting_for_capacity: false,
+            writing: false,
         }),
         wake: Condvar::new(),
         worker_progress: std::sync::atomic::AtomicUsize::new(0),

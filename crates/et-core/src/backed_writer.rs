@@ -23,18 +23,44 @@ pub const MAX_RECOVERY_BACKUP_BYTES: i64 = 76 * 1024 * 1024;
 pub const MAX_BACKUP_PACKETS: usize = 262_144;
 pub const MAX_DISCONNECT_PACKETS: usize = 262_144;
 /// Replay history kept while connected; must comfortably exceed the largest
-/// amount of written-but-undelivered data a live TCP connection can hold
-/// (socket send buffer + in flight, <= 4 MiB on default Linux autotuning).
+/// amount of written-but-undelivered data a live TCP connection can hold.
+/// Kernel buffers alone can exceed 8 MiB on an autotuned loopback, so
+/// writers whose peer acknowledges delivery also stop producing at
+/// [`MAX_UNACKNOWLEDGED_BYTES`] (see [`BackedWriter::delivery_backlog`]).
 pub const CONNECTED_BACKUP_BYTES: i64 = 8 * 1024 * 1024;
 pub const CONNECTED_BACKUP_PACKETS: usize = 32_768;
-/// Packets retained beyond an acknowledged sequence. Jumphosts (upstream C++
-/// and released et.rs) relay keep-alives verbatim, so an acknowledgement can
-/// arrive carrying the sequence of a *different* hop's connection. The two
-/// domains only drift by packets a relay injects outside the relayed stream
-/// (one keep-alive per recovery), so retaining a generous fixed slack makes a
-/// foreign acknowledgement unable to trim away packets a genuine recovery
-/// could still request.
+/// Unacknowledged bytes after which an acknowledging peer's writer should
+/// stop producing until the next acknowledgement. The acknowledged slack kept
+/// beside them is at most [`ACK_RETAIN_SLACK_BYTES`], or the
+/// [`ACK_RETAIN_FLOOR_PACKETS`] most recent acknowledged frames when those
+/// alone are larger (<= 1 MiB of 64 KiB frames), so the total stays well
+/// inside [`CONNECTED_BACKUP_BYTES`]: the connected cap never trims a packet
+/// the peer could still request, and the replay memory a bulk transfer pins
+/// is bounded regardless of how much the kernel is willing to buffer.
+pub const MAX_UNACKNOWLEDGED_BYTES: i64 = 4 * 1024 * 1024;
+/// Upper bound on acknowledged packets retained beyond an acknowledged
+/// sequence (see [`BackedWriter::acknowledge`]).
 pub const ACK_RETAIN_SLACK_PACKETS: usize = 1024;
+/// Acknowledged history retained once [`ACK_RETAIN_FLOOR_PACKETS`] are kept.
+/// Small interactive packets still keep the full packet slack; bulk
+/// forwarding packets (up to 64 KiB) stop at the floor instead of pinning
+/// the whole connected cap after every transfer.
+pub const ACK_RETAIN_SLACK_BYTES: usize = 256 * 1024;
+/// Acknowledged packets always retained, whatever their size.
+///
+/// An acknowledgement is normally per-hop and exact, but a jumphost that
+/// relays keep-alives verbatim can deliver a *different* hop's reader
+/// sequence. The two sequence domains only drift by packets the relay
+/// injects outside the relayed stream: et.rs jumphosts up to et@0.0.7 relay
+/// keep-alives verbatim and inject one proof keep-alive per recovery, so the
+/// drift grows by one per recovery. Upstream C++ relays
+/// (`TerminalServer::runJumpHost`, `UserJumphostHandler`) inject nothing:
+/// recovery replays existing sequence numbers and each hop's
+/// `INITIAL_PAYLOAD` is consumed and re-sent one-for-one. Retaining this many
+/// packets keeps a foreign acknowledgement from trimming anything a genuine
+/// recovery could request for the first 16 recoveries through such a legacy
+/// relay, while bounding the bulk-transfer cost to 16 frames (<= 1 MiB).
+pub const ACK_RETAIN_FLOOR_PACKETS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriterOutcome {
@@ -87,6 +113,12 @@ pub struct BackedWriter {
     disconnected_packets: usize,
     sequence: i64,
     connected: bool,
+    /// Latest plausible peer acknowledgement; `None` until the peer proves it
+    /// acknowledges at all (legacy peers never do).
+    acknowledged: Option<i64>,
+    /// Wire bytes written after `acknowledged`, including packets the
+    /// connected cap already dropped from `backup`.
+    unacknowledged_bytes: i64,
 }
 
 impl BackedWriter {
@@ -99,6 +131,8 @@ impl BackedWriter {
             disconnected_packets: 0,
             sequence: 0,
             connected,
+            acknowledged: None,
+            unacknowledged_bytes: 0,
         }
     }
 
@@ -140,6 +174,7 @@ impl BackedWriter {
         frame: std::sync::Arc<Vec<u8>>,
     ) -> WriterOutcome {
         let packet_wire_len = reserved.packet_wire_len;
+        self.unacknowledged_bytes += packet_wire_len as i64;
         if !self.connected {
             self.backup.push_front(frame);
             self.backup_size += packet_wire_len as i64;
@@ -196,23 +231,55 @@ impl BackedWriter {
     /// Drop backup packets the peer has confirmed it consumed.
     ///
     /// `acknowledged` is the peer's reader sequence, delivered on a
-    /// keep-alive payload (see [`crate::keepalive`]). Only the
-    /// still-unacknowledged tail plus [`ACK_RETAIN_SLACK_PACKETS`] is kept,
-    /// so an idle session's backup stays near-empty instead of pinning the
-    /// full connected cap. Ignored while disconnected (a reconnect may
-    /// replay any of it) and for implausible sequences.
+    /// keep-alive payload (see [`crate::keepalive`]). The still-unacknowledged
+    /// tail is always kept, followed by up to [`ACK_RETAIN_SLACK_PACKETS`]
+    /// acknowledged packets: at least [`ACK_RETAIN_FLOOR_PACKETS`] of them,
+    /// and beyond that only while they fit [`ACK_RETAIN_SLACK_BYTES`]. An idle
+    /// session's backup therefore stays near-empty and a bulk transfer stops
+    /// pinning the full connected cap. Ignored while disconnected (a
+    /// reconnect may replay any of it) and for implausible sequences.
     pub fn acknowledge(&mut self, acknowledged: i64) {
         if !self.connected || acknowledged < 0 || acknowledged > self.sequence {
             return;
         }
         let unacknowledged = usize::try_from(self.sequence - acknowledged).unwrap_or(usize::MAX);
-        let keep = unacknowledged.saturating_add(ACK_RETAIN_SLACK_PACKETS);
+        self.acknowledged = Some(acknowledged);
+        self.unacknowledged_bytes = self
+            .backup
+            .iter()
+            .take(unacknowledged)
+            .map(|frame| (frame.len() - 4) as i64)
+            .sum();
+        let mut keep = unacknowledged.min(self.backup.len());
+        let mut slack_packets = 0;
+        let mut slack_bytes = 0;
+        while slack_packets < ACK_RETAIN_SLACK_PACKETS {
+            let Some(frame) = self.backup.get(keep) else {
+                break;
+            };
+            let wire_len = frame.len() - 4;
+            if slack_packets >= ACK_RETAIN_FLOOR_PACKETS
+                && slack_bytes + wire_len > ACK_RETAIN_SLACK_BYTES
+            {
+                break;
+            }
+            slack_packets += 1;
+            slack_bytes += wire_len;
+            keep += 1;
+        }
         while self.backup.len() > keep {
             if let Some(old) = self.backup.pop_back() {
                 self.backup_size -= (old.len() - 4) as i64;
             }
         }
         self.release_slack_capacity();
+    }
+
+    /// The peer's latest acknowledged sequence and the wire bytes written
+    /// since, or `None` while the peer has never acknowledged delivery.
+    pub fn delivery_backlog(&self) -> Option<(i64, i64)> {
+        self.acknowledged
+            .map(|acknowledged| (acknowledged, self.unacknowledged_bytes))
     }
 
     /// A disconnect can balloon the deque to the 64 MiB catchup cap; return
@@ -250,6 +317,8 @@ impl BackedWriter {
         self.disconnected_packets = 0;
         self.sequence = 0;
         self.connected = false;
+        self.acknowledged = None;
+        self.unacknowledged_bytes = 0;
         Ok(())
     }
 
@@ -402,6 +471,64 @@ mod tests {
         w.acknowledge(4);
         // Nothing may be dropped: 6 unacknowledged + slack exceeds the 10 kept.
         assert_eq!(w.recover(0).unwrap().len(), 10);
+    }
+
+    #[test]
+    fn acknowledge_bounds_bulk_slack_to_the_packet_floor() {
+        let mut w = writer(true);
+        let chunk = vec![0u8; 64 * 1024];
+        let total = 100;
+        for _ in 0..total {
+            w.write_packet(0, &chunk).unwrap();
+        }
+        let unacknowledged = 5;
+        w.acknowledge(w.sequence() - unacknowledged);
+        // Every unacknowledged frame plus exactly the floor of acknowledged
+        // ones survive, even though the floor alone exceeds the byte slack.
+        let kept = unacknowledged as usize + ACK_RETAIN_FLOOR_PACKETS;
+        let oldest_recoverable = w.sequence() - kept as i64;
+        assert_eq!(w.recover(oldest_recoverable).unwrap().len(), kept);
+        assert_eq!(
+            w.recover(oldest_recoverable - 1),
+            Err(RecoverError::TooFarBehind)
+        );
+    }
+
+    #[test]
+    fn acknowledge_keeps_acknowledged_packets_within_the_byte_slack() {
+        let mut w = writer(true);
+        let payload = vec![0u8; 4 * 1024];
+        for _ in 0..ACK_RETAIN_SLACK_PACKETS {
+            w.write_packet(0, &payload).unwrap();
+        }
+        w.acknowledge(w.sequence());
+        let wire_len = 2 + payload.len() + MAC_LEN;
+        let kept = ACK_RETAIN_SLACK_BYTES / wire_len;
+        assert!(kept > ACK_RETAIN_FLOOR_PACKETS);
+        let oldest_recoverable = w.sequence() - kept as i64;
+        assert_eq!(w.recover(oldest_recoverable).unwrap().len(), kept);
+        assert_eq!(
+            w.recover(oldest_recoverable - 1),
+            Err(RecoverError::TooFarBehind)
+        );
+    }
+
+    #[test]
+    fn delivery_backlog_counts_bytes_written_after_the_latest_acknowledgement() {
+        let mut w = writer(true);
+        let payload = vec![0u8; 1000];
+        let wire_len = (2 + payload.len() + MAC_LEN) as i64;
+        for _ in 0..10 {
+            w.write_packet(0, &payload).unwrap();
+        }
+        // A peer that never acknowledged is a legacy peer: no backlog signal.
+        assert_eq!(w.delivery_backlog(), None);
+        w.acknowledge(4);
+        assert_eq!(w.delivery_backlog(), Some((4, 6 * wire_len)));
+        w.write_packet(0, &payload).unwrap();
+        assert_eq!(w.delivery_backlog(), Some((4, 7 * wire_len)));
+        w.acknowledge(w.sequence());
+        assert_eq!(w.delivery_backlog(), Some((11, 0)));
     }
 
     #[test]

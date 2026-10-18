@@ -1,6 +1,9 @@
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::io::{Read, Write};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use et_net::local::LocalStream;
 
 use crate::registry::{RegistrationError, RegistrationIdentity};
 use crate::runtime_error::RuntimeError;
@@ -58,132 +61,218 @@ fn release_idle_memory() -> Result<IdleMemoryAccounting, tikv_jemalloc_ctl::Erro
     })
 }
 
+/// Active-session decay: dirty pages return to the kernel after 1 s (the
+/// build-time default, see `.cargo/config.toml`, restated here so builds
+/// without that config keep it), and purged pages skip jemalloc's lazy
+/// `MADV_FREE` stage (`muzzy_decay_ms` 0, jemalloc's own default): lazily
+/// freed pages stay resident until the kernel is under memory pressure.
 #[cfg(target_os = "linux")]
 fn restore_active_decay() {
     use tikv_jemalloc_ctl::{Access, AsName};
 
-    let _ = b"arenas.dirty_decay_ms\0".name().write(1000_isize);
-    let _ = b"arenas.muzzy_decay_ms\0".name().write(1000_isize);
+    const DIRTY_DECAY_MS: isize = 1000;
+    const MUZZY_DECAY_MS: isize = 0;
+    let _ = b"arenas.dirty_decay_ms\0".name().write(DIRTY_DECAY_MS);
+    let _ = b"arenas.muzzy_decay_ms\0".name().write(MUZZY_DECAY_MS);
     if let Ok(limit) = b"arenas.narenas\0".name().read() {
         let limit: u32 = limit;
         for index in 0..limit {
             let dirty = format!("arena.{index}.dirty_decay_ms\0");
-            if dirty.as_bytes().name().write(1000_isize).is_err() {
+            if dirty.as_bytes().name().write(DIRTY_DECAY_MS).is_err() {
                 continue;
             }
             let muzzy = format!("arena.{index}.muzzy_decay_ms\0");
-            let _ = muzzy.as_bytes().name().write(1000_isize);
+            let _ = muzzy.as_bytes().name().write(MUZZY_DECAY_MS);
         }
     }
 }
 
-pub(crate) fn run(
+/// Sends lifecycle events to the runtime control thread and wakes its poll.
+#[derive(Clone)]
+pub(crate) struct LifecycleSender {
+    events: Sender<LifecycleEvent>,
+    wake: Arc<LocalStream>,
+}
+
+impl LifecycleSender {
+    pub(crate) fn send(&self, event: LifecycleEvent) {
+        if self.events.send(event).is_ok() {
+            // Non-blocking: a full wake buffer already guarantees a wakeup.
+            let _ = (&*self.wake).write(&[1]);
+        }
+    }
+}
+
+/// Terminal lifecycle handling, serviced by the runtime control thread next
+/// to its TCP listeners instead of on a thread of its own.
+pub(crate) struct Lifecycle {
     events: Receiver<LifecycleEvent>,
-    core: Arc<RuntimeCore>,
-) -> Result<(), RuntimeError> {
-    #[cfg(target_os = "linux")]
-    restore_active_decay();
-    let mut first_error = None;
-    let mut next_sweep = Instant::now();
-    let mut sweep_failed = false;
-    loop {
+    wake: LocalStream,
+    next_sweep: Instant,
+    sweep_failed: bool,
+    first_error: Option<RuntimeError>,
+}
+
+pub(crate) fn channel() -> std::io::Result<(LifecycleSender, Lifecycle)> {
+    let (wake, signal) = et_net::local::wake_pair()?;
+    wake.set_nonblocking(true)?;
+    signal.set_nonblocking(true)?;
+    let (events, receiver) = std::sync::mpsc::channel();
+    Ok((
+        LifecycleSender {
+            events,
+            wake: Arc::new(signal),
+        },
+        Lifecycle {
+            events: receiver,
+            wake,
+            next_sweep: Instant::now(),
+            sweep_failed: false,
+            first_error: None,
+        },
+    ))
+}
+
+impl Lifecycle {
+    pub(crate) fn start(&self) {
+        #[cfg(target_os = "linux")]
+        restore_active_decay();
+    }
+
+    /// Readable when events are queued.
+    #[cfg(unix)]
+    pub(crate) fn wake(&self) -> &LocalStream {
+        &self.wake
+    }
+
+    /// When the next resume-expiry sweep is due.
+    #[cfg(unix)]
+    pub(crate) fn next_sweep(&self) -> Instant {
+        self.next_sweep
+    }
+
+    /// Run a due sweep and apply every queued event. Returns `true` once the
+    /// runtime asked for shutdown (or every sender is gone).
+    pub(crate) fn service(&mut self, core: &RuntimeCore, woken: bool) -> bool {
         let now = Instant::now();
-        if now >= next_sweep {
-            match expire_unclaimed_resumes(&core, now) {
-                Ok(()) => sweep_failed = false,
-                Err(error) if !sweep_failed => {
+        if now >= self.next_sweep {
+            match expire_unclaimed_resumes(core, now) {
+                Ok(()) => self.sweep_failed = false,
+                Err(error) if !self.sweep_failed => {
                     crate::diag::info(format!(
                         "could not expire unclaimed terminal resumes: {error}"
                     ));
-                    sweep_failed = true;
+                    self.sweep_failed = true;
                 }
                 Err(_) => {}
             }
             // Recovery grace is measured in minutes. A one-second pass keeps
             // expiry prompt without churning the registry lock at 10 Hz.
-            next_sweep = now + Duration::from_secs(1);
+            self.next_sweep = now + Duration::from_secs(1);
         }
-        let event = match events.recv_timeout(next_sweep.saturating_duration_since(Instant::now()))
-        {
-            Ok(event) => event,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
-        };
-        match event {
-            LifecycleEvent::TerminalDisconnected(identity) => {
-                crate::diag::info(format!(
-                    "terminal disconnected for registration id={}",
-                    identity.id()
-                ));
-                // Keep the active transport open long enough for the bridge to
-                // drain terminal bytes already buffered at HUP, but cancel every
-                // pre-slot, starting, and returning raw socket in this generation.
-                if let Err(error) = core.raw_sockets.shutdown_inactive_registration(&identity) {
-                    crate::diag::info(format!(
-                        "id={}: error shutting down inactive raw sockets: {error}",
-                        identity.id()
-                    ));
-                    first_error.get_or_insert(error);
+        if woken {
+            drain_wake(&mut self.wake);
+        }
+        loop {
+            match self.events.try_recv() {
+                Ok(LifecycleEvent::TerminalDisconnected(identity)) => {
+                    terminal_disconnected(core, &identity, &mut self.first_error);
                 }
-                #[cfg(test)]
-                notify_raw_scan_complete(identity.id());
-                let removed = core.sessions.remove_registration_with(&identity, |_| {});
-                match removed {
-                    Ok(Some(removed)) => {
-                        crate::diag::info(format!(
-                            "id={}: removed session after terminal disconnect",
-                            identity.id()
-                        ));
-                        if let Some(SessionConnection::Starting(stream)) = removed.connection {
-                            match stream.shutdown(std::net::Shutdown::Both) {
-                                Ok(()) => {}
-                                Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
-                                Err(error) => {
-                                    crate::diag::info(format!(
-                                        "id={}: error shutting down session connection: {error}",
-                                        identity.id()
-                                    ));
-                                    first_error.get_or_insert(RuntimeError::Session(
-                                        crate::session::SessionError::Io(error),
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        crate::diag::verbose(
-                            1,
-                            format!(
-                                "id={}: terminal disconnect with no active session slot",
-                                identity.id()
-                            ),
-                        );
-                    }
-                    Err(error) => {
-                        crate::diag::info(format!(
-                            "id={}: session table error on terminal disconnect: {error}",
-                            identity.id()
-                        ));
-                        first_error.get_or_insert(RuntimeError::SessionTable(error));
-                    }
-                }
-                // The removed session and its replay queues are out of scope;
-                // now return their freed allocator pages to the kernel.
-                #[cfg(target_os = "linux")]
-                {
-                    if let Err(error) = release_idle_memory() {
-                        crate::diag::info(format!(
-                            "could not release allocator pages after id={}: {error}",
-                            identity.id()
-                        ));
-                    }
-                    restore_active_decay();
-                }
+                Ok(LifecycleEvent::Shutdown) | Err(TryRecvError::Disconnected) => return true,
+                Err(TryRecvError::Empty) => return false,
             }
-            LifecycleEvent::Shutdown => return first_error.map_or(Ok(()), Err),
         }
     }
-    first_error.map_or(Ok(()), Err)
+
+    pub(crate) fn finish(self) -> Result<(), RuntimeError> {
+        self.first_error.map_or(Ok(()), Err)
+    }
+}
+
+fn drain_wake(wake: &mut LocalStream) {
+    let mut buffer = [0u8; 64];
+    loop {
+        match wake.read(&mut buffer) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
+}
+
+fn terminal_disconnected(
+    core: &RuntimeCore,
+    identity: &RegistrationIdentity,
+    first_error: &mut Option<RuntimeError>,
+) {
+    crate::diag::info(format!(
+        "terminal disconnected for registration id={}",
+        identity.id()
+    ));
+    // Keep the active transport open long enough for the bridge to drain
+    // terminal bytes already buffered at HUP, but cancel every pre-slot,
+    // starting, and returning raw socket in this generation.
+    if let Err(error) = core.raw_sockets.shutdown_inactive_registration(identity) {
+        crate::diag::info(format!(
+            "id={}: error shutting down inactive raw sockets: {error}",
+            identity.id()
+        ));
+        first_error.get_or_insert(error);
+    }
+    #[cfg(test)]
+    notify_raw_scan_complete(identity.id());
+    match core.sessions.remove_registration_with(identity, |_| {}) {
+        Ok(Some(removed)) => {
+            crate::diag::info(format!(
+                "id={}: removed session after terminal disconnect",
+                identity.id()
+            ));
+            if let Some(SessionConnection::Starting(stream)) = removed.connection {
+                match stream.shutdown(std::net::Shutdown::Both) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
+                    Err(error) => {
+                        crate::diag::info(format!(
+                            "id={}: error shutting down session connection: {error}",
+                            identity.id()
+                        ));
+                        first_error.get_or_insert(RuntimeError::Session(
+                            crate::session::SessionError::Io(error),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(None) => {
+            crate::diag::verbose(
+                1,
+                format!(
+                    "id={}: terminal disconnect with no active session slot",
+                    identity.id()
+                ),
+            );
+        }
+        Err(error) => {
+            crate::diag::info(format!(
+                "id={}: session table error on terminal disconnect: {error}",
+                identity.id()
+            ));
+            first_error.get_or_insert(RuntimeError::SessionTable(error));
+        }
+    }
+    // The removed session and its replay queues are out of scope; now return
+    // their freed allocator pages to the kernel.
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(error) = release_idle_memory() {
+            crate::diag::info(format!(
+                "could not release allocator pages after id={}: {error}",
+                identity.id()
+            ));
+        }
+        restore_active_decay();
+    }
 }
 
 /// A live PTY can re-register after restart without its client ever returning.

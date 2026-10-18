@@ -668,6 +668,14 @@ impl ForwardStream {
     }
 
     #[cfg(unix)]
+    pub(crate) fn write_vectored_shared(&self, buffers: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => (&mut &*stream).write_vectored(buffers),
+            Self::Unix(stream) => (&mut &*stream).write_vectored(buffers),
+        }
+    }
+
+    #[cfg(unix)]
     pub(crate) fn read_shared(&self, buffer: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Tcp(stream) => (&mut &*stream).read(buffer),
@@ -753,14 +761,18 @@ impl ForwardListener {
         self.cleanup_dirs.push(directory);
     }
 
+    /// Accept one stream in blocking mode. Linux `accept4` never inherits
+    /// the listener's `O_NONBLOCK`; BSD-derived kernels do, so they reset it.
     pub(crate) fn accept(&self) -> io::Result<ForwardStream> {
         let stream = match &self.inner {
             ListenerKind::Tcp(listener) => listener.accept().map(|(stream, _)| {
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
                 let _ = stream.set_nonblocking(false);
                 ForwardStream::Tcp(stream)
             }),
             #[cfg(unix)]
             ListenerKind::Unix(listener) => listener.accept().map(|(stream, _)| {
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
                 let _ = stream.set_nonblocking(false);
                 ForwardStream::Unix(stream)
             }),

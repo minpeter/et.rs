@@ -22,6 +22,13 @@ pub enum QueuePushError {
     Oversized(Packet),
 }
 
+/// Lane that carries a packet; see [`is_terminal_output`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputLane {
+    Terminal,
+    Control,
+}
+
 pub struct OutputQueue {
     mode: FlowControlMode,
     limit: usize,
@@ -199,6 +206,23 @@ impl OutputQueue {
         }
     }
 
+    /// Whether a producer refused by `lane` should be woken: the lane has
+    /// `free_bytes` of unused byte budget and at most half of its packet slots
+    /// occupied. Resuming only at this hysteresis lets a saturated producer
+    /// refill a batch instead of one packet per completion, whether the lane
+    /// is byte-bound or packet-count-bound. Discard-mode terminal output
+    /// evicts instead of refusing, so it resumes whenever `free_bytes` fits.
+    pub fn can_resume(&self, lane: OutputLane, free_bytes: usize) -> bool {
+        let (bytes, packets) = match lane {
+            OutputLane::Terminal if self.mode == FlowControlMode::Discard => {
+                return free_bytes <= self.limit;
+            }
+            OutputLane::Terminal => (self.terminal_bytes, self.terminal_packets),
+            OutputLane::Control => (self.control_bytes, self.control_packets),
+        };
+        packets <= MAX_PACKETS_PER_LANE / 2 && bytes.saturating_add(free_bytes) <= self.limit
+    }
+
     pub fn is_empty(&self) -> bool {
         self.terminal.is_empty() && self.control.is_empty()
     }
@@ -291,6 +315,10 @@ impl OutputQueue {
     /// Adjust admission after a connection state change without evicting data.
     pub fn set_limit(&mut self, limit: usize) {
         self.limit = limit;
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
     }
 }
 

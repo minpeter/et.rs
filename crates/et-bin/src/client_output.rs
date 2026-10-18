@@ -73,6 +73,9 @@ struct State {
     stream: et_core::output_interrupt::TerminalStream,
     skip_until_newline: bool,
     waiting_for_capacity: bool,
+    /// The worker owns a snapshot it has not finished writing; the session
+    /// loop must not write around it.
+    writing: bool,
 }
 
 struct Shared {
@@ -99,6 +102,10 @@ pub(crate) struct ConsoleOutput {
     cancel: Option<Box<dyn FnOnce() + Send>>,
     graceful_finish: Option<Box<dyn FnOnce() -> io::Result<()> + Send>>,
     worker: Option<thread::JoinHandle<()>>,
+    /// Non-blocking descriptor for writing an idle console straight from the
+    /// session loop, skipping the worker hand-off.
+    #[cfg(target_os = "linux")]
+    direct: Option<File>,
 }
 
 impl ConsoleOutput {
@@ -111,11 +118,17 @@ impl ConsoleOutput {
                 use std::os::unix::io::AsRawFd;
                 let dup_file = File::from(rustix::io::dup(io::stdout().lock().as_fd())?);
                 let is_fifo = dup_file.metadata().is_ok_and(|m| m.file_type().is_fifo());
-                if is_fifo {
+                // A FIFO or terminal reopened through /proc is a separate open
+                // file description, so O_NONBLOCK never leaks into the
+                // inherited stdout the parent shell keeps using.
+                if is_fifo || rustix::termios::isatty(&dup_file) {
                     let raw = io::stdout().lock().as_raw_fd();
                     match std::fs::OpenOptions::new()
                         .write(true)
-                        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+                        .custom_flags(
+                            (rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOCTTY).bits()
+                                as i32,
+                        )
                         .open(format!("/proc/self/fd/{raw}"))
                     {
                         Ok(file) => (file, true),
@@ -130,11 +143,20 @@ impl ConsoleOutput {
                 File::from(rustix::io::dup(io::stdout().lock().as_fd())?),
                 false,
             );
+            // Only a non-blocking descriptor may be written from the session
+            // loop: a full terminal must never stall network and input.
+            #[cfg(target_os = "linux")]
+            let direct = if nonblocking {
+                Some(file.try_clone()?)
+            } else {
+                None
+            };
             let (cancel_reader, mut cancel_writer) = et_net::local::wake_pair()?;
             let cancel = Box::new(move || {
                 let _ = cancel_writer.write_all(&[1]);
             });
-            Self::new_with_lifecycle(
+            #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+            let mut output = Self::new_with_lifecycle(
                 mode,
                 Box::new(CancellableStdout {
                     file,
@@ -146,7 +168,12 @@ impl ConsoleOutput {
                 }),
                 cancel,
                 Box::new(|| Ok(())),
-            )
+            )?;
+            #[cfg(target_os = "linux")]
+            {
+                output.direct = direct;
+            }
+            Ok(output)
         }
         #[cfg(windows)]
         {
@@ -233,6 +260,7 @@ impl ConsoleOutput {
                 stream: et_core::output_interrupt::TerminalStream::default(),
                 skip_until_newline: false,
                 waiting_for_capacity: false,
+                writing: false,
             }),
             wake: Condvar::new(),
             worker_progress: std::sync::atomic::AtomicUsize::new(0),
@@ -262,6 +290,8 @@ impl ConsoleOutput {
             cancel: Some(cancel),
             graceful_finish: Some(graceful_finish),
             worker: Some(worker),
+            #[cfg(target_os = "linux")]
+            direct: None,
         })
     }
 
@@ -329,6 +359,30 @@ impl ConsoleOutput {
                         break;
                     };
                     state.bytes -= removed.bytes.len();
+                }
+            }
+        }
+        // An idle console takes the packet straight from the session loop:
+        // nothing queued or in flight can be overtaken, and the descriptor is
+        // non-blocking. A short write queues the rest for the worker. Cursor
+        // report requests keep the worker's delivery accounting, and write
+        // errors surface through the worker exactly as before.
+        #[cfg(target_os = "linux")]
+        if let Some(direct) = &self.direct {
+            if state.queue.is_empty()
+                && !state.writing
+                && !crate::client_terminal::contains_cursor_report_request(retained)
+            {
+                if let Ok(written) = rustix::io::write(direct, retained) {
+                    if written != 0 {
+                        state.skip_until_newline = false;
+                        state.stream.observe(&retained[..written]);
+                        terminal_modes.observe(&retained[..written]);
+                        retained = &retained[written..];
+                    }
+                    if retained.is_empty() {
+                        return Ok(true);
+                    }
                 }
             }
         }
@@ -561,6 +615,7 @@ fn run_writer(
             // be observed before interrupt filtering can inspect the next queue.
             let entries: Vec<_> = state.queue.drain(..).collect();
             state.bytes = 0;
+            state.writing = true;
             let notify_capacity = std::mem::replace(&mut state.waiting_for_capacity, false);
             for entry in &entries {
                 state.stream.observe(&entry.bytes);
@@ -573,21 +628,29 @@ fn run_writer(
         }
         #[cfg(not(unix))]
         let _ = notify_capacity;
-        let total_len: usize = entries.iter().map(|entry| entry.bytes.len()).sum();
-        let mut bytes = Vec::with_capacity(total_len);
-        for entry in &entries {
-            bytes.extend_from_slice(&entry.bytes);
-        }
-        let mut entries = entries.into_iter().peekable();
+        let joined: Vec<u8>;
+        let bytes: &[u8] = match entries.as_slice() {
+            [entry] => &entry.bytes,
+            _ => {
+                let total_len: usize = entries.iter().map(|entry| entry.bytes.len()).sum();
+                let mut all = Vec::with_capacity(total_len);
+                for entry in &entries {
+                    all.extend_from_slice(&entry.bytes);
+                }
+                joined = all;
+                &joined
+            }
+        };
+        let mut pending = entries.iter().peekable();
         let mut confirmed = 0;
-        let result = write_all_with_progress(shared, writer, &bytes, &mut |count| {
+        let result = write_all_with_progress(shared, writer, bytes, &mut |count| {
             confirmed += count;
             let mut cursor_reports = 0;
-            while entries
+            while pending
                 .peek()
                 .is_some_and(|entry| entry.bytes.len() <= confirmed)
             {
-                let entry = entries.next().unwrap();
+                let entry = pending.next().unwrap();
                 confirmed -= entry.bytes.len();
                 entry.terminal_modes.observe(&entry.bytes);
                 cursor_reports += usize::from(
@@ -602,14 +665,16 @@ fn run_writer(
                 signal_capacity(capacity_signal);
             }
         });
+        let notify_capacity = shared.state.lock().is_ok_and(|mut state| {
+            state.writing = false;
+            std::mem::replace(&mut state.waiting_for_capacity, false)
+        });
         #[cfg(unix)]
-        if shared
-            .state
-            .lock()
-            .is_ok_and(|mut state| std::mem::replace(&mut state.waiting_for_capacity, false))
-        {
+        if notify_capacity {
             signal_capacity(capacity_signal);
         }
+        #[cfg(not(unix))]
+        let _ = notify_capacity;
         if let Err(error) = result {
             if let Ok(mut state) = shared.state.lock() {
                 state.error = Some(error);

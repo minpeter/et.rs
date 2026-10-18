@@ -3,7 +3,6 @@ use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -16,7 +15,7 @@ use crate::router::Router;
 use crate::runtime_accept;
 use crate::runtime_error::RuntimeError;
 use crate::runtime_handle::RuntimeHandle;
-use crate::runtime_lifecycle::{self, LifecycleEvent};
+use crate::runtime_lifecycle::{self, LifecycleEvent, LifecycleSender};
 use crate::runtime_state::{
     HandlerThreads, PreAuthSlots, RawSockets, RuntimeCore, MAX_PRE_AUTH_CONNECTIONS,
 };
@@ -29,10 +28,9 @@ mod recovery_tests;
 pub struct Runtime {
     core: Arc<RuntimeCore>,
     router: Option<Router>,
-    lifecycle_sender: Option<Sender<LifecycleEvent>>,
-    lifecycle_worker: Option<JoinHandle<Result<(), RuntimeError>>>,
-    accept_wakers: Vec<LocalStream>,
-    accept_workers: Vec<JoinHandle<Result<(), RuntimeError>>>,
+    lifecycle: Option<LifecycleSender>,
+    control_wake: Option<LocalStream>,
+    control_worker: Option<JoinHandle<Result<(), RuntimeError>>>,
     tcp_addresses: Vec<SocketAddr>,
     router_path: PathBuf,
     listen_backlog: i32,
@@ -133,57 +131,50 @@ impl Runtime {
             disconnect_timeout_seconds,
         });
         let router_name = router_path.path().to_path_buf();
-        let (lifecycle_sender, lifecycle_events) = mpsc::channel();
+        let (lifecycle, lifecycle_events) =
+            runtime_lifecycle::channel().map_err(|source| RuntimeError::Io {
+                operation: "create lifecycle wakeup",
+                source,
+            })?;
         let mut router =
-            Router::start_with_lifecycle(router_path, registry, Some(lifecycle_sender.clone()))?;
-        let lifecycle_core = core.clone();
-        let lifecycle_worker = match thread::Builder::new()
-            .name("et-terminal-lifecycle".to_owned())
-            .spawn(move || runtime_lifecycle::run(lifecycle_events, lifecycle_core))
-        {
-            Ok(worker) => worker,
+            Router::start_with_lifecycle(router_path, registry, Some(lifecycle.clone()))?;
+        let (wake_reader, wake_writer) = match et_net::local::wake_pair() {
+            Ok(pair) => pair,
             Err(source) => {
                 let _ = router.shutdown();
-                return Err(RuntimeError::Spawn(source));
+                return Err(RuntimeError::Io {
+                    operation: "create accept wakeup",
+                    source,
+                });
             }
         };
-        let mut runtime = Self {
-            core,
-            router: Some(router),
-            lifecycle_sender: Some(lifecycle_sender),
-            lifecycle_worker: Some(lifecycle_worker),
-            accept_wakers: Vec::new(),
-            accept_workers: Vec::new(),
-            tcp_addresses,
-            router_path: router_name,
-            listen_backlog: bound.listen_backlog(),
-        };
-        for listener in bound.into_listeners() {
-            let (wake_reader, wake_writer) = match et_net::local::wake_pair() {
-                Ok(pair) => pair,
-                Err(source) => {
-                    let _ = runtime.shutdown();
-                    return Err(RuntimeError::Io {
-                        operation: "create accept wakeup",
-                        source,
-                    });
-                }
-            };
-            let worker_core = runtime.core.clone();
-            let worker = match thread::Builder::new()
-                .name("et-tcp-accept".to_owned())
-                .spawn(move || runtime_accept::run(listener, wake_reader, worker_core))
-            {
+        // One control thread accepts on every listener (IPv4 and IPv6) and
+        // services terminal lifecycle events between accepts.
+        let control_core = core.clone();
+        let listen_backlog = bound.listen_backlog();
+        let listeners = bound.into_listeners();
+        let control_worker =
+            match thread::Builder::new()
+                .name("et-runtime".to_owned())
+                .spawn(move || {
+                    runtime_accept::run(listeners, wake_reader, lifecycle_events, control_core)
+                }) {
                 Ok(worker) => worker,
                 Err(source) => {
-                    let _ = runtime.shutdown();
+                    let _ = router.shutdown();
                     return Err(RuntimeError::Spawn(source));
                 }
             };
-            runtime.accept_wakers.push(wake_writer);
-            runtime.accept_workers.push(worker);
-        }
-        Ok(runtime)
+        Ok(Self {
+            core,
+            router: Some(router),
+            lifecycle: Some(lifecycle),
+            control_wake: Some(wake_writer),
+            control_worker: Some(control_worker),
+            tcp_addresses,
+            router_path: router_name,
+            listen_backlog,
+        })
     }
 
     pub fn handle(&self) -> RuntimeHandle {
@@ -214,12 +205,12 @@ impl Runtime {
                 Vec::new()
             }
         };
-        for waker in &mut self.accept_wakers {
+        if let Some(waker) = self.control_wake.as_mut() {
             if let Err(source) = waker.write_all(&[1]) {
                 remember(
                     &mut first_error,
                     RuntimeError::Io {
-                        operation: "wake TCP accept worker",
+                        operation: "wake runtime control thread",
                         source,
                     },
                 );
@@ -241,24 +232,18 @@ impl Runtime {
         if let Err(error) = self.core.registry.clear() {
             remember(&mut first_error, RuntimeError::Registration(error));
         }
-        if let Some(sender) = self.lifecycle_sender.take() {
-            let _ = sender.send(LifecycleEvent::Shutdown);
+        // The control thread keeps applying lifecycle events until this one.
+        if let Some(lifecycle) = self.lifecycle.take() {
+            lifecycle.send(LifecycleEvent::Shutdown);
         }
-        if let Some(worker) = self.lifecycle_worker.take() {
+        if let Some(worker) = self.control_worker.take() {
             match worker.join() {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => remember(&mut first_error, error),
                 Err(_) => remember(
                     &mut first_error,
-                    RuntimeError::WorkerPanicked("terminal lifecycle"),
+                    RuntimeError::WorkerPanicked("runtime control"),
                 ),
-            }
-        }
-        for worker in self.accept_workers.drain(..) {
-            match worker.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => remember(&mut first_error, error),
-                Err(_) => remember(&mut first_error, RuntimeError::WorkerPanicked("TCP accept")),
             }
         }
         if let Err(error) = self.core.raw_sockets.shutdown_all() {
@@ -268,7 +253,7 @@ impl Runtime {
             Ok(workers) => join_handlers(workers, &mut first_error),
             Err(error) => remember(&mut first_error, error),
         }
-        self.accept_wakers.clear();
+        self.control_wake = None;
         first_error.map_or(Ok(()), Err)
     }
 }

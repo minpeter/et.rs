@@ -164,24 +164,28 @@ impl std::fmt::Display for TerminalPacketError {
     }
 }
 
-pub fn handle_packet(
-    packet: Packet,
-    master: &dyn MasterPty,
-    writer: &mut dyn Write,
-) -> Result<LocalPacketEffect, TerminalPacketError> {
-    if local_packet_effect(&packet).map_err(TerminalPacketError::Protocol)?
+/// What a router packet asks the PTY runtime to do, decoded without touching
+/// the PTY so readiness-driven runtimes can own their non-blocking writes.
+pub(crate) enum TerminalCommand<'a> {
+    /// Keystrokes for the PTY. Canonical `TERMINAL_BUFFER` payloads borrow
+    /// straight from the packet.
+    Input(std::borrow::Cow<'a, [u8]>),
+    Resize(PtySize),
+    Close,
+}
+
+pub(crate) fn terminal_command(
+    packet: &Packet,
+) -> Result<TerminalCommand<'_>, TerminalPacketError> {
+    if local_packet_effect(packet).map_err(TerminalPacketError::Protocol)?
         == LocalPacketEffect::Close
     {
-        return Ok(LocalPacketEffect::Close);
+        return Ok(TerminalCommand::Close);
     }
     match packet.header() {
         header if header == TerminalPacketType::TerminalBuffer as u8 => {
             if let Some((bytes, _)) = et_core::packet::decode_terminal_buffer(packet.payload()) {
-                writer
-                    .write_all(bytes)
-                    .and_then(|()| writer.flush())
-                    .map_err(TerminalPacketError::Pty)?;
-                return Ok(LocalPacketEffect::Continue);
+                return Ok(TerminalCommand::Input(std::borrow::Cow::Borrowed(bytes)));
             }
             let message = TerminalBuffer::decode(packet.payload()).map_err(|_| {
                 TerminalPacketError::Protocol("TERMINAL_BUFFER protobuf is malformed".to_owned())
@@ -189,11 +193,7 @@ pub fn handle_packet(
             let bytes = message.buffer.ok_or_else(|| {
                 TerminalPacketError::Protocol("TERMINAL_BUFFER is missing bytes".to_owned())
             })?;
-            writer
-                .write_all(&bytes)
-                .and_then(|()| writer.flush())
-                .map_err(TerminalPacketError::Pty)?;
-            Ok(LocalPacketEffect::Continue)
+            Ok(TerminalCommand::Input(std::borrow::Cow::Owned(bytes)))
         }
         header if header == TerminalPacketType::TerminalInfo as u8 => {
             let info = TerminalInfo::decode(packet.payload()).map_err(|_| {
@@ -202,17 +202,37 @@ pub fn handle_packet(
             if info.command == Some(et_core::proto::terminal_info::Command::KillSession as i32)
                 && info.commandversion == Some(et_core::SESSION_KILL_COMMAND_VERSION)
             {
-                return Ok(LocalPacketEffect::Close);
+                return Ok(TerminalCommand::Close);
             }
             // An unsupported command version is ignored. Resize still applies.
-            master
-                .resize(terminal_size(&info))
-                .map_err(|error| TerminalPacketError::Pty(io::Error::other(error)))?;
-            Ok(LocalPacketEffect::Continue)
+            Ok(TerminalCommand::Resize(terminal_size(&info)))
         }
         _ => Err(TerminalPacketError::Protocol(
             "unsupported local terminal packet type".to_owned(),
         )),
+    }
+}
+
+pub fn handle_packet(
+    packet: Packet,
+    master: &dyn MasterPty,
+    writer: &mut dyn Write,
+) -> Result<LocalPacketEffect, TerminalPacketError> {
+    match terminal_command(&packet)? {
+        TerminalCommand::Close => Ok(LocalPacketEffect::Close),
+        TerminalCommand::Input(bytes) => {
+            writer
+                .write_all(&bytes)
+                .and_then(|()| writer.flush())
+                .map_err(TerminalPacketError::Pty)?;
+            Ok(LocalPacketEffect::Continue)
+        }
+        TerminalCommand::Resize(size) => {
+            master
+                .resize(size)
+                .map_err(|error| TerminalPacketError::Pty(io::Error::other(error)))?;
+            Ok(LocalPacketEffect::Continue)
+        }
     }
 }
 

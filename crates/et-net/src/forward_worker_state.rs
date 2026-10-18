@@ -305,20 +305,17 @@ impl Worker {
             stdio,
             ..
         } = pending;
-        let has_early = !early.is_empty();
-        if has_early {
+        if !early.is_empty() {
             self.send_data(Role::Source, socket_id, early, false, None)?;
         }
         self.activate(Role::Source, socket_id, stream, peer_advertised, None)?;
         if let Some(active) = self.sources.get_mut(&socket_id) {
             active.half_close_on_eof = half_close_on_eof;
+            // The application usually wrote while the request was in flight;
+            // the session-driven engine reads it before returning to poll.
             #[cfg(unix)]
-            if has_early {
-                if let Some(route) = &active.fast_route {
-                    route
-                        .direct_read_ok
-                        .store(false, std::sync::atomic::Ordering::Release);
-                }
+            if self.engine {
+                self.fresh_sources.push(socket_id);
             }
         }
         if stdio {
@@ -755,21 +752,77 @@ impl Worker {
         message: M,
     ) -> Result<(), ForwardError> {
         let packet = Ok(Packet::new(header, message.encode_to_vec()));
+        #[cfg(unix)]
+        {
+            if self.engine || self.handover_pending {
+                self.engine_priority.push_back(packet);
+                return Ok(());
+            }
+            if let Some(packet) = self.send_blocking(true, packet)? {
+                self.engine_priority.push_back(packet);
+                return Ok(());
+            }
+            self.note_outbound_emitted();
+        }
+        #[cfg(windows)]
         channel::select! {
             send(self.priority, packet) -> result => {
                 result.map_err(|_| ForwardError::Unavailable)?;
             }
             recv(self.cancel) -> _ => return Err(ForwardError::Unavailable),
         }
-        #[cfg(unix)]
-        {
-            self.note_outbound_emitted();
-        }
         Ok(())
     }
+
+    /// Block until `packet` fits the outbound (or priority) channel. Gives
+    /// the packet back when the session asks to take this worker over in
+    /// the meantime: the session cannot drain the channel while it waits for
+    /// the handover, so blocking here would deadlock both threads.
+    #[cfg(unix)]
+    fn send_blocking(
+        &mut self,
+        priority: bool,
+        packet: super::Outbound,
+    ) -> Result<Option<super::Outbound>, ForwardError> {
+        loop {
+            let sender = if priority {
+                &self.priority
+            } else {
+                &self.outbound
+            };
+            let mut select = channel::Select::new();
+            let send_index = select.send(sender);
+            let handover_index = select.recv(&self.handover_request);
+            let cancel_index = select.recv(&self.cancel);
+            let operation = select.select();
+            let index = operation.index();
+            if index == send_index {
+                return operation
+                    .send(sender, packet)
+                    .map(|()| None)
+                    .map_err(|_| ForwardError::Unavailable);
+            }
+            if index == cancel_index {
+                let _ = operation.recv(&self.cancel);
+                return Err(ForwardError::Unavailable);
+            }
+            debug_assert_eq!(index, handover_index);
+            if operation.recv(&self.handover_request).is_ok() {
+                self.handover_pending = true;
+                return Ok(Some(packet));
+            }
+            // The forwarder is gone; only cancellation can end this wait.
+            self.handover_request = channel::never();
+        }
+    }
+
     #[cfg(unix)]
     pub(super) fn flush_outbound_wake(&mut self) {
         self.outbound_wake_needed = false;
+        if self.engine {
+            // The session thread checks the engine queues itself.
+            return;
+        }
         // Always write the byte. Gating it on the queues being non-empty
         // loses the wake when the session drains the last packet and goes
         // back to poll between this check and the write.
@@ -783,6 +836,9 @@ impl Worker {
 
     #[cfg(unix)]
     pub(super) fn note_outbound_emitted(&mut self) {
+        if self.engine {
+            return;
+        }
         if !self.defer_outbound_wake || self.outbound.len() >= 32 {
             self.flush_outbound_wake();
         } else {
@@ -792,6 +848,11 @@ impl Worker {
 
     #[cfg(unix)]
     fn enqueue_outbound_ordered(&mut self, packet: super::Outbound) -> Result<(), ForwardError> {
+        if self.engine {
+            self.engine_outbound_bytes += super::poll::outbound_len(&packet);
+            self.engine_outbound.push_back(packet);
+            return Ok(());
+        }
         self.flush_outbound_spill()?;
         if self.outbound_spill.is_empty() {
             match self.outbound.try_send(packet) {
@@ -805,16 +866,14 @@ impl Worker {
                 }
             }
         }
-        if self.outbound_spill.len() < crate::forward::CHANNEL_SPILL_LIMIT {
+        if self.handover_pending || self.outbound_spill.len() < crate::forward::CHANNEL_SPILL_LIMIT
+        {
             self.outbound_spill.push_back(packet);
             return Ok(());
         }
         let oldest = self.outbound_spill.pop_front().expect("spill is full");
-        channel::select! {
-            send(self.outbound, oldest) -> result => {
-                result.map_err(|_| ForwardError::Unavailable)?;
-            }
-            recv(self.cancel) -> _ => return Err(ForwardError::Unavailable),
+        if let Some(oldest) = self.send_blocking(false, oldest)? {
+            self.outbound_spill.push_front(oldest);
         }
         self.outbound_spill.push_back(packet);
         Ok(())

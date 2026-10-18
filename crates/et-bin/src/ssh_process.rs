@@ -795,8 +795,11 @@ fn terminate_and_reap(
 ) -> Result<(), ClientError> {
     // ssh may leave descendants (ProxyJump helpers, remote-command wrappers)
     // that outlive it and keep the captured stdout pipe open, so kill the
-    // subtree and anything still holding that pipe.
-    let mut targets = descendants(child_pid);
+    // subtree and anything still holding that pipe. A descendant that started
+    // its own session detached on purpose (a ControlPersist master, or the
+    // terminal daemon a local bootstrap command leaves behind) and is spared:
+    // the subtree scan can catch it while its parent is still exiting.
+    let mut targets = attached_descendants(child_pid);
     if let Some(pipe) = pipe {
         for holder in pipe_holders(pipe) {
             if !targets.contains(&holder) {
@@ -861,6 +864,27 @@ fn kill_process(pid: ProcessId) -> io::Result<()> {
         Some(process) if process.kill() => Ok(()),
         Some(_) => Err(io::Error::other("could not terminate the ssh process")),
     }
+}
+
+/// Descendants of `root` still in its session, deepest first.
+#[cfg(unix)]
+fn attached_descendants(root: ProcessId) -> Vec<ProcessId> {
+    let session = |pid: ProcessId| {
+        rustix::process::Pid::from_raw(pid.as_raw())
+            .and_then(|pid| rustix::process::getsid(Some(pid)).ok())
+    };
+    let Some(root_session) = session(root) else {
+        return descendants(root);
+    };
+    descendants(root)
+        .into_iter()
+        .filter(|pid| session(*pid) == Some(root_session))
+        .collect()
+}
+
+#[cfg(windows)]
+fn attached_descendants(root: ProcessId) -> Vec<ProcessId> {
+    descendants(root)
 }
 
 /// Descendants of `root`, deepest first.
@@ -1567,6 +1591,70 @@ exit 0
         drop(hold_control);
 
         assert_eq!(result.unwrap(), RemoteShell::Cmd);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_cleanup_spares_descendant_that_started_its_own_session() {
+        // Like a local bootstrap's terminal daemon: setsid() before the marker,
+        // yet still a descendant while its launcher keeps running.
+        const SCRIPT: &str = r#"
+setsid sh -c 'echo $$ > "$1"; exec sleep 30' detached "$1" </dev/null >/dev/null 2>&1 &
+(IFS= read -r _ < "$2") &
+echo $! > "$3"
+while [ ! -s "$1" ]; do sleep 0.01; done
+printf 'IDPASSKEY:abcdefghijklmnop/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef\n'
+IFS= read -r _ < "$2"
+"#;
+
+        let dir = ProcessGroupTestDir::new();
+        let detached_file = dir.0.join("detached.pid");
+        let attached_file = dir.0.join("attached.pid");
+        let hold_fifo = dir.fifo("bootstrap-hold");
+        let hold_control = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&hold_fifo)
+            .unwrap();
+        let runner = SystemSsh::with_timeout(Duration::from_secs(5));
+        let mut invocation = invocation(
+            "/bin/sh",
+            &[
+                "-c",
+                SCRIPT,
+                "bootstrap-test",
+                detached_file.to_str().unwrap(),
+                hold_fifo.to_str().unwrap(),
+                attached_file.to_str().unwrap(),
+            ],
+        );
+        invocation.completion = InvocationCompletion::Credentials;
+
+        let result = run_bootstrap(&runner, &invocation, runner.deadline());
+        let pid_in = |path: &PathBuf| {
+            RustixPid::from_raw(fs::read_to_string(path).unwrap().trim().parse().unwrap()).unwrap()
+        };
+        // Checked while the fifo is still held, so only cleanup can end it.
+        let attached_gone = pidfd_open(pid_in(&attached_file), PidfdFlags::empty())
+            .map_or(true, |attached| poll_readable(&attached));
+        let detached = pidfd_open(pid_in(&detached_file), PidfdFlags::empty());
+        let detached_alive = detached
+            .as_ref()
+            .is_ok_and(|detached| !poll_readable_with(detached, 100));
+        if let Ok(detached) = &detached {
+            pidfd_send_signal(detached, RustixSignal::KILL).unwrap();
+        }
+        drop(hold_control);
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            attached_gone,
+            "attached stdout-holding descendant survived cleanup"
+        );
+        assert!(
+            detached_alive,
+            "ssh cleanup killed a descendant in its own session"
+        );
     }
 
     #[test]

@@ -36,6 +36,15 @@ impl std::fmt::Display for ReadError {
 
 impl std::error::Error for ReadError {}
 
+/// Smallest socket read [`BackedReader::prepare_socket_read`] asks for: all an
+/// idle or interactive connection ever zero-fills.
+pub const MIN_SOCKET_READ: usize = 16 * 1024;
+/// Largest socket read; a bulk stream reaches it after two full reads.
+/// Smaller bulk reads cost single-session CPU: a 64 KiB cap left a partial
+/// frame to compact after nearly every read (+8-17% CPU on one 512 MiB
+/// stream).
+pub const MAX_SOCKET_READ: usize = 256 * 1024;
+
 #[derive(Clone)]
 pub struct BackedReader {
     crypto: CryptoHandler,
@@ -45,6 +54,10 @@ pub struct BackedReader {
     replay: VecDeque<Packet>,
     sequence: i64,
     connected: bool,
+    /// Size of the next socket read, adapted to how full recent reads were.
+    read_hint: usize,
+    /// Size of the socket read in flight, to tell a full read from a short one.
+    read_requested: usize,
 }
 
 impl BackedReader {
@@ -57,6 +70,8 @@ impl BackedReader {
             replay: VecDeque::new(),
             sequence: 0,
             connected,
+            read_hint: MIN_SOCKET_READ,
+            read_requested: 0,
         }
     }
 
@@ -92,6 +107,37 @@ impl BackedReader {
 
     pub fn commit_read(&mut self, count: usize) {
         self.filled += count;
+    }
+
+    /// Space for the next socket read, sized by recent reads: it starts at
+    /// [`MIN_SOCKET_READ`], so an idle connection never zero-fills a
+    /// bulk-sized buffer, quadruples up to [`MAX_SOCKET_READ`] while reads
+    /// fill it, and halves after a read returns less than a quarter of it. A
+    /// drained buffer that grew for a burst is released once reads are back
+    /// at the minimum. Report the result with [`Self::commit_socket_read`].
+    pub fn prepare_socket_read(&mut self) -> &mut [u8] {
+        if self.offset == self.filled
+            && self.read_hint == MIN_SOCKET_READ
+            && self.partial.capacity() > 4 * MIN_SOCKET_READ
+        {
+            self.partial = Vec::new();
+            self.offset = 0;
+            self.filled = 0;
+        }
+        let size = self.read_hint;
+        self.read_requested = size;
+        &mut self.prepare_read_slice(size)[..size]
+    }
+
+    /// Record `count` bytes read into the slice from
+    /// [`Self::prepare_socket_read`] and adapt the next read's size.
+    pub fn commit_socket_read(&mut self, count: usize) {
+        self.commit_read(count);
+        if count >= self.read_requested {
+            self.read_hint = (self.read_hint * 4).min(MAX_SOCKET_READ);
+        } else if count < self.read_hint / 4 {
+            self.read_hint = (self.read_hint / 2).max(MIN_SOCKET_READ);
+        }
     }
 
     pub fn has_buffered_data(&self) -> bool {

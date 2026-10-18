@@ -233,6 +233,7 @@ where
     // the transport permanently pending and starve them.
     let mut local_turn = false;
     let mut bytes_since_ack: usize = 0;
+    let mut delivery_gate = crate::delivery_gate::DeliveryGate::default();
     let mut interrupt_input = et_core::output_interrupt::InterruptInput::default();
     let mut fast_poll = et_net::forward::FastPollState::new();
     let forward_wake = forwarder
@@ -365,6 +366,7 @@ where
         // the frame deadline elapsed. Per-socket credit throttles the peer's
         // sender instead, and `pending_output` backpressure remains because it
         // is ordered terminal output, not forwarding.
+        let delivery_blocked = delivery_gate.blocked(connection, interval);
         let mut network_flags = network_poll_flags(
             pending_output.is_some(),
             pending_forward.len() >= FORWARD_BACKLOG_CAPACITY,
@@ -378,7 +380,7 @@ where
         if connection.write_pending() {
             network_flags |= PollFlags::OUT;
         }
-        if (!connection.write_pending() && outbound_ready)
+        if (!connection.write_pending() && outbound_ready && !delivery_blocked)
             || (inbound_ready
                 && pending_output.is_none()
                 && pending_forward.len() < FORWARD_BACKLOG_CAPACITY)
@@ -387,10 +389,16 @@ where
         }
         // While a frame is pending, producers are left out of the poll set:
         // poll(2) reports HUP/ERR even for an empty event mask, so a hung-up
-        // wake fd would spin this loop until the frame deadline.
-        let producers_polled = !connection.write_pending();
+        // wake fd would spin this loop until the frame deadline. A delivery
+        // backlog parks them the same way until the server acknowledges.
+        let producers_polled = !connection.write_pending() && !delivery_blocked;
         if producers_polled {
             forwarder.collect_fast_poll_routes(&mut fast_poll);
+            // Forwarding timers (idle window credit, parked accepts) and
+            // packets it already holds bound how long this poll may sleep.
+            if let Some(at) = fast_poll.deadline() {
+                deadline = deadline.min(at);
+            }
         }
         let (network, resize, output_ready, output_status, forward_events, input) = {
             let mut descriptors = vec![
@@ -614,7 +622,7 @@ where
                         if let Some(ack) = et_core::keepalive::decode_ack(packet.payload()) {
                             connection.acknowledge_delivery(ack);
                         }
-                    } else if is_forward_packet(packet.header()) || binary_stdio {
+                    } else {
                         bytes_since_ack = bytes_since_ack.saturating_add(packet.payload().len());
                     }
                     if is_forward_packet(packet.header()) {
@@ -712,11 +720,22 @@ where
         if !reconnect_needed
             && !connection.write_pending()
             && !local_turn
+            && !delivery_blocked
             && (outbound_ready || forward_events.intersects(PollFlags::IN | PollFlags::HUP))
         {
             // try_outbound drains its wake socket even when queue entries
             // remain. Remember that readiness until the queue is empty.
             for _ in 0..128 {
+                // A saturated transport is rarely idle at the keep-alive
+                // check below; yield the batch so a due acknowledgement is
+                // not starved behind forwarded data, and stop at the
+                // delivery bound.
+                if (bytes_since_ack >= et_core::keepalive::ACK_INTERVAL_BYTES
+                    && !remote_exit.session_ended())
+                    || delivery_gate.blocked(connection, interval)
+                {
+                    break;
+                }
                 let Some(packet) = forwarder
                     .try_outbound()
                     .map_err(|error| terminal_text(error.to_string()))?
@@ -786,7 +805,9 @@ where
             next_keepalive = last_received + interval;
             continue;
         }
-        if !connection.write_pending() && input.contains(PollFlags::IN) {
+        let ack_due = bytes_since_ack >= et_core::keepalive::ACK_INTERVAL_BYTES
+            && !remote_exit.session_ended();
+        if !connection.write_pending() && !ack_due && input.contains(PollFlags::IN) {
             let mut bytes = [0u8; 65_472];
             let read_len = if binary_stdio {
                 bytes.len()
@@ -880,12 +901,13 @@ where
             read_stdin = false;
         }
         let now = Instant::now();
+        // Acknowledge by volume as well as on the idle interval, including
+        // under continuous inbound: the server trims its replay backup on the
+        // payload and its echo trims ours.
         if !connection.write_pending()
             && (now >= next_keepalive
-                || (pending_output.is_none()
-                    && !inbound_ready
-                    && !remote_exit.session_ended()
-                    && bytes_since_ack >= 2 * 1024 * 1024))
+                || (!remote_exit.session_ended()
+                    && bytes_since_ack >= et_core::keepalive::ACK_INTERVAL_BYTES))
         {
             bytes_since_ack = 0;
             // The payload acknowledges everything read so far, so the server

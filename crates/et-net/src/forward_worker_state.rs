@@ -305,12 +305,21 @@ impl Worker {
             stdio,
             ..
         } = pending;
-        if !early.is_empty() {
+        let has_early = !early.is_empty();
+        if has_early {
             self.send_data(Role::Source, socket_id, early, false, None)?;
         }
         self.activate(Role::Source, socket_id, stream, peer_advertised, None)?;
         if let Some(active) = self.sources.get_mut(&socket_id) {
             active.half_close_on_eof = half_close_on_eof;
+            #[cfg(unix)]
+            if has_early {
+                if let Some(route) = &active.fast_route {
+                    route
+                        .direct_read_ok
+                        .store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
         }
         if stdio {
             self.stdio_socket = Some(socket_id);
@@ -781,32 +790,41 @@ impl Worker {
         }
     }
 
+    #[cfg(unix)]
+    fn enqueue_outbound_ordered(&mut self, packet: super::Outbound) -> Result<(), ForwardError> {
+        self.flush_outbound_spill()?;
+        if self.outbound_spill.is_empty() {
+            match self.outbound.try_send(packet) {
+                Ok(()) => return Ok(()),
+                Err(crossbeam_channel::TrySendError::Full(packet)) => {
+                    self.outbound_spill.push_back(packet);
+                    return Ok(());
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    return Err(ForwardError::Unavailable);
+                }
+            }
+        }
+        if self.outbound_spill.len() < crate::forward::CHANNEL_SPILL_LIMIT {
+            self.outbound_spill.push_back(packet);
+            return Ok(());
+        }
+        let oldest = self.outbound_spill.pop_front().expect("spill is full");
+        channel::select! {
+            send(self.outbound, oldest) -> result => {
+                result.map_err(|_| ForwardError::Unavailable)?;
+            }
+            recv(self.cancel) -> _ => return Err(ForwardError::Unavailable),
+        }
+        self.outbound_spill.push_back(packet);
+        Ok(())
+    }
+
     pub(super) fn emit<M: Message>(&mut self, header: u8, message: M) -> Result<(), ForwardError> {
         let packet = Ok(Packet::new(header, message.encode_to_vec()));
         #[cfg(unix)]
         {
-            // A full outbound channel must not freeze the poll loop: the
-            // session drains it, and the worker has sockets to service in the
-            // meantime. Spill up to one channel's worth and retry next cycle.
-            // Past that the session is not draining, so block as before.
-            if self.outbound_spill.len() < crate::forward::CHANNEL_SPILL_LIMIT {
-                match self.outbound.try_send(packet) {
-                    Ok(()) => {}
-                    Err(crossbeam_channel::TrySendError::Full(packet)) => {
-                        self.outbound_spill.push_back(packet);
-                    }
-                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                        return Err(ForwardError::Unavailable);
-                    }
-                }
-            } else {
-                channel::select! {
-                    send(self.outbound, packet) -> result => {
-                        result.map_err(|_| ForwardError::Unavailable)?;
-                    }
-                    recv(self.cancel) -> _ => return Err(ForwardError::Unavailable),
-                }
-            }
+            self.enqueue_outbound_ordered(packet)?;
             self.note_outbound_emitted();
             Ok(())
         }
@@ -826,35 +844,7 @@ impl Worker {
     pub(super) fn emit_raw(&mut self, header: u8, payload: Vec<u8>) -> Result<(), ForwardError> {
         let is_small = payload.len() <= 4096;
         let packet = Ok(Packet::new(header, payload));
-        if !self.outbound_spill.is_empty() {
-            if self.outbound_spill.len() < crate::forward::CHANNEL_SPILL_LIMIT {
-                self.outbound_spill.push_back(packet);
-            } else {
-                channel::select! {
-                    send(self.outbound, packet) -> result => {
-                        result.map_err(|_| ForwardError::Unavailable)?;
-                    }
-                    recv(self.cancel) -> _ => return Err(ForwardError::Unavailable),
-                }
-            }
-        } else if self.outbound_spill.len() < crate::forward::CHANNEL_SPILL_LIMIT {
-            match self.outbound.try_send(packet) {
-                Ok(()) => {}
-                Err(crossbeam_channel::TrySendError::Full(packet)) => {
-                    self.outbound_spill.push_back(packet);
-                }
-                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                    return Err(ForwardError::Unavailable);
-                }
-            }
-        } else {
-            channel::select! {
-                send(self.outbound, packet) -> result => {
-                    result.map_err(|_| ForwardError::Unavailable)?;
-                }
-                recv(self.cancel) -> _ => return Err(ForwardError::Unavailable),
-            }
-        }
+        self.enqueue_outbound_ordered(packet)?;
         if is_small {
             self.flush_outbound_wake();
         } else {

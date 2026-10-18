@@ -69,7 +69,7 @@ pub(crate) struct SocketIo {
     credit_bytes: i64,
     credit_packets: i64,
     credit_flush_at: Option<Instant>,
-    fast_route: Option<std::sync::Arc<super::UnixFastRoute>>,
+    pub(super) fast_route: Option<std::sync::Arc<super::UnixFastRoute>>,
 }
 
 pub(crate) enum ReadOutcome {
@@ -161,13 +161,13 @@ impl SocketIo {
     /// before popping new commands, mirroring the backpressure the bounded
     /// writer channel provided.
     fn queue_write(&mut self, buffer: Vec<u8>) -> Result<(), Vec<u8>> {
-        if self.out.len() >= OUT_QUEUE_PACKETS {
-            return Err(buffer);
-        }
         if let Some(route) = &self.fast_route {
             route
                 .direct_ok
                 .store(false, std::sync::atomic::Ordering::Release);
+        }
+        if self.out.len() >= OUT_QUEUE_PACKETS {
+            return Err(buffer);
         }
         let len = buffer.len();
         self.out.push_back(QueuedBuffer {
@@ -182,13 +182,13 @@ impl SocketIo {
         if len == 0 {
             return Ok(());
         }
-        if len > MAX_DATA_PACKET || self.out.len() >= OUT_QUEUE_PACKETS {
-            return Err(data);
-        }
         if let Some(route) = &self.fast_route {
             route
                 .direct_ok
                 .store(false, std::sync::atomic::Ordering::Release);
+        }
+        if len > MAX_DATA_PACKET || self.out.len() >= OUT_QUEUE_PACKETS {
+            return Err(data);
         }
         self.out.push_back(QueuedBuffer { data, start, len });
         Ok(())
@@ -378,17 +378,8 @@ impl SocketIo {
                 Err(error) => return Err(error),
             }
         }
-        if self.out.is_empty() {
-            if !self.write_closed && !self.close_when_drained && !self.shutdown_write_when_drained {
-                if let Some(route) = &self.fast_route {
-                    route
-                        .direct_ok
-                        .store(true, std::sync::atomic::Ordering::Release);
-                }
-            }
-            if self.credit_bytes > 0 && self.credit_flush_at.is_none() {
-                self.credit_flush_at = Some(Instant::now());
-            }
+        if self.out.is_empty() && self.credit_bytes > 0 && self.credit_flush_at.is_none() {
+            self.credit_flush_at = Some(Instant::now());
         }
         Ok(())
     }
@@ -488,32 +479,6 @@ impl Worker {
             .map_err(ForwardError::Io)?;
         if let Some(route) = fast_route {
             socket.fast_route = Some(std::sync::Arc::clone(&route));
-            if role == Role::Source
-                && self
-                    .session_polls_reads
-                    .load(std::sync::atomic::Ordering::Acquire)
-            {
-                let mut reads = 0;
-                while socket.read_interest() && !self.outbound.is_full() && reads < 4 {
-                    match socket.read_encoded_chunk(&mut self.read_scratch[..]) {
-                        Ok(ReadOutcome::Data(payload)) => {
-                            let is_small = payload.len() <= 4096;
-                            self.emit_raw(TerminalPacketType::PortForwardData as u8, payload)?;
-                            reads += 1;
-                            if is_small {
-                                break;
-                            }
-                        }
-                        Ok(ReadOutcome::Idle) => break,
-                        Ok(ReadOutcome::Eof) | Err(_) => {
-                            route
-                                .direct_read_ok
-                                .store(false, std::sync::atomic::Ordering::Release);
-                            break;
-                        }
-                    }
-                }
-            }
             self.routes
                 .write()
                 .unwrap()
@@ -946,6 +911,20 @@ impl Worker {
             return Ok(SocketVerdict::Drop);
         }
         if event.readable {
+            if let Some(route) = &socket.fast_route {
+                if self
+                    .session_polls_reads
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    && route
+                        .direct_read_ok
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Ok(SocketVerdict::Keep);
+                }
+                route
+                    .direct_read_ok
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
             let mut reads = 0;
             while socket.read_interest() && reads < READS_PER_CYCLE {
                 let outcome = {
@@ -1021,7 +1000,7 @@ impl Worker {
 
     /// Hand spilled outbound packets back to the session. Stops at the first
     /// one that still does not fit, keeping emission order.
-    fn flush_outbound_spill(&mut self) -> Result<(), ForwardError> {
+    pub(super) fn flush_outbound_spill(&mut self) -> Result<(), ForwardError> {
         while let Some(packet) = self.outbound_spill.pop_front() {
             match self.outbound.try_send(packet) {
                 Ok(()) => {}
@@ -1096,6 +1075,13 @@ impl Worker {
                         socket.write_closed = true;
                         shutdown_write(&socket.stream);
                     }
+                    if self.held.is_empty() && !socket.write_closed() {
+                        if let Some(route) = &socket.fast_route {
+                            route
+                                .direct_ok
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
+                    }
                 }
                 self.map_mut(role).insert(socket_id, socket);
                 if let Some((credit, packet_credit)) = credit_to_flush {
@@ -1142,9 +1128,9 @@ impl Worker {
                 for command in batch.drain(..) {
                     self.handle_command(command)?;
                 }
+                self.flush_queued_writes()?;
                 commands.complete_count(count);
                 commands.arm_wake();
-                self.flush_queued_writes()?;
                 self.flush_due_credits()?;
             }
             for event in &ready {

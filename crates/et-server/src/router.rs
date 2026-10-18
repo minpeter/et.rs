@@ -12,7 +12,7 @@ pub const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
 use crate::path::{PathError, RouterPath};
 use crate::registry::Registry;
 use crate::router_loop;
-use crate::runtime_lifecycle::LifecycleEvent;
+use crate::runtime_lifecycle::LifecycleSender;
 #[cfg(unix)]
 use crate::socket_path::OwnedRouterListener;
 #[cfg(windows)]
@@ -89,7 +89,7 @@ impl Router {
     pub(crate) fn start_with_lifecycle(
         path: RouterPath,
         registry: Registry,
-        lifecycle: Option<std::sync::mpsc::Sender<LifecycleEvent>>,
+        lifecycle: Option<LifecycleSender>,
     ) -> Result<Self, RouterError> {
         let listener = OwnedRouterListener::bind(&path)?;
         let (wake_reader, wake_writer) = et_net::local::wake_pair().map_err(RouterError::Io)?;

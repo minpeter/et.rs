@@ -1313,8 +1313,9 @@ pub(crate) struct AcceptedStream {
 }
 
 /// Accept up to `limit` queued connections from `entry`. Accepting never
-/// blocks (listeners are non-blocking); a failed listener is retired, as
-/// its own thread used to end.
+/// blocks (listeners are non-blocking). A connection that failed before it
+/// was accepted is skipped, like upstream's `accept` loop; any other failure
+/// retires the listener, as its own thread used to end.
 fn accept_streams(entry: &Arc<ListenerEntry>, limit: usize, out: &mut Vec<AcceptedStream>) {
     for _ in 0..limit {
         if entry.retired() {
@@ -1329,12 +1330,41 @@ fn accept_streams(entry: &Arc<ListenerEntry>, limit: usize, out: &mut Vec<Accept
             }),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if connection_failed_before_accept(&error) => {}
             Err(_) => {
                 entry.retire();
                 return;
             }
         }
     }
+}
+
+/// accept(2) reports a pending connection's own network error (the peer
+/// reset first, or its route vanished); the listener itself is fine.
+fn connection_failed_before_accept(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NetworkDown
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+    ) {
+        return true;
+    }
+    let Some(code) = error
+        .raw_os_error()
+        .map(rustix::io::Errno::from_raw_os_error)
+    else {
+        return false;
+    };
+    [
+        rustix::io::Errno::PROTO,
+        rustix::io::Errno::NOPROTOOPT,
+        rustix::io::Errno::HOSTDOWN,
+        rustix::io::Errno::OPNOTSUPP,
+    ]
+    .contains(&code)
 }
 
 /// Every listener a forwarder accepts on, shared by the forwarder (runtime

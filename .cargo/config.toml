@@ -8,8 +8,12 @@
 # - narenas:1 — every role runs a handful of threads whose large I/O buffers
 #   are allocated on one thread and freed on another; per-CPU arenas (4 x ncpu
 #   by default) strand each thread's freed pages in its own arena. One arena
-#   keeps a session's footprint at its live set for a few percent of extra
-#   lock traffic on >= 32 KiB allocations (small ones stay in the tcache).
+#   keeps a session's footprint at its live set. Allocations >= 32 KiB bypass
+#   the tcache and take the arena lock, which `etserver` shares across all of
+#   its sessions. Measured on a 24-core host with 8 and 16 concurrently
+#   saturated sessions on one server (128 MiB each, -L or -R): aggregate
+#   throughput within +/-6% of narenas:4 either way and server CPU within 2%,
+#   while server RSS stayed 5-22% lower (16 x -R: 73 vs 91 MB).
 # - dirty_decay_ms:1000 — the server already switches to 1 s at runtime
 #   (et-server runtime_lifecycle.rs); apply the same 1 s to the client and
 #   terminal roles instead of jemalloc's 10 s default.

@@ -798,3 +798,89 @@ fn concurrent_hard_stop_cannot_be_downgraded_to_graceful_drain() {
     // Then: the hard-stopped writer does not drain the packet after transport unblocks.
     assert!(client.read_packet().is_err());
 }
+
+fn terminal_output(len: usize) -> et_core::packet::Packet {
+    et_core::packet::Packet::new(
+        et_core::proto::TerminalPacketType::TerminalBuffer as u8,
+        et_core::proto::TerminalBuffer {
+            buffer: Some(vec![b'x'; len]),
+            is_stderr: None,
+        }
+        .encode_to_vec(),
+    )
+}
+
+fn forwarding_data(len: usize) -> et_core::packet::Packet {
+    et_core::packet::Packet::new(
+        et_core::proto::TerminalPacketType::PortForwardData as u8,
+        vec![7; len],
+    )
+}
+
+/// Enqueues `packet` until its lane refuses it; returns how many were admitted.
+fn fill_lane(flow: &FlowControl, packet: &et_core::packet::Packet) -> usize {
+    let mut admitted = 0;
+    loop {
+        match flow.enqueue(packet.clone()) {
+            Ok(()) => admitted += 1,
+            Err(SessionError::Connection(ConnError::Backpressure)) => return admitted,
+            Err(error) => panic!("unexpected admission: {error}"),
+        }
+    }
+}
+
+#[test]
+fn control_lane_refusal_resumes_on_control_capacity_while_terminal_stays_full() {
+    // Given: connected default buffering where both lanes refused the bridge.
+    // Terminal output uses small packets and forwarding large ones, so the
+    // writer's alternating completions free half the control lane long
+    // before half the terminal lane.
+    let flow = FlowControl::new_default();
+    let terminal_admitted = fill_lane(&flow, &terminal_output(16 * 1024));
+    let control_admitted = fill_lane(&flow, &forwarding_data(60 * 1024));
+
+    // When: the writer delivers packets until it signals the bridge.
+    let mut terminal_completed = 0;
+    let mut control_completed = 0;
+    loop {
+        let packet = flow.next_packet().unwrap();
+        let is_terminal =
+            packet.header() == et_core::proto::TerminalPacketType::TerminalBuffer as u8;
+        let (running, signal) =
+            flow.complete_with_signal(packet, &FlowWriteResult::Delivered, true);
+        assert!(running);
+        if is_terminal {
+            terminal_completed += 1;
+        } else {
+            control_completed += 1;
+        }
+        if signal {
+            assert!(!is_terminal, "terminal completion signalled first");
+            break;
+        }
+    }
+
+    // Then: control capacity alone woke the bridge while the terminal lane
+    // stayed above its resume threshold, and control resumed in a batch
+    // rather than after its first freed packet.
+    assert!(terminal_completed * 2 < terminal_admitted);
+    assert!(control_completed * 2 >= control_admitted);
+}
+
+#[test]
+fn connected_default_output_bounds_both_lanes_by_one_total() {
+    // Given: connected default buffering.
+    let flow = FlowControl::new_default();
+    let terminal = terminal_output(16 * 1024);
+    let forwarding = forwarding_data(60 * 1024);
+    // The queue also charges each packet its u32 length frame.
+    let cost = |packet: &et_core::packet::Packet| packet.wire_len() + std::mem::size_of::<u32>();
+
+    // When: both lanes are filled until they refuse.
+    let terminal_staged = fill_lane(&flow, &terminal) * cost(&terminal);
+    let control_staged = fill_lane(&flow, &forwarding) * cost(&forwarding);
+
+    // Then: both lanes staged output, and together stay within the total.
+    assert!(terminal_staged > 0 && control_staged > 0);
+    assert!(terminal_staged + control_staged <= super::session_flow::CONNECTED_OUTPUT_BYTES);
+}

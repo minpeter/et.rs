@@ -160,6 +160,14 @@ const STDERR_SUFFIX: [u8; 2] = [0x10, 0x01];
 impl TerminalBufferFrame {
     /// Frame `output_len` bytes of terminal output; rejects frames over 64 KiB.
     pub fn new(output_len: usize, is_stderr: bool) -> io::Result<Self> {
+        // Reject oversized output before sizing the payload, so the length
+        // arithmetic below stays far from `usize::MAX`.
+        if output_len > MAX_LOCAL_PACKET_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "local packet exceeds 64 KiB",
+            ));
+        }
         let mut varint = [0u8; 10];
         let mut varint_len = 0usize;
         let mut value = output_len;
@@ -220,14 +228,21 @@ impl TerminalBufferFrame {
     }
 
     /// Issue one write for the unsent remainder and return how many bytes the
-    /// stream accepted. `output` must be the slice the frame was created for.
-    /// `WouldBlock`/`Interrupted` are returned unchanged for the caller's loop.
+    /// stream accepted. `output` must be the slice the frame was created for;
+    /// a slice of any other length fails with `InvalidInput` before a byte is
+    /// written. `WouldBlock`/`Interrupted` are returned unchanged for the
+    /// caller's loop.
     pub fn write_some<W: Write + ?Sized>(
         &mut self,
         writer: &mut W,
         output: &[u8],
     ) -> io::Result<usize> {
-        debug_assert_eq!(output.len(), self.output_len);
+        if output.len() != self.output_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "terminal output length does not match its frame",
+            ));
+        }
         let head_len = self.head_len;
         let written = self.written;
         let count = if written < head_len {
@@ -588,46 +603,5 @@ fn read_exact_classified<R: Read>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{mpsc, Arc};
-
-    struct StalledWriter(Option<mpsc::Sender<()>>);
-
-    impl Write for StalledWriter {
-        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
-            if let Some(started) = self.0.take() {
-                let _ = started.send(());
-            }
-            Err(io::ErrorKind::WouldBlock.into())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn cancelled_local_write_finishes_while_peer_remains_stalled() {
-        let (started_tx, started_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let worker_cancelled = cancelled.clone();
-        std::thread::spawn(move || {
-            let result = write_local_packet_cancelled(
-                &mut StalledWriter(Some(started_tx)),
-                &Packet::new(1, vec![0; 1024]),
-                &worker_cancelled,
-                Instant::now() + Duration::from_secs(30),
-            );
-            let _ = done_tx.send(result);
-        });
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        cancelled.store(true, Ordering::Release);
-        let error = done_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("cancelled writer did not terminate")
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-    }
-}
+#[path = "local_packet_tests.rs"]
+mod tests;

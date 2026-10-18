@@ -30,11 +30,13 @@ pub const MAX_DISCONNECT_PACKETS: usize = 262_144;
 pub const CONNECTED_BACKUP_BYTES: i64 = 8 * 1024 * 1024;
 pub const CONNECTED_BACKUP_PACKETS: usize = 32_768;
 /// Unacknowledged bytes after which an acknowledging peer's writer should
-/// stop producing until the next acknowledgement. Together with the retained
-/// slack (<= [`ACK_RETAIN_FLOOR_PACKETS`] frames) this stays well inside
-/// [`CONNECTED_BACKUP_BYTES`], so the connected cap never trims a packet the
-/// peer could still request, and it bounds the replay memory a bulk transfer
-/// pins regardless of how much the kernel is willing to buffer.
+/// stop producing until the next acknowledgement. The acknowledged slack kept
+/// beside them is at most [`ACK_RETAIN_SLACK_BYTES`], or the
+/// [`ACK_RETAIN_FLOOR_PACKETS`] most recent acknowledged frames when those
+/// alone are larger (<= 1 MiB of 64 KiB frames), so the total stays well
+/// inside [`CONNECTED_BACKUP_BYTES`]: the connected cap never trims a packet
+/// the peer could still request, and the replay memory a bulk transfer pins
+/// is bounded regardless of how much the kernel is willing to buffer.
 pub const MAX_UNACKNOWLEDGED_BYTES: i64 = 4 * 1024 * 1024;
 /// Upper bound on acknowledged packets retained beyond an acknowledged
 /// sequence (see [`BackedWriter::acknowledge`]).

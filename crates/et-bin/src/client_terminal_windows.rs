@@ -333,7 +333,9 @@ where
                             &mut reconnect,
                             terminal_enabled,
                         )? {
-                            OwnedWriteOutcome::Written => {}
+                            OwnedWriteOutcome::Written => {
+                                bytes_since_ack = bytes_since_ack.saturating_add(payload.len());
+                            }
                             OwnedWriteOutcome::Recovered => reconnect_needed = false,
                             OwnedWriteOutcome::SessionEnded => {
                                 return finish_remote_completion(
@@ -489,15 +491,6 @@ where
         {
             local_turn = true;
             for _ in 0..64 {
-                // Yield so a due acknowledgement is not starved behind
-                // forwarded data on a saturated transport, and stop at the
-                // delivery bound.
-                if (bytes_since_ack >= et_core::keepalive::ACK_INTERVAL_BYTES
-                    && !remote_exit.session_ended())
-                    || delivery_gate.blocked(connection, interval)
-                {
-                    break;
-                }
                 let Some(packet) = forwarder
                     .try_outbound()
                     .map_err(|error| terminal_text(error.to_string()))?
@@ -529,7 +522,15 @@ where
                         );
                     }
                 }
-                if connection.write_pending() {
+                // Yield after each written packet, never before the first one:
+                // a due acknowledgement or the delivery bound ends the batch,
+                // but cannot cost forwarding its turn while local input keeps
+                // refilling the acknowledgement counter.
+                if connection.write_pending()
+                    || (bytes_since_ack >= et_core::keepalive::ACK_INTERVAL_BYTES
+                        && !remote_exit.session_ended())
+                    || delivery_gate.blocked(connection, interval)
+                {
                     break;
                 }
             }

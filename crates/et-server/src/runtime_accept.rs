@@ -24,26 +24,32 @@ pub(crate) fn run(
     core: Arc<RuntimeCore>,
 ) -> Result<(), RuntimeError> {
     let mut first_error = None;
+    // Configure the wakeup independently of the listeners: `drain` reads until
+    // `WouldBlock`, which would block forever on a blocking socket and keep
+    // `Runtime::shutdown` from joining this thread. Without a non-blocking
+    // wakeup it is neither polled nor drained; shutdown is still observed via
+    // the lifecycle wakeup or the next resume sweep.
+    let wake_usable = match wake_reader.set_nonblocking(true) {
+        Ok(()) => true,
+        Err(source) => {
+            first_error = Some(RuntimeError::Io {
+                operation: "configure accept wakeup",
+                source,
+            });
+            false
+        }
+    };
     let configured = listeners
         .iter()
-        .try_for_each(|listener| listener.set_nonblocking(true))
-        .map_err(|source| RuntimeError::Io {
-            operation: "configure TCP listener",
-            source,
-        })
-        .and_then(|()| {
-            wake_reader
-                .set_nonblocking(true)
-                .map_err(|source| RuntimeError::Io {
-                    operation: "configure accept wakeup",
-                    source,
-                })
-        });
+        .try_for_each(|listener| listener.set_nonblocking(true));
     // Lifecycle cleanup must keep running even if the listeners cannot.
     let mut listeners = match configured {
         Ok(()) => listeners,
-        Err(error) => {
-            first_error = Some(error);
+        Err(source) => {
+            first_error.get_or_insert(RuntimeError::Io {
+                operation: "configure TCP listener",
+                source,
+            });
             Vec::new()
         }
     };
@@ -60,7 +66,12 @@ pub(crate) fn run(
             true
         };
         #[cfg(unix)]
-        let lifecycle_woken = match wait(&listeners, &wake_reader, &lifecycle, &mut ready) {
+        let lifecycle_woken = match wait(
+            &listeners,
+            wake_usable.then_some(&wake_reader),
+            &lifecycle,
+            &mut ready,
+        ) {
             Ok(woken) => woken,
             Err(error) => {
                 first_error.get_or_insert(error);
@@ -70,7 +81,9 @@ pub(crate) fn run(
             }
         };
         if core.shutdown.load(Ordering::Acquire) {
-            drain(&mut wake_reader);
+            if wake_usable {
+                drain(&mut wake_reader);
+            }
             listeners.clear();
         }
         let mut index = 0;
@@ -104,30 +117,33 @@ pub(crate) fn run(
 }
 
 /// Block until a listener is ready, the runtime wakes us, a lifecycle event
-/// arrives or the next resume sweep is due. Fills listener readiness into
-/// `ready` and returns whether the lifecycle wakeup fired.
+/// arrives or the next resume sweep is due. `wake_reader` is `None` when the
+/// runtime wakeup could not be made non-blocking. Fills listener readiness
+/// into `ready` and returns whether the lifecycle wakeup fired.
 #[cfg(unix)]
 fn wait(
     listeners: &[TcpListener],
-    wake_reader: &LocalStream,
+    wake_reader: Option<&LocalStream>,
     lifecycle: &Lifecycle,
     ready: &mut Vec<bool>,
 ) -> Result<bool, RuntimeError> {
     let mut descriptors: Vec<PollFd<'_>> = listeners
         .iter()
         .map(|listener| PollFd::new(listener, PollFlags::IN))
-        .chain([
-            PollFd::new(wake_reader, PollFlags::IN | PollFlags::HUP),
-            PollFd::new(lifecycle.wake(), PollFlags::IN | PollFlags::HUP),
-        ])
+        .chain(
+            wake_reader
+                .into_iter()
+                .map(|wake_reader| PollFd::new(wake_reader, PollFlags::IN | PollFlags::HUP)),
+        )
+        .chain([PollFd::new(
+            lifecycle.wake(),
+            PollFlags::IN | PollFlags::HUP,
+        )])
         .collect();
-    let timeout = rustix::event::Timespec::try_from(
-        lifecycle
-            .next_sweep()
-            .saturating_duration_since(std::time::Instant::now()),
-    )
-    .expect("one-second sweep interval fits timespec");
+    let deadline = lifecycle.next_sweep();
     loop {
+        // Recomputed on every retry so interrupted polls keep the deadline.
+        let timeout = poll_timeout(deadline, std::time::Instant::now());
         match poll(&mut descriptors, Some(&timeout)) {
             Ok(_) => break,
             Err(error) if error == rustix::io::Errno::INTR => {}
@@ -145,7 +161,17 @@ fn wait(
             .iter()
             .map(|descriptor| descriptor.revents().contains(PollFlags::IN)),
     );
-    Ok(!descriptors[listeners.len() + 1].revents().is_empty())
+    // The lifecycle wakeup is always the last descriptor.
+    Ok(descriptors
+        .last()
+        .is_some_and(|descriptor| !descriptor.revents().is_empty()))
+}
+
+/// Time left until `deadline` as a poll timeout; zero once it has passed.
+#[cfg(unix)]
+fn poll_timeout(deadline: std::time::Instant, now: std::time::Instant) -> rustix::event::Timespec {
+    rustix::event::Timespec::try_from(deadline.saturating_duration_since(now))
+        .expect("one-second sweep interval fits timespec")
 }
 
 fn accept_ready(listener: &TcpListener, core: &Arc<RuntimeCore>) -> Result<(), RuntimeError> {

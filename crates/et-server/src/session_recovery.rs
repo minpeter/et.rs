@@ -102,12 +102,15 @@ impl ActiveSession {
             .try_clone_stream()
             .map_err(SessionError::Connection)?;
 
-        // Phase 3: install under a short lock.
+        // Phase 3: install under a short lock. Holding the reader slot orders
+        // the swap after any in-progress bridge read of the old transport.
         {
             let mut control = lock_timeout(&self.control, RECOVERY_LOCK_TIMEOUT)?;
             let _write_serial = lock_timeout(&self.write_serial, RECOVERY_LOCK_TIMEOUT)?;
             let mut connection = lock_timeout(&self.connection, RECOVERY_LOCK_TIMEOUT)?;
+            let mut reader = lock_timeout(&self.reader, RECOVERY_LOCK_TIMEOUT)?;
             if self.torn_down.load(Ordering::Acquire) {
+                drop(reader);
                 drop(connection);
                 drop(control);
                 let _ = new_control.shutdown(Shutdown::Both);
@@ -115,6 +118,7 @@ impl ActiveSession {
             }
             let old_control = std::mem::replace(&mut *control, new_control);
             let _ = old_control.shutdown(Shutdown::Both);
+            *reader = candidate.reader_handle();
             *connection = candidate;
             self.connection_generation.fetch_add(1, Ordering::Release);
         }

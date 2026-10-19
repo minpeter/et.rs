@@ -1,6 +1,6 @@
 use std::io;
 use std::net::{Shutdown, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::connection_nonblocking::read_blocking;
@@ -45,9 +45,52 @@ pub enum ConnError {
 pub struct Connection {
     stream: Arc<TcpStream>,
     writer: BackedWriter,
-    reader: BackedReader,
+    /// Shared with [`ConnectionReader`] handles, so a dedicated reader thread
+    /// receives and decrypts without the lock that serializes the writer.
+    reader: Arc<Mutex<BackedReader>>,
     live_write_timeout: Duration,
     pending_live: Option<pending::PendingWrite>,
+}
+
+/// Receive half of a [`Connection`].
+///
+/// A server session's terminal bridge is its only transport reader, while its
+/// output writer takes the session's connection lock for every frame. Reading
+/// through this handle keeps receive and decryption off that lock. The handle
+/// shares the connection's reader state, so a recovery snapshot, disconnect,
+/// or keep-alive acknowledgement through the connection observes every packet
+/// read here.
+pub struct ConnectionReader {
+    stream: Arc<TcpStream>,
+    reader: Arc<Mutex<BackedReader>>,
+}
+
+impl ConnectionReader {
+    /// Read one packet without blocking. An error invalidates the shared
+    /// reader only; the owner disconnects the writer through the connection.
+    pub fn try_read_packet(&self) -> Result<Option<Packet>, ConnError> {
+        let mut reader = lock_reader(&self.reader);
+        let result = crate::connection_nonblocking::try_read(&self.stream, &mut reader);
+        if result.is_err() {
+            reader.invalidate();
+        }
+        result
+    }
+
+    pub fn has_buffered_read(&self) -> bool {
+        lock_reader(&self.reader).has_buffered_data()
+    }
+
+    /// Keep-alive payload acknowledging everything read so far.
+    pub fn keepalive_ack(&self) -> [u8; et_core::keepalive::ACK_PAYLOAD_LEN] {
+        et_core::keepalive::encode_ack(lock_reader(&self.reader).sequence())
+    }
+}
+
+// Every reader mutation completes before it can fail, so state behind a
+// poisoned lock is still consistent.
+fn lock_reader(reader: &Mutex<BackedReader>) -> MutexGuard<'_, BackedReader> {
+    reader.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 pub struct PreparedWrite {
@@ -119,8 +162,10 @@ impl Connection {
         Self {
             stream: Arc::new(stream),
             writer: BackedWriter::new(CryptoHandler::new(key, encrypt), true),
-            reader: BackedReader::new(CryptoHandler::new(key, decrypt), true)
-                .with_max_socket_read(max_socket_read),
+            reader: Arc::new(Mutex::new(
+                BackedReader::new(CryptoHandler::new(key, decrypt), true)
+                    .with_max_socket_read(max_socket_read),
+            )),
             live_write_timeout: DEFAULT_LIVE_WRITE_TIMEOUT,
             pending_live: None,
         }
@@ -214,6 +259,12 @@ impl Connection {
         }
     }
 
+    /// Reserve the next frame for an output writer whose session has its own
+    /// transport reader (see [`ConnectionReader`]). That reader observes a
+    /// peer close, so on Unix this skips the per-frame `MSG_PEEK` probe that
+    /// would contend for the socket lock with its receives. Windows still
+    /// probes: the probe also switches the shared socket to nonblocking mode
+    /// before replay admission.
     pub fn reserve_write_packet(
         &mut self,
         header: u8,
@@ -221,10 +272,6 @@ impl Connection {
     ) -> Result<et_core::backed_writer::ReservedWrite, WritePacketError> {
         if self.pending_live.is_some() {
             return Err(WritePacketError::BeforeReplay(ConnError::Backpressure));
-        }
-        #[cfg(unix)]
-        if self.refresh_connectivity().is_err() {
-            self.disconnect();
         }
         #[cfg(windows)]
         if let Err(error) = self.refresh_connectivity() {
@@ -346,7 +393,8 @@ impl Connection {
 
     pub fn read_packet(&mut self) -> Result<Packet, ConnError> {
         loop {
-            match self.reader.pop() {
+            let item = self.reader().pop();
+            match item {
                 Ok(ReadItem::Packet(packet)) => return Ok(packet),
                 Ok(ReadItem::NeedMore) => {}
                 Err(error) => {
@@ -360,7 +408,7 @@ impl Connection {
                     self.disconnect();
                     return Err(ConnError::Io(io::ErrorKind::UnexpectedEof.into()));
                 }
-                Ok(count) => self.reader.feed(&buffer[..count]),
+                Ok(count) => self.reader().feed(&buffer[..count]),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
                     self.disconnect();
@@ -376,7 +424,8 @@ impl Connection {
 
     pub fn read_packet_until(&mut self, deadline: Instant) -> Result<Packet, ConnError> {
         loop {
-            match self.reader.pop() {
+            let item = self.reader().pop();
+            match item {
                 Ok(ReadItem::Packet(packet)) => {
                     self.stream.set_read_timeout(None).map_err(ConnError::Io)?;
                     return Ok(packet);
@@ -405,7 +454,7 @@ impl Connection {
                     self.disconnect();
                     return Err(ConnError::Io(io::ErrorKind::UnexpectedEof.into()));
                 }
-                Ok(count) => self.reader.feed(&buffer[..count]),
+                Ok(count) => self.reader().feed(&buffer[..count]),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
                     let _ = self.stream.set_read_timeout(None);
@@ -417,16 +466,29 @@ impl Connection {
     }
 
     pub fn try_read_packet(&mut self) -> Result<Option<Packet>, ConnError> {
-        match crate::connection_nonblocking::try_read(&self.stream, &mut self.reader) {
-            Ok(packet) => Ok(packet),
-            Err(error) => {
-                self.disconnect();
-                Err(error)
-            }
+        let result = crate::connection_nonblocking::try_read(&self.stream, &mut self.reader());
+        if result.is_err() {
+            self.disconnect();
+        }
+        result
+    }
+
+    pub fn has_buffered_read(&self) -> bool {
+        self.reader().has_buffered_data()
+    }
+
+    /// Receive half sharing this connection's reader state. Recovery replaces
+    /// the whole connection, so a handle reads only the transport it was
+    /// taken from.
+    pub fn reader_handle(&self) -> ConnectionReader {
+        ConnectionReader {
+            stream: Arc::clone(&self.stream),
+            reader: Arc::clone(&self.reader),
         }
     }
-    pub fn has_buffered_read(&self) -> bool {
-        self.reader.has_buffered_data()
+
+    fn reader(&self) -> MutexGuard<'_, BackedReader> {
+        lock_reader(&self.reader)
     }
 
     pub fn write_terminal(&mut self, bytes: &[u8]) -> Result<(), ConnError> {
@@ -440,7 +502,7 @@ impl Connection {
     pub fn disconnect(&mut self) {
         self.pending_live = None;
         self.writer.invalidate();
-        self.reader.invalidate();
+        self.reader().invalidate();
     }
 
     pub fn shutdown(&mut self) -> Result<(), ConnError> {
@@ -481,7 +543,7 @@ impl Connection {
 
     /// Keep-alive payload acknowledging everything read so far.
     pub fn keepalive_ack(&self) -> [u8; et_core::keepalive::ACK_PAYLOAD_LEN] {
-        et_core::keepalive::encode_ack(self.reader.sequence())
+        et_core::keepalive::encode_ack(self.reader().sequence())
     }
 
     pub fn set_io_timeout(&self, timeout: Option<Duration>) -> Result<(), ConnError> {
@@ -529,7 +591,7 @@ impl Connection {
     }
 
     pub fn reader_sequence(&self) -> i64 {
-        self.reader.sequence()
+        self.reader().sequence()
     }
 
     fn refresh_connectivity(&mut self) -> Result<(), ConnError> {

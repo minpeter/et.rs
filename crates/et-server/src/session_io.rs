@@ -33,31 +33,20 @@ impl ActiveSession {
     }
 
     pub(crate) fn has_buffered_read(&self) -> bool {
-        self.connection
-            .try_lock()
-            .is_ok_and(|connection| connection.has_buffered_read())
+        self.reader
+            .lock()
+            .is_ok_and(|reader| reader.has_buffered_read())
     }
 
+    /// Read through the receive half: the output writer keeps the connection
+    /// lock for its frames, and recovery swaps this handle only between reads.
     pub(crate) fn try_read_packet(&self) -> Result<Option<et_core::packet::Packet>, SessionError> {
-        let packet = {
-            let mut connection = match self.connection.try_lock() {
-                Ok(guard) => guard,
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    if let Some(flow) = self.output_flow() {
-                        flow.set_reader_waiting(true);
-                    }
-                    let guard = self.connection.lock();
-                    if let Some(flow) = self.output_flow() {
-                        flow.set_reader_waiting(false);
-                    }
-                    guard.map_err(|_| SessionError::Unavailable)?
-                }
-                Err(_) => return Err(SessionError::Unavailable),
-            };
-            connection
-                .try_read_packet()
-                .map_err(SessionError::Connection)?
-        };
+        let packet = self
+            .reader
+            .lock()
+            .map_err(|_| SessionError::Unavailable)?
+            .try_read_packet()
+            .map_err(SessionError::Connection)?;
         if !self.pipe_mode {
             if let (Some(flow), Some(packet)) = (self.output_flow(), packet.as_ref()) {
                 if packet.header() == et_core::proto::TerminalPacketType::TerminalBuffer as u8 {
@@ -172,7 +161,7 @@ impl ActiveSession {
         &self,
     ) -> Result<[u8; et_core::keepalive::ACK_PAYLOAD_LEN], SessionError> {
         Ok(self
-            .connection
+            .reader
             .lock()
             .map_err(|_| SessionError::Unavailable)?
             .keepalive_ack())

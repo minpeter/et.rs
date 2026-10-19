@@ -15,6 +15,8 @@ use rustix::event::{poll, PollFd, PollFlags};
 #[cfg(unix)]
 use rustix::time::Timespec;
 
+#[cfg(unix)]
+use crate::session::OutputPump;
 use crate::session::{ActiveSession, SessionError, SessionWriteError};
 
 const READ_BUFFER: usize = 16 * 1024;
@@ -148,6 +150,9 @@ fn run_mode_poll(
     let mut client_buffered = false;
     let mut cached_client: Option<(std::net::TcpStream, u64)> = None;
     let mut fast_poll = et_net::forward::FastPollState::new();
+    // This loop writes the client transport too; nothing else touches it
+    // while the bridge runs.
+    let mut output = OutputPump::new(&session);
     loop {
         if session.is_shutting_down() {
             return Ok(());
@@ -168,9 +173,11 @@ fn run_mode_poll(
             if let Some(packet) = pending_terminal.take() {
                 pending_terminal =
                     send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
-                session.flush_bridge_outbound();
             }
         }
+        // Write queued output before deciding how long to sleep. A frame
+        // still waiting for transport room keeps POLLOUT in the poll set.
+        let output_state = output.run();
         if !connected {
             cached_client = None;
         } else if cached_client.as_ref().map(|(_, gen)| *gen) != Some(connection_generation) {
@@ -204,15 +211,10 @@ fn run_mode_poll(
         if pending_outbound.is_empty() {
             forwarder.collect_fast_poll_routes(&mut fast_poll);
         }
-        let (terminal_events, wake_events, forward_events, client_events) = wait(
-            &terminal,
-            &wake,
-            forwarder.wake().map_err(forward_error)?,
-            cached_client.as_ref().map(|(stream, _)| stream),
-            terminal_flags,
-            // Keep draining the shared transport while the bounded spill has
-            // room. Once full, stop polling readability to avoid a busy-loop;
-            // per-socket credit makes that state transient for windowed peers.
+        // Keep draining the shared transport while the bounded spill has
+        // room. Once full, stop polling readability to avoid a busy-loop;
+        // per-socket credit makes that state transient for windowed peers.
+        let client_policy = output_wait_policy(
             client_wait_policy(
                 pending_local.is_some()
                     || pending_forward.len() >= FORWARD_BACKLOG_CAPACITY
@@ -223,11 +225,26 @@ fn run_mode_poll(
                         && lookahead_terminal.is_some()
                         && session.can_buffer_write((READ_BUFFER * 2) as i64)?),
             ),
+            output_state.deadline,
+            output_state.wake,
+        );
+        let (terminal_events, wake_events, forward_events, client_events) = wait(
+            &terminal,
+            &wake,
+            forwarder.wake().map_err(forward_error)?,
+            cached_client.as_ref().map(|(stream, _)| stream),
+            terminal_flags,
+            client_policy,
             pending_outbound.is_empty().then_some(&fast_poll),
         )?;
-        let client_events_are_stale = wake_events.intersects(PollFlags::IN | PollFlags::HUP);
-        if client_events_are_stale {
+        let woken = wake_events.intersects(PollFlags::IN | PollFlags::HUP);
+        if woken {
             drain(&mut wake)?;
+        }
+        // An output completion that reopened a refused lane or changed
+        // connectivity is this thread's own wake.
+        let client_events_are_stale = woken || output_state.wake;
+        if client_events_are_stale {
             if session.is_shutting_down() {
                 return Ok(());
             }
@@ -363,7 +380,6 @@ fn run_mode_poll(
                     break;
                 }
             }
-            session.flush_bridge_outbound();
         }
         if terminal_eof && pending_terminal.is_none() && lookahead_terminal.is_none() {
             finish_killed_session(&session);
@@ -536,7 +552,6 @@ fn run_mode_poll(
                     break;
                 }
             }
-            session.flush_bridge_outbound();
         }
     }
 }
@@ -854,6 +869,7 @@ fn flush_outbound(
             break;
         }
     }
+    #[cfg(windows)]
     session.flush_bridge_outbound();
     Ok(())
 }
@@ -1034,6 +1050,27 @@ fn client_wait_policy(
     } else {
         Some(Duration::from_millis(100))
     };
+    (client_flags, timeout)
+}
+
+/// Add queued output to the client wait: poll for room for a pending frame,
+/// at most until its live-write deadline. A completion that changed what the
+/// loop waits on (lane capacity, connectivity) makes the next poll return
+/// immediately.
+#[cfg(unix)]
+fn output_wait_policy(
+    (mut client_flags, mut timeout): (PollFlags, Option<Duration>),
+    deadline: Option<std::time::Instant>,
+    wake: bool,
+) -> (PollFlags, Option<Duration>) {
+    if let Some(deadline) = deadline {
+        client_flags |= PollFlags::OUT;
+        let until = deadline.saturating_duration_since(std::time::Instant::now());
+        timeout = Some(timeout.map_or(until, |timeout| timeout.min(until)));
+    }
+    if wake {
+        timeout = Some(Duration::ZERO);
+    }
     (client_flags, timeout)
 }
 
@@ -1319,7 +1356,7 @@ mod tests {
             4096,
         )
         .unwrap();
-        session.start_flow_writer();
+        session.start_output();
         let bridge_session = Arc::clone(&session);
         let bridge = thread::spawn(move || {
             run_mode(

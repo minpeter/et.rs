@@ -9,6 +9,8 @@ use et_core::proto::FlowControlMode;
 use et_net::connection::{ConnError, Connection, WritePacketError};
 use prost::Message;
 
+#[cfg(unix)]
+use super::OutputPump;
 use super::{
     session_flow::{FlowControl, FlowWriteResult},
     ActiveSession, SessionError, SessionWriteError,
@@ -128,13 +130,9 @@ fn exit_status_waits_for_queued_and_in_flight_output() {
 #[cfg(unix)]
 #[test]
 fn final_in_flight_completion_wakes_bridge_after_control_capacity_reopens() {
-    use rustix::event::{poll, PollFd, PollFlags};
-    use rustix::time::Timespec;
-    use std::io::Read;
-
-    // Given: a bounded control lane with one in-flight packet that still
-    // owns its capacity. The bridge's next forwarding packet cannot enter.
-    let (server, mut client) = connection_pair();
+    // Given: a bounded control lane whose only packet is still partly on the
+    // wire. It owns its capacity, so the bridge's next packet is refused.
+    let (server, client) = connection_pair();
     let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
     let session = Arc::new(
         ActiveSession::new(
@@ -144,43 +142,41 @@ fn final_in_flight_completion_wakes_bridge_after_control_capacity_reopens() {
         )
         .unwrap(),
     );
-    let mut wake = session.take_wake_reader().unwrap();
-    wake.set_nonblocking(true).unwrap();
-    let (reached_tx, reached_rx) = mpsc::sync_channel(1);
-    let (release_tx, release_rx) = mpsc::sync_channel(1);
-    *session.prepared_write_hook.lock().unwrap() = Some((reached_tx, release_rx));
-    session.start_flow_writer();
+    session
+        .connection
+        .lock()
+        .unwrap()
+        .shrink_transport_window_for_tests(4 * 1024)
+        .unwrap();
+    session.start_output();
+    let mut output = OutputPump::new(&session);
     session.send_packet_owned(7, &vec![3; 60 * 1024]).unwrap();
-    reached_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+    assert!(
+        output.run().deadline.is_some(),
+        "the frame must wait for transport room"
+    );
     assert!(matches!(
         session.send_packet_owned(7, &vec![4; 16 * 1024]),
         Err(SessionWriteError::BeforeReplay(SessionError::Connection(
             ConnError::Backpressure
         )))
     ));
-    let mut bytes = [0; 64];
-    loop {
-        match wake.read(&mut bytes) {
-            Ok(count) => assert!(count > 0),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(error) => panic!("draining earlier bridge wake: {error}"),
-        }
-    }
-    let mut descriptors = [PollFd::new(&wake, PollFlags::IN)];
-    let timeout = Timespec::try_from(Duration::from_secs(1)).unwrap();
 
-    // When: the final writer completes; there is no next queue pop to wake
-    // the bridge, and no new inbound network traffic.
-    release_tx.send(()).unwrap();
-    assert_eq!(client.read_packet().unwrap().payload(), vec![3; 60 * 1024]);
-    let ready = poll(&mut descriptors, Some(&timeout)).unwrap();
-    session.shutdown().unwrap();
+    // When: that final frame completes; no later queue pop or inbound
+    // network traffic follows to wake the session loop.
+    let (stream, _) = session.try_clone_stream().unwrap();
+    let reader = thread::spawn(move || {
+        let mut client = client;
+        client.read_packet().unwrap()
+    });
+    let outcome = output.run_until_idle(&stream);
 
-    // Then: the bridge observes the precise capacity-reopened event.
-    assert_eq!(
-        ready, 1,
+    // Then: the loop learns the refused lane reopened from its own write.
+    assert!(
+        outcome.wake,
         "final control completion stranded the bridge's retained packet"
     );
+    assert_eq!(reader.join().unwrap().payload(), vec![3; 60 * 1024]);
 }
 
 fn connection_pair() -> (Connection, Connection) {
@@ -236,15 +232,16 @@ fn default_none_preserves_write_ownership_for_exact_once_retry() {
 #[test]
 fn graceful_hup_drains_and_joins_a_deliberately_blocked_writer() {
     for mode in [FlowControlMode::Backpressure, FlowControlMode::Discard] {
-        // Given: a flow writer has removed the final packet from its queue but
-        // is deterministically blocked before taking the connection lock.
+        // Given: the final packet is queued while its writer is
+        // deterministically blocked before taking the connection lock.
         let (server, mut client) = connection_pair();
         let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
         let session = Arc::new(ActiveSession::new(server, &terminal, Some(mode as i32)).unwrap());
-        session.start_flow_writer();
+        session.start_output();
         let connection = session.connection.lock().unwrap();
         session.send_packet(47, b"final-packet").unwrap();
         let flow = session.flow_control.as_ref().unwrap();
+        #[cfg(windows)]
         flow.wait_in_flight();
 
         // When: terminal HUP requests graceful completion while the write is blocked.
@@ -265,6 +262,8 @@ fn graceful_hup_drains_and_joins_a_deliberately_blocked_writer() {
     }
 }
 
+// Windows only: there a writer thread owns output and `finish_terminal` joins it.
+#[cfg(windows)]
 #[test]
 fn terminal_finish_fails_and_joins_after_unrecoverable_before_replay() {
     let (server, mut client) = connection_pair();
@@ -321,6 +320,39 @@ fn terminal_finish_fails_and_joins_after_unrecoverable_before_replay() {
     assert!(client.read_packet().is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn graceful_finish_fails_when_final_output_only_reaches_replay() {
+    // Given: the final packet is queued and its transport has dropped, but
+    // the flow queue has not observed the disconnect yet.
+    let (server, mut client) = connection_pair();
+    client
+        .set_io_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
+    let session = Arc::new(
+        ActiveSession::new(
+            server,
+            &terminal,
+            Some(FlowControlMode::Backpressure as i32),
+        )
+        .unwrap(),
+    );
+    session.start_output();
+    session.send_packet(58, b"replay-only").unwrap();
+    session.connection.lock().unwrap().disconnect();
+
+    // When: terminal EOF drains the queue on the finishing thread.
+    let error = session.finish_terminal().unwrap_err();
+
+    // Then: the frame only reached replay, so completion is a typed failure
+    // and the client sees no output.
+    assert!(matches!(error, SessionError::Connection(ConnError::Io(_))));
+    assert!(client.read_packet().is_err());
+}
+
+// Windows only: there a writer thread owns output and `shutdown` joins it.
+#[cfg(windows)]
 #[test]
 fn hard_shutdown_wakes_and_joins_a_deliberately_blocked_writer() {
     // Given: a writer blocked after taking ownership of a queued packet.
@@ -329,7 +361,7 @@ fn hard_shutdown_wakes_and_joins_a_deliberately_blocked_writer() {
     let session = Arc::new(
         ActiveSession::new(server, &terminal, Some(FlowControlMode::Discard as i32)).unwrap(),
     );
-    session.start_flow_writer();
+    session.start_output();
     let connection = session.connection.lock().unwrap();
     session.send_packet(48, b"discardable").unwrap();
     let flow = session.flow_control.as_ref().unwrap();
@@ -783,17 +815,18 @@ fn concurrent_hard_stop_cannot_be_downgraded_to_graceful_drain() {
         )
         .unwrap(),
     );
-    session.start_flow_writer();
+    session.start_output();
     let connection = session.connection.lock().unwrap();
     session.send_packet(49, b"must-not-drain").unwrap();
     let flow = session.flow_control.as_ref().unwrap();
+    #[cfg(windows)]
     flow.wait_in_flight();
 
     // When: hard shutdown wins before a concurrent terminal HUP asks for graceful stop.
     flow.stop_hard();
     flow.stop_gracefully();
     drop(connection);
-    session.join_flow_writer(true).unwrap();
+    session.stop_output(true).unwrap();
 
     // Then: the hard-stopped writer does not drain the packet after transport unblocks.
     assert!(client.read_packet().is_err());

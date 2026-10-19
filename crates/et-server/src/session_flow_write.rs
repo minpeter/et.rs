@@ -95,6 +95,61 @@ pub(crate) fn write_packet(
     }
 }
 
+#[cfg(unix)]
+pub(crate) enum NonblockingWrite {
+    /// The frame waits for transport room until this live-write deadline.
+    Pending(std::time::Instant),
+    Done(FlowWriteResult, bool),
+}
+
+/// Start `packet`'s frame, or advance it once `started`, without blocking.
+/// Both steps hold `write_serial` and the connection lock, so a synchronous
+/// writer finishes a still-pending frame before it assigns its own.
+#[cfg(unix)]
+pub(crate) fn write_nonblocking(
+    session: &ActiveSession,
+    flow: &FlowControl,
+    packet: &Packet,
+    started: bool,
+) -> NonblockingWrite {
+    let Ok(_write_serial) = session.write_serial.lock() else {
+        return NonblockingWrite::Done(FlowWriteResult::Fatal(SessionError::Unavailable), false);
+    };
+    let Ok(mut connection) = session.connection.lock() else {
+        return NonblockingWrite::Done(FlowWriteResult::Fatal(SessionError::Unavailable), false);
+    };
+    if flow.is_hard_stopped() {
+        return NonblockingWrite::Done(FlowWriteResult::Fatal(SessionError::Unavailable), false);
+    }
+    let step = if started {
+        connection.advance_write()
+    } else {
+        connection
+            .start_write_packet_owned_unprobed(packet.header(), packet.payload())
+            .map(|()| !connection.write_pending())
+    };
+    let result = match step {
+        Ok(true) => FlowWriteResult::Delivered,
+        Ok(false) => match connection.pending_write_deadline() {
+            Some(deadline) => return NonblockingWrite::Pending(deadline),
+            None => FlowWriteResult::Delivered,
+        },
+        Err(WritePacketError::BeforeReplay(ConnError::Io(error))) => {
+            FlowWriteResult::BeforeReplay(SessionError::Connection(ConnError::Io(error)))
+        }
+        Err(WritePacketError::BeforeReplay(error)) => {
+            FlowWriteResult::Fatal(SessionError::Connection(error))
+        }
+        Err(WritePacketError::ReplayOwned(error)) => {
+            FlowWriteResult::ReplayOwned(SessionError::Connection(error))
+        }
+    };
+    if !matches!(result, FlowWriteResult::Delivered) {
+        connection.disconnect();
+    }
+    NonblockingWrite::Done(result, connection.connected())
+}
+
 pub(crate) fn finish_pending_packet(
     session: &ActiveSession,
     flow: &FlowControl,

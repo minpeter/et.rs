@@ -196,11 +196,20 @@ impl ActiveSession {
         self.shutdown.load(Ordering::Acquire)
     }
 
+    /// Wake the terminal bridge. Never blocks: a full wake channel already
+    /// holds a pending wake.
     pub(super) fn signal(&self) -> Result<(), SessionError> {
-        self.wake_writer
+        let mut wake = self
+            .wake_writer
             .lock()
-            .map_err(|_| SessionError::Unavailable)?
-            .write_all(&[1])
-            .map_err(SessionError::Io)
+            .map_err(|_| SessionError::Unavailable)?;
+        loop {
+            match wake.write(&[1]) {
+                Ok(_) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(SessionError::Io(error)),
+            }
+        }
     }
 }

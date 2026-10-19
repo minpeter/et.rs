@@ -10,7 +10,7 @@ use et_core::backed_writer::{
 };
 use et_core::flow_control::FlowControlMode as QueueMode;
 use et_core::packet::Packet;
-use et_net::connection::{ConnError, Connection};
+use et_net::connection::{ConnError, Connection, ConnectionReader};
 
 /// How long `recover` may wait for the session mutexes.
 ///
@@ -104,6 +104,11 @@ use session_flow::FlowControl;
 
 pub(crate) struct ActiveSession {
     connection: Mutex<Connection>,
+    /// Receive half of `connection`. The terminal bridge is the session's only
+    /// transport reader; reading here keeps receive and decryption off the
+    /// connection lock that the output writer takes for every frame. Recovery
+    /// replaces it together with `connection`.
+    reader: Mutex<ConnectionReader>,
     // Always acquire before connection when assigning/sending output frames.
     write_serial: Mutex<()>,
     #[cfg(test)]
@@ -235,10 +240,12 @@ impl ActiveSession {
         let control = connection
             .try_clone_stream()
             .map_err(SessionError::Connection)?;
+        let reader = connection.reader_handle();
         let terminal_control = terminal.try_clone().map_err(SessionError::Io)?;
         let (wake_reader, wake_writer) = et_net::local::wake_pair().map_err(SessionError::Io)?;
         Ok(Self {
             connection: Mutex::new(connection),
+            reader: Mutex::new(reader),
             write_serial: Mutex::new(()),
             #[cfg(test)]
             prepared_write_hook: Mutex::new(None),

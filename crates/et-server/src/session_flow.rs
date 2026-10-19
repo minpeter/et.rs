@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use et_core::flow_control::{
@@ -119,8 +119,6 @@ impl WriterState {
 pub(super) struct FlowControl {
     state: Mutex<WriterState>,
     wake: Condvar,
-    reader_waiting: AtomicBool,
-    writer_waiting_for_reader: AtomicBool,
     #[cfg(test)]
     enqueue_hook: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
 }
@@ -149,8 +147,6 @@ impl FlowControl {
                 input: et_core::output_interrupt::InterruptInput::default(),
             }),
             wake: Condvar::new(),
-            reader_waiting: AtomicBool::new(false),
-            writer_waiting_for_reader: AtomicBool::new(false),
             #[cfg(test)]
             enqueue_hook: Mutex::new(None),
         }
@@ -391,15 +387,6 @@ impl FlowControl {
         }
     }
 
-    pub(super) fn set_reader_waiting(&self, waiting: bool) {
-        self.reader_waiting.store(waiting, Ordering::Release);
-        if !waiting && self.writer_waiting_for_reader.swap(false, Ordering::AcqRel) {
-            if let Ok(_state) = self.state.lock() {
-                self.wake.notify_all();
-            }
-        }
-    }
-
     pub(super) fn stop_gracefully(&self) {
         if let Ok(mut state) = self.state.lock() {
             // A recovery pause owns the connection snapshot until its permit
@@ -480,29 +467,11 @@ impl FlowControl {
                         || (state.queue.is_empty()
                             && state.pending_live_in_flight.is_none()
                             && state.in_flight)
-                        || {
-                            if self.reader_waiting.load(Ordering::Acquire) {
-                                self.writer_waiting_for_reader
-                                    .store(true, Ordering::Release);
-                                true
-                            } else {
-                                false
-                            }
-                        }
                 }
                 StopMode::Running => {
                     state.paused
                         || !state.connected
                         || (state.queue.is_empty() && state.pending_live_in_flight.is_none())
-                        || {
-                            if self.reader_waiting.load(Ordering::Acquire) {
-                                self.writer_waiting_for_reader
-                                    .store(true, Ordering::Release);
-                                true
-                            } else {
-                                false
-                            }
-                        }
                 }
             })
             .ok()?;

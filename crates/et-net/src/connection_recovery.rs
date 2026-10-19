@@ -85,7 +85,7 @@ impl Connection {
         let mut candidate = Self {
             stream: std::sync::Arc::new(new_stream),
             writer: self.writer.clone(),
-            reader: self.reader.clone(),
+            reader: std::sync::Arc::new(std::sync::Mutex::new(self.reader().clone())),
             live_write_timeout: self.live_write_timeout,
             pending_live: None,
         };
@@ -111,13 +111,13 @@ impl Connection {
         match self.exchange_recovery(deadline, exchange) {
             Ok(remote_catchup) => {
                 let catchup = if let Some(salt) = exchange.reset_salt.as_ref() {
-                    self.reader.reset(salt).map_err(|_| invalid_reset())?;
+                    self.reader().reset(salt).map_err(|_| invalid_reset())?;
                     self.writer.reset(salt).map_err(|_| invalid_reset())?;
                     Vec::new()
                 } else {
                     remote_catchup.buffer
                 };
-                self.reader.revive(catchup)?;
+                self.reader().revive(catchup)?;
                 self.writer.revive();
                 self.set_io_timeout(None)?;
                 Ok(())
@@ -150,7 +150,7 @@ impl Connection {
         match self.exchange_recovery(deadline, exchange) {
             Ok(remote_catchup) => {
                 let salt = exchange.reset_salt.as_ref().unwrap();
-                self.reader.reset(salt).map_err(|_| invalid_reset())?;
+                self.reader().reset(salt).map_err(|_| invalid_reset())?;
                 self.writer.reset(salt).map_err(|_| invalid_reset())?;
                 if !remote_catchup.buffer.is_empty() {
                     return Err(ConnError::Io(io::Error::new(
@@ -158,7 +158,7 @@ impl Connection {
                         "reset recovery received a non-empty catchup",
                     )));
                 }
-                self.reader.revive(Vec::new())?;
+                self.reader().revive(Vec::new())?;
                 self.writer.revive();
                 self.set_io_timeout(None)?;
                 Ok(())
@@ -188,7 +188,7 @@ impl Connection {
     /// discarded.
     pub fn authenticate_peer(&mut self, timeout: Duration) -> Result<(), ConnError> {
         let packet = self.read_live_packet_until(recovery_deadline(timeout)?)?;
-        self.reader.unread(packet);
+        self.reader().unread(packet);
         self.set_io_timeout(None)?;
         Ok(())
     }
@@ -199,7 +199,11 @@ impl Connection {
         exchange: RecoveryExchange,
     ) -> Result<CatchupBuffer, ConnError> {
         let resetting = exchange.reset_salt.is_some();
-        let local_sequence = if resetting { 0 } else { self.reader.sequence() };
+        let local_sequence = if resetting {
+            0
+        } else {
+            self.reader().sequence()
+        };
         let wire_sequence = i32::try_from(local_sequence)
             .map_err(|_| ConnError::SequenceOutOfRange(local_sequence))?;
         let mut stream = self.stream.try_clone()?;
@@ -287,7 +291,8 @@ impl Connection {
 
     fn read_live_packet_until(&mut self, deadline: Instant) -> Result<Packet, ConnError> {
         loop {
-            match self.reader.pop_live() {
+            let item = self.reader().pop_live();
+            match item {
                 Ok(ReadItem::Packet(packet)) => return Ok(packet),
                 Ok(ReadItem::NeedMore) => {}
                 Err(error) => {
@@ -302,7 +307,7 @@ impl Connection {
                     self.disconnect();
                     return Err(ConnError::Io(io::ErrorKind::UnexpectedEof.into()));
                 }
-                Ok(count) => self.reader.feed(&buffer[..count]),
+                Ok(count) => self.reader().feed(&buffer[..count]),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
                     self.disconnect();

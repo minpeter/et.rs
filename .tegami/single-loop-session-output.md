@@ -1,0 +1,11 @@
+---
+packages:
+  et:
+    type: patch
+---
+
+### One thread per server session on Unix
+
+- **The terminal bridge writes its own output:** a server session no longer starts a separate output writer thread on Linux and macOS. The bridge loop that already reads the client, the terminal and forwarded sockets now also writes queued output to the client without blocking, waiting for socket room in the same `poll`, as upstream's `TerminalServer::runTerminal` drains its `WriteBuffer` in its select loop. Two threads no longer send and receive on one TCP socket at once, so the kernel socket lock stops forcing context switches, and an idle server session has one thread fewer. Flow control, Ctrl+C output discarding, exit-status ordering, recovery pauses and replay are unchanged; when the terminal ends, the remaining output is delivered on the same thread before the session closes.
+- **Wakes never block:** waking the session loop no longer blocks the caller when the wake channel is full.
+- Windows keeps its writer thread: its bridge cannot wait on the client socket together with its other sources.

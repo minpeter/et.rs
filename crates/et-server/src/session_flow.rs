@@ -1,5 +1,10 @@
+#[cfg(windows)]
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Condvar, Mutex, Weak};
+#[cfg(windows)]
+use std::sync::{Arc, Weak};
+use std::sync::{Condvar, Mutex};
+#[cfg(unix)]
+use std::time::Instant;
 
 use et_core::flow_control::{
     is_terminal_output, FlowControlMode, OutputLane, OutputQueue, QueuePushError,
@@ -195,6 +200,9 @@ impl FlowControl {
         }
     }
 
+    /// Windows bridge output: writes directly while nothing is queued or in
+    /// flight, otherwise stages the packet for the writer thread.
+    #[cfg(windows)]
     pub(super) fn enqueue_bridge_owned(
         &self,
         session: &ActiveSession,
@@ -320,6 +328,7 @@ impl FlowControl {
         }
     }
 
+    #[cfg(windows)]
     pub(super) fn flush_bridge_wake(&self) {
         if let Ok(mut state) = self.state.lock() {
             if state.pending_live_in_flight.is_some() {
@@ -416,7 +425,7 @@ impl FlowControl {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(super) fn wait_in_flight(&self) {
         let state = self.state.lock().unwrap();
         drop(
@@ -456,25 +465,22 @@ impl FlowControl {
 
     fn next_item(&self) -> Option<(Packet, bool)> {
         let state = self.state.lock().ok()?;
-        let mut state = self
-            .wake
-            .wait_while(state, |state| match state.stop {
-                StopMode::Hard => false,
-                StopMode::Graceful => {
-                    state.paused
-                        || (!state.connected
-                            && (!state.queue.is_empty() || state.pending_live_in_flight.is_some()))
-                        || (state.queue.is_empty()
-                            && state.pending_live_in_flight.is_none()
-                            && state.in_flight)
-                }
-                StopMode::Running => {
-                    state.paused
-                        || !state.connected
-                        || (state.queue.is_empty() && state.pending_live_in_flight.is_none())
-                }
-            })
-            .ok()?;
+        let mut state = self.wake.wait_while(state, writer_must_wait).ok()?;
+        self.take_item(&mut state)
+    }
+
+    /// [`Self::next_item`] for the session loop: `None` wherever a blocking
+    /// writer would wait.
+    #[cfg(unix)]
+    fn try_next_item(&self) -> Option<(Packet, bool)> {
+        let mut state = self.state.lock().ok()?;
+        if writer_must_wait(&mut state) {
+            return None;
+        }
+        self.take_item(&mut state)
+    }
+
+    fn take_item(&self, state: &mut WriterState) -> Option<(Packet, bool)> {
         match state.stop {
             StopMode::Hard => None,
             StopMode::Graceful
@@ -495,6 +501,18 @@ impl FlowControl {
                 self.wake.notify_all();
                 Some((packet, false))
             }
+        }
+    }
+
+    /// The session loop stopped while `packet`'s frame was still partly on
+    /// the wire. The blocking drain that follows finishes that frame first.
+    #[cfg(unix)]
+    fn hand_back_live(&self, packet: Packet) {
+        if let Ok(mut state) = self.state.lock() {
+            debug_assert!(state.pending_live_in_flight.is_none());
+            state.pending_live_in_flight = Some(packet);
+            state.in_flight = false;
+            self.wake.notify_all();
         }
     }
 
@@ -568,6 +586,57 @@ impl FlowControl {
     }
 }
 
+/// Whether a writer must wait before taking its next item.
+fn writer_must_wait(state: &mut WriterState) -> bool {
+    match state.stop {
+        StopMode::Hard => false,
+        StopMode::Graceful => {
+            state.paused
+                || (!state.connected
+                    && (!state.queue.is_empty() || state.pending_live_in_flight.is_some()))
+                || (state.queue.is_empty()
+                    && state.pending_live_in_flight.is_none()
+                    && state.in_flight)
+        }
+        StopMode::Running => {
+            state.paused
+                || !state.connected
+                || (state.queue.is_empty() && state.pending_live_in_flight.is_none())
+        }
+    }
+}
+
+/// Write one item taken by [`FlowControl::next_item`], blocking until its
+/// frame is on the wire or fails. Returns whether the writer keeps running
+/// and whether the bridge must re-check backpressure or connection state.
+fn write_item(
+    session: &ActiveSession,
+    flow: &FlowControl,
+    packet: Packet,
+    is_pending_live: bool,
+) -> (bool, bool) {
+    let (result, connected) = if is_pending_live {
+        writer::finish_pending_packet(session, flow)
+    } else {
+        writer::write_packet(session, flow, &packet)
+    };
+    flow.complete_with_signal(packet, &result, connected)
+}
+
+/// Deliver what the session loop left queued, on the calling thread, until
+/// the queue stops. The terminal bridge has exited, so nothing needs waking.
+#[cfg(unix)]
+pub(super) fn write_until_stopped(session: &ActiveSession, flow: &FlowControl) {
+    while let Some((packet, is_pending_live)) = flow.next_item() {
+        if flow.is_hard_stopped() || !write_item(session, flow, packet, is_pending_live).0 {
+            return;
+        }
+    }
+}
+
+/// Windows writer thread. The bridge there cannot poll the client socket
+/// together with its other sources, so a thread owns blocking writes.
+#[cfg(windows)]
 pub(super) fn run_writer(session: Weak<ActiveSession>, flow: Arc<FlowControl>) {
     while let Some((packet, is_pending_live)) = flow.next_item() {
         if flow.is_hard_stopped() {
@@ -576,12 +645,7 @@ pub(super) fn run_writer(session: Weak<ActiveSession>, flow: Arc<FlowControl>) {
         let Some(session) = session.upgrade() else {
             return;
         };
-        let (result, connected) = if is_pending_live {
-            writer::finish_pending_packet(&session, &flow)
-        } else {
-            writer::write_packet(&session, &flow, &packet)
-        };
-        let (running, should_signal) = flow.complete_with_signal(packet, &result, connected);
+        let (running, should_signal) = write_item(&session, &flow, packet, is_pending_live);
         // In-flight packets still own queue capacity until complete. Wake
         // after releasing it when the bridge observed backpressure or a
         // state transition: a signal before the write can strand the
@@ -591,6 +655,106 @@ pub(super) fn run_writer(session: Weak<ActiveSession>, flow: Arc<FlowControl>) {
         }
         if !running {
             return;
+        }
+    }
+}
+
+/// Session-loop output (Unix): writes queued packets without blocking, so
+/// one thread both reads and writes the client transport, as upstream
+/// `TerminalServer::runTerminal` drains its `WriteBuffer` in its select loop.
+#[cfg(unix)]
+pub(crate) struct OutputPump<'a> {
+    session: &'a ActiveSession,
+    /// Packet whose frame is partly on the wire. It keeps its queue capacity
+    /// and the in-flight state recovery waits on until the frame completes.
+    live: Option<Packet>,
+}
+
+#[cfg(unix)]
+pub(crate) struct PumpOutcome {
+    /// Live-write deadline while a frame waits for transport room.
+    pub(crate) deadline: Option<Instant>,
+    /// A completion changed state the loop waits on (lane capacity,
+    /// connectivity, stop); re-check before sleeping.
+    pub(crate) wake: bool,
+}
+
+#[cfg(unix)]
+impl<'a> OutputPump<'a> {
+    pub(crate) fn new(session: &'a ActiveSession) -> Self {
+        Self {
+            session,
+            live: None,
+        }
+    }
+
+    /// Write until the queue is empty or paused, or a frame waits for room.
+    /// A partly written frame keeps advancing during a recovery pause, which
+    /// waits for it.
+    pub(crate) fn run(&mut self) -> PumpOutcome {
+        let mut outcome = PumpOutcome {
+            deadline: None,
+            wake: false,
+        };
+        let Some(flow) = self.session.output_flow() else {
+            return outcome;
+        };
+        loop {
+            let (packet, started) = match self.live.take() {
+                Some(packet) => (packet, true),
+                None => match flow.try_next_item() {
+                    Some(item) => item,
+                    None => return outcome,
+                },
+            };
+            match writer::write_nonblocking(self.session, flow, &packet, started) {
+                writer::NonblockingWrite::Pending(deadline) => {
+                    self.live = Some(packet);
+                    outcome.deadline = Some(deadline);
+                    return outcome;
+                }
+                writer::NonblockingWrite::Done(result, connected) => {
+                    let (running, should_signal) =
+                        flow.complete_with_signal(packet, &result, connected);
+                    outcome.wake |= should_signal;
+                    if !running {
+                        return outcome;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OutputPump<'_> {
+    fn drop(&mut self) {
+        if let (Some(packet), Some(flow)) = (self.live.take(), self.session.output_flow()) {
+            flow.hand_back_live(packet);
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+impl OutputPump<'_> {
+    /// Run like the session loop until nothing more can be written now,
+    /// waiting on `stream` for room. `wake` reports any completion's wake.
+    pub(crate) fn run_until_idle(&mut self, stream: &std::net::TcpStream) -> PumpOutcome {
+        let mut woke = false;
+        loop {
+            let mut outcome = self.run();
+            woke |= outcome.wake;
+            let Some(deadline) = outcome.deadline else {
+                outcome.wake = woke;
+                return outcome;
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let timeout = rustix::time::Timespec::try_from(remaining).unwrap();
+            let mut descriptors = [rustix::event::PollFd::new(
+                stream,
+                rustix::event::PollFlags::OUT,
+            )];
+            let _ = rustix::event::poll(&mut descriptors, Some(&timeout));
         }
     }
 }

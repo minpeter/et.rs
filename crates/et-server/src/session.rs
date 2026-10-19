@@ -101,6 +101,8 @@ mod session_io;
 #[path = "session_recovery.rs"]
 mod session_recovery;
 use session_flow::FlowControl;
+#[cfg(unix)]
+pub(crate) use session_flow::OutputPump;
 
 pub(crate) struct ActiveSession {
     connection: Mutex<Connection>,
@@ -148,6 +150,7 @@ pub(crate) struct ActiveSession {
     connection_generation: AtomicU64,
     flow_control: Option<Arc<FlowControl>>,
     default_output: OnceLock<Arc<FlowControl>>,
+    #[cfg(windows)]
     flow_writer: Mutex<Option<std::thread::JoinHandle<()>>>,
     bridge_generation: Mutex<u64>,
     bridge_changed: Condvar,
@@ -243,6 +246,11 @@ impl ActiveSession {
         let reader = connection.reader_handle();
         let terminal_control = terminal.try_clone().map_err(SessionError::Io)?;
         let (wake_reader, wake_writer) = et_net::local::wake_pair().map_err(SessionError::Io)?;
+        // A full wake channel already holds a pending wake; `signal` must not
+        // block a producer while the bridge is not draining it.
+        wake_writer
+            .set_nonblocking(true)
+            .map_err(SessionError::Io)?;
         Ok(Self {
             connection: Mutex::new(connection),
             reader: Mutex::new(reader),
@@ -264,6 +272,7 @@ impl ActiveSession {
             connection_generation: AtomicU64::new(0),
             flow_control: queue_mode.map(|mode| Arc::new(FlowControl::new(mode))),
             default_output: OnceLock::new(),
+            #[cfg(windows)]
             flow_writer: Mutex::new(None),
             bridge_generation: Mutex::new(0),
             bridge_changed: Condvar::new(),
@@ -314,18 +323,32 @@ impl ActiveSession {
         self.forward_exit_status.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn start_flow_writer(self: &Arc<Self>) {
-        // Bootstrap/control handshakes remain synchronous. Once the terminal
-        // bridge starts, even default sessions stage output before replay.
-        let state = Arc::clone(self.flow_control.as_ref().unwrap_or_else(|| {
-            self.default_output
-                .get_or_init(|| Arc::new(FlowControl::new_default()))
-        }));
+    /// Stage terminal-bridge output in the flow queue from now on;
+    /// bootstrap and control handshakes before this stay synchronous. The
+    /// Unix bridge writes the queue from its own poll loop ([`OutputPump`]).
+    #[cfg(unix)]
+    pub(crate) fn start_output(&self) {
+        self.staged_output();
+    }
+
+    /// Stage terminal-bridge output in the flow queue from now on. Windows
+    /// cannot poll the client socket together with the bridge's other
+    /// sources, so a writer thread owns blocking writes there.
+    #[cfg(windows)]
+    pub(crate) fn start_output(self: &Arc<Self>) {
+        let state = Arc::clone(self.staged_output());
         let session = Arc::downgrade(self);
         let handle = std::thread::spawn(move || session_flow::run_writer(session, state));
         if let Ok(mut writer) = self.flow_writer.lock() {
             *writer = Some(handle);
         }
+    }
+
+    fn staged_output(&self) -> &Arc<FlowControl> {
+        self.flow_control.as_ref().unwrap_or_else(|| {
+            self.default_output
+                .get_or_init(|| Arc::new(FlowControl::new_default()))
+        })
     }
 
     fn output_flow(&self) -> Option<&Arc<FlowControl>> {
@@ -377,7 +400,7 @@ impl ActiveSession {
     }
 
     /// Terminal-bridge output. The bridge thread is the session's only
-    /// transport reader, so once the flow writer runs, every packet it emits
+    /// transport reader, so once output starts, every packet it emits
     /// (forwarding and control included) is staged in the bounded queue; a
     /// synchronous write here would stall client input behind a peer that is
     /// not draining. Other callers keep `send_packet_owned` semantics:
@@ -388,8 +411,12 @@ impl ActiveSession {
         packet: Packet,
     ) -> Result<(), (Packet, SessionWriteError)> {
         if let Some(state) = self.output_flow() {
-            return state
-                .enqueue_bridge_owned(self, packet)
+            // The Unix bridge writes the queue itself after enqueueing.
+            #[cfg(unix)]
+            let staged = state.enqueue_owned(packet);
+            #[cfg(windows)]
+            let staged = state.enqueue_bridge_owned(self, packet);
+            return staged
                 .map_err(|(packet, error)| (packet, SessionWriteError::BeforeReplay(error)));
         }
         match self.send_packet_owned(packet.header(), packet.payload()) {
@@ -398,6 +425,7 @@ impl ActiveSession {
         }
     }
 
+    #[cfg(windows)]
     pub(crate) fn flush_bridge_outbound(&self) {
         if let Some(state) = self.output_flow() {
             state.flush_bridge_wake();
@@ -417,9 +445,13 @@ impl ActiveSession {
             self.flow_control.is_some()
                 || header == et_core::proto::TerminalPacketType::TerminalBuffer as u8
         }) {
-            return state
+            state
                 .enqueue(Packet::new(header, payload))
-                .map_err(SessionWriteError::BeforeReplay);
+                .map_err(SessionWriteError::BeforeReplay)?;
+            // The Unix bridge writes queued output from its poll loop.
+            #[cfg(unix)]
+            let _ = self.signal();
+            return Ok(());
         }
         // While a recover holds the single-flight permit, queue terminal
         // output instead of contending on the connection mutex for the
@@ -520,7 +552,7 @@ impl ActiveSession {
 
     pub(crate) fn finish_terminal(&self) -> Result<(), SessionError> {
         self.shutdown.store(true, Ordering::Release);
-        let flow_result = self.join_flow_writer(true);
+        let flow_result = self.stop_output(true);
         let _ = self.signal();
         let terminal = self
             .terminal_control
@@ -560,7 +592,7 @@ impl ActiveSession {
             self.torn_down.store(true, Ordering::Release);
         }
         self.shutdown.store(true, Ordering::Release);
-        self.join_flow_writer(false)?;
+        self.stop_output(false)?;
         let _ = self.signal();
         let terminal = self
             .terminal_control
@@ -582,21 +614,29 @@ impl ActiveSession {
         connection.shutdown().map_err(SessionError::Connection)
     }
 
-    fn join_flow_writer(&self, graceful: bool) -> Result<(), SessionError> {
+    /// Stop output. A graceful stop delivers what is still queued first: on
+    /// Unix on this thread, after the terminal bridge loop has exited; on
+    /// Windows by joining the writer thread.
+    fn stop_output(&self, graceful: bool) -> Result<(), SessionError> {
         if let Some(state) = self.output_flow() {
             if graceful {
                 state.stop_gracefully();
+                #[cfg(unix)]
+                session_flow::write_until_stopped(self, state);
             } else {
                 state.stop_hard();
             }
         }
-        let handle = self
-            .flow_writer
-            .lock()
-            .map_err(|_| SessionError::Unavailable)?
-            .take();
-        if handle.is_some_and(|handle| handle.join().is_err()) {
-            return Err(SessionError::Unavailable);
+        #[cfg(windows)]
+        {
+            let handle = self
+                .flow_writer
+                .lock()
+                .map_err(|_| SessionError::Unavailable)?
+                .take();
+            if handle.is_some_and(|handle| handle.join().is_err()) {
+                return Err(SessionError::Unavailable);
+            }
         }
         if graceful
             && self
@@ -610,17 +650,13 @@ impl ActiveSession {
         }
         Ok(())
     }
-
-    fn stop_flow_writer(&self) {
-        if let Some(state) = self.output_flow() {
-            state.stop_hard();
-        }
-    }
 }
 
 impl Drop for ActiveSession {
     fn drop(&mut self) {
-        self.stop_flow_writer();
+        if let Some(state) = self.output_flow() {
+            state.stop_hard();
+        }
     }
 }
 

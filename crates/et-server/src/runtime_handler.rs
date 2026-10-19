@@ -615,7 +615,7 @@ fn handle_new(
             .disconnect_timeout_seconds
             .unwrap_or(core.disconnect_timeout_seconds),
     ));
-    active.start_flow_writer();
+    active.start_output();
     let identity = start.registration().identity();
     if start.activate(active.clone()).is_err() {
         crate::diag::info(format!("id={id}: could not activate session for {peer}"));
@@ -774,7 +774,7 @@ fn run_jumphost(
             .disconnect_timeout_seconds
             .unwrap_or(core.disconnect_timeout_seconds),
     ));
-    active.start_flow_writer();
+    active.start_output();
     let identity = start.registration().identity();
     if start.activate(active.clone()).is_err() {
         crate::diag::info(format!("id={id}: jumphost could not activate session"));
@@ -1018,7 +1018,7 @@ fn resume_pty_session(
             .disconnect_timeout_seconds
             .unwrap_or(core.disconnect_timeout_seconds),
     ));
-    active.start_flow_writer();
+    active.start_output();
     let identity = start.registration().identity();
     if start.activate(active.clone()).is_err() {
         return;

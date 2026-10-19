@@ -10,13 +10,13 @@ use et_net::connection::Connection;
 use prost::Message;
 use rustix::event::{poll, PollFd, PollFlags};
 
-use super::ActiveSession;
+use super::{ActiveSession, OutputPump};
 
 const TIMEOUT: Duration = Duration::from_secs(3);
 
 #[test]
-fn prepared_terminal_and_synchronous_control_preserve_encrypted_frame_order() {
-    // Given a real terminal frame paused after encryption but before socket send.
+fn pending_terminal_frame_and_synchronous_control_preserve_encrypted_frame_order() {
+    // Given a real terminal frame the session loop has only partly written.
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (server, _) = listener.accept().unwrap();
@@ -31,48 +31,37 @@ fn prepared_terminal_and_synchronous_control_preserve_encrypted_frame_order() {
         )
         .unwrap(),
     );
-    let (prepared_tx, prepared_rx) = mpsc::sync_channel(1);
-    let (release_tx, release_rx) = mpsc::sync_channel(1);
-    *session.prepared_write_hook.lock().unwrap() = Some((prepared_tx, release_rx));
-    session.start_flow_writer();
-    let terminal = terminal(b"terminal-first\n");
+    session
+        .connection
+        .lock()
+        .unwrap()
+        .shrink_transport_window_for_tests(4 * 1024)
+        .unwrap();
+    session.start_output();
+    let mut output = OutputPump::new(&session);
+    let terminal = terminal(&vec![b't'; 60 * 1024]);
     session
         .send_packet(terminal.header(), terminal.payload())
         .unwrap();
-    prepared_rx.recv_timeout(TIMEOUT).unwrap();
+    assert!(
+        output.run().deadline.is_some(),
+        "the terminal frame must wait for transport room"
+    );
 
-    // When synchronous control traffic arrives at that exact physical-write gap.
-    // The lock probe only chooses a deterministic schedule, never the assertion:
-    // before the fix the control send completes before releasing the first frame;
-    // after the fix it must wait behind the physical writer.
-    let writer_owned = match session.write_serial.try_lock() {
-        Ok(guard) => {
-            drop(guard);
-            false
-        }
-        Err(std::sync::TryLockError::WouldBlock) => true,
-        Err(error) => panic!("write lock poisoned: {error}"),
-    };
-    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    // When synchronous control traffic is sent before that frame completes.
     let sending = Arc::clone(&session);
     let control = control();
     let expected_control = control.clone();
-    let sender = std::thread::spawn(move || {
-        done_tx
-            .send(sending.send_packet(control.header(), control.payload()))
-            .unwrap();
-    });
-    if !writer_owned {
-        done_rx.recv_timeout(TIMEOUT).unwrap().unwrap();
-    }
-    release_tx.send(()).unwrap();
+    let sender =
+        std::thread::spawn(move || sending.send_packet(control.header(), control.payload()));
     let first = client.read_packet();
     let second = client.read_packet();
-    if writer_owned {
-        done_rx.recv_timeout(TIMEOUT).unwrap().unwrap();
-    }
-    sender.join().unwrap();
+    sender.join().unwrap().unwrap();
+    // The synchronous writer finished the loop's frame; nothing is left.
+    assert!(output.run().deadline.is_none());
+    drop(output);
     session.shutdown().unwrap();
+
     // Then the actual peer decrypts whole frames in their assigned nonce order.
     assert_eq!(first.unwrap(), terminal);
     assert_eq!(second.unwrap(), expected_control);
@@ -145,11 +134,14 @@ fn output_after_interrupt(bytes: &[u8]) -> Vec<Packet> {
         )
         .unwrap(),
     );
-    session.start_flow_writer();
+    session.start_output();
+    let mut output = OutputPump::new(&session);
+    let (stream, _) = session.try_clone_stream().unwrap();
     let first = terminal(b"replay prefix\n");
     session
         .send_packet(first.header(), first.payload())
         .unwrap();
+    output.run_until_idle(&stream);
     assert_eq!(client.read_packet().unwrap(), first);
 
     // Existing recovery admission deterministically retains output before any
@@ -170,7 +162,6 @@ fn output_after_interrupt(bytes: &[u8]) -> Vec<Packet> {
     client
         .write_packet(interrupt.header(), interrupt.payload())
         .unwrap();
-    let (stream, _) = session.try_clone_stream().unwrap();
     let deadline = Instant::now() + TIMEOUT;
     let input = loop {
         if let Some(packet) = session.try_read_packet().unwrap() {
@@ -207,8 +198,10 @@ fn output_after_interrupt(bytes: &[u8]) -> Vec<Packet> {
         done_tx.send(packets).unwrap();
     });
     drop(permit);
+    output.run_until_idle(&stream);
     let packets = done_rx.recv_timeout(TIMEOUT).unwrap();
     reader.join().unwrap();
+    drop(output);
     session.shutdown().unwrap();
     packets
 }

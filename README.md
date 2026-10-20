@@ -212,6 +212,10 @@ configuration injection; ET applies the command to the session, not bootstrap.
   entries are considered before `SendEnv`, and entries that do not fit are
   omitted. Non-POSIX sessions also receive `SetEnv` and `SendEnv`, with first-wins
   case-insensitive name deduplication and reserved-name checks.
+  These limits apply to what the `et` client sends, so et.rs 0.0.43 and older
+  servers keep working. An et.rs `etserver` and `etterminal` accept what an ET C++
+  client sends, like upstream: messages up to 128 MiB, any number of variables of
+  any length, and any name `setenv` accepts.
 
 ### Local multiplexing and control (Unix)
 
@@ -285,9 +289,11 @@ server. OpenSSH on Windows must be reachable.
 - Reconnecting client and server sessions with backed reader/writer replay.
 - Non-TTY sessions survive local input EOF (including redirected Windows handles)
   while reporting recognizable SSH bootstrap diagnostics.
-  Protocol v6 has no terminal-stdin half-close: a raw `-T` command that requires
-  stdin EOF (for example `cat`) cannot finish from redirected local EOF alone.
-  Use a command with explicit framing/length instead; `-W` has separate half-close semantics.
+  Like `ssh -T`, a raw `-T` command sees EOF when the client's stdin ends
+  (`et -T host 'wc -c' < file` finishes). This needs an et.rs client and an et.rs
+  `etterminal`; ET C++ has no such signal, so its client or terminal leaves the
+  command reading. On a terminal, Ctrl-D in `-T` ends the command's input instead
+  of closing `et`. `-W` has separate half-close semantics.
 - SSH bootstrap (`IDPASSKEY` handshake), remote PTY, window resize, keepalives, `--command`
   execution, and `--no-terminal` mode.
 - Forward, reverse, Unix-socket, port-range, environment-variable named-pipe, and ssh-style

@@ -125,8 +125,8 @@ impl ResolvedSshConfig {
                         let (name, value) = assignment
                             .split_once('=')
                             .ok_or(ClientError::SshConfigMalformed("setenv"))?;
-                        if !crate::terminal_protocol::valid_environment_name(name)
-                            || value.len() > crate::terminal_protocol::MAX_ENV_VALUE
+                        if !crate::client_environment::portable_environment_name(name)
+                            || value.len() > crate::client_environment::MAX_ENV_VALUE
                         {
                             return Err(ClientError::SshConfigMalformed("setenv"));
                         }
@@ -420,8 +420,8 @@ fn parse_ssh_config(
                 let (name, value) = value
                     .split_once('=')
                     .ok_or(ClientError::SshConfigMalformed("setenv"))?;
-                if !crate::terminal_protocol::valid_environment_name(name)
-                    || value.len() > crate::terminal_protocol::MAX_ENV_VALUE
+                if !crate::client_environment::portable_environment_name(name)
+                    || value.len() > crate::client_environment::MAX_ENV_VALUE
                     || value.contains(['\0', '\r'])
                 {
                     return Err(ClientError::SshConfigMalformed("setenv"));

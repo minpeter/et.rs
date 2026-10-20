@@ -8,7 +8,13 @@ use std::time::{Duration, Instant};
 
 use et_core::packet::{Packet, PacketError};
 
-pub const MAX_LOCAL_PACKET_LEN: usize = 64 * 1024;
+/// Largest serialized local packet, its two header bytes included, and the
+/// largest protobuf the upstream router stream carries: upstream
+/// `SocketHandler::readPacket` and `readProto` accept up to 128 MiB.
+pub const MAX_LOCAL_PACKET_LEN: usize = 128 * 1024 * 1024;
+/// Largest registration packet the router reads, header included: upstream
+/// `UserTerminalRouter::MAX_REGISTRATION_LENGTH`.
+pub const MAX_REGISTRATION_LEN: usize = 4096;
 /// Local-only control packets. These values are deliberately outside the
 /// protocol-v6 terminal enum and never cross the encrypted network transport.
 pub const REGISTRATION_STATUS: u8 = 254;
@@ -18,6 +24,10 @@ const PREFIX_LEN: usize = std::mem::size_of::<i64>();
 /// How long a blocking local packet writer naps before retrying a `WouldBlock`
 /// write on non-Unix or generic `Write` streams.
 const BACKPRESSURE_RETRY: Duration = Duration::from_micros(100);
+/// Payload bytes a reader makes room for ahead of what has arrived. Like
+/// upstream `BackedReader`, a declared length is never allocated up front, so
+/// a peer that announces a large message but sends little costs little.
+const PAYLOAD_READ_STEP: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub enum LocalPacketError {
@@ -27,6 +37,7 @@ pub enum LocalPacketError {
     NegativeLength,
     FrameTooLarge {
         length: i64,
+        limit: usize,
     },
     MalformedPacket(PacketError),
     TrailingData,
@@ -42,8 +53,8 @@ impl std::fmt::Display for LocalPacketError {
             Self::TruncatedPrefix => write!(f, "local packet length prefix is truncated"),
             Self::TruncatedPayload => write!(f, "local packet payload is truncated"),
             Self::NegativeLength => write!(f, "local packet length is negative"),
-            Self::FrameTooLarge { length } => {
-                write!(f, "local packet length {length} exceeds 64 KiB")
+            Self::FrameTooLarge { length, limit } => {
+                write!(f, "local packet length {length} exceeds {limit} bytes")
             }
             Self::MalformedPacket(error) => write!(f, "malformed local packet: {error}"),
             Self::TrailingData => write!(f, "local registration contains trailing data"),
@@ -68,19 +79,44 @@ impl std::error::Error for LocalPacketError {
 pub fn read_local_packet<R: Read>(reader: &mut R) -> Result<Packet, LocalPacketError> {
     let mut prefix = [0u8; PREFIX_LEN];
     read_exact_classified(reader, &mut prefix, LocalPacketError::TruncatedPrefix)?;
-    let length = parse_length(prefix)?;
-    let mut serialized = vec![0u8; length];
-    read_exact_classified(reader, &mut serialized, LocalPacketError::TruncatedPayload)?;
-    Packet::from_serialized(&serialized).map_err(LocalPacketError::MalformedPacket)
+    let length = parse_length(prefix, MAX_LOCAL_PACKET_LEN)?;
+    let mut header = [0u8; et_core::packet::HEADER_LEN];
+    let header_len = length.min(et_core::packet::HEADER_LEN);
+    read_exact_classified(
+        reader,
+        &mut header[..header_len],
+        LocalPacketError::TruncatedPayload,
+    )?;
+    if length < et_core::packet::HEADER_LEN {
+        return Err(LocalPacketError::MalformedPacket(PacketError::Short));
+    }
+    let body_len = length - et_core::packet::HEADER_LEN;
+    let mut payload = Vec::new();
+    while payload.len() < body_len {
+        let filled = payload.len();
+        grow_payload(&mut payload, filled, body_len);
+        read_exact_classified(
+            reader,
+            &mut payload[filled..],
+            LocalPacketError::TruncatedPayload,
+        )?;
+    }
+    Ok(Packet::raw(header[0] != 0, header[1], payload))
+}
+
+/// The error every local writer returns for a packet over
+/// [`MAX_LOCAL_PACKET_LEN`].
+fn packet_too_large() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("local packet exceeds {MAX_LOCAL_PACKET_LEN} bytes"),
+    )
 }
 
 pub fn encode_local_packet(packet: &Packet) -> io::Result<Vec<u8>> {
     let wire_len = packet.wire_len();
     if wire_len > MAX_LOCAL_PACKET_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "local packet exceeds 64 KiB",
-        ));
+        return Err(packet_too_large());
     }
     let length = i64::try_from(wire_len)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "local packet too large"))?;
@@ -183,20 +219,24 @@ pub struct RouterHead {
 impl RouterHead {
     /// Head for a plaintext message of `payload_len` bytes.
     ///
-    /// Rejects a message over the 64 KiB local cap. [`RouterFraming::Upstream`]
-    /// also rejects types upstream never writes to a terminal and a payload
-    /// on `TERMINAL_CLOSE`.
+    /// [`RouterFraming::Upstream`] carries a protobuf of up to
+    /// [`MAX_LOCAL_PACKET_LEN`] (upstream `writeProto`) and rejects types
+    /// upstream never writes to a terminal and a payload on `TERMINAL_CLOSE`;
+    /// [`RouterFraming::Packets`] carries a packet of up to
+    /// [`MAX_LOCAL_PACKET_LEN`], header included.
     pub fn new(header: u8, payload_len: usize, framing: RouterFraming) -> io::Result<Self> {
-        let too_large =
-            || io::Error::new(io::ErrorKind::InvalidInput, "local packet exceeds 64 KiB");
-        if payload_len > MAX_LOCAL_PACKET_LEN - et_core::packet::HEADER_LEN {
-            return Err(too_large());
+        let max_payload_len = match framing {
+            RouterFraming::Packets => MAX_LOCAL_PACKET_LEN - et_core::packet::HEADER_LEN,
+            RouterFraming::Upstream => MAX_LOCAL_PACKET_LEN,
+        };
+        if payload_len > max_payload_len {
+            return Err(packet_too_large());
         }
         let mut bytes = [0u8; ROUTER_HEAD_MAX];
         let len = match framing {
             RouterFraming::Packets => {
                 let length = i64::try_from(et_core::packet::HEADER_LEN + payload_len)
-                    .map_err(|_| too_large())?;
+                    .map_err(|_| packet_too_large())?;
                 bytes[..PREFIX_LEN].copy_from_slice(&length.to_ne_bytes());
                 bytes[PREFIX_LEN + 1] = header;
                 ROUTER_HEAD_MAX
@@ -207,7 +247,7 @@ impl RouterHead {
                     1
                 }
                 Some(UpstreamMessage::Proto) => {
-                    let length = i64::try_from(payload_len).map_err(|_| too_large())?;
+                    let length = i64::try_from(payload_len).map_err(|_| packet_too_large())?;
                     bytes[0] = header;
                     bytes[1..=PREFIX_LEN].copy_from_slice(&length.to_ne_bytes());
                     1 + PREFIX_LEN
@@ -331,15 +371,13 @@ const TERMINAL_FRAME_HEAD_MAX: usize = PREFIX_LEN + et_core::packet::HEADER_LEN 
 const STDERR_SUFFIX: [u8; 2] = [0x10, 0x01];
 
 impl TerminalBufferFrame {
-    /// Frame `output_len` bytes of terminal output; rejects frames over 64 KiB.
+    /// Frame `output_len` bytes of terminal output; rejects frames over
+    /// [`MAX_LOCAL_PACKET_LEN`].
     pub fn new(output_len: usize, is_stderr: bool) -> io::Result<Self> {
         // Reject oversized output before sizing the payload, so the length
         // arithmetic below stays far from `usize::MAX`.
         if output_len > MAX_LOCAL_PACKET_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "local packet exceeds 64 KiB",
-            ));
+            return Err(packet_too_large());
         }
         let mut varint = [0u8; 10];
         let mut varint_len = 0usize;
@@ -359,10 +397,7 @@ impl TerminalBufferFrame {
         };
         let wire_len = et_core::packet::HEADER_LEN + payload_len;
         if wire_len > MAX_LOCAL_PACKET_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "local packet exceeds 64 KiB",
-            ));
+            return Err(packet_too_large());
         }
         let length = i64::try_from(wire_len)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "local packet too large"))?;
@@ -563,7 +598,11 @@ fn flush_blocking<W: Write>(writer: &mut W, cancelled: &impl Fn() -> bool) -> io
     }
 }
 
+/// Reads one length-prefixed packet, from a stream that may block or from
+/// bytes fed to it. The payload grows as bytes arrive (see
+/// [`PAYLOAD_READ_STEP`]), however large the declared length.
 pub struct LocalPacketDecoder {
+    max_packet_len: usize,
     prefix: [u8; PREFIX_LEN],
     prefix_len: usize,
     expected: Option<usize>,
@@ -581,8 +620,17 @@ impl Default for LocalPacketDecoder {
 }
 
 impl LocalPacketDecoder {
+    /// A decoder for packets of up to [`MAX_LOCAL_PACKET_LEN`].
     pub fn new() -> Self {
+        Self::with_limit(MAX_LOCAL_PACKET_LEN)
+    }
+
+    /// A decoder that rejects a declared length over `max_packet_len` bytes,
+    /// header included, as [`LocalPacketError::FrameTooLarge`]. Limits above
+    /// [`MAX_LOCAL_PACKET_LEN`] are clamped to it.
+    pub fn with_limit(max_packet_len: usize) -> Self {
         Self {
+            max_packet_len: max_packet_len.min(MAX_LOCAL_PACKET_LEN),
             prefix: [0; PREFIX_LEN],
             prefix_len: 0,
             expected: None,
@@ -616,10 +664,7 @@ impl LocalPacketDecoder {
             self.prefix_len += count;
             offset += count;
             if self.prefix_len == PREFIX_LEN {
-                let expected = parse_length(self.prefix)?;
-                self.payload
-                    .reserve(expected.saturating_sub(et_core::packet::HEADER_LEN));
-                self.expected = Some(expected);
+                self.expected = Some(parse_length(self.prefix, self.max_packet_len)?);
             }
         }
         if let Some(expected) = self.expected {
@@ -633,14 +678,15 @@ impl LocalPacketDecoder {
             }
             if self.header_len == hdr_target {
                 let body_len = expected.saturating_sub(et_core::packet::HEADER_LEN);
-                let remaining = body_len.saturating_sub(self.filled);
-                let count = remaining.min(input.len().saturating_sub(offset));
-                if self.payload.len() == self.filled {
-                    self.payload
-                        .extend_from_slice(&input[offset..offset + count]);
-                } else {
-                    self.payload[self.filled..self.filled + count]
-                        .copy_from_slice(&input[offset..offset + count]);
+                let remaining = body_len - self.filled;
+                let count = remaining.min(input.len() - offset);
+                let chunk = &input[offset..offset + count];
+                // `read_from` may already have made room past `filled`.
+                let room = (self.payload.len() - self.filled).min(count);
+                self.payload[self.filled..self.filled + room].copy_from_slice(&chunk[..room]);
+                if room < count {
+                    reserve_payload(&mut self.payload, self.filled + count, body_len);
+                    self.payload.extend_from_slice(&chunk[room..]);
                 }
                 self.filled += count;
                 offset += count;
@@ -681,10 +727,7 @@ impl LocalPacketDecoder {
                 Ok(count) => {
                     self.prefix_len += count;
                     if self.prefix_len == PREFIX_LEN {
-                        let expected = parse_length(self.prefix)?;
-                        self.payload
-                            .resize(expected.saturating_sub(et_core::packet::HEADER_LEN), 0);
-                        self.expected = Some(expected);
+                        self.expected = Some(parse_length(self.prefix, self.max_packet_len)?);
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
@@ -713,7 +756,8 @@ impl LocalPacketDecoder {
             }
             let body_len = expected - et_core::packet::HEADER_LEN;
             while self.filled < body_len {
-                match reader.read(&mut self.payload[self.filled..body_len]) {
+                grow_payload(&mut self.payload, self.filled, body_len);
+                match reader.read(&mut self.payload[self.filled..]) {
                     Ok(0) => {
                         return Err(LocalPacketError::Io(io::ErrorKind::UnexpectedEof.into()));
                     }
@@ -793,7 +837,8 @@ struct UpstreamRouterDecoder {
     header: Option<u8>,
     length: [u8; PREFIX_LEN],
     length_len: usize,
-    payload: Option<Vec<u8>>,
+    body_len: Option<usize>,
+    payload: Vec<u8>,
     filled: usize,
 }
 
@@ -818,41 +863,64 @@ impl UpstreamRouterDecoder {
                 }
             }
         };
-        while self.payload.is_none() {
+        let body_len = loop {
+            if let Some(body_len) = self.body_len {
+                break body_len;
+            }
             let start = self.length_len;
             let Some(count) = read_ready(reader, &mut self.length[start..])? else {
                 return Ok(None);
             };
             self.length_len += count;
             if self.length_len == PREFIX_LEN {
-                self.payload = Some(vec![0; parse_proto_length(self.length)?]);
+                self.body_len = Some(parse_proto_length(self.length)?);
             }
+        };
+        while self.filled < body_len {
+            grow_payload(&mut self.payload, self.filled, body_len);
+            let Some(count) = read_ready(reader, &mut self.payload[self.filled..])? else {
+                return Ok(None);
+            };
+            self.filled += count;
         }
-        if let Some(payload) = self.payload.as_mut() {
-            while self.filled < payload.len() {
-                let Some(count) = read_ready(reader, &mut payload[self.filled..])? else {
-                    return Ok(None);
-                };
-                self.filled += count;
-            }
-        }
-        let packet = Packet::new(header, self.payload.take().unwrap_or_default());
+        let packet = Packet::new(header, std::mem::take(&mut self.payload));
         *self = Self::default();
         Ok(Some(packet))
     }
 }
 
-/// Upstream `readProto` length: the protobuf alone, capped so the message
-/// still fits a 64 KiB local packet.
+/// Upstream `readProto` length: the protobuf alone, up to
+/// [`MAX_LOCAL_PACKET_LEN`] like upstream's `DEFAULT_MAX_PROTO_LENGTH`.
 fn parse_proto_length(prefix: [u8; PREFIX_LEN]) -> Result<usize, LocalPacketError> {
-    let length = i64::from_ne_bytes(prefix);
-    if length < 0 {
-        return Err(LocalPacketError::NegativeLength);
+    parse_length(prefix, MAX_LOCAL_PACKET_LEN)
+}
+
+/// Make room for the next read of a `body_len`-byte payload whose first
+/// `filled` bytes arrived: once those fill the initialized part, extend it by
+/// at most one [`PAYLOAD_READ_STEP`]. A payload of up to one step gets its
+/// exact size in one allocation.
+fn grow_payload(payload: &mut Vec<u8>, filled: usize, body_len: usize) {
+    if payload.len() == filled {
+        let len = body_len.min(filled + PAYLOAD_READ_STEP);
+        reserve_payload(payload, len, body_len);
+        payload.resize(len, 0);
     }
-    usize::try_from(length)
-        .ok()
-        .filter(|length| *length <= MAX_LOCAL_PACKET_LEN - et_core::packet::HEADER_LEN)
-        .ok_or(LocalPacketError::FrameTooLarge { length })
+}
+
+/// Let `payload` hold `needed` bytes of a `body_len`-byte payload. The
+/// capacity starts at one [`PAYLOAD_READ_STEP`] and at most doubles from
+/// there, like upstream `BackedReader` appending to its partial message, so
+/// it stays within twice the bytes received plus one step and never exceeds
+/// `body_len`.
+fn reserve_payload(payload: &mut Vec<u8>, needed: usize, body_len: usize) {
+    if needed <= payload.capacity() {
+        return;
+    }
+    let capacity = needed
+        .max(PAYLOAD_READ_STEP)
+        .max(payload.capacity().saturating_mul(2))
+        .min(body_len);
+    payload.reserve_exact(capacity - payload.len());
 }
 
 /// One `read` into a non-empty `buffer`: `Ok(None)` when it would block, and
@@ -872,15 +940,15 @@ fn read_ready<R: Read>(
     }
 }
 
-fn parse_length(prefix: [u8; PREFIX_LEN]) -> Result<usize, LocalPacketError> {
+fn parse_length(prefix: [u8; PREFIX_LEN], limit: usize) -> Result<usize, LocalPacketError> {
     let length = i64::from_ne_bytes(prefix);
     if length < 0 {
         return Err(LocalPacketError::NegativeLength);
     }
-    if length > MAX_LOCAL_PACKET_LEN as i64 {
-        return Err(LocalPacketError::FrameTooLarge { length });
-    }
-    usize::try_from(length).map_err(|_| LocalPacketError::FrameTooLarge { length })
+    usize::try_from(length)
+        .ok()
+        .filter(|length| *length <= limit)
+        .ok_or(LocalPacketError::FrameTooLarge { length, limit })
 }
 
 fn read_exact_classified<R: Read>(

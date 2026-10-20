@@ -73,6 +73,7 @@ where
         decoder: RouterStreamDecoder::new(framing),
         stdin: Some(stdin),
         pending: Vec::new(),
+        input_ended: false,
         outputs: [Some(stdout), Some(stderr)],
         next_output: 0,
         output: vec![0; MAX_OUTPUT_CHUNK],
@@ -111,6 +112,9 @@ struct PipeSession {
     stdin: Option<ChildStdin>,
     /// Input the command has not accepted yet.
     pending: Vec<u8>,
+    /// The client's stdin ended (an empty TERMINAL_BUFFER, `-T` EOF): close
+    /// stdin once `pending` is written and ignore later input.
+    input_ended: bool,
     /// stdout then stderr; `None` once at EOF.
     outputs: [Option<OwnedFd>; 2],
     /// Output stream served first on the next read, alternating under load.
@@ -134,9 +138,10 @@ impl PipeSession {
     fn pump(&mut self, child: &mut Child) -> Result<Option<i32>, String> {
         loop {
             let stdout_done = self.outputs[STDOUT].is_none();
-            if stdout_done && self.pending.is_empty() {
+            if (stdout_done || self.input_ended) && self.pending.is_empty() {
                 // A redirected last command (`cat >file`) EOFs stdout while
-                // still reading: flush accepted input, then close stdin.
+                // still reading, and the client may end its input: flush
+                // accepted input, then close stdin.
                 self.stdin = None;
             }
             let backlog = self.backlog();
@@ -154,8 +159,11 @@ impl PipeSession {
                     return Ok(Some(code));
                 }
             }
-            let accept_input =
-                self.stdin.is_some() && !stdout_done && self.pending.len() < MAX_PENDING_INPUT;
+            // After stdin closes on client EOF, keep reading the router:
+            // later input is ignored, TERMINAL_CLOSE still ends the session.
+            let accept_input = (self.stdin.is_some() || self.input_ended)
+                && !stdout_done
+                && self.pending.len() < MAX_PENDING_INPUT;
             let mut router_flags = PollFlags::empty();
             if accept_input {
                 router_flags |= PollFlags::IN;
@@ -229,7 +237,12 @@ impl PipeSession {
                     else {
                         break;
                     };
-                    if take_input(packet, &mut self.stdin, &mut self.pending)? {
+                    if take_input(
+                        packet,
+                        &mut self.stdin,
+                        &mut self.pending,
+                        &mut self.input_ended,
+                    )? {
                         return Ok(None);
                     }
                 }

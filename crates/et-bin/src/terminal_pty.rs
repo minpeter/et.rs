@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use et_core::proto::FlowControlMode;
 use et_net::local::LocalStream;
-use et_net::local_packet::{RouterFraming, RouterStreamDecoder};
+use et_net::local_packet::{
+    status_packet, write_local_packet, RouterFraming, RouterStreamDecoder, STARTUP_STATUS,
+};
 #[cfg(unix)]
 use nix::sys::signal::{kill, Signal};
 #[cfg(unix)]
@@ -881,6 +883,16 @@ fn try_reconnect(resume: &RouterResume) -> Result<(LocalStream, RouterFraming), 
         resume.had_reverse_tunnels,
         resume.disconnect_timeout_seconds,
     )?;
+    if framing == RouterFraming::Packets {
+        // Only et.rs 0.0.43 and older answer with the bare success byte. They
+        // wait for a STARTUP_STATUS after every `fd = -6` registration, a
+        // resumed live pty included, and would swallow the session's first
+        // output while waiting. Answer before anything else is written. A
+        // current etserver (`RouterFraming::Upstream`) does not wait for one
+        // on resume and would reject it.
+        write_local_packet(&mut router, &status_packet(STARTUP_STATUS, Ok(())))
+            .map_err(|error| format!("could not report resumed terminal startup: {error}"))?;
+    }
     Ok((router, framing))
 }
 

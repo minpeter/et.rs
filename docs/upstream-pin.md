@@ -674,8 +674,8 @@ et.rs now writes and reads upstream's stream (`et_net::local_packet::RouterFrami
   restart in either order. A terminal re-checks the marker whenever it
   re-registers, so a session also survives `etserver` switching between et.rs
   and C++.
-- A local message stays capped at 64 KiB; upstream's `readProto` accepts
-  128 MiB.
+- Local messages, registrations and `TERMINAL_INIT` environments are accepted
+  as upstream accepts them; see the next section.
 
 Three bugs surfaced in the live check and are fixed with it:
 
@@ -683,7 +683,9 @@ Three bugs surfaced in the live check and are fixed with it:
   re-registered after an `etserver` restart. Such a pty never sends one, so
   the router read the resumed session's first output itself: the output was
   lost, or the client printed `malformed terminal output` and reconnected a
-  second time. Restarting into et.rs 0.0.43 or older still has this race.
+  second time. A new `etterminal` also answers the startup check of et.rs
+  0.0.43 or older when it re-registers (next section), so only a 0.0.43
+  `etterminal` restarting into a 0.0.43 `etserver` still has this race.
 - `et --jumphost` gave the jump terminal its provisional `XXX` credentials.
   Upstream `SshSetupHandler::SetupSsh` gives it the pair the destination
   `etterminal` answered with, which an ET C++ `etterminal` regenerates.
@@ -706,6 +708,50 @@ Live check (2026-10-20, loopback, ET-C++ built from
 | `--jumphost`, et.rs terminals behind a C++ jump server | et.rs and C++ clients | pass | pass |
 | `etserver` restart under a live session | 0.0.43→new with 0.0.43 and new terminals, C++→new, new→C++, new→new | — | pass |
 | et.rs 0.0.43 peer | new `etserver` + 0.0.43 `etterminal`, 0.0.43 `etserver` + new `etterminal` | — | pass |
+
+No network wire, handshake, crypto or `PROTOCOL_VERSION` change.
+
+### Local limits, environment and `-T` stdin EOF (et.rs 0.0.44)
+
+Reviewed against upstream master
+[`7ee361a`](https://github.com/MisterTea/EternalTerminal/commit/7ee361a75fbb3e0900445b110188996fbe950823).
+Upstream `SocketHandler::readPacket` takes a local packet of up to 128 MiB and
+`readProto` a router protobuf of up to `DEFAULT_MAX_PROTO_LENGTH` (128 MiB);
+`UserTerminalRouter` refuses a registration over `MAX_REGISTRATION_LENGTH`
+(4096 bytes); `UserTerminalHandler::run` calls `setenv` for every
+`TERMINAL_INIT` entry and ignores failures.
+
+- et.rs accepts the same: `MAX_LOCAL_PACKET_LEN` is 128 MiB and
+  `MAX_REGISTRATION_LEN` 4096 bytes. Readers grow their buffer as bytes arrive,
+  like upstream's network `BackedReader`, instead of allocating a declared
+  length up front (upstream's `readPacket` allocates it). `etterminal` applies
+  any number of variables of any length and skips only entries `setenv`
+  rejects; 0.0.43 failed the session on more than 128 entries, a value over
+  4096 bytes or a name outside `[A-Za-z_][A-Za-z0-9_]*`, and the server could
+  not write a `TERMINAL_INIT` over 64 KiB.
+- The `et` client keeps its own limits (128 variables, 4096-byte values,
+  portable names, a 64 KiB `TERMINAL_INIT`) because every et.rs `etserver` and
+  `etterminal` through 0.0.43 accepts that; upstream's client has none.
+- `-T` goes beyond upstream, like `ssh -T`: when the client's stdin ends it
+  sends one `TERMINAL_BUFFER` whose `buffer` is present and empty, and an et.rs
+  pipe `etterminal` closes the command's stdin after the input before it.
+  Upstream's `TerminalClient` never sends an empty buffer (it skips empty
+  reads), its `etserver` relays this one unchanged, and its `etterminal` and
+  et.rs 0.0.43 append nothing for it, so no protobuf field is needed. With a
+  C++ client or terminal the command keeps reading.
+- A new `etterminal` that re-registers with et.rs 0.0.43 or older (bare success
+  status) sends `STARTUP_STATUS` at once, so that server's router stops
+  waiting before the resumed session's output arrives.
+
+Live check (2026-10-21, same setup; "Before" is main at
+[`e572fa3`](https://github.com/minpeter/et.rs/commit/e572fa3)):
+
+| Session | Mixes | Before | After |
+| --- | --- | --- | --- |
+| C++ client, `SendEnv` of a 70000-byte value, 200 variables and `ET-DASH` | et.rs `etserver` and/or et.rs `etterminal` | fail | pass |
+| `et -T host 'wc -c'`, 1 MiB of stdin, then EOF | et.rs client and `etterminal`, et.rs or C++ `etserver` | hangs | pass, exit status 3 |
+| Same | C++ client or C++ `etterminal` | hangs | hangs (no upstream signal) |
+| `etserver` restart from the new build into 0.0.43 | et.rs client and new `etterminal` | flaky | 6 of 6 pass |
 
 No network wire, handshake, crypto or `PROTOCOL_VERSION` change.
 

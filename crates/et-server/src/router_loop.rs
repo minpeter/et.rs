@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use et_core::packet::Packet;
 use et_net::local_packet::{
     parse_status, registration_status_packet, write_local_packet, LocalPacketDecoder,
-    STARTUP_STATUS,
+    MAX_REGISTRATION_LEN, MAX_STATUS_MESSAGE, STARTUP_STATUS,
 };
 #[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags};
@@ -26,6 +26,10 @@ use crate::runtime_lifecycle::{LifecycleEvent, LifecycleSender};
 use crate::socket_path::OwnedRouterListener;
 #[cfg(windows)]
 use crate::socket_path_windows::OwnedRouterListener;
+
+/// Largest `STARTUP_STATUS` packet: [`et_net::local_packet::status_packet`]
+/// carries a result byte and at most [`MAX_STATUS_MESSAGE`] message bytes.
+const MAX_STARTUP_STATUS_LEN: usize = et_core::packet::HEADER_LEN + 1 + MAX_STATUS_MESSAGE;
 
 struct PendingConnection {
     stream: LocalStream,
@@ -445,7 +449,7 @@ fn accept_ready(
                 stream.set_nonblocking(true).map_err(RouterError::Io)?;
                 pending.push(PendingConnection {
                     stream,
-                    decoder: LocalPacketDecoder::new(),
+                    decoder: registration_decoder(),
                     accepted: Instant::now(),
                     peer,
                     #[cfg(windows)]
@@ -532,12 +536,19 @@ fn read_decoder(
     }
 }
 
+/// Decoder for a pending registration: upstream `UserTerminalRouter` refuses
+/// a registration packet over `MAX_REGISTRATION_LENGTH` without a reply.
+fn registration_decoder() -> LocalPacketDecoder {
+    LocalPacketDecoder::with_limit(MAX_REGISTRATION_LEN)
+}
+
 /// Decoder for the `STARTUP_STATUS` an et.rs terminal sends once its new
 /// session starts. A live pty that re-registers after an etserver restart
 /// never sends one, and its stream already carries output for the resumed
 /// bridge: reading it here would steal and corrupt that output.
 fn startup_watch(terminal: &RegisteredTerminal) -> Option<LocalPacketDecoder> {
-    (terminal.startup_ack && !terminal.resumed).then(LocalPacketDecoder::new)
+    (terminal.startup_ack && !terminal.resumed)
+        .then(|| LocalPacketDecoder::with_limit(MAX_STARTUP_STATUS_LEN))
 }
 
 /// Register a read `TERMINAL_USER_INFO` and answer the terminal.
@@ -668,7 +679,7 @@ mod tests {
         drop(peer);
         let mut pending = vec![PendingConnection {
             stream,
-            decoder: LocalPacketDecoder::new(),
+            decoder: registration_decoder(),
             accepted: Instant::now() - REGISTRATION_TIMEOUT,
             peer: PeerIdentity::Unix {
                 uid: rustix::process::getuid().as_raw(),

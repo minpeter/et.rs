@@ -6,7 +6,8 @@ mod support;
 use et_core::keys::passkey_to_key;
 use et_core::packet::Packet;
 use et_core::proto::{
-    ConnectStatus, FlowControlMode, TermInit, TerminalBuffer, TerminalInfo, TerminalPacketType,
+    ConnectStatus, FlowControlMode, InitialPayload, TermInit, TerminalBuffer, TerminalInfo,
+    TerminalPacketType,
 };
 use et_net::local_packet::{
     encode_local_packet, read_local_packet, status_packet, write_local_packet, RouterFraming,
@@ -14,8 +15,8 @@ use et_net::local_packet::{
 };
 use prost::Message;
 use runtime_support::{
-    default_payload, initialize, read_upstream, TerminalKind, TestRuntime, ID_A, ID_B, KEY_A,
-    KEY_B, TIMEOUT,
+    default_payload, initialize, read_router, read_upstream, TerminalKind, TestRuntime, ID_A, ID_B,
+    KEY_A, KEY_B, TIMEOUT,
 };
 
 #[test]
@@ -517,6 +518,93 @@ fn router_writes_each_registration_kind_in_its_own_framing() {
             matches!(terminal.read(&mut extra), Ok(0) | Err(_)),
             "{kind:?}: unexpected bytes after TERMINAL_CLOSE"
         );
+        server.runtime.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn messages_over_64_kib_cross_the_bridge_both_ways() {
+    use std::thread;
+
+    const TERMINAL_BUFFER: u8 = TerminalPacketType::TerminalBuffer as u8;
+    let input = TerminalBuffer {
+        buffer: Some((0..1024 * 1024).map(|index| (index % 251) as u8).collect()),
+        is_stderr: None,
+    }
+    .encode_to_vec();
+    let output = TerminalBuffer {
+        buffer: Some(vec![b'o'; 512 * 1024]),
+        is_stderr: None,
+    }
+    .encode_to_vec();
+    for (kind, jumphost) in [
+        (TerminalKind::Upstream, false),
+        (TerminalKind::LegacyEtrs, false),
+        (TerminalKind::Etrs, false),
+        (TerminalKind::Upstream, true),
+    ] {
+        // Given: a client whose environment alone exceeds 64 KiB.
+        let mut server = TestRuntime::start();
+        let mut terminal = server.register_as(ID_A, KEY_A, kind);
+        terminal.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let (stream, response) = server.handshake(ID_A);
+        assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+        let key = passkey_to_key(KEY_A).unwrap();
+        let mut payload = default_payload();
+        payload.jumphost = Some(jumphost);
+        let value = "v".repeat(100 * 1024);
+        payload
+            .environmentvariables
+            .insert("LARGE".to_owned(), value.clone());
+        let environment = payload.environmentvariables.clone();
+        let initializing = thread::spawn(move || initialize(stream, &key, payload));
+
+        // Then: TERMINAL_INIT or JUMPHOST_INIT carries all of it.
+        let init = read_local_packet(&mut terminal).unwrap();
+        if jumphost {
+            assert_eq!(init.header(), TerminalPacketType::JumphostInit as u8);
+            let relayed = InitialPayload::decode(init.payload()).unwrap();
+            assert_eq!(relayed.environmentvariables, environment);
+        } else {
+            assert_eq!(init.header(), TerminalPacketType::TerminalInit as u8);
+            let init = TermInit::decode(init.payload()).unwrap();
+            assert_eq!(init.environmentnames, ["LARGE"]);
+            assert_eq!(init.environmentvalues, [value]);
+            if kind.startup_ack() {
+                write_local_packet(&mut terminal, &status_packet(STARTUP_STATUS, Ok(()))).unwrap();
+            }
+        }
+        let (mut client, initial) = initializing.join().unwrap();
+        assert_eq!(initial.error, None, "{kind:?} jumphost {jumphost}");
+
+        // When: the client sends 1 MiB of input.
+        let framing = if jumphost {
+            RouterFraming::Packets
+        } else {
+            kind.framing()
+        };
+        let reader = thread::spawn(move || {
+            let received = read_router(&mut terminal, framing);
+            (terminal, received)
+        });
+        client.write_packet(TERMINAL_BUFFER, &input).unwrap();
+
+        // Then: the terminal reads it whole, in its framing.
+        let (mut terminal, received) = reader.join().unwrap();
+        let received = received.unwrap();
+        assert_eq!(received.header(), TERMINAL_BUFFER);
+        assert!(received.payload() == input, "{kind:?} jumphost {jumphost}");
+
+        // And: 512 KiB of terminal output reaches the client whole.
+        let sent = output.clone();
+        let writer = thread::spawn(move || {
+            write_local_packet(&mut terminal, &Packet::new(TERMINAL_BUFFER, sent)).unwrap();
+            terminal
+        });
+        let received = client.read_packet().unwrap();
+        assert_eq!(received.header(), TERMINAL_BUFFER);
+        assert!(received.payload() == output, "{kind:?} jumphost {jumphost}");
+        let _terminal = writer.join().unwrap();
         server.runtime.shutdown().unwrap();
     }
 }

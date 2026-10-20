@@ -229,7 +229,7 @@ fn run_client(
             .iter()
             .filter_map(|request| request.environmentvariable.as_deref()),
     );
-    if reserved_environment.len() > crate::terminal_protocol::MAX_ENVIRONMENT {
+    if reserved_environment.len() > crate::client_environment::MAX_ENVIRONMENT {
         return Err(
             crate::forward_config::ForwardConfigError::TooManyEnvironmentNames(
                 reserved_environment.len(),

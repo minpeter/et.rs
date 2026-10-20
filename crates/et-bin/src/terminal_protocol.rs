@@ -9,9 +9,6 @@ use et_net::local_packet::{read_local_packet, write_local_packet, RouterStreamDe
 use portable_pty::{MasterPty, PtySize};
 use prost::Message;
 
-pub(crate) const MAX_ENVIRONMENT: usize = 128;
-pub(crate) const MAX_ENV_VALUE: usize = 4096;
-
 #[derive(Debug)]
 pub struct TerminalInitialization {
     pub environment: Vec<(String, String)>,
@@ -49,27 +46,30 @@ pub fn read_initialization(router: &mut LocalStream) -> Result<TerminalInitializ
     }
     let init = TermInit::decode(packet.payload())
         .map_err(|_| "TERMINAL_INIT protobuf is malformed".to_owned())?;
-    if init.environmentnames.len() != init.environmentvalues.len()
-        || init.environmentnames.len() > MAX_ENVIRONMENT
-    {
+    if init.environmentnames.len() != init.environmentvalues.len() {
         return Err("TERMINAL_INIT environment lists are invalid".to_owned());
     }
     let flow_control = init
         .flowcontrol
         .and_then(|value| FlowControlMode::try_from(value).ok())
         .unwrap_or(FlowControlMode::None);
+    // Upstream `UserTerminalHandler::run` calls setenv(3) for each entry and
+    // ignores failures: no count, size or portable-name limit applies beyond
+    // the local message cap. Skip only what setenv rejects, on every platform.
     let environment = init
         .environmentnames
         .into_iter()
         .zip(init.environmentvalues)
-        .map(|(name, value)| {
-            if !valid_environment_name(&name) || value.len() > MAX_ENV_VALUE || value.contains('\0')
-            {
-                return Err("TERMINAL_INIT contains an invalid environment entry".to_owned());
+        .filter(|(name, value)| {
+            let applicable = setenv_accepts(name, value);
+            if !applicable {
+                et_cli::logging::info(format!(
+                    "skipping TERMINAL_INIT environment entry {name:?}: setenv rejects it"
+                ));
             }
-            Ok((name, value))
+            applicable
         })
-        .collect::<Result<_, _>>()?;
+        .collect();
     let no_pty = init.no_pty.unwrap_or(false);
     let no_shell = init.no_shell.unwrap_or(false);
     if no_pty && no_shell {
@@ -238,10 +238,10 @@ pub fn handle_packet(
     }
 }
 
-pub(crate) fn valid_environment_name(name: &str) -> bool {
-    let mut bytes = name.bytes();
-    matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
-        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+/// POSIX setenv(3) fails with EINVAL for an empty name or one containing `=`;
+/// a C string cannot carry NUL in either the name or the value.
+fn setenv_accepts(name: &str, value: &str) -> bool {
+    !name.is_empty() && !name.contains(['=', '\0']) && !value.contains('\0')
 }
 
 /// Convert a `TERMINAL_INFO` payload into a PTY size with upstream semantics.
@@ -310,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn initialization_rejects_wrong_type_malformed_and_invalid_environment() {
+    fn initialization_rejects_wrong_type_malformed_and_mismatched_environment() {
         let wrong_type = Packet::new(
             TerminalPacketType::TerminalBuffer as u8,
             TerminalBuffer {
@@ -326,55 +326,45 @@ mod tests {
             vec![0xff]
         ))
         .is_err());
-        for init in [
-            TermInit {
-                environmentnames: vec!["A".to_owned()],
-                environmentvalues: Vec::new(),
-                flowcontrol: None,
+        let mismatched = TermInit {
+            environmentnames: vec!["A".to_owned()],
+            environmentvalues: Vec::new(),
+            ..TermInit::default()
+        };
+        let packet = Packet::new(
+            TerminalPacketType::TerminalInit as u8,
+            mismatched.encode_to_vec(),
+        );
+        assert!(read_environment_packet(packet).is_err());
+    }
 
-                no_pty: None,
-                command: None,
-                no_shell: None,
-                disconnect_timeout_seconds: None,
-                hadreversetunnels: None,
-            },
-            TermInit {
-                environmentnames: vec!["BAD-NAME".to_owned()],
-                environmentvalues: vec!["value".to_owned()],
-                flowcontrol: None,
-
-                no_pty: None,
-                command: None,
-                no_shell: None,
-                disconnect_timeout_seconds: None,
-                hadreversetunnels: None,
-            },
-            TermInit {
-                environmentnames: vec!["VALID".to_owned()],
-                environmentvalues: vec!["bad\0value".to_owned()],
-                flowcontrol: None,
-
-                no_pty: None,
-                command: None,
-                no_shell: None,
-                disconnect_timeout_seconds: None,
-                hadreversetunnels: None,
-            },
-            TermInit {
-                environmentnames: vec!["VALID".to_owned()],
-                environmentvalues: vec!["x".repeat(MAX_ENV_VALUE + 1)],
-                flowcontrol: None,
-
-                no_pty: None,
-                command: None,
-                no_shell: None,
-                disconnect_timeout_seconds: None,
-                hadreversetunnels: None,
-            },
-        ] {
-            let packet = Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec());
-            assert!(read_environment_packet(packet).is_err());
-        }
+    #[test]
+    fn initialization_applies_any_environment_and_skips_only_what_setenv_rejects() {
+        // Upstream calls setenv(3) for every entry and ignores failures: no
+        // count, value-size or portable-name limit (et.rs 0.0.43 had all three).
+        let mut expected: Vec<(String, String)> = (0..200)
+            .map(|index| (format!("E_{index:03}"), format!("v{index}")))
+            .collect();
+        expected.extend([
+            ("BIG".to_owned(), "x".repeat(5000)),
+            ("MY-VAR".to_owned(), "dash".to_owned()),
+            ("1ABC".to_owned(), "digit".to_owned()),
+            ("UNICODE_\u{e9}".to_owned(), "\u{1f600}".to_owned()),
+        ]);
+        let mut entries = expected.clone();
+        entries.extend([
+            ("BROKEN=NAME".to_owned(), "skipped".to_owned()),
+            (String::new(), "skipped".to_owned()),
+            ("NUL\0NAME".to_owned(), "skipped".to_owned()),
+            ("NUL_VALUE".to_owned(), "bad\0value".to_owned()),
+        ]);
+        let init = TermInit {
+            environmentnames: entries.iter().map(|(name, _)| name.clone()).collect(),
+            environmentvalues: entries.into_iter().map(|(_, value)| value).collect(),
+            ..TermInit::default()
+        };
+        let packet = Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec());
+        assert_eq!(read_environment_packet(packet).unwrap(), expected);
     }
 
     fn read_environment_packet(packet: Packet) -> Result<Vec<(String, String)>, String> {

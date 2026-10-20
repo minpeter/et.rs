@@ -91,8 +91,9 @@ pub(crate) struct PumpOptions<'a> {
     pub(crate) flow_control: et_cli::client::FlowControlMode,
     pub(crate) terminal_enabled: bool,
     pub(crate) auto_cursor_report: bool,
-    /// `et -T`: write stdout and stderr as raw bytes, and do not treat stdin
-    /// as terminal interrupts.
+    /// `et -T`: write stdout and stderr as raw bytes, do not treat stdin as
+    /// terminal interrupts, and when stdin ends send one empty
+    /// TERMINAL_BUFFER so the remote command sees EOF (like `ssh -T`).
     pub(crate) binary_stdio: bool,
     pub(crate) terminal_modes: &'a mut TerminalModeState,
     pub(crate) hangup: &'a crate::client_hangup::HangupClose,
@@ -235,6 +236,9 @@ where
     let mut bytes_since_ack: usize = 0;
     let mut delivery_gate = crate::delivery_gate::DeliveryGate::default();
     let mut interrupt_input = et_core::output_interrupt::InterruptInput::default();
+    // `-T` stdin ended; the empty TERMINAL_BUFFER that tells the remote
+    // command waits until no frame is pending.
+    let mut input_eof_pending = false;
     let mut fast_poll = et_net::forward::FastPollState::new();
     let forward_wake = forwarder
         .wake()
@@ -318,6 +322,41 @@ where
                     None,
                     remote_exit,
                 );
+            }
+        }
+        if input_eof_pending && !connection.write_pending() {
+            // Like `ssh -T`, the remote command sees EOF on its stdin. It goes
+            // through replay like other input and is sent exactly once.
+            input_eof_pending = false;
+            let payload = encoded_buffer(&[]);
+            match write_owned(
+                connection,
+                TerminalPacketType::TerminalBuffer as u8,
+                &payload,
+                &mut reconnect,
+                &mut stream,
+                terminal_enabled,
+            )? {
+                OwnedWriteOutcome::Written => {
+                    bytes_since_ack = bytes_since_ack.saturating_add(payload.len());
+                }
+                OwnedWriteOutcome::Recovered => {
+                    last_received = Instant::now();
+                    next_keepalive = last_received + interval;
+                }
+                OwnedWriteOutcome::SessionEnded => {
+                    return finish_remote_completion(
+                        console_output,
+                        pending_output,
+                        pending_forward,
+                        terminal_enabled,
+                        binary_stdio,
+                        terminal_modes,
+                        forwarder,
+                        None,
+                        remote_exit,
+                    );
+                }
             }
         }
         if let Some(packet) = pending_output.take() {
@@ -876,13 +915,18 @@ where
                 }
                 Err(_) if !stdin_is_terminal => {
                     read_stdin = false;
+                    input_eof_pending = binary_stdio;
                     continue;
                 }
                 Err(error) => return Err(terminal_io("reading terminal input", error)),
             };
             if count == 0 {
-                if !stdin_is_terminal {
+                // `-T` ends only the remote command's input, like `ssh -T`,
+                // even for Ctrl-D on a terminal. A closed pipe never ends the
+                // session either.
+                if binary_stdio || !stdin_is_terminal {
                     read_stdin = false;
+                    input_eof_pending = binary_stdio;
                     continue;
                 }
                 console_output
@@ -945,6 +989,7 @@ where
             // Do not close the remote session or abandon a replay-owned frame;
             // output, forwarding, recovery and keepalives still belong to it.
             read_stdin = false;
+            input_eof_pending = binary_stdio;
         }
         let now = Instant::now();
         // Acknowledge by volume as well as on the idle interval, including

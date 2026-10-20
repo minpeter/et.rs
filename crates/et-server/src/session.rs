@@ -315,6 +315,21 @@ impl ActiveSession {
         disconnect_deadline_reached(&mut since, Instant::now(), connected, *timeout)
     }
 
+    /// When a disconnected client's timeout fires. Like
+    /// [`Self::disconnect_deadline_reached`], the first disconnected
+    /// observation starts the clock and a connected client clears it, so a
+    /// loop that sleeps until this deadline cannot miss its first stamp.
+    #[cfg(unix)]
+    pub(crate) fn disconnect_deadline(&self, connected: bool) -> Option<Instant> {
+        let timeout = (*self.disconnect_timeout.lock().ok()?).filter(|timeout| !timeout.is_zero());
+        let mut since = self.disconnected_since.lock().ok()?;
+        let (Some(timeout), false) = (timeout, connected) else {
+            *since = None;
+            return None;
+        };
+        since.get_or_insert_with(Instant::now).checked_add(timeout)
+    }
+
     pub(crate) fn set_forward_exit_status(&self, enabled: bool) {
         self.forward_exit_status.store(enabled, Ordering::Relaxed);
     }

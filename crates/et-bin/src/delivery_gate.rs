@@ -48,6 +48,13 @@ impl DeliveryGate {
         )
     }
 
+    /// When a stalled gate releases its producers unless acknowledgements
+    /// advance first; the session loop must wake by then.
+    #[cfg(unix)]
+    pub(crate) fn release_at(&self, patience: Duration) -> Option<Instant> {
+        self.stalled.map(|(_, since)| since + patience)
+    }
+
     fn observe(
         &mut self,
         connected: bool,

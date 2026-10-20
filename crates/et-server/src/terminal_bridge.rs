@@ -206,20 +206,20 @@ fn run_mode_poll(
                 && session.can_buffer_write((READ_BUFFER * 2) as i64)?,
             pending_local.is_some(),
         );
-        // When the client is down, poll with a short timeout so recovery wakes
-        // (via the wake pipe) are still processed promptly and we re-check
         if pending_outbound.is_empty() {
             forwarder.collect_fast_poll_routes(&mut fast_poll);
         }
         // Keep draining the shared transport while the bounded spill has
         // room. Once full, stop polling readability to avoid a busy-loop;
         // per-socket credit makes that state transient for windowed peers.
-        let client_policy = output_wait_policy(
+        let mut client_policy = output_wait_policy(
             client_wait_policy(
                 pending_local.is_some()
                     || pending_forward.len() >= FORWARD_BACKLOG_CAPACITY
                     || !connected,
-                !pending_forward.is_empty() || !connected,
+                // Darwin also rechecks a lost client every 10ms; elsewhere the
+                // disconnect deadline below bounds a disconnected wait.
+                !pending_forward.is_empty() || (cfg!(target_os = "macos") && !connected),
                 client_buffered
                     || (pending_terminal.is_none()
                         && lookahead_terminal.is_some()
@@ -228,6 +228,10 @@ fn run_mode_poll(
             output_state.deadline,
             output_state.wake,
         );
+        // A disconnected client's timeout must fire without any other event.
+        if let Some(expiry) = session.disconnect_deadline(connected) {
+            client_policy.1 = wait_until(client_policy.1, expiry);
+        }
         let (terminal_events, wake_events, forward_events, client_events) = wait(
             &terminal,
             &wake,
@@ -1047,8 +1051,13 @@ fn client_wait_policy(
         Some(Duration::ZERO)
     } else if forwarding_retry_pending {
         Some(Duration::from_millis(10))
-    } else {
+    } else if cfg!(target_os = "macos") {
+        // Darwin can omit readiness for a closed socket, so keep rechecking.
         Some(Duration::from_millis(100))
+    } else {
+        // Every source wakes this loop through a descriptor or a deadline,
+        // so an idle session sleeps until one does.
+        None
     };
     (client_flags, timeout)
 }
@@ -1065,13 +1074,19 @@ fn output_wait_policy(
 ) -> (PollFlags, Option<Duration>) {
     if let Some(deadline) = deadline {
         client_flags |= PollFlags::OUT;
-        let until = deadline.saturating_duration_since(std::time::Instant::now());
-        timeout = Some(timeout.map_or(until, |timeout| timeout.min(until)));
+        timeout = wait_until(timeout, deadline);
     }
     if wake {
         timeout = Some(Duration::ZERO);
     }
     (client_flags, timeout)
+}
+
+/// Bound a poll `timeout` so the wait ends by `at`.
+#[cfg(unix)]
+fn wait_until(timeout: Option<Duration>, at: std::time::Instant) -> Option<Duration> {
+    let until = at.saturating_duration_since(std::time::Instant::now());
+    Some(timeout.map_or(until, |timeout| timeout.min(until)))
 }
 
 #[cfg(unix)]

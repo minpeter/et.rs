@@ -75,8 +75,6 @@ fn run_poll(
 ) -> Result<(), RouterError> {
     let mut pending = Vec::<PendingConnection>::new();
     let mut watched = Vec::<WatchedRegistration>::new();
-    let idle = rustix::time::Timespec::try_from(std::time::Duration::from_millis(100))
-        .expect("100ms fits in timespec");
     loop {
         // Expire before constructing poll descriptors so readiness indices and
         // the pending vector always describe the same generation.
@@ -99,7 +97,10 @@ fn run_poll(
             }
             poll_fds.push(PollFd::new(&registration.stream, flags));
         }
-        match poll(&mut poll_fds, Some(&idle)) {
+        let timeout = idle_timeout(&pending).map(|duration| {
+            rustix::time::Timespec::try_from(duration).expect("registration timeout fits timespec")
+        });
+        match poll(&mut poll_fds, timeout.as_ref()) {
             Ok(_) => {}
             Err(error) if error == rustix::io::Errno::INTR => continue,
             Err(error) => return Err(RouterError::Io(io::Error::from(error))),
@@ -534,6 +535,26 @@ fn expire_pending(pending: &mut Vec<PendingConnection>, events: &SyncSender<Rout
     for _ in 0..expired {
         emit(events, RouterEvent::Rejected(RouterReject::Timeout));
     }
+}
+
+/// How long the router may sleep: until the oldest pending registration
+/// expires. Every other source wakes it through a descriptor, so with nothing
+/// pending it sleeps until one does. Darwin can omit readiness for a closed
+/// registration socket, so it keeps rechecking every 100ms.
+#[cfg(unix)]
+fn idle_timeout(pending: &[PendingConnection]) -> Option<Duration> {
+    let now = Instant::now();
+    let expiry = pending
+        .iter()
+        .map(|connection| {
+            (connection.accepted + REGISTRATION_TIMEOUT).saturating_duration_since(now)
+        })
+        .min();
+    if cfg!(target_os = "macos") {
+        let recheck = Duration::from_millis(100);
+        return Some(expiry.map_or(recheck, |expiry| expiry.min(recheck)));
+    }
+    expiry
 }
 
 fn emit(events: &SyncSender<RouterEvent>, event: RouterEvent) {

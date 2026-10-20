@@ -377,6 +377,10 @@ where
         if pending_output.is_none() {
             deadline = deadline.min(last_received + silence);
         }
+        // A stalled delivery gate releases after `interval` without progress.
+        if let Some(release) = delivery_gate.release_at(interval) {
+            deadline = deadline.min(release);
+        }
         if connection.write_pending() {
             network_flags |= PollFlags::OUT;
         }
@@ -422,18 +426,22 @@ where
             }
             // poll() is never auto-restarted by SA_RESTART, so any signal
             // delivered to this thread (e.g. SIGWINCH from a window resize,
-            // SIGCONT after job control) interrupts it with EINTR. The 100ms
-            // cap also lets the nonblocking read below detect closed sockets
-            // when Darwin omits the expected readiness bit.
+            // SIGCONT after job control) interrupts it with EINTR. On Darwin a
+            // 100ms cap also lets the nonblocking read below detect closed
+            // sockets when the expected readiness bit is omitted; elsewhere an
+            // idle session sleeps until its next deadline.
             loop {
                 // Cap at 10ms while a forwarding packet is held so the retry
                 // above runs even when nothing else becomes ready.
                 let poll_cap = if !pending_forward.is_empty() {
-                    Duration::from_millis(10)
+                    Some(Duration::from_millis(10))
+                } else if cfg!(target_os = "macos") {
+                    Some(Duration::from_millis(100))
                 } else {
-                    Duration::from_millis(100)
+                    None
                 };
-                let poll_deadline = deadline.min(Instant::now() + poll_cap);
+                let poll_deadline =
+                    poll_cap.map_or(deadline, |cap| deadline.min(Instant::now() + cap));
                 let timeout =
                     Timespec::try_from(poll_deadline.saturating_duration_since(Instant::now()))
                         .map_err(|_| terminal_text("keepalive deadline exceeds poll range"))?;

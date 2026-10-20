@@ -115,3 +115,23 @@ fn disconnected_connection_is_never_gated() {
     let full = MAX_UNACKNOWLEDGED_BYTES;
     assert!(!gate.observe(false, Some((10, full)), Instant::now(), PATIENCE));
 }
+
+#[cfg(unix)]
+#[test]
+fn a_stalled_gate_reports_when_it_releases_producers() {
+    let mut gate = DeliveryGate::default();
+    let start = Instant::now();
+    let full = MAX_UNACKNOWLEDGED_BYTES;
+    assert_eq!(gate.release_at(PATIENCE), None);
+    assert!(gate.check(Some((10, full)), start, PATIENCE));
+    // An idle session loop must wake when the patience window ends, even
+    // when no other event arrives.
+    assert_eq!(gate.release_at(PATIENCE), Some(start + PATIENCE));
+    // Progress restarts the window.
+    let later = start + PATIENCE / 2;
+    assert!(gate.check(Some((20, full)), later, PATIENCE));
+    assert_eq!(gate.release_at(PATIENCE), Some(later + PATIENCE));
+    // Once released there is nothing left to wake for.
+    assert!(!gate.check(Some((20, full)), later + PATIENCE, PATIENCE));
+    assert_eq!(gate.release_at(PATIENCE), None);
+}

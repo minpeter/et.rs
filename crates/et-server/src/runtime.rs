@@ -11,7 +11,10 @@ use et_net::listener::{bind_tcp_with_backlog, DEFAULT_LISTEN_BACKLOG};
 
 use crate::path::RouterPath;
 use crate::registry::Registry;
+#[cfg(windows)]
 use crate::router::Router;
+#[cfg(unix)]
+use crate::router::RouterError;
 use crate::runtime_accept;
 use crate::runtime_error::RuntimeError;
 use crate::runtime_handle::RuntimeHandle;
@@ -27,7 +30,11 @@ mod recovery_tests;
 
 pub struct Runtime {
     core: Arc<RuntimeCore>,
+    #[cfg(windows)]
     router: Option<Router>,
+    /// Reports when the control thread closed the router it drives (Unix).
+    #[cfg(unix)]
+    router_stopped: Option<std::sync::mpsc::Receiver<Result<(), RouterError>>>,
     lifecycle: Option<LifecycleSender>,
     control_wake: Option<LocalStream>,
     control_worker: Option<JoinHandle<Result<(), RuntimeError>>>,
@@ -136,11 +143,33 @@ impl Runtime {
                 operation: "create lifecycle wakeup",
                 source,
             })?;
+        #[cfg(windows)]
         let mut router =
             Router::start_with_lifecycle(router_path, registry, Some(lifecycle.clone()))?;
+        // Unix runs the router on the control thread, next to the TCP
+        // listeners: one thread for the whole control plane.
+        #[cfg(unix)]
+        let (control_router, router_stopped) = {
+            let listener = crate::socket_path::OwnedRouterListener::bind(&router_path)
+                .map_err(RouterError::from)?;
+            // The runtime consumes no diagnostic router events.
+            let (events, _) = std::sync::mpsc::sync_channel(1);
+            let (stopped, router_stopped) = std::sync::mpsc::sync_channel(1);
+            let poll = crate::router_loop::RouterPoll::new(
+                listener,
+                registry,
+                events,
+                Some(lifecycle.clone()),
+            );
+            (
+                runtime_accept::ControlRouter { poll, stopped },
+                router_stopped,
+            )
+        };
         let (wake_reader, wake_writer) = match et_net::local::wake_pair() {
             Ok(pair) => pair,
             Err(source) => {
+                #[cfg(windows)]
                 let _ = router.shutdown();
                 return Err(RuntimeError::Io {
                     operation: "create accept wakeup",
@@ -149,7 +178,8 @@ impl Runtime {
             }
         };
         // One control thread accepts on every listener (IPv4 and IPv6) and
-        // services terminal lifecycle events between accepts.
+        // services terminal lifecycle events (and, on Unix, the router)
+        // between accepts.
         let control_core = core.clone();
         let listen_backlog = bound.listen_backlog();
         let listeners = bound.into_listeners();
@@ -157,17 +187,28 @@ impl Runtime {
             match thread::Builder::new()
                 .name("et-runtime".to_owned())
                 .spawn(move || {
-                    runtime_accept::run(listeners, wake_reader, lifecycle_events, control_core)
+                    runtime_accept::run(
+                        listeners,
+                        wake_reader,
+                        lifecycle_events,
+                        control_core,
+                        #[cfg(unix)]
+                        Some(control_router),
+                    )
                 }) {
                 Ok(worker) => worker,
                 Err(source) => {
+                    #[cfg(windows)]
                     let _ = router.shutdown();
                     return Err(RuntimeError::Spawn(source));
                 }
             };
         Ok(Self {
             core,
+            #[cfg(windows)]
             router: Some(router),
+            #[cfg(unix)]
+            router_stopped: Some(router_stopped),
             lifecycle: Some(lifecycle),
             control_wake: Some(wake_writer),
             control_worker: Some(control_worker),
@@ -224,8 +265,20 @@ impl Runtime {
                 remember(&mut first_error, RuntimeError::Session(error));
             }
         }
+        #[cfg(windows)]
         if let Some(mut router) = self.router.take() {
             if let Err(error) = router.shutdown() {
+                remember(&mut first_error, RuntimeError::Router(error));
+            }
+        }
+        // The control thread closes the router at its next turn. A router that
+        // already failed has reported its error and closed.
+        #[cfg(unix)]
+        if let Some(stopped) = self.router_stopped.take() {
+            if let Some(lifecycle) = self.lifecycle.as_ref() {
+                lifecycle.send(LifecycleEvent::StopRouter);
+            }
+            if let Ok(Err(error)) = stopped.recv() {
                 remember(&mut first_error, RuntimeError::Router(error));
             }
         }

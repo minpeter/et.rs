@@ -15,6 +15,9 @@ pub(crate) enum LifecycleEvent {
     TerminalDisconnected(RegistrationIdentity),
     /// A terminal re-registered a live PTY: its recovery grace needs sweeps.
     TerminalResumed,
+    /// The runtime is shutting down: close the router this thread drives.
+    #[cfg(unix)]
+    StopRouter,
     Shutdown,
 }
 
@@ -119,6 +122,9 @@ pub(crate) struct Lifecycle {
     /// terminal is registered, so an idle server never wakes for it.
     next_sweep: Option<Instant>,
     sweep_failed: bool,
+    /// `StopRouter` arrived; the control loop closes its router.
+    #[cfg(unix)]
+    router_stop: bool,
     first_error: Option<RuntimeError>,
 }
 
@@ -137,6 +143,8 @@ pub(crate) fn channel() -> std::io::Result<(LifecycleSender, Lifecycle)> {
             wake,
             next_sweep: None,
             sweep_failed: false,
+            #[cfg(unix)]
+            router_stop: false,
             first_error: None,
         },
     ))
@@ -158,6 +166,12 @@ impl Lifecycle {
     #[cfg(unix)]
     pub(crate) fn next_sweep(&self) -> Option<Instant> {
         self.next_sweep
+    }
+
+    /// Whether `StopRouter` arrived since the last call.
+    #[cfg(unix)]
+    pub(crate) fn take_router_stop(&mut self) -> bool {
+        std::mem::take(&mut self.router_stop)
     }
 
     /// Run a due sweep and apply every queued event. Returns `true` once the
@@ -191,6 +205,8 @@ impl Lifecycle {
                 Ok(LifecycleEvent::TerminalResumed) => {
                     self.next_sweep.get_or_insert(now + SWEEP_INTERVAL);
                 }
+                #[cfg(unix)]
+                Ok(LifecycleEvent::StopRouter) => self.router_stop = true,
                 Ok(LifecycleEvent::Shutdown) | Err(TryRecvError::Disconnected) => return true,
                 Err(TryRecvError::Empty) => return false,
             }

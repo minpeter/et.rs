@@ -73,33 +73,14 @@ fn run_poll(
     lifecycle: Option<LifecycleSender>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), RouterError> {
-    let mut pending = Vec::<PendingConnection>::new();
-    let mut watched = Vec::<WatchedRegistration>::new();
+    let mut router = RouterPoll::new(listener, registry, events, lifecycle);
     loop {
-        // Expire before constructing poll descriptors so readiness indices and
-        // the pending vector always describe the same generation.
-        expire_pending(&mut pending, &events);
-        let pending_start = 2;
-        let watched_start = pending_start + pending.len();
-        let mut poll_fds = Vec::with_capacity(watched_start + watched.len());
-        poll_fds.push(PollFd::new(listener.listener(), PollFlags::IN));
-        poll_fds.push(PollFd::new(&wake_reader, PollFlags::IN));
-        for connection in &pending {
-            poll_fds.push(PollFd::new(
-                &connection.stream,
-                PollFlags::IN | PollFlags::HUP | PollFlags::ERR,
-            ));
-        }
-        for registration in &watched {
-            let mut flags = PollFlags::HUP | PollFlags::ERR;
-            if registration.startup.is_some() {
-                flags |= PollFlags::IN;
-            }
-            poll_fds.push(PollFd::new(&registration.stream, flags));
-        }
-        let timeout = idle_timeout(&pending).map(|duration| {
+        router.expire();
+        let timeout = router.timeout().map(|duration| {
             rustix::time::Timespec::try_from(duration).expect("registration timeout fits timespec")
         });
+        let mut poll_fds = vec![PollFd::new(&wake_reader, PollFlags::IN)];
+        router.descriptors(&mut poll_fds);
         match poll(&mut poll_fds, timeout.as_ref()) {
             Ok(_) => {}
             Err(error) if error == rustix::io::Errno::INTR => continue,
@@ -107,17 +88,86 @@ fn run_poll(
         }
         let readiness: Vec<PollFlags> = poll_fds.iter().map(PollFd::revents).collect();
         drop(poll_fds);
-        if readiness
-            .get(1)
-            .is_some_and(|flags| flags.intersects(PollFlags::IN | PollFlags::HUP))
-        {
+        if readiness[0].intersects(PollFlags::IN | PollFlags::HUP) {
             drain_waker(&mut wake_reader)?;
             if shutdown.load(Ordering::Acquire) {
                 return Ok(());
             }
         }
+        router.service(&readiness[1..])?;
+    }
+}
+
+/// The Unix router's poll state: its listener, registrations still being
+/// read, and registered terminals watched for hang-up. A standalone
+/// [`crate::router::Router`] drives it from a thread of its own; the runtime
+/// drives it from its control thread, next to the TCP listeners.
+#[cfg(unix)]
+pub(crate) struct RouterPoll {
+    listener: OwnedRouterListener,
+    registry: Registry,
+    events: SyncSender<RouterEvent>,
+    lifecycle: Option<LifecycleSender>,
+    pending: Vec<PendingConnection>,
+    watched: Vec<WatchedRegistration>,
+}
+
+#[cfg(unix)]
+impl RouterPoll {
+    pub(crate) fn new(
+        listener: OwnedRouterListener,
+        registry: Registry,
+        events: SyncSender<RouterEvent>,
+        lifecycle: Option<LifecycleSender>,
+    ) -> Self {
+        Self {
+            listener,
+            registry,
+            events,
+            lifecycle,
+            pending: Vec::new(),
+            watched: Vec::new(),
+        }
+    }
+
+    /// Drop expired registrations. Called before [`Self::descriptors`], so
+    /// readiness indices and the pending list always describe the same
+    /// generation.
+    pub(crate) fn expire(&mut self) {
+        expire_pending(&mut self.pending, &self.events);
+    }
+
+    /// How long the router may sleep, see [`idle_timeout`].
+    pub(crate) fn timeout(&self) -> Option<Duration> {
+        idle_timeout(&self.pending)
+    }
+
+    /// Append the listener, the pending registrations and the watched
+    /// terminals, in that order. Returns how many descriptors were added.
+    pub(crate) fn descriptors<'a>(&'a self, poll_fds: &mut Vec<PollFd<'a>>) -> usize {
+        poll_fds.push(PollFd::new(self.listener.listener(), PollFlags::IN));
+        for connection in &self.pending {
+            poll_fds.push(PollFd::new(
+                &connection.stream,
+                PollFlags::IN | PollFlags::HUP | PollFlags::ERR,
+            ));
+        }
+        for registration in &self.watched {
+            let mut flags = PollFlags::HUP | PollFlags::ERR;
+            if registration.startup.is_some() {
+                flags |= PollFlags::IN;
+            }
+            poll_fds.push(PollFd::new(&registration.stream, flags));
+        }
+        1 + self.pending.len() + self.watched.len()
+    }
+
+    /// Act on the readiness of the descriptors [`Self::descriptors`] added.
+    pub(crate) fn service(&mut self, readiness: &[PollFlags]) -> Result<(), RouterError> {
+        let pending_start = 1;
+        let watched_start = pending_start + self.pending.len();
         let mut watched_readiness = readiness[watched_start..].to_vec();
-        for (flags, registration) in watched_readiness.iter_mut().zip(&watched) {
+        for (flags, registration) in watched_readiness.iter_mut().zip(&self.watched) {
             let mut probe = [0u8; 1];
             match recv(
                 &registration.stream,
@@ -133,16 +183,16 @@ fn run_poll(
         }
         service_watched(
             &watched_readiness,
-            &mut watched,
-            &registry,
-            &events,
-            lifecycle.as_ref(),
+            &mut self.watched,
+            &self.registry,
+            &self.events,
+            self.lifecycle.as_ref(),
         )?;
         if readiness
             .first()
             .is_some_and(|flags| flags.contains(PollFlags::IN))
         {
-            accept_ready(&listener, &mut pending, &events)?;
+            accept_ready(&self.listener, &mut self.pending, &self.events)?;
         }
         let ready_pending: Vec<usize> = readiness[pending_start..watched_start]
             .iter()
@@ -155,15 +205,15 @@ fn run_poll(
             .rev()
             .collect();
         for index in ready_pending {
-            match read_ready(&mut pending[index])? {
+            match read_ready(&mut self.pending[index])? {
                 ReadOutcome::Pending => {}
                 ReadOutcome::Packet(packet) => {
-                    let connection = pending.swap_remove(index);
+                    let connection = self.pending.swap_remove(index);
                     let mut status = connection.stream.try_clone().map_err(RouterError::Io)?;
                     match router_registration::process(
                         packet,
                         connection.stream,
-                        &registry,
+                        &self.registry,
                         connection.peer,
                     ) {
                         Ok(terminal) => {
@@ -174,7 +224,11 @@ fn run_poll(
                                 )
                                 .is_err()
                             {
-                                rollback_registration(&registry, &terminal.identity, &events)?;
+                                rollback_registration(
+                                    &self.registry,
+                                    &terminal.identity,
+                                    &self.events,
+                                )?;
                                 continue;
                             }
                             let id = terminal.identity.id().to_owned();
@@ -182,14 +236,14 @@ fn run_poll(
                                 .watcher
                                 .set_nonblocking(true)
                                 .map_err(RouterError::Io)?;
-                            watched.push(WatchedRegistration {
+                            self.watched.push(WatchedRegistration {
                                 stream: terminal.watcher,
                                 identity: terminal.identity,
                                 startup: terminal.startup_ack.then(LocalPacketDecoder::new),
                             });
-                            emit(&events, RouterEvent::Registered { id });
+                            emit(&self.events, RouterEvent::Registered { id });
                             if terminal.resumed {
-                                notify_resumed(lifecycle.as_ref());
+                                notify_resumed(self.lifecycle.as_ref());
                             }
                         }
                         Err(error) => {
@@ -198,16 +252,20 @@ fn run_poll(
                                 &mut status,
                                 &status_packet(REGISTRATION_STATUS, Err(&message)),
                             );
-                            emit(&events, RouterEvent::Rejected(error));
+                            emit(&self.events, RouterEvent::Rejected(error));
                         }
                     }
                 }
                 ReadOutcome::Reject => {
-                    pending.swap_remove(index);
-                    emit(&events, RouterEvent::Rejected(RouterReject::MalformedFrame));
+                    self.pending.swap_remove(index);
+                    emit(
+                        &self.events,
+                        RouterEvent::Rejected(RouterReject::MalformedFrame),
+                    );
                 }
             }
         }
+        Ok(())
     }
 }
 

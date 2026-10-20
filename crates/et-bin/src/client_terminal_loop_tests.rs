@@ -101,6 +101,7 @@ fn pump_services_inbound_while_forwarding_peer_refuses_to_read() {
                 recoveries += 1;
                 Ok(ReconnectOutcome::SessionEnded)
             },
+            &crate::client_terminal::ReconnectInput::default(),
         );
         done_tx
             .send((result, recoveries, connection.reader_sequence()))
@@ -321,6 +322,7 @@ fn close_on_hangup_sends_terminal_close_and_exits_the_loop() {
         },
         &mut et_net::forward::Forwarder::start(Vec::new()).unwrap(),
         |_| panic!("hangup close must not reconnect"),
+        &crate::client_terminal::ReconnectInput::default(),
     )
     .unwrap();
     assert!(hangup.completed());

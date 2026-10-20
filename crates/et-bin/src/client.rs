@@ -555,6 +555,9 @@ fn run_client(
             false
         }
     };
+    // Keystrokes read while waiting between reconnect attempts; the terminal
+    // loop sends them once the session recovers, like upstream's BackedWriter.
+    let reconnect_input = crate::client_terminal::ReconnectInput::default();
     let reconnect_session = |connection: &mut Connection| {
         let outcome = if local_mode {
             reconnect(
@@ -565,7 +568,13 @@ fn run_client(
                 Deadline::after(Duration::from_secs(2)),
             )
         } else {
-            reconnect_with_retry(connection, &endpoint, &credentials, resolver)
+            reconnect_with_retry(
+                connection,
+                &endpoint,
+                &credentials,
+                resolver,
+                &reconnect_input,
+            )
         }?;
         agent_forward.reconnected(outcome)
     };
@@ -595,6 +604,7 @@ fn run_client(
             close_on_hangup: args.close_on_hangup,
             no_pty: args.no_pty,
             stdio_forward: args.stdio_forward.is_some(),
+            reconnect_input: &reconnect_input,
         },
         forwarder,
         reconnect_session,
@@ -615,12 +625,14 @@ fn run_client(
 /// server for several seconds; a single failed attempt must not kill the
 /// session (upstream ET retries until the server ends the session). Raw
 /// mode turns off ISIG, so Ctrl-C arrives as the 0x03 byte on stdin and is
-/// honoured as "give up now" while waiting between attempts.
+/// honoured as "give up now" while waiting between attempts. Other input
+/// read while waiting is kept in `input` for the recovered session.
 fn reconnect_with_retry(
     connection: &mut Connection,
     endpoint: &Endpoint,
     credentials: &Credentials,
     resolver: &dyn EndpointResolver,
+    input: &crate::client_terminal::ReconnectInput,
 ) -> Result<ReconnectOutcome, ClientError> {
     retry_transient(
         || {
@@ -634,7 +646,7 @@ fn reconnect_with_retry(
         },
         |error| {
             et_cli::logging::info(format!("reconnect attempt failed, retrying: {error}"));
-            reconnect_wait_aborted(RECONNECT_RETRY_DELAY)
+            reconnect_wait_aborted(RECONNECT_RETRY_DELAY, input)
         },
     )
 }
@@ -662,21 +674,33 @@ fn retry_transient<T>(
 /// Wait out the retry delay. Returns `true` when the user pressed Ctrl-C.
 ///
 /// Stdin is in raw mode, so the byte must be read to be seen. Other input
-/// typed while the link is down cannot reach the server and is dropped,
-/// which is also what a dead TCP connection would have done with it.
+/// typed while the link is down is kept, in order, in `input`; the terminal
+/// loop sends it after recovery, as upstream ET replays input it queued
+/// while disconnected.
 #[cfg(unix)]
-fn reconnect_wait_aborted(delay: Duration) -> bool {
-    use std::io::{IsTerminal, Read};
+fn reconnect_wait_aborted(delay: Duration, input: &crate::client_terminal::ReconnectInput) -> bool {
+    use std::io::IsTerminal;
 
-    use rustix::event::{poll, PollFd, PollFlags};
-    use rustix::time::Timespec;
-
-    const CTRL_C: u8 = 0x03;
     let stdin = std::io::stdin();
     if !stdin.is_terminal() {
         std::thread::sleep(delay);
         return false;
     }
+    wait_for_interrupt(&stdin, delay, input)
+}
+
+/// Read `stdin` for up to `delay`: `true` on Ctrl-C, otherwise every byte
+/// read is appended to `input`.
+#[cfg(unix)]
+fn wait_for_interrupt(
+    stdin: impl std::os::fd::AsFd,
+    delay: Duration,
+    input: &crate::client_terminal::ReconnectInput,
+) -> bool {
+    use rustix::event::{poll, PollFd, PollFlags};
+    use rustix::time::Timespec;
+
+    const CTRL_C: u8 = 0x03;
     let deadline = std::time::Instant::now() + delay;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -693,15 +717,17 @@ fn reconnect_wait_aborted(delay: Duration) -> bool {
                 if !descriptors[0].revents().contains(PollFlags::IN) {
                     return false;
                 }
+                // Read the descriptor directly: bytes left in std's stdin
+                // buffer would be invisible to the terminal loop's poll.
                 let mut bytes = [0u8; 256];
-                match stdin.lock().read(&mut bytes) {
+                match rustix::io::read(stdin.as_fd(), &mut bytes) {
                     // EOF: stdin is gone, nothing to poll for any more.
                     Ok(0) => {
                         std::thread::sleep(remaining);
                         return false;
                     }
                     Ok(count) if bytes[..count].contains(&CTRL_C) => return true,
-                    Ok(_) => {}
+                    Ok(count) => input.keep(&bytes[..count]),
                     Err(_) => return false,
                 }
             }
@@ -712,9 +738,13 @@ fn reconnect_wait_aborted(delay: Duration) -> bool {
 }
 
 #[cfg(windows)]
-fn reconnect_wait_aborted(delay: Duration) -> bool {
+fn reconnect_wait_aborted(
+    delay: Duration,
+    _input: &crate::client_terminal::ReconnectInput,
+) -> bool {
     // The Windows console loop owns stdin; a Ctrl-C abort would need a
-    // console reader here. Sleep and retry: the process can still be killed.
+    // console reader here. Sleep and retry: the process can still be killed,
+    // and unread console input stays queued for the recovered session.
     std::thread::sleep(delay);
     false
 }
@@ -1193,6 +1223,42 @@ mod tests {
         );
         assert!(matches!(result, Err(ClientError::ProtocolMismatch(None))));
         assert_eq!(attempts, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconnect_wait_keeps_typed_input_in_order() {
+        use std::io::Write;
+
+        let (local, mut typed) = std::os::unix::net::UnixStream::pair().unwrap();
+        let input = crate::client_terminal::ReconnectInput::default();
+        typed.write_all(b"echo 1\r").unwrap();
+        assert!(!wait_for_interrupt(
+            &local,
+            Duration::from_millis(20),
+            &input
+        ));
+        typed.write_all(b"echo 2\r").unwrap();
+        assert!(!wait_for_interrupt(
+            &local,
+            Duration::from_millis(20),
+            &input
+        ));
+        let mut kept = [0u8; 64];
+        let count = input.take_into(&mut kept);
+        assert_eq!(&kept[..count], b"echo 1\recho 2\r");
+        assert!(input.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconnect_wait_gives_up_on_ctrl_c() {
+        use std::io::Write;
+
+        let (local, mut typed) = std::os::unix::net::UnixStream::pair().unwrap();
+        let input = crate::client_terminal::ReconnectInput::default();
+        typed.write_all(b"x\x03").unwrap();
+        assert!(wait_for_interrupt(&local, Duration::from_secs(10), &input));
     }
 
     #[test]

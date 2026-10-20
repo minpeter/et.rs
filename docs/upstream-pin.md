@@ -755,6 +755,31 @@ Live check (2026-10-21, same setup; "Before" is main at
 
 No network wire, handshake, crypto or `PROTOCOL_VERSION` change.
 
+### Input typed while reconnecting, and wider mixed coverage (et.rs 0.0.44)
+
+Upstream
+[`TerminalClient::run`](https://github.com/MisterTea/EternalTerminal/blob/7ee361a75fbb3e0900445b110188996fbe950823/src/terminal/TerminalClient.cpp)
+keeps reading the console while disconnected and queues each keystroke in the
+`BackedWriter`, so recovery replays it to the shell. The et.rs client waits
+between reconnect attempts reading stdin only to see Ctrl-C (its own "press
+Ctrl-C to give up", from et.rs #14) and dropped every other byte. It now keeps
+them and sends them after recovery, in order after input read before the
+outage and before newer input. Ctrl-C still gives up.
+
+Live check (2026-10-21, loopback; a TCP relay between client and `etserver`
+cuts the link and refuses reconnects for about 3 s). Each row ran with et.rs
+and C++ clients against et.rs and C++ servers (the terminal matches the
+server) unless noted:
+
+| Session | Before | After |
+| --- | --- | --- |
+| Output during the outage (35 lines) replayed once, in order | pass | pass |
+| Command typed during the outage runs after recovery | fail with the et.rs client, pass with the C++ client | pass |
+| 20 s idle: keepalives only, no reconnect, then input works | pass | pass |
+| `--name`, client killed, `--attach`: same shell PID | pass | pass |
+| `-D` SOCKS5 CONNECT, 256 KiB echoed | pass | pass |
+| `-L`/`-R` 8 MiB each way and a 64-byte round trip, every client/`etserver`/`etterminal` mix | pass | pass |
+
 ## Ledger (classified 2026-10-14)
 
 Twenty commits after [`e02aefa`](https://github.com/MisterTea/EternalTerminal/commit/e02aefa2301a9544fe7a40564e612dcf122291e1).

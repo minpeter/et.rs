@@ -413,6 +413,7 @@ dependencies = [
  "et-server",
  "filedescriptor",
  "jiff",
+ "memchr",
  "nix 0.31.3",
  "portable-pty",
  "prost",

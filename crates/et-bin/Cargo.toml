@@ -30,6 +30,7 @@ et-server = { path = "../et-server" }
 et-htm = { path = "../et-htm" }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29.0"
+memchr = "2"
 # ConPTY on Windows, forkpty on Unix.
 portable-pty = "0.9.0"
 prost = "0.13"

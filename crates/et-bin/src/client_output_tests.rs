@@ -708,24 +708,7 @@ fn partial_writes_report_progress_before_completion_and_drain_every_byte() {
         }
     }
 
-    let shared = Arc::new(Shared {
-        state: Mutex::new(State {
-            queue: VecDeque::new(),
-            bytes: 0,
-            stopping: false,
-            error: None,
-            cursor_reports: 0,
-            worker_done: false,
-            worker_progress: 0,
-            stream: et_core::output_interrupt::TerminalStream::default(),
-            skip_until_newline: false,
-            waiting_for_capacity: false,
-            writing: false,
-        }),
-        wake: Condvar::new(),
-        worker_progress: std::sync::atomic::AtomicUsize::new(0),
-        stopping_fast: std::sync::atomic::AtomicBool::new(false),
-    });
+    let shared = Arc::new(Shared::new());
     let output = Arc::new(Mutex::new(Vec::new()));
     let (second_entered_tx, second_entered_rx) = mpsc::sync_channel(0);
     let (release_second_tx, release_second_rx) = mpsc::sync_channel(0);
@@ -807,11 +790,8 @@ fn cancellable_stdout_accepts_null_output_but_still_honors_cancellation() {
         file,
         cancel,
         discard_device: None,
-        nonblocking: false,
         #[cfg(target_os = "linux")]
         stdout_kind: None,
-        #[cfg(target_os = "linux")]
-        terminal: None,
     };
     let (done_tx, done_rx) = mpsc::sync_channel(0);
     std::thread::spawn(move || {
@@ -841,11 +821,8 @@ fn cancellable_stdout_fails_when_output_is_closed() {
         file,
         cancel,
         discard_device: None,
-        nonblocking: false,
         #[cfg(target_os = "linux")]
         stdout_kind: None,
-        #[cfg(target_os = "linux")]
-        terminal: None,
     };
 
     let (done_tx, done_rx) = mpsc::sync_channel(0);
@@ -876,4 +853,104 @@ fn last_packet_broken_pipe_is_reported_without_another_packet() {
         output.check_error().unwrap_err().kind(),
         io::ErrorKind::BrokenPipe
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn direct_console_delivers_partial_writes_in_order_and_confirms_on_delivery() {
+    let (mut reader, writer) = io::pipe().unwrap();
+    let file = File::from(std::os::fd::OwnedFd::from(writer));
+    rustix::io::ioctl_fionbio(&file, true).unwrap();
+    nix::fcntl::fcntl(&file, nix::fcntl::FcntlArg::F_SETPIPE_SZ(4096)).unwrap();
+    let mut output = ConsoleOutput::direct(FlowControlMode::Backpressure, file);
+    let modes = TerminalModeState::default();
+    let other_modes = TerminalModeState::default();
+    let first = b"prompt$ ".to_vec();
+    let second = [b"\x1b[?1049h".as_slice(), &[b'b'; 8_000], b"\x1b[6n"].concat();
+    let third = b"\x1b[?1049l\x1b[6n".to_vec();
+
+    // An idle console takes a packet straight through.
+    assert!(output.try_write(&first, &modes).unwrap());
+    assert!(!output.has_pending_data().unwrap());
+    let mut descriptors = Vec::new();
+    output.poll_descriptors(&mut descriptors).unwrap();
+    assert!(descriptors.is_empty());
+    drop(descriptors);
+    // A one-page pipe takes only part of the next packet, and the one after
+    // waits behind it.
+    assert!(output.try_write(&second, &modes).unwrap());
+    assert!(output.try_write(&third, &other_modes).unwrap());
+    assert!(output.has_pending_data().unwrap());
+    let mut descriptors = Vec::new();
+    output.poll_descriptors(&mut descriptors).unwrap();
+    assert_eq!(descriptors.len(), 1);
+    drop(descriptors);
+    // Neither packet holding a cursor report request is complete yet.
+    assert_eq!(output.take_cursor_reports().unwrap(), 0);
+    assert!(!other_modes.alternate_screen());
+
+    let expected = [first, second, third].concat();
+    let mut delivered = Vec::new();
+    let mut chunk = vec![0; 16 * 1024];
+    while output.has_pending_data().unwrap() {
+        let count = reader.read(&mut chunk).unwrap();
+        delivered.extend_from_slice(&chunk[..count]);
+        output.service_ready().unwrap();
+    }
+    output.check_error().unwrap();
+    while delivered.len() < expected.len() {
+        let count = reader.read(&mut chunk).unwrap();
+        delivered.extend_from_slice(&chunk[..count]);
+    }
+    assert_eq!(delivered, expected);
+    // One report per completed packet, each tracker on its own bytes.
+    assert_eq!(output.take_cursor_reports().unwrap(), 2);
+    assert!(modes.alternate_screen());
+    assert!(!other_modes.alternate_screen());
+    output
+        .complete(ConsoleCompletion::RemoteSessionEnded)
+        .unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn direct_console_completion_drains_then_cancels_a_stalled_console() {
+    let (mut reader, writer) = io::pipe().unwrap();
+    let file = File::from(std::os::fd::OwnedFd::from(writer));
+    rustix::io::ioctl_fionbio(&file, true).unwrap();
+    let modes = TerminalModeState::default();
+    let packet = vec![b'x'; OUTPUT_BYTES];
+
+    // A console that keeps reading receives every queued byte.
+    let output = ConsoleOutput::direct(FlowControlMode::Backpressure, file.try_clone().unwrap());
+    assert!(output.try_write(&packet, &modes).unwrap());
+    let queued = OUTPUT_BYTES;
+    let drain = std::thread::spawn(move || {
+        let mut total = 0;
+        let mut chunk = vec![0; 4096];
+        while total < queued {
+            total += reader.read(&mut chunk).unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        (reader, total)
+    });
+    output
+        .complete(ConsoleCompletion::RemoteSessionEnded)
+        .unwrap();
+    let (_reader, total) = drain.join().unwrap();
+    assert!(total >= queued);
+
+    // A console that stops reading is given up after the stall timeout.
+    let output = ConsoleOutput::direct(FlowControlMode::Backpressure, file);
+    let mut admitted = 0;
+    while admitted < 4 * OUTPUT_BYTES && output.try_write(&packet[..4096], &modes).unwrap() {
+        admitted += 1;
+    }
+    assert!(output.has_pending_data().unwrap());
+    let started = Instant::now();
+    let error = output
+        .complete(ConsoleCompletion::RemoteSessionEnded)
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert!(started.elapsed() >= GRACEFUL_DRAIN_STALL_TIMEOUT);
 }

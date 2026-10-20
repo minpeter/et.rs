@@ -34,6 +34,7 @@ fn register(
         ptyactive: None,
         hadreversetunnels: None,
         disconnect_timeout_seconds: None,
+        upstream_router_stream: None,
     };
     let packet = Packet::new(
         TerminalPacketType::TerminalUserInfo as u8,

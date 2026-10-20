@@ -5,6 +5,11 @@
 //! for the `JUMPHOST_INIT` payload the jumphost etserver forwards from the
 //! client, opens its own ET client connection to the final destination with
 //! the same id/passkey, and then relays packets verbatim in both directions.
+//!
+//! Upstream etserver has already answered the client by then, so this
+//! process consumes the destination `INITIAL_RESPONSE` itself and exits on
+//! an error. An et.rs etserver that acknowledges registrations instead
+//! waits for that response: it is handed back as a `JUMPHOST_INIT` packet.
 
 use et_net::local::LocalStream;
 use std::io::{self, Read, Write};
@@ -28,7 +33,7 @@ use et_net::handshake::MAX_HANDSHAKE_PROTO_LEN;
 use et_net::local_packet::{encode_local_packet, write_local_packet, LocalPacketDecoder};
 use prost::Message;
 #[cfg(unix)]
-use rustix::event::{poll, PollFd, PollFlags};
+use rustix::event::{poll, PollFd, PollFlags, Timespec};
 
 use crate::terminal_credentials::CredentialInput;
 
@@ -43,21 +48,26 @@ fn run(
     input: &CredentialInput,
     destination_host: &str,
     destination_port: u16,
+    registration_ack: bool,
 ) -> Result<i32, String> {
     run_with_startup(
         router,
         input,
         destination_host,
         destination_port,
+        registration_ack,
         |_| Ok(()),
     )
 }
 
+/// `registration_ack` is whether the router acknowledged the registration,
+/// i.e. it is an et.rs etserver waiting for the destination response.
 pub fn run_with_startup<F>(
     mut router: LocalStream,
     input: &CredentialInput,
     destination_host: &str,
     destination_port: u16,
+    registration_ack: bool,
     started: F,
 ) -> Result<i32, String>
 where
@@ -83,25 +93,37 @@ where
     payload.jumphost = Some(false);
 
     let mut destination = connect_destination(input, destination_host, destination_port, &payload)?;
-    started(&mut router)?;
-    write_local_packet(
-        &mut router,
-        &Packet::new(
-            TerminalPacketType::JumphostInit as u8,
-            destination.response_payload.clone(),
-        ),
-    )
-    .map_err(|error| format!("could not relay destination INITIAL_RESPONSE: {error}"))?;
-    if downstream_requires_ack(&destination.response_payload)? {
-        let acknowledgement = et_net::local_packet::read_local_packet(&mut router)
-            .map_err(|error| format!("could not read jumphost acknowledgement: {error}"))?;
-        if !is_acknowledgement(&acknowledgement) {
-            return Err("jumphost acknowledgement is malformed".to_owned());
+    let refusal = destination_error(&destination.response_payload)?;
+    if registration_ack {
+        started(&mut router)?;
+        write_local_packet(
+            &mut router,
+            &Packet::new(
+                TerminalPacketType::JumphostInit as u8,
+                destination.response_payload.clone(),
+            ),
+        )
+        .map_err(|error| format!("could not relay destination INITIAL_RESPONSE: {error}"))?;
+        if refusal.is_some() {
+            let acknowledgement = et_net::local_packet::read_local_packet(&mut router)
+                .map_err(|error| format!("could not read jumphost acknowledgement: {error}"))?;
+            if !is_acknowledgement(&acknowledgement) {
+                return Err("jumphost acknowledgement is malformed".to_owned());
+            }
+            destination
+                .connection
+                .write_packet_live(EtPacketType::Heartbeat as u8, &[])
+                .map_err(|error| format!("could not acknowledge destination response: {error}"))?;
         }
-        destination
-            .connection
-            .write_packet_live(EtPacketType::Heartbeat as u8, &[])
-            .map_err(|error| format!("could not acknowledge destination response: {error}"))?;
+    } else {
+        // Upstream `UserJumphostHandler::run`: the response stays on this hop.
+        if let Some(error) = refusal {
+            return Err(format!(
+                "Could not make initial connection to {destination_host}:{destination_port}: \
+                 Error initializing connection: {error}"
+            ));
+        }
+        started(&mut router)?;
     }
     destination
         .connection
@@ -245,9 +267,10 @@ where
     })
 }
 
-fn downstream_requires_ack(payload: &[u8]) -> Result<bool, String> {
+/// The error a destination `INITIAL_RESPONSE` carries, if any.
+fn destination_error(payload: &[u8]) -> Result<Option<String>, String> {
     InitialResponse::decode(payload)
-        .map(|response| response.error.is_some())
+        .map(|response| response.error)
         .map_err(|_| "destination sent a malformed INITIAL_RESPONSE".to_owned())
 }
 
@@ -315,8 +338,11 @@ fn relay_with_output_observer(
     }
     #[cfg(unix)]
     let mut pending_output: Option<(Vec<u8>, usize)> = None;
+    // The handshake's INITIAL_RESPONSE read may already have pulled the
+    // destination's first packets into the connection, where no socket
+    // readiness will ever announce them.
     #[cfg(unix)]
-    let mut resume_destination_drain = false;
+    let mut resume_destination_drain = true;
     #[cfg(unix)]
     let mut destination_closed = false;
     #[cfg(unix)]
@@ -350,10 +376,16 @@ fn relay_with_output_observer(
                 PollFd::new(&router, router_flags),
                 PollFd::new(&client, client_flags),
             ];
+            // Buffered destination packets must not wait for new readiness.
+            let drain_now = resume_destination_drain && pending_output.is_none();
+            let timeout = drain_now.then_some(&Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            });
             // poll() is never restarted by SA_RESTART; retry on EINTR so a
             // stray signal cannot kill the jump-host bridge.
             loop {
-                match poll(&mut descriptors, None) {
+                match poll(&mut descriptors, timeout) {
                     Ok(_) => break,
                     Err(error) if error == rustix::io::Errno::INTR => {}
                     Err(error) => return Err(format!("poll failed: {error}")),

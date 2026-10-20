@@ -636,6 +636,79 @@ et.rs now follows that single-loop shape with these deliberate differences:
 
 No wire, handshake, crypto or `PROTOCOL_VERSION` change.
 
+### Local router stream (et.rs 0.0.44)
+
+Reviewed against upstream master
+[`7ee361a`](https://github.com/MisterTea/EternalTerminal/commit/7ee361a75fbb3e0900445b110188996fbe950823).
+Upstream
+[`TerminalServer::runTerminal`](https://github.com/MisterTea/EternalTerminal/blob/7ee361a75fbb3e0900445b110188996fbe950823/src/terminal/TerminalServer.cpp)
+writes `TERMINAL_INIT` to `etterminal` as a length-prefixed packet, then each
+client `TERMINAL_BUFFER` and `TERMINAL_INFO` as the type byte followed by
+`writeProto` (a native `int64` length and the protobuf), and `TERMINAL_CLOSE`
+as the bare type byte; the disconnect timeout and
+`UserTerminalRouter::closeTerminal` write the same byte.
+[`UserTerminalHandler::runUserTerminal`](https://github.com/MisterTea/EternalTerminal/blob/7ee361a75fbb3e0900445b110188996fbe950823/src/terminal/UserTerminalHandlerUnix.cpp)
+and `runIdleSession` read that stream. Everything `etterminal` writes stays a
+length-prefixed packet. `runJumpHost` sends the client an empty
+`INITIAL_RESPONSE` itself, then `JUMPHOST_INIT`, and relays length-prefixed
+packets both ways;
+[`UserJumphostHandler::run`](https://github.com/MisterTea/EternalTerminal/blob/7ee361a75fbb3e0900445b110188996fbe950823/src/terminal/UserJumphostHandler.cpp)
+consumes the destination's `INITIAL_RESPONSE` and exits on its error.
+`UserTerminalRouter::registerTerminal` closes a refused registration without
+writing.
+
+et.rs 0.0.43 and older wrote every router message as a length-prefixed packet
+and handed the destination `INITIAL_RESPONSE` back through the jump terminal,
+so an et.rs `etserver` could not serve a C++ `etterminal`, or the reverse.
+et.rs now writes and reads upstream's stream (`et_net::local_packet::RouterFraming`):
+
+- A C++ peer gets upstream's stream and jumphost flow, and no
+  `REGISTRATION_STATUS`, `STARTUP_STATUS` or refusal packet.
+- et.rs peers still negotiate the et.rs-only registration acknowledgement
+  (`<router>.cap` marker, `fd = -6` sentinel) and the jumphost
+  `INITIAL_RESPONSE` relay. A terminal also sets the et.rs-only
+  `TerminalUserInfo.upstream_router_stream` (tag 1000, far from upstream's
+  sequential tags), and the server confirms the upstream stream with a second
+  success byte. et.rs 0.0.43 and older peers do neither and keep
+  length-prefixed router messages, so their live sessions survive an upgrade
+  restart in either order. A terminal re-checks the marker whenever it
+  re-registers, so a session also survives `etserver` switching between et.rs
+  and C++.
+- A local message stays capped at 64 KiB; upstream's `readProto` accepts
+  128 MiB.
+
+Three bugs surfaced in the live check and are fixed with it:
+
+- The router waited for a `STARTUP_STATUS` from an et.rs pty that
+  re-registered after an `etserver` restart. Such a pty never sends one, so
+  the router read the resumed session's first output itself: the output was
+  lost, or the client printed `malformed terminal output` and reconnected a
+  second time. Restarting into et.rs 0.0.43 or older still has this race.
+- `et --jumphost` gave the jump terminal its provisional `XXX` credentials.
+  Upstream `SshSetupHandler::SetupSsh` gives it the pair the destination
+  `etterminal` answered with, which an ET C++ `etterminal` regenerates.
+- The jump terminal's relay waited for socket readiness before forwarding
+  destination output that its read of the destination `INITIAL_RESPONSE` had
+  already buffered, so the first output could wait for a keypress. et.rs
+  connections read the socket ahead; upstream's `BackedReader` reads exact
+  lengths and never holds a second packet.
+
+Live check (2026-10-20, loopback, ET-C++ built from
+[`7eb237e`](https://github.com/MisterTea/EternalTerminal/commit/7eb237e6d9822b674f4a527924b5f09117659321);
+`7eb237e..7ee361a` changes none of these files). "Before" is et.rs 0.0.43.
+
+| Session | Server-side mixes | Before | After |
+| --- | --- | --- | --- |
+| PTY shell: input, resize, 200 KB paste | et.rs and C++ clients; et.rs `etserver` + C++ `etterminal`, C++ `etserver` + et.rs `etterminal` | fail | pass |
+| `-T` with 1 MiB of stdin, exit status | et.rs client; both mixes | fail | pass |
+| `-W` | et.rs client; both mixes | pass | pass |
+| `--jumphost`, C++ jump and destination terminals behind an et.rs jump server | et.rs and C++ clients | fail | pass |
+| `--jumphost`, et.rs terminals behind a C++ jump server | et.rs and C++ clients | pass | pass |
+| `etserver` restart under a live session | 0.0.43→new with 0.0.43 and new terminals, C++→new, new→C++, new→new | — | pass |
+| et.rs 0.0.43 peer | new `etserver` + 0.0.43 `etterminal`, 0.0.43 `etserver` + new `etterminal` | — | pass |
+
+No network wire, handshake, crypto or `PROTOCOL_VERSION` change.
+
 ## Ledger (classified 2026-10-14)
 
 Twenty commits after [`e02aefa`](https://github.com/MisterTea/EternalTerminal/commit/e02aefa2301a9544fe7a40564e612dcf122291e1).
@@ -716,7 +789,6 @@ Live interop smoke (2026-10-20, et.rs 0.0.42 against an ET-C++ `master` build,
 loopback): an et.rs client with C++ `etserver`/`etterminal`, and a C++ client
 with et.rs `etserver`/`etterminal`, both ran a PTY command stream and `-L`/`-R`
 tunnels. Mixing implementations within one host's server pair (et.rs
-`etserver` with C++ `etterminal`, or the reverse) does not work: the local
-router channel between them uses et.rs framing, not the raw C++ type byte.
-Packages install the two roles together, so this pairing only arises from a
-hand-mixed install.
+`etserver` with C++ `etterminal`, or the reverse) failed there because the
+local router stream used et.rs framing; et.rs 0.0.44 speaks upstream's stream
+(see "Local router stream" above).

@@ -13,7 +13,8 @@ use et_net::connection::Connection;
 use et_net::framing_io::{read_proto_limited, write_proto};
 use et_net::handshake::client_request;
 use et_net::local_packet::{
-    parse_status, read_local_packet, write_local_packet, REGISTRATION_STATUS,
+    parse_registration_status, read_local_packet, write_local_packet, LocalPacketError,
+    RouterFraming, RouterStreamDecoder,
 };
 use et_server::path::select_router_path_for;
 use et_server::{Runtime, RuntimeHandle};
@@ -26,6 +27,48 @@ pub const ID_B: &str = "bbbbbbbbbbbbbbbb";
 pub const KEY_A: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
 pub const KEY_B: &str = "0123456789abcdefghijklmnopqrstuv";
 pub const TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How a fake `etterminal` registers, which decides how the router answers
+/// and frames what it writes once a session runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalKind {
+    /// ET C++: no fd sentinel, no `REGISTRATION_STATUS`, upstream raw stream.
+    Upstream,
+    /// et.rs 0.0.43 and older: fd sentinel only, `[0]` status, packets.
+    LegacyEtrs,
+    /// et.rs from 0.0.44: fd sentinel and `upstream_router_stream`, `[0, 1]`
+    /// status, upstream raw stream.
+    Etrs,
+}
+
+impl TerminalKind {
+    pub fn framing(self) -> RouterFraming {
+        match self {
+            Self::LegacyEtrs => RouterFraming::Packets,
+            Self::Upstream | Self::Etrs => RouterFraming::Upstream,
+        }
+    }
+
+    pub fn startup_ack(self) -> bool {
+        self != Self::Upstream
+    }
+}
+
+/// Read one message the router wrote after `TERMINAL_INIT`. A timeout
+/// reports `WouldBlock`.
+pub fn read_router(
+    terminal: &mut UnixStream,
+    framing: RouterFraming,
+) -> Result<Packet, LocalPacketError> {
+    RouterStreamDecoder::new(framing)
+        .read_from(terminal)?
+        .ok_or_else(|| LocalPacketError::Io(std::io::ErrorKind::WouldBlock.into()))
+}
+
+/// [`read_router`] for a terminal registered with [`TestRuntime::register`].
+pub fn read_upstream(terminal: &mut UnixStream) -> Result<Packet, LocalPacketError> {
+    read_router(terminal, RouterFraming::Upstream)
+}
 
 pub struct TestRuntime {
     pub dir: TestDir,
@@ -65,16 +108,28 @@ impl TestRuntime {
         }
     }
 
+    /// Register like an ET C++ `etterminal`.
     pub fn register(&self, id: &str, passkey: &str) -> UnixStream {
-        self.register_with_capability(id, passkey, false)
+        self.register_as(id, passkey, TerminalKind::Upstream)
     }
 
+    /// Register like an et.rs `etterminal`, with the startup sentinel when
+    /// `startup_ack` is set.
     pub fn register_with_capability(
         &self,
         id: &str,
         passkey: &str,
         startup_ack: bool,
     ) -> UnixStream {
+        let kind = if startup_ack {
+            TerminalKind::Etrs
+        } else {
+            TerminalKind::Upstream
+        };
+        self.register_as(id, passkey, kind)
+    }
+
+    pub fn register_as(&self, id: &str, passkey: &str, kind: TerminalKind) -> UnixStream {
         let mut stream = UnixStream::connect(self.dir.socket()).unwrap();
         let uid = i64::from(rustix::process::getuid().as_raw());
         let gid = i64::from(rustix::process::getgid().as_raw());
@@ -83,19 +138,23 @@ impl TestRuntime {
             passkey: Some(passkey.to_owned()),
             uid: Some(uid),
             gid: Some(gid),
-            fd: startup_ack.then_some(-6),
+            fd: kind.startup_ack().then_some(-6),
             ptyactive: None,
             hadreversetunnels: None,
             disconnect_timeout_seconds: None,
+            upstream_router_stream: (kind == TerminalKind::Etrs).then_some(true),
         };
         let packet = Packet::new(
             TerminalPacketType::TerminalUserInfo as u8,
             user.encode_to_vec(),
         );
         write_local_packet(&mut stream, &packet).unwrap();
-        if startup_ack {
+        if kind.startup_ack() {
             let acknowledgement = read_local_packet(&mut stream).unwrap();
-            parse_status(&acknowledgement, REGISTRATION_STATUS).unwrap();
+            assert_eq!(
+                parse_registration_status(&acknowledgement).unwrap(),
+                kind.framing()
+            );
         }
         self.handle.wait_registered(id, TIMEOUT).unwrap();
         stream

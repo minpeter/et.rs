@@ -13,13 +13,15 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use et_core::keys::passkey_to_key;
+use et_core::packet::Packet;
 use et_core::proto::{
     ConnectRequest, ConnectResponse, ConnectStatus, FlowControlMode, InitialPayload,
-    InitialResponse, PortForwardSourceRequest, SocketEndpoint,
+    InitialResponse, PortForwardSourceRequest, SocketEndpoint, TerminalBuffer, TerminalPacketType,
 };
 use et_net::connection::Connection;
 use et_net::framing_io::{read_proto_limited, write_proto};
 use et_net::handshake::client_request;
+use et_net::local_packet::{read_local_packet, status_packet, write_local_packet, STARTUP_STATUS};
 use et_server::SessionState;
 use prost::Message;
 use runtime_support::{bound, default_payload, TestRuntime, ID_A, KEY_A, TIMEOUT};
@@ -574,7 +576,8 @@ fn obsolete_origin_marker_has_no_privileged_meaning() {
 #[test]
 fn jumphost_payload_is_relayed_to_the_registered_terminal() {
     let mut server = TestRuntime::start();
-    let mut terminal = server.register(ID_A, KEY_A);
+    // An et.rs jump terminal reports startup, then its destination's answer.
+    let mut terminal = server.register_with_capability(ID_A, KEY_A, true);
     let key = passkey_to_key(KEY_A).unwrap();
     let payload = InitialPayload {
         jumphost: Some(true),
@@ -593,16 +596,14 @@ fn jumphost_payload_is_relayed_to_the_registered_terminal() {
     assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
     let (client_received_tx, client_received_rx) = std::sync::mpsc::sync_channel(0);
     let terminal_handshake = std::thread::spawn(move || {
-        let packet = et_net::local_packet::read_local_packet(&mut terminal).unwrap();
-        assert_eq!(
-            packet.header(),
-            et_core::proto::TerminalPacketType::JumphostInit as u8
-        );
+        let packet = read_local_packet(&mut terminal).unwrap();
+        assert_eq!(packet.header(), TerminalPacketType::JumphostInit as u8);
         let relayed = InitialPayload::decode(packet.payload()).unwrap();
-        et_net::local_packet::write_local_packet(
+        write_local_packet(&mut terminal, &status_packet(STARTUP_STATUS, Ok(()))).unwrap();
+        write_local_packet(
             &mut terminal,
-            &et_core::packet::Packet::new(
-                et_core::proto::TerminalPacketType::JumphostInit as u8,
+            &Packet::new(
+                TerminalPacketType::JumphostInit as u8,
                 InitialResponse { error: None }.encode_to_vec(),
             ),
         )
@@ -616,6 +617,61 @@ fn jumphost_payload_is_relayed_to_the_registered_terminal() {
     let relayed = terminal_handshake.join().unwrap();
     assert_eq!(relayed.jumphost, Some(true));
     assert_eq!(relayed.flowcontrol, Some(FlowControlMode::Discard as i32));
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
+fn upstream_jump_terminal_is_answered_like_upstream_run_jump_host() {
+    // Given: an ET C++ `etterminal --jump`, which registers without the fd
+    // sentinel and never answers JUMPHOST_INIT.
+    let mut server = TestRuntime::start();
+    let mut terminal = server.register(ID_A, KEY_A);
+    terminal.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let key = passkey_to_key(KEY_A).unwrap();
+    let mut payload = default_payload();
+    payload.jumphost = Some(true);
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+
+    // When: the client initializes while the jump terminal stays silent.
+    let (mut client, initial) = runtime_support::initialize(stream, &key, payload);
+
+    // Then: the server answered the client itself, as `runJumpHost` does,
+    // and the jump terminal reads JUMPHOST_INIT as a packet.
+    assert_eq!(initial.error, None);
+    let init = read_local_packet(&mut terminal).unwrap();
+    assert_eq!(init.header(), TerminalPacketType::JumphostInit as u8);
+    assert_eq!(
+        InitialPayload::decode(init.payload()).unwrap().jumphost,
+        Some(true)
+    );
+
+    // And: packets relay verbatim, length-prefixed, both ways.
+    let input = TerminalBuffer {
+        buffer: Some(b"to-destination".to_vec()),
+        is_stderr: None,
+    }
+    .encode_to_vec();
+    client
+        .write_packet(TerminalPacketType::TerminalBuffer as u8, &input)
+        .unwrap();
+    let relayed = read_local_packet(&mut terminal).unwrap();
+    assert!(!relayed.is_encrypted());
+    assert_eq!(relayed.header(), TerminalPacketType::TerminalBuffer as u8);
+    assert_eq!(relayed.payload(), input.as_slice());
+    let output = TerminalBuffer {
+        buffer: Some(b"from-destination".to_vec()),
+        is_stderr: None,
+    }
+    .encode_to_vec();
+    write_local_packet(
+        &mut terminal,
+        &Packet::new(TerminalPacketType::TerminalBuffer as u8, output.clone()),
+    )
+    .unwrap();
+    let received = client.read_packet().unwrap();
+    assert_eq!(received.header(), TerminalPacketType::TerminalBuffer as u8);
+    assert_eq!(received.payload(), output.as_slice());
     server.runtime.shutdown().unwrap();
 }
 

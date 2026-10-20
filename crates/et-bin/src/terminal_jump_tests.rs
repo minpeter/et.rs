@@ -13,18 +13,157 @@ const KEY_TEXT: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
 #[test]
 fn malformed_downstream_initial_response_fails_closed() {
     assert_eq!(
-        downstream_requires_ack(&[0xff]),
+        destination_error(&[0xff]),
         Err("destination sent a malformed INITIAL_RESPONSE".to_owned())
     );
     assert_eq!(
-        downstream_requires_ack(
+        destination_error(
             &InitialResponse {
                 error: Some("ordinary fatal".to_owned()),
             }
             .encode_to_vec()
         ),
-        Ok(true)
+        Ok(Some("ordinary fatal".to_owned()))
     );
+}
+
+#[test]
+fn jump_terminal_under_upstream_router_relays_without_handing_back_the_response() {
+    // Given: an upstream etserver (no registration acknowledgement), which
+    // answered the client itself and relays packets straight away.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let key = passkey_to_key(KEY_TEXT).unwrap();
+    let destination = thread::spawn(move || {
+        let mut connection = accept_destination(&listener, &key);
+        connection
+            .write_packet(
+                EtPacketType::InitialResponse as u8,
+                &InitialResponse { error: None }.encode_to_vec(),
+            )
+            .unwrap();
+        connection.write_packet(71, b"destination output").unwrap();
+        let input = connection.read_packet().unwrap();
+        connection.shutdown().unwrap();
+        (input.header(), input.payload().to_vec())
+    });
+    let (run_router, mut router_peer) = et_net::local::wake_pair().unwrap();
+    router_peer.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    write_jumphost_init(&mut router_peer);
+    let relay = thread::spawn(move || run(run_router, &credentials(), "127.0.0.1", port, false));
+
+    // When: the destination accepts the session and writes output.
+    let first = et_net::local_packet::read_local_packet(&mut router_peer).unwrap();
+
+    // Then: the first router packet is destination output, not a
+    // JUMPHOST_INIT carrying the INITIAL_RESPONSE, and input flows back.
+    assert_eq!(
+        (first.header(), first.payload()),
+        (71, b"destination output".as_slice())
+    );
+    write_local_packet(
+        &mut router_peer,
+        &Packet::new(TerminalPacketType::TerminalBuffer as u8, vec![3]),
+    )
+    .unwrap();
+    assert_eq!(
+        destination.join().unwrap(),
+        (TerminalPacketType::TerminalBuffer as u8, vec![3])
+    );
+    drop(router_peer);
+    assert_eq!(relay.join().unwrap().unwrap(), 0);
+}
+
+#[test]
+fn jump_terminal_under_upstream_router_exits_on_destination_error() {
+    // Given: an upstream etserver and a destination that refuses the session.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let key = passkey_to_key(KEY_TEXT).unwrap();
+    let destination = thread::spawn(move || {
+        let mut connection = accept_destination(&listener, &key);
+        connection
+            .write_packet(
+                EtPacketType::InitialResponse as u8,
+                &InitialResponse {
+                    error: Some("no terminal".to_owned()),
+                }
+                .encode_to_vec(),
+            )
+            .unwrap();
+    });
+    let (run_router, mut router_peer) = et_net::local::wake_pair().unwrap();
+    router_peer.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    write_jumphost_init(&mut router_peer);
+    let relay = thread::spawn(move || run(run_router, &credentials(), "127.0.0.1", port, false));
+
+    // When: the jump terminal reads the refusal.
+    let router_output = et_net::local_packet::read_local_packet(&mut router_peer);
+
+    // Then: like upstream it fails with the destination's error and writes
+    // nothing to the router before closing it.
+    assert!(
+        matches!(
+            router_output,
+            Err(et_net::local_packet::LocalPacketError::TruncatedPrefix)
+        ),
+        "jump terminal wrote to the router: {router_output:?}"
+    );
+    destination.join().unwrap();
+    let error = relay.join().unwrap().unwrap_err();
+    assert!(
+        error.ends_with("Error initializing connection: no terminal"),
+        "{error}"
+    );
+}
+
+/// Accept the jump terminal's destination connection up to its
+/// `INITIAL_PAYLOAD`.
+fn accept_destination(listener: &TcpListener, key: &[u8; 32]) -> Connection {
+    let (mut stream, _) = listener.accept().unwrap();
+    stream.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    stream.set_write_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let _: et_core::proto::ConnectRequest =
+        read_proto_limited(&mut stream, MAX_HANDSHAKE_PROTO_LEN).unwrap();
+    write_proto(
+        &mut stream,
+        &ConnectResponse {
+            status: Some(ConnectStatus::NewClient as i32),
+            error: None,
+            auth_challenge: None,
+            reset_proof: None,
+            reset_required: None,
+            reset_salt: None,
+        },
+    )
+    .unwrap();
+    let mut connection = Connection::new_server(stream, key);
+    let packet = connection.read_packet().unwrap();
+    assert_eq!(packet.header(), EtPacketType::InitialPayload as u8);
+    connection
+}
+
+fn write_jumphost_init(router: &mut LocalStream) {
+    let payload = InitialPayload {
+        jumphost: Some(true),
+        ..Default::default()
+    };
+    write_local_packet(
+        router,
+        &Packet::new(
+            TerminalPacketType::JumphostInit as u8,
+            payload.encode_to_vec(),
+        ),
+    )
+    .unwrap();
+}
+
+fn credentials() -> CredentialInput {
+    CredentialInput {
+        id: ID.to_owned(),
+        passkey: KEY_TEXT.to_owned(),
+        term: "xterm-256color".to_owned(),
+    }
 }
 
 #[test]
@@ -200,6 +339,43 @@ fn jumphost_drains_coalesced_destination_packets_without_new_socket_readiness() 
             .map(|header| (header, vec![header]))
             .collect::<Vec<_>>()
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn jumphost_relays_packets_the_handshake_already_buffered() {
+    // Given: the destination's INITIAL_RESPONSE and first output arrived
+    // together, and the handshake's read of the response pulled the output
+    // into the connection's userspace buffer, so the socket stays unreadable.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let connector = thread::spawn(move || std::net::TcpStream::connect(address).unwrap());
+    let (server_stream, _) = listener.accept().unwrap();
+    let client_stream = connector.join().unwrap();
+    let key = [43u8; 32];
+    let mut destination_client = Connection::new_client(client_stream, &key);
+    let mut destination_server = Connection::new_server(server_stream, &key);
+    destination_server
+        .write_packet(EtPacketType::InitialResponse as u8, &[])
+        .unwrap();
+    destination_server.write_packet(71, b"prompt").unwrap();
+    let response = destination_client.read_packet().unwrap();
+    assert_eq!(response.header(), EtPacketType::InitialResponse as u8);
+    let (relay_router, mut router_peer) = et_net::local::wake_pair().unwrap();
+    router_peer.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let relay = thread::spawn(move || relay(relay_router, &mut destination_client));
+
+    // When: nothing else happens on either side.
+    let first = et_net::local_packet::read_local_packet(&mut router_peer);
+
+    // Then: the buffered output still reaches the router.
+    let first = first.expect("buffered destination output was not relayed");
+    assert_eq!(
+        (first.header(), first.payload()),
+        (71, b"prompt".as_slice())
+    );
+    drop(router_peer);
+    assert_eq!(relay.join().unwrap().unwrap(), 0);
 }
 
 #[cfg(unix)]
@@ -385,7 +561,7 @@ fn jumphost_run_bounds_router_sender_before_destination_output() {
         passkey: KEY_TEXT.to_owned(),
         term: "xterm-256color".to_owned(),
     };
-    let relay = thread::spawn(move || run(run_router, &input, "127.0.0.1", port));
+    let relay = thread::spawn(move || run(run_router, &input, "127.0.0.1", port, true));
 
     // When: destination startup reaches the exact pre-output barrier.
     initialized_rx.recv_timeout(TEST_TIMEOUT).unwrap();

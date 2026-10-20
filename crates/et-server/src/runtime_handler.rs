@@ -617,12 +617,13 @@ fn handle_new(
     ));
     active.start_output();
     let identity = start.registration().identity();
+    let framing = start.registration().router_framing;
     if start.activate(active.clone()).is_err() {
         crate::diag::info(format!("id={id}: could not activate session for {peer}"));
         return;
     }
     crate::diag::info(format!("id={id}: terminal bridge running for {peer}"));
-    let _ = crate::terminal_bridge::run(active.clone(), terminal, forwarder);
+    let _ = crate::terminal_bridge::run(active.clone(), terminal, forwarder, framing);
     crate::diag::info(format!("id={id}: terminal bridge ended for {peer}"));
     let _ = active.finish_terminal();
     retire_ended_terminal(core, &identity);
@@ -631,6 +632,10 @@ fn handle_new(
 /// Upstream `TerminalServer::runJumpHost`: answer the initial response, hand
 /// the payload to the registered `etterminal --jump` process through a
 /// JUMPHOST_INIT packet, then relay packets verbatim in both directions.
+///
+/// An et.rs jump terminal that registered with the startup sentinel instead
+/// reports its destination's INITIAL_RESPONSE first, see
+/// [`start_acknowledged_jumphost`].
 fn run_jumphost(
     mut connection: Connection,
     start: crate::session_slot::SessionStart,
@@ -657,102 +662,29 @@ fn run_jumphost(
         TerminalPacketType::JumphostInit as u8,
         payload.encode_to_vec(),
     );
-    if terminal.set_nonblocking(true).is_err()
-        || write_initial_local_packet(&mut terminal, &init_packet, initialization_deadline).is_err()
-    {
-        crate::diag::info(format!("id={id}: jumphost failed sending JUMPHOST_INIT"));
-        send_initial_error(
+    let started = if start.registration().startup_ack {
+        start_acknowledged_jumphost(
             &mut connection,
-            "jumphost disconnected during initialization",
-        );
-        return;
-    }
-    if start.registration().startup_ack {
-        if let Err(error) = wait_for_terminal_startup(
-            &core.registry,
-            start.registration(),
+            &mut terminal,
+            &init_packet,
+            &start,
+            core,
+            id,
+            peer,
             initialization_deadline,
-        ) {
-            crate::diag::info(format!("id={id}: jumphost startup failed: {error}"));
-            send_initial_error(&mut connection, &error);
-            let _ = terminal.shutdown(std::net::Shutdown::Both);
-            return;
-        }
-    }
-    let remaining = match initialization_deadline.checked_duration_since(Instant::now()) {
-        Some(remaining) => remaining,
-        None => {
-            send_initial_error(&mut connection, "jumphost initialization deadline elapsed");
-            return;
-        }
-    };
-    if terminal
-        .set_nonblocking(false)
-        .and_then(|()| terminal.set_read_timeout(Some(remaining)))
-        .and_then(|()| terminal.set_write_timeout(Some(remaining)))
-        .is_err()
-    {
-        send_initial_error(&mut connection, "jumphost initialization deadline elapsed");
-        return;
-    }
-    let response_packet = match et_net::local_packet::read_local_packet(&mut terminal) {
-        Ok(packet)
-            if !packet.is_encrypted()
-                && packet.header() == TerminalPacketType::JumphostInit as u8 =>
-        {
-            packet
-        }
-        Ok(_) | Err(_) => {
-            crate::diag::info(format!(
-                "id={id}: jumphost received invalid destination response"
-            ));
-            return;
-        }
-    };
-    let response = InitialResponse::decode(response_packet.payload()).ok();
-    if Instant::now() >= initialization_deadline {
-        send_initial_error(
-            &mut connection,
-            "initialization deadline elapsed before response",
-        );
-        return;
-    }
-    if connection
-        .write_packet_strict(
-            EtPacketType::InitialResponse as u8,
-            response_packet.payload(),
         )
-        .is_err()
-    {
-        crate::diag::info(format!(
-            "id={id}: jumphost failed writing destination INITIAL_RESPONSE to {peer}"
-        ));
-        return;
-    }
-    let Some(response) = response else {
-        let _ = terminal.shutdown(std::net::Shutdown::Both);
-        return;
+    } else {
+        start_upstream_jumphost(
+            &mut connection,
+            &mut terminal,
+            &init_packet,
+            id,
+            peer,
+            initialization_deadline,
+        )
     };
-    if response.error.is_some() {
-        if connection.set_io_timeout(Some(HANDSHAKE_TIMEOUT)).is_err() {
-            return;
-        }
-        let acknowledged = connection.read_packet().is_ok_and(|packet| {
-            packet.header() == EtPacketType::Heartbeat as u8 && packet.payload().is_empty()
-        });
-        if !acknowledged
-            || write_local_packet(
-                &mut terminal,
-                &et_core::packet::Packet::new(EtPacketType::Heartbeat as u8, Vec::new()),
-            )
-            .is_err()
-            || connection.set_io_timeout(None).is_err()
-        {
-            let _ = terminal.shutdown(std::net::Shutdown::Both);
-            return;
-        }
-    }
-    if terminal.set_read_timeout(None).is_err()
+    if !started
+        || terminal.set_read_timeout(None).is_err()
         || terminal.set_write_timeout(None).is_err()
         || terminal.set_nonblocking(true).is_err()
     {
@@ -796,6 +728,145 @@ fn run_jumphost(
     crate::diag::info(format!("id={id}: jumphost bridge ended for {peer}"));
     let _ = active.finish_terminal();
     retire_ended_terminal(core, &identity);
+}
+
+/// Upstream `runJumpHost` with an ET C++ `etterminal --jump`: an empty
+/// success INITIAL_RESPONSE goes to the client before JUMPHOST_INIT, and the
+/// jump terminal consumes the destination's response itself. Returns whether
+/// the relay may start.
+fn start_upstream_jumphost(
+    connection: &mut Connection,
+    terminal: &mut et_net::local::LocalStream,
+    init_packet: &et_core::packet::Packet,
+    id: &str,
+    peer: &str,
+    initialization_deadline: Instant,
+) -> bool {
+    if connection
+        .write_packet_strict(
+            EtPacketType::InitialResponse as u8,
+            &InitialResponse { error: None }.encode_to_vec(),
+        )
+        .is_err()
+    {
+        crate::diag::info(format!(
+            "id={id}: jumphost failed writing INITIAL_RESPONSE to {peer}"
+        ));
+        return false;
+    }
+    if terminal.set_nonblocking(true).is_err()
+        || write_initial_local_packet(terminal, init_packet, initialization_deadline).is_err()
+    {
+        crate::diag::info(format!("id={id}: jumphost failed sending JUMPHOST_INIT"));
+        return false;
+    }
+    true
+}
+
+/// et.rs jump terminal: after JUMPHOST_INIT it reports startup, then answers
+/// with a JUMPHOST_INIT packet carrying the destination's INITIAL_RESPONSE,
+/// which is relayed to the client. A refused destination waits for the
+/// client's Heartbeat and passes it on, so both ends close in order. Returns
+/// whether the relay may start.
+#[allow(clippy::too_many_arguments)]
+fn start_acknowledged_jumphost(
+    connection: &mut Connection,
+    terminal: &mut et_net::local::LocalStream,
+    init_packet: &et_core::packet::Packet,
+    start: &crate::session_slot::SessionStart,
+    core: &RuntimeCore,
+    id: &str,
+    peer: &str,
+    initialization_deadline: Instant,
+) -> bool {
+    if terminal.set_nonblocking(true).is_err()
+        || write_initial_local_packet(terminal, init_packet, initialization_deadline).is_err()
+    {
+        crate::diag::info(format!("id={id}: jumphost failed sending JUMPHOST_INIT"));
+        send_initial_error(connection, "jumphost disconnected during initialization");
+        return false;
+    }
+    if let Err(error) = wait_for_terminal_startup(
+        &core.registry,
+        start.registration(),
+        initialization_deadline,
+    ) {
+        crate::diag::info(format!("id={id}: jumphost startup failed: {error}"));
+        send_initial_error(connection, &error);
+        let _ = terminal.shutdown(std::net::Shutdown::Both);
+        return false;
+    }
+    let Some(remaining) = initialization_deadline.checked_duration_since(Instant::now()) else {
+        send_initial_error(connection, "jumphost initialization deadline elapsed");
+        return false;
+    };
+    if terminal
+        .set_nonblocking(false)
+        .and_then(|()| terminal.set_read_timeout(Some(remaining)))
+        .and_then(|()| terminal.set_write_timeout(Some(remaining)))
+        .is_err()
+    {
+        send_initial_error(connection, "jumphost initialization deadline elapsed");
+        return false;
+    }
+    let response_packet = match et_net::local_packet::read_local_packet(terminal) {
+        Ok(packet)
+            if !packet.is_encrypted()
+                && packet.header() == TerminalPacketType::JumphostInit as u8 =>
+        {
+            packet
+        }
+        Ok(_) | Err(_) => {
+            crate::diag::info(format!(
+                "id={id}: jumphost received invalid destination response"
+            ));
+            return false;
+        }
+    };
+    let response = InitialResponse::decode(response_packet.payload()).ok();
+    if Instant::now() >= initialization_deadline {
+        send_initial_error(
+            connection,
+            "initialization deadline elapsed before response",
+        );
+        return false;
+    }
+    if connection
+        .write_packet_strict(
+            EtPacketType::InitialResponse as u8,
+            response_packet.payload(),
+        )
+        .is_err()
+    {
+        crate::diag::info(format!(
+            "id={id}: jumphost failed writing destination INITIAL_RESPONSE to {peer}"
+        ));
+        return false;
+    }
+    let Some(response) = response else {
+        let _ = terminal.shutdown(std::net::Shutdown::Both);
+        return false;
+    };
+    if response.error.is_some() {
+        if connection.set_io_timeout(Some(HANDSHAKE_TIMEOUT)).is_err() {
+            return false;
+        }
+        let acknowledged = connection.read_packet().is_ok_and(|packet| {
+            packet.header() == EtPacketType::Heartbeat as u8 && packet.payload().is_empty()
+        });
+        if !acknowledged
+            || write_local_packet(
+                terminal,
+                &et_core::packet::Packet::new(EtPacketType::Heartbeat as u8, Vec::new()),
+            )
+            .is_err()
+            || connection.set_io_timeout(None).is_err()
+        {
+            let _ = terminal.shutdown(std::net::Shutdown::Both);
+            return false;
+        }
+    }
+    true
 }
 
 fn wait_for_terminal_startup(
@@ -1030,7 +1101,12 @@ fn resume_pty_session(
     crate::diag::info(format!(
         "id={id}: resumed terminal bridge running for {peer}"
     ));
-    let _ = crate::terminal_bridge::run(active.clone(), terminal, forwarder);
+    let _ = crate::terminal_bridge::run(
+        active.clone(),
+        terminal,
+        forwarder,
+        registration.router_framing,
+    );
     let _ = active.finish_terminal();
     retire_ended_terminal(core, &identity);
 }
@@ -1211,6 +1287,7 @@ mod tests {
                 ptyactive: None,
                 hadreversetunnels: None,
                 disconnect_timeout_seconds: None,
+                upstream_router_stream: None,
             }
             .encode_to_vec(),
         );

@@ -17,7 +17,9 @@ use et_core::proto::{
 use et_net::connection::Connection;
 use et_net::framing_io::{read_proto_limited, write_proto};
 use et_net::handshake::client_request;
-use et_net::local_packet::{read_local_packet, write_local_packet};
+use et_net::local_packet::{
+    read_local_packet, write_local_packet, RouterFraming, RouterStreamDecoder,
+};
 use prost::Message;
 
 use super::Runtime;
@@ -221,12 +223,22 @@ fn register_resume(
             ptyactive: resumed.then_some(true),
             hadreversetunnels: None,
             disconnect_timeout_seconds: timeout,
+            upstream_router_stream: None,
         }
         .encode_to_vec(),
     );
     write_local_packet(&mut stream, &packet).unwrap();
     handle.wait_registered(ID, TIMEOUT).unwrap();
     stream
+}
+
+/// One message of the upstream raw stream a terminal registered without the
+/// startup sentinel reads once its pty runs.
+fn read_upstream(terminal: &mut et_net::local::LocalStream) -> Packet {
+    RouterStreamDecoder::new(RouterFraming::Upstream)
+        .read_from(terminal)
+        .unwrap()
+        .expect("router message before the read timeout")
 }
 
 fn handshake(address: SocketAddr) -> (TcpStream, ConnectResponse) {
@@ -292,7 +304,7 @@ fn unclaimed_resumes_obey_grace_override_and_exact_expiry_boundary() {
         if expires_after.is_some() {
             assert!(runtime.core.registry.was_removed(ID).unwrap());
             assert_eq!(
-                read_local_packet(&mut terminal).unwrap().header(),
+                read_upstream(&mut terminal).header(),
                 TerminalPacketType::TerminalClose as u8
             );
         }
@@ -340,7 +352,7 @@ fn authenticated_reconnect_blocks_expiry_only_while_claim_is_pending() {
         .contains(&registration.identity())
         .unwrap());
     assert_eq!(
-        read_local_packet(&mut terminal).unwrap().header(),
+        read_upstream(&mut terminal).header(),
         TerminalPacketType::TerminalClose as u8
     );
     drop(peer);
@@ -406,7 +418,7 @@ fn unclaimed_sweep_does_not_close_starting_active_or_fresh_terminals() {
                 .contains(&registration.identity())
                 .unwrap());
             assert_eq!(
-                read_local_packet(&mut terminal).unwrap().header(),
+                read_upstream(&mut terminal).header(),
                 TerminalPacketType::TerminalClose as u8
             );
             assert!(matches!(

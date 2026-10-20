@@ -2,6 +2,7 @@ use std::io;
 use std::sync::Arc;
 
 use et_net::local::LocalStream;
+use et_net::local_packet::RouterFraming;
 
 use et_core::keys::passkey_to_key;
 use et_core::proto::TerminalUserInfo;
@@ -86,12 +87,22 @@ pub(crate) fn validate(
         }
     };
     let startup_ack = user_info.fd == Some(-6);
+    // et.rs 0.0.43 and older terminals register with the fd sentinel but
+    // without `upstream_router_stream`, and read every router message as a
+    // length-prefixed packet. ET C++ and newer et.rs terminals read the
+    // upstream raw stream.
+    let router_framing = if startup_ack && user_info.upstream_router_stream != Some(true) {
+        RouterFraming::Packets
+    } else {
+        RouterFraming::Upstream
+    };
     Ok(Registration {
         id,
         key,
         uid,
         gid,
         startup_ack,
+        router_framing,
         pty_active: user_info.ptyactive.unwrap_or(false),
         had_reverse_tunnels: user_info.hadreversetunnels.unwrap_or(false),
         disconnect_timeout_seconds: user_info.disconnect_timeout_seconds,
@@ -113,6 +124,7 @@ mod tests {
             ptyactive: None,
             hadreversetunnels: None,
             disconnect_timeout_seconds: None,
+            upstream_router_stream: None,
         }
     }
 

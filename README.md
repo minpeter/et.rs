@@ -8,7 +8,8 @@ A Rust port of [Eternal Terminal](https://github.com/MisterTea/EternalTerminal) 
 automatically reconnects without interrupting the session.
 
 Wire-compatible with upstream protocol version 6: an et.rs client can talk to a C++ `etserver`, and a
-C++ `et` client can talk to an et.rs server, in both terminal and port-forwarding modes.
+C++ `et` client can talk to an et.rs server, in both terminal and port-forwarding modes. On the server
+host, `etserver` and `etterminal` can also come from different implementations.
 How we track upstream (Rust rewrite, not a C++ git fork): [docs/upstream-factory.md](docs/upstream-factory.md).
 
 Windows is a first-class target. Upstream has no native server there, so hosting a session on

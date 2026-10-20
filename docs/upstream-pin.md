@@ -20,11 +20,11 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-10-14.
 | Baseline / latest release tag | [`et-v7.0.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.0.0) |
 | Baseline / release commit | [`7656a32a5bc15c6746726a27a5a4ba1e468fab6e`](https://github.com/MisterTea/EternalTerminal/commit/7656a32a5bc15c6746726a27a5a4ba1e468fab6e) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`7eb237e`](https://github.com/MisterTea/EternalTerminal/commit/7eb237e6d9822b674f4a527924b5f09117659321) (merge of #879 ssh-agent session-bind 3/3, reviewed 2026-10-14) |
+| Pin tip (last classified) | [`7ee361a`](https://github.com/MisterTea/EternalTerminal/commit/7ee361a75fbb3e0900445b110188996fbe950823) (merge of #900 plain `%` lines are not tmux -CC, reviewed 2026-10-20) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
 | ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.0.0` and `master`) |
 
-The reviewed baseline-to-tip range contains 129 classified commits. Unclassified commits would be drift. The product-parity ports below passed combined Linux verification: 824 tests passed, none failed, and two existing tests were ignored. Formatting, workspace clippy, Windows GNU/macOS ARM binary cross-checks, and release/AUR packaging checks passed. Real OpenSSH mux clients exercised the Rust master; no live C++ peer, native Windows/macOS runtime, or actual VS Code sleep cycle was tested in this port. `ported` covers the behavior described in each row, including its explicit limitations, not unrestricted product parity. Protocol remains v6.
+The reviewed baseline-to-tip range contains 131 classified commits. Unclassified commits would be drift. The product-parity ports below passed combined Linux verification: 824 tests passed, none failed, and two existing tests were ignored. Formatting, workspace clippy, Windows GNU/macOS ARM binary cross-checks, and release/AUR packaging checks passed. Real OpenSSH mux clients exercised the Rust master; no live C++ peer, native Windows/macOS runtime, or actual VS Code sleep cycle was tested in this port. `ported` covers the behavior described in each row, including its explicit limitations, not unrestricted product parity. Protocol remains v6.
 
 ## Ledger (classified 2026-10-12)
 
@@ -628,9 +628,11 @@ et.rs now follows that single-loop shape with these deliberate differences:
 - Forwarding moves onto the session thread only after the session loop first
   polls it; before that (and on Windows) the forwarding worker thread runs the
   same engine.
-- `etserver` keeps the router on its own thread; one `et-runtime` thread
-  accepts on all TCP listeners and applies terminal lifecycle events plus the
-  1 s resume sweep from its poll timeout.
+- `etserver` runs one `et-runtime` control thread: on Linux and macOS it accepts
+  on all TCP listeners, serves the terminal router (registrations, startup
+  status, terminal hang-ups) and applies terminal lifecycle events in one
+  `poll(2)`, and sweeps resume expiry once a second only while a resumed
+  terminal is registered. Windows keeps a separate router thread.
 
 No wire, handshake, crypto or `PROTOCOL_VERSION` change.
 
@@ -688,3 +690,33 @@ dumps and pid files, and the Windows pre-`TERMINAL_INIT` thread join.
 Review ports against the conflict policy in
 [`docs/upstream-factory.md`](upstream-factory.md). Gate any later port with
 `cargo test --workspace` (especially `fixtures/wire.json`), not a GUI.
+
+## Ledger (classified 2026-10-20)
+
+Two commits after [`7eb237e`](https://github.com/MisterTea/EternalTerminal/commit/7eb237e6d9822b674f4a527924b5f09117659321).
+`PROTOCOL_VERSION` stays **6**.
+
+| sha | date | kind | status | note |
+| --- | --- | --- | --- | --- |
+| [`8caa1e8`](https://github.com/MisterTea/EternalTerminal/commit/8caa1e8c1ca833c094ac43837a9bb1272126dca0) | 2026-10-16 | product | **ported** | #900 plain `%` lines are not tmux -CC |
+| [`7ee361a`](https://github.com/MisterTea/EternalTerminal/commit/7ee361a75fbb3e0900445b110188996fbe950823) | 2026-10-19 | product | **ported** | Merge #900 |
+
+Upstream `WriteBuffer` latched control mode on any line starting with `%`, so
+`top` (`%Cpu(s)`) and csh `%` prompts were reordered after Ctrl+C. #900 arms it
+only on the `ESC P 1000 p` introducer or a known control token. et.rs
+`TerminalStream` already worked that way (`plain_percent_lines_do_not_enter_tmux_control_mode_or_reorder_output`,
+from upstream report #899); the port adds the remaining piece: a plain `%exit`
+line no longer arms control mode. One difference is kept: inside control mode
+et.rs leaves at the ST that follows `%exit` rather than at `%exit`, so a Ctrl+C
+flush between the two cannot drop the terminator
+(`dcs_introducer_and_exit_transition_tmux_control_mode_cleanly`). The
+`etterminal` wall filter already enables itself only on the introducer.
+
+Live interop smoke (2026-10-20, et.rs 0.0.42 against an ET-C++ `master` build,
+loopback): an et.rs client with C++ `etserver`/`etterminal`, and a C++ client
+with et.rs `etserver`/`etterminal`, both ran a PTY command stream and `-L`/`-R`
+tunnels. Mixing implementations within one host's server pair (et.rs
+`etserver` with C++ `etterminal`, or the reverse) does not work: the local
+router channel between them uses et.rs framing, not the raw C++ type byte.
+Packages install the two roles together, so this pairing only arises from a
+hand-mixed install.

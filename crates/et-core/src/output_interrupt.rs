@@ -114,6 +114,15 @@ fn is_tmux_control_token(token: &[u8]) -> bool {
     )
 }
 
+/// Whether a line's first token puts the stream in tmux control mode. `%exit`
+/// is tmux's goodbye, so a plain line reading `%exit` stays ordinary output
+/// (upstream #900); inside control mode the stream still waits for the ST
+/// that follows `%exit`, so an interrupt flush never drops that terminator.
+fn arms_control_mode(token: &[u8]) -> bool {
+    let token = token.strip_prefix(TMUX_DCS).unwrap_or(token);
+    token != b"%exit" && is_tmux_control_token(token)
+}
+
 fn line_first_token(line: &[u8]) -> &[u8] {
     let token = line
         .split(|byte| byte.is_ascii_whitespace())
@@ -210,7 +219,7 @@ impl TerminalStream {
             self.escape = byte == b'\x1b';
             if byte == b'\n' {
                 let token = self.token.strip_prefix(TMUX_DCS).unwrap_or(&self.token);
-                if is_tmux_control_token(token) {
+                if arms_control_mode(token) {
                     self.control = true;
                 }
                 match token {
@@ -224,7 +233,7 @@ impl TerminalStream {
             } else {
                 self.midline = true;
                 if byte.is_ascii_whitespace() {
-                    if !self.token_done && is_tmux_control_token(&self.token) {
+                    if !self.token_done && arms_control_mode(&self.token) {
                         self.control = true;
                     }
                     self.token_done = true;

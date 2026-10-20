@@ -16,7 +16,9 @@ use std::time::Duration;
 use et_core::packet::Packet;
 use et_core::proto::{TerminalBuffer, TerminalPacketType};
 use et_net::local::LocalStream;
-use et_net::local_packet::{write_local_terminal_buffer_until_cancelled, LocalPacketDecoder};
+use et_net::local_packet::{
+    write_local_terminal_buffer_until_cancelled, RouterFraming, RouterStreamDecoder,
+};
 use prost::Message;
 
 #[cfg(unix)]
@@ -42,6 +44,7 @@ enum PipeEvent {
 pub(crate) fn run<F>(
     mut router: LocalStream,
     term: &str,
+    framing: RouterFraming,
     initialization: TerminalInitialization,
     started: F,
 ) -> Result<i32, String>
@@ -59,7 +62,7 @@ where
     let mut child = spawn_command(&command, term, &initialization.environment)?;
     #[cfg(target_os = "linux")]
     if let Some(pidfd) = terminal_pipe_poll::watch(&child) {
-        return terminal_pipe_poll::run(router, child, pidfd, started);
+        return terminal_pipe_poll::run(router, framing, child, pidfd, started);
     }
     let stdin = child
         .stdin
@@ -143,7 +146,13 @@ where
         return Err(error);
     }
 
-    let status = pump(&mut router, wake_reader, &events_rx, &mut Some(stdin));
+    let status = pump(
+        &mut router,
+        framing,
+        wake_reader,
+        &events_rx,
+        &mut Some(stdin),
+    );
     drop(cleanup);
     let status = status?;
     if let PipeStatus::Exited(code) = status {
@@ -310,6 +319,7 @@ enum PipeStatus {
 
 fn pump(
     router: &mut LocalStream,
+    framing: RouterFraming,
     mut wake_reader: LocalStream,
     events: &mpsc::Receiver<PipeEvent>,
     stdin: &mut Option<ChildStdin>,
@@ -317,7 +327,7 @@ fn pump(
     wake_reader
         .set_nonblocking(true)
         .map_err(|error| format!("could not configure pipe wakeup: {error}"))?;
-    let mut decoder = LocalPacketDecoder::new();
+    let mut decoder = RouterStreamDecoder::new(framing);
     let mut pending = Vec::new();
     let mut stdout_done = false;
     let mut child_status = None;
@@ -383,7 +393,6 @@ fn pump(
                     // session status.
                     return Ok(PipeStatus::Closed);
                 }
-                decoder = LocalPacketDecoder::new();
             }
         }
         if let Some(input) = stdin.as_mut() {
@@ -576,7 +585,7 @@ impl Drop for Cleanup {
 mod tests {
     use super::*;
     use crate::terminal_pty;
-    use et_net::local_packet::{read_local_packet, write_local_packet};
+    use et_net::local_packet::{read_local_packet, write_local_packet, write_router_message};
 
     fn collect(peer: &mut LocalStream) -> Vec<TerminalBuffer> {
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -617,7 +626,12 @@ mod tests {
         write_init(&mut peer, "printf 'OUT\\000\\001\\377'; printf 'ERR' >&2");
         let (done_tx, done_rx) = mpsc::channel();
         thread::spawn(move || {
-            let result = terminal_pty::run_with_startup(router, "xterm", |_| Ok(()));
+            let result = terminal_pty::run_with_startup(
+                router,
+                "xterm",
+                RouterFraming::Upstream,
+                |_| Ok(()),
+            );
             let _ = done_tx.send(result);
         });
         let buffers = collect(&mut peer);
@@ -643,17 +657,23 @@ mod tests {
             buffer: Some(b"a\x03b\n".to_vec()),
             is_stderr: None,
         };
-        write_local_packet(
+        write_router_message(
             &mut peer,
             &Packet::new(
                 TerminalPacketType::TerminalBuffer as u8,
                 input.encode_to_vec(),
             ),
+            RouterFraming::Upstream,
         )
         .unwrap();
         let (done_tx, done_rx) = mpsc::channel();
         thread::spawn(move || {
-            let result = terminal_pty::run_with_startup(router, "xterm", |_| Ok(()));
+            let result = terminal_pty::run_with_startup(
+                router,
+                "xterm",
+                RouterFraming::Upstream,
+                |_| Ok(()),
+            );
             let _ = done_tx.send(result);
         });
         let buffers = collect(&mut peer);
@@ -669,6 +689,66 @@ mod tests {
     }
 
     #[test]
+    fn raw_pipe_takes_input_and_closes_on_either_router_framing() {
+        // Upstream and et.rs from 0.0.44 write the raw upstream stream, with
+        // TERMINAL_CLOSE as a lone type byte; et.rs 0.0.43 writes packets.
+        for framing in [RouterFraming::Upstream, RouterFraming::Packets] {
+            let (router, mut peer) = et_net::local::wake_pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            write_init(
+                &mut peer,
+                "IFS= read -r line; printf '%s' \"$line\"; exec sleep 30",
+            );
+            let input = TerminalBuffer {
+                buffer: Some(b"PIPE-INPUT\n".to_vec()),
+                is_stderr: None,
+            };
+            write_router_message(
+                &mut peer,
+                &Packet::new(
+                    TerminalPacketType::TerminalBuffer as u8,
+                    input.encode_to_vec(),
+                ),
+                framing,
+            )
+            .unwrap();
+            let (done_tx, done_rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = done_tx.send(terminal_pty::run_with_startup(
+                    router,
+                    "xterm",
+                    framing,
+                    |_| Ok(()),
+                ));
+            });
+            let mut output = Vec::new();
+            while output != b"PIPE-INPUT" {
+                let packet = read_local_packet(&mut peer).unwrap();
+                assert_eq!(packet.header(), TerminalPacketType::TerminalBuffer as u8);
+                output.extend(
+                    TerminalBuffer::decode(packet.payload())
+                        .unwrap()
+                        .buffer
+                        .unwrap(),
+                );
+            }
+            write_router_message(
+                &mut peer,
+                &Packet::new(TerminalPacketType::TerminalClose as u8, Vec::new()),
+                framing,
+            )
+            .unwrap();
+            assert_eq!(
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("pipe session missed TERMINAL_CLOSE"),
+                Ok(0),
+                "{framing:?}"
+            );
+        }
+    }
+
+    #[test]
     fn stdout_eof_closes_stdin_when_the_child_redirects_stdout() {
         let (router, mut peer) = et_net::local::wake_pair().unwrap();
         // `exec` closes the session stdout pipe while cat still reads stdin
@@ -676,7 +756,12 @@ mod tests {
         write_init(&mut peer, "printf OUT; exec cat >/dev/null");
         let (done_tx, done_rx) = mpsc::channel();
         thread::spawn(move || {
-            let result = terminal_pty::run_with_startup(router, "xterm", |_| Ok(()));
+            let result = terminal_pty::run_with_startup(
+                router,
+                "xterm",
+                RouterFraming::Upstream,
+                |_| Ok(()),
+            );
             let _ = done_tx.send(result);
         });
         let buffers = collect(&mut peer);
@@ -704,7 +789,9 @@ mod tests {
             &Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec()),
         )
         .unwrap();
-        let error = terminal_pty::run_with_startup(router, "xterm", |_| Ok(())).unwrap_err();
+        let error =
+            terminal_pty::run_with_startup(router, "xterm", RouterFraming::Upstream, |_| Ok(()))
+                .unwrap_err();
         assert!(error.contains("non-empty"), "{error}");
     }
 }

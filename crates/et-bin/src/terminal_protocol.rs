@@ -5,7 +5,7 @@ use et_core::packet::Packet;
 use et_core::proto::{
     FlowControlMode, TermInit, TerminalBuffer, TerminalExitStatus, TerminalInfo, TerminalPacketType,
 };
-use et_net::local_packet::{read_local_packet, write_local_packet, LocalPacketDecoder};
+use et_net::local_packet::{read_local_packet, write_local_packet, RouterStreamDecoder};
 use portable_pty::{MasterPty, PtySize};
 use prost::Message;
 
@@ -103,9 +103,11 @@ pub(crate) fn write_terminal_exit_status(
         .map_err(|error| format!("could not write terminal exit status: {error}"))
 }
 
+/// Read one message of the router stream that follows `TERMINAL_INIT` (or a
+/// live pty's re-registration). `Ok(None)` means the router would block.
 pub fn read_ready_packet(
     router: &mut LocalStream,
-    decoder: &mut LocalPacketDecoder,
+    decoder: &mut RouterStreamDecoder,
 ) -> Result<Option<Packet>, String> {
     match decoder.read_from(router) {
         Ok(packet) => Ok(packet),
@@ -121,7 +123,7 @@ pub fn read_ready_packet(
     }
 }
 
-/// What a framed local packet asks `etterminal` to do.
+/// What a router message asks `etterminal` to do.
 ///
 /// `Close` is the success path for upstream `TERMINAL_CLOSE`: stop the PTY
 /// session without reporting an unsupported-packet error.

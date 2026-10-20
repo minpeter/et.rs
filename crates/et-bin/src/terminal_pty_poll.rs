@@ -15,7 +15,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
 use et_net::local::LocalStream;
-use et_net::local_packet::{LocalPacketDecoder, TerminalBufferFrame};
+use et_net::local_packet::{RouterFraming, RouterStreamDecoder, TerminalBufferFrame};
 use portable_pty::{Child, ChildKiller, MasterPty};
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
@@ -71,6 +71,7 @@ pub(super) fn run<F>(
     child: Box<dyn Child + Send + Sync>,
     motd: Option<Vec<u8>>,
     output_delay: Duration,
+    framing: RouterFraming,
     resume: Option<RouterResume>,
     started: F,
 ) -> Result<i32, String>
@@ -100,7 +101,7 @@ where
         child: Some(child),
         pidfd: Some(pidfd),
         resume,
-        decoder: LocalPacketDecoder::new(),
+        decoder: RouterStreamDecoder::new(framing),
         input: Vec::new(),
         input_sent: 0,
         shaper: OutputShaper::new(motd.is_some()),
@@ -164,7 +165,7 @@ struct Session {
     child: Option<Box<dyn Child + Send + Sync>>,
     pidfd: Option<OwnedFd>,
     resume: Option<RouterResume>,
-    decoder: LocalPacketDecoder,
+    decoder: RouterStreamDecoder,
     /// Keystrokes the PTY has not accepted yet; router reads pause meanwhile.
     input: Vec<u8>,
     input_sent: usize,
@@ -364,14 +365,13 @@ impl Session {
         reap_shell(child)
     }
 
-    /// Apply router packets until the socket runs dry. Keystrokes the PTY
+    /// Apply router messages until the socket runs dry. Keystrokes the PTY
     /// cannot take yet pause reading, unless the router is already gone.
     fn read_router(&mut self, drain: bool) -> Result<Option<PumpCompletion>, String> {
         while drain || self.input_sent == self.input.len() {
             let Some(packet) = read_ready_packet(&mut self.router, &mut self.decoder)? else {
                 return Ok(None);
             };
-            self.decoder = LocalPacketDecoder::new();
             match terminal_command(&packet) {
                 Ok(TerminalCommand::Close) => return Ok(Some(terminal_close_completion())),
                 Ok(TerminalCommand::Input(bytes)) => self.write_input(&bytes),
@@ -543,13 +543,15 @@ impl Session {
     }
 
     /// Re-register a lost router when the session can resume; a frame that
-    /// was cut short restarts whole on the new stream.
+    /// was cut short restarts whole on the new stream, which is read with
+    /// the framing its registration negotiated.
     fn recover_router(&mut self, error: String) -> Result<(), String> {
         let Some(resume) = self.resume.as_ref() else {
             return Err(error);
         };
-        self.router = reconnect_router_stream(resume)?;
-        self.decoder = LocalPacketDecoder::new();
+        let (router, framing) = reconnect_router_stream(resume)?;
+        self.router = router;
+        self.decoder = RouterStreamDecoder::new(framing);
         if let Some((frame, length, _)) = self.frame.as_mut() {
             *frame = TerminalBufferFrame::new(*length, false)
                 .map_err(|error| format!("could not forward PTY output: {error}"))?;

@@ -8,7 +8,7 @@ use et_core::packet::Packet;
 use et_core::proto::{TerminalInfo, TerminalPacketType};
 use et_net::connection::ConnError;
 use et_net::forward::{is_forward_packet, Forwarder};
-use et_net::local_packet::{LocalPacketDecoder, MAX_LOCAL_PACKET_LEN};
+use et_net::local_packet::{LocalPacketDecoder, RouterFraming, RouterHead};
 use prost::Message;
 #[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags};
@@ -23,31 +23,19 @@ const READ_BUFFER: usize = 16 * 1024;
 const CLIENT_READ_BATCH: usize = 128;
 const FORWARD_BACKLOG_CAPACITY: usize = 513;
 
-const LOCAL_HEADER_LEN: usize = std::mem::size_of::<i64>() + 2;
-
+/// One router message for the terminal: its [`RouterHead`] and payload,
+/// resumable across local-stream backpressure without copying the payload.
 struct PendingLocalFrame {
-    header: [u8; LOCAL_HEADER_LEN],
+    head: RouterHead,
     payload: Vec<u8>,
     offset: usize,
 }
 
 impl PendingLocalFrame {
-    fn from_packet(packet: Packet) -> io::Result<Self> {
-        let wire_len = packet.wire_len();
-        if wire_len > MAX_LOCAL_PACKET_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "local packet exceeds 64 KiB",
-            ));
-        }
-        let length = i64::try_from(wire_len)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "local packet too large"))?;
-        let mut header = [0u8; LOCAL_HEADER_LEN];
-        header[..8].copy_from_slice(&length.to_ne_bytes());
-        header[8] = packet.is_encrypted() as u8;
-        header[9] = packet.header();
+    fn new(packet: Packet, framing: RouterFraming) -> io::Result<Self> {
+        let head = RouterHead::new(packet.header(), packet.payload().len(), framing)?;
         Ok(Self {
-            header,
+            head,
             payload: packet.into_payload(),
             offset: 0,
         })
@@ -55,16 +43,17 @@ impl PendingLocalFrame {
 
     /// Write as much as the non-blocking local stream currently accepts.
     fn try_write<W: Write>(&mut self, terminal: &mut W) -> io::Result<bool> {
-        let total = LOCAL_HEADER_LEN + self.payload.len();
+        let head = self.head.as_bytes();
+        let total = head.len() + self.payload.len();
         while self.offset < total {
-            let res = if self.offset < LOCAL_HEADER_LEN {
+            let res = if self.offset < head.len() {
                 let slices = [
-                    io::IoSlice::new(&self.header[self.offset..]),
+                    io::IoSlice::new(&head[self.offset..]),
                     io::IoSlice::new(&self.payload),
                 ];
                 terminal.write_vectored(&slices)
             } else {
-                terminal.write(&self.payload[self.offset - LOCAL_HEADER_LEN..])
+                terminal.write(&self.payload[self.offset - head.len()..])
             };
             match res {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
@@ -82,20 +71,32 @@ impl PendingLocalFrame {
 ///
 /// `Terminal` mirrors `TerminalServer::runTerminal`: terminal output must be
 /// TERMINAL_BUFFER, client packets are dispatched by type, and port
-/// forwarding is handled locally. `Jumphost` mirrors
-/// `TerminalServer::runJumpHost`: both directions are relayed verbatim.
+/// forwarding is handled locally. It writes the terminal in the framing its
+/// registration chose. `Jumphost` mirrors `TerminalServer::runJumpHost`: both
+/// directions are relayed verbatim as length-prefixed packets.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BridgeMode {
-    Terminal,
+    Terminal(RouterFraming),
     Jumphost,
+}
+
+impl BridgeMode {
+    /// How this bridge frames what it writes to the terminal.
+    fn framing(self) -> RouterFraming {
+        match self {
+            Self::Terminal(framing) => framing,
+            Self::Jumphost => RouterFraming::Packets,
+        }
+    }
 }
 
 pub(crate) fn run(
     session: Arc<ActiveSession>,
     terminal: LocalStream,
     forwarder: Forwarder,
+    framing: RouterFraming,
 ) -> Result<(), SessionError> {
-    run_mode(session, terminal, forwarder, BridgeMode::Terminal)
+    run_mode(session, terminal, forwarder, BridgeMode::Terminal(framing))
 }
 
 pub(crate) fn run_mode(
@@ -127,6 +128,7 @@ fn run_mode_poll(
     let mut wake = session.take_wake_reader()?;
     wake.set_nonblocking(true).map_err(SessionError::Io)?;
     let mut decoder = LocalPacketDecoder::new();
+    let framing = mode.framing();
     let (mut connected, mut connection_generation) = session.connection_state()?;
     session.note_bridge_generation(connection_generation)?;
     // Forwarding packets awaiting worker capacity. Keeping one bounded spill
@@ -310,7 +312,7 @@ fn run_mode_poll(
                 let Some(mut packet) = next? else {
                     continue;
                 };
-                if mode == BridgeMode::Terminal
+                if matches!(mode, BridgeMode::Terminal(_))
                     && packet.header() == TerminalPacketType::TerminalBuffer as u8
                 {
                     if let Some((first_bytes, false)) =
@@ -389,7 +391,13 @@ fn run_mode_poll(
             finish_killed_session(&session);
             return Ok(());
         }
-        if close_expired_disconnect(&session, &mut terminal, &mut pending_local, connected)? {
+        if close_expired_disconnect(
+            &session,
+            &mut terminal,
+            &mut pending_local,
+            connected,
+            framing,
+        )? {
             return Ok(());
         }
         // Recovery authentication may read more than its proof packet into
@@ -411,7 +419,7 @@ fn run_mode_poll(
                     Ok(Some(packet)) if mode == BridgeMode::Jumphost => {
                         let packet = jumphost_client_packet(&session, packet)?;
                         let mut frame =
-                            PendingLocalFrame::from_packet(packet).map_err(SessionError::Io)?;
+                            PendingLocalFrame::new(packet, framing).map_err(SessionError::Io)?;
                         match frame.try_write(&mut terminal) {
                             Ok(true) => {}
                             Ok(false) => pending_local = Some(frame),
@@ -455,7 +463,7 @@ fn run_mode_poll(
                                     if terminal_input_closed {
                                         continue;
                                     }
-                                    let mut frame = PendingLocalFrame::from_packet(packet)
+                                    let mut frame = PendingLocalFrame::new(packet, framing)
                                         .map_err(SessionError::Io)?;
                                     match frame.try_write(&mut terminal) {
                                         Ok(true) => {}
@@ -479,6 +487,7 @@ fn run_mode_poll(
                                     match write_local_terminal_close(
                                         &mut terminal,
                                         &mut pending_local,
+                                        framing,
                                     )? {
                                         LocalClose::Done => return Ok(()),
                                         LocalClose::Pending => close_after_local = true,
@@ -579,6 +588,7 @@ fn run_mode_windows(
     let mut wake = session.take_wake_reader()?;
     wake.set_nonblocking(true).map_err(SessionError::Io)?;
     let mut decoder = LocalPacketDecoder::new();
+    let framing = mode.framing();
     let (mut connected, mut connection_generation) = session.connection_state()?;
     session.note_bridge_generation(connection_generation)?;
     let mut pending_forward = VecDeque::with_capacity(FORWARD_BACKLOG_CAPACITY);
@@ -591,7 +601,13 @@ fn run_mode_windows(
         if session.is_shutting_down() {
             return Ok(());
         }
-        if close_expired_disconnect(&session, &mut terminal, &mut pending_local, connected)? {
+        if close_expired_disconnect(
+            &session,
+            &mut terminal,
+            &mut pending_local,
+            connected,
+            framing,
+        )? {
             return Ok(());
         }
         let mut progress = false;
@@ -682,7 +698,8 @@ fn run_mode_windows(
                         if mode == BridgeMode::Jumphost {
                             let packet = jumphost_client_packet(&session, packet)?;
                             pending_local = Some(
-                                PendingLocalFrame::from_packet(packet).map_err(SessionError::Io)?,
+                                PendingLocalFrame::new(packet, framing)
+                                    .map_err(SessionError::Io)?,
                             );
                         } else if is_forward_packet(packet.header()) {
                             enqueue_forwarding(&forwarder, &mut pending_forward, packet)?;
@@ -711,7 +728,7 @@ fn run_mode_windows(
                                         continue;
                                     }
                                     pending_local = Some(
-                                        PendingLocalFrame::from_packet(packet)
+                                        PendingLocalFrame::new(packet, framing)
                                             .map_err(SessionError::Io)?,
                                     );
                                 }
@@ -728,6 +745,7 @@ fn run_mode_windows(
                                     match write_local_terminal_close(
                                         &mut terminal,
                                         &mut pending_local,
+                                        framing,
                                     )? {
                                         LocalClose::Done => return Ok(()),
                                         LocalClose::Pending => close_after_local = true,
@@ -1281,6 +1299,7 @@ fn close_expired_disconnect(
     terminal: &mut LocalStream,
     pending_local: &mut Option<PendingLocalFrame>,
     connected: bool,
+    framing: RouterFraming,
 ) -> Result<bool, SessionError> {
     let (live, _) = if connected {
         (true, 0)
@@ -1290,7 +1309,7 @@ fn close_expired_disconnect(
     if !session.disconnect_deadline_reached(live) {
         return Ok(false);
     }
-    let _ = write_local_terminal_close(terminal, pending_local);
+    let _ = write_local_terminal_close(terminal, pending_local, framing);
     Ok(true)
 }
 
@@ -1304,14 +1323,15 @@ enum LocalClose {
     InputGone,
 }
 
-/// Write a framed local `TERMINAL_CLOSE`. et.rs local sockets use framed
-/// packets, not the raw C++ type byte.
+/// Write a local `TERMINAL_CLOSE` in the terminal's framing: upstream writes
+/// the bare type byte, et.rs 0.0.43 and older terminals read a packet.
 fn write_local_terminal_close(
     terminal: &mut LocalStream,
     pending_local: &mut Option<PendingLocalFrame>,
+    framing: RouterFraming,
 ) -> Result<LocalClose, SessionError> {
     let packet = Packet::new(TerminalPacketType::TerminalClose as u8, Vec::new());
-    let mut frame = PendingLocalFrame::from_packet(packet).map_err(SessionError::Io)?;
+    let mut frame = PendingLocalFrame::new(packet, framing).map_err(SessionError::Io)?;
     match frame.try_write(terminal) {
         Ok(true) => Ok(LocalClose::Done),
         Ok(false) => {
@@ -1471,21 +1491,31 @@ mod tests {
             TerminalPacketType::TerminalBuffer as u8,
             b"ordered".to_vec(),
         );
-        let expected = et_net::local_packet::encode_local_packet(&packet).unwrap();
-        let mut pending = PendingLocalFrame::from_packet(packet).unwrap();
-        let mut writer = ScriptedWriter {
-            steps: VecDeque::from([
-                WriteStep::Accept(5),
-                WriteStep::WouldBlock,
-                WriteStep::Accept(usize::MAX),
-            ]),
-            bytes: Vec::new(),
-        };
+        let mut upstream = vec![TerminalPacketType::TerminalBuffer as u8];
+        upstream.extend_from_slice(&7i64.to_ne_bytes());
+        upstream.extend_from_slice(b"ordered");
+        for (framing, expected) in [
+            (
+                RouterFraming::Packets,
+                et_net::local_packet::encode_local_packet(&packet).unwrap(),
+            ),
+            (RouterFraming::Upstream, upstream),
+        ] {
+            let mut pending = PendingLocalFrame::new(packet.clone(), framing).unwrap();
+            let mut writer = ScriptedWriter {
+                steps: VecDeque::from([
+                    WriteStep::Accept(5),
+                    WriteStep::WouldBlock,
+                    WriteStep::Accept(usize::MAX),
+                ]),
+                bytes: Vec::new(),
+            };
 
-        assert!(!pending.try_write(&mut writer).unwrap());
-        assert_eq!(writer.bytes, expected[..5]);
-        assert!(pending.try_write(&mut writer).unwrap());
-        assert_eq!(writer.bytes, expected);
+            assert!(!pending.try_write(&mut writer).unwrap());
+            assert_eq!(writer.bytes, expected[..5]);
+            assert!(pending.try_write(&mut writer).unwrap());
+            assert_eq!(writer.bytes, expected, "{framing:?}");
+        }
     }
 
     #[cfg(unix)]
@@ -1554,15 +1584,21 @@ mod tests {
             }
             .encode_to_vec(),
         );
-        assert!(
-            accept_terminal_packet(&session, BridgeMode::Terminal, packet.clone())
-                .unwrap()
-                .is_none()
-        );
+        assert!(accept_terminal_packet(
+            &session,
+            BridgeMode::Terminal(RouterFraming::Upstream),
+            packet.clone()
+        )
+        .unwrap()
+        .is_none());
         session.set_forward_exit_status(true);
-        let forwarded = accept_terminal_packet(&session, BridgeMode::Terminal, packet)
-            .unwrap()
-            .unwrap();
+        let forwarded = accept_terminal_packet(
+            &session,
+            BridgeMode::Terminal(RouterFraming::Upstream),
+            packet,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             forwarded.header(),
             TerminalPacketType::TerminalExitStatus as u8

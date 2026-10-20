@@ -12,7 +12,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::process::{Child, ChildStdin};
 
 use et_net::local::LocalStream;
-use et_net::local_packet::{LocalPacketDecoder, TerminalBufferFrame};
+use et_net::local_packet::{RouterFraming, RouterStreamDecoder, TerminalBufferFrame};
 use rustix::event::{poll, PollFd, PollFlags};
 use rustix::io::Errno;
 use rustix::process::{pidfd_open, Pid, PidfdFlags};
@@ -30,6 +30,7 @@ pub(super) fn watch(child: &Child) -> Option<OwnedFd> {
 
 pub(super) fn run<F>(
     router: LocalStream,
+    framing: RouterFraming,
     mut child: Child,
     pidfd: OwnedFd,
     started: F,
@@ -69,7 +70,7 @@ where
     };
     let mut session = PipeSession {
         router,
-        decoder: LocalPacketDecoder::new(),
+        decoder: RouterStreamDecoder::new(framing),
         stdin: Some(stdin),
         pending: Vec::new(),
         outputs: [Some(stdout), Some(stderr)],
@@ -106,7 +107,7 @@ where
 
 struct PipeSession {
     router: LocalStream,
-    decoder: LocalPacketDecoder,
+    decoder: RouterStreamDecoder,
     stdin: Option<ChildStdin>,
     /// Input the command has not accepted yet.
     pending: Vec<u8>,
@@ -231,7 +232,6 @@ impl PipeSession {
                     if take_input(packet, &mut self.stdin, &mut self.pending)? {
                         return Ok(None);
                     }
-                    self.decoder = LocalPacketDecoder::new();
                 }
             }
             if stdin_ready {

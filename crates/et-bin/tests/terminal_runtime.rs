@@ -31,8 +31,8 @@ use et_core::proto::{
     TermInit, TerminalBuffer, TerminalInfo, TerminalPacketType, TerminalUserInfo,
 };
 use et_net::local_packet::{
-    parse_status, read_local_packet, status_packet, write_local_packet, REGISTRATION_STATUS,
-    STARTUP_STATUS,
+    parse_status, read_local_packet, registration_status_packet, status_packet, write_local_packet,
+    write_router_message, RouterFraming, REGISTRATION_STATUS, STARTUP_STATUS,
 };
 use prost::Message;
 use terminal_runtime_support::{
@@ -139,7 +139,7 @@ fn write_lastlog_record(path: &Path, timestamp: u32, host: &[u8]) {
 }
 
 #[test]
-fn framed_terminal_close_shuts_the_pty_down_successfully() {
+fn terminal_close_shuts_the_pty_down_successfully() {
     let fixture = Fixture::new("terminal-close");
     let mut child = fixture.spawn_with_shell("/bin/sh");
     write_credentials(&mut child);
@@ -164,22 +164,18 @@ fn framed_terminal_close_shuts_the_pty_down_successfully() {
         },
     );
     expect_startup(&mut router);
-    write_local_packet(
-        &mut router,
-        &Packet::new(TerminalPacketType::TerminalClose as u8, Vec::new()),
-    )
-    .unwrap();
+    close_terminal(&mut router, RouterFraming::Upstream);
     let status = child
         .wait_timeout(TIMEOUT)
         .unwrap()
-        .expect("etterminal hung after framed TERMINAL_CLOSE");
+        .expect("etterminal hung after TERMINAL_CLOSE");
     let mut stderr = String::new();
     if let Some(mut err) = child.stderr.take() {
         let _ = err.read_to_string(&mut stderr);
     }
     assert!(
         status.success(),
-        "framed TERMINAL_CLOSE should be a success path, got {status}, stderr={stderr}"
+        "TERMINAL_CLOSE should be a success path, got {status}, stderr={stderr}"
     );
     assert!(
         !stderr.to_ascii_lowercase().contains("unsupported"),
@@ -329,44 +325,112 @@ fn detached_terminal_is_session_leader_and_closes_inherited_descriptors() {
 }
 
 #[test]
-fn new_terminal_uses_legacy_sequence_with_old_router() {
-    let fixture = Fixture::new_legacy("old-router-new-terminal");
+fn upstream_router_stream_drives_input_resize_and_single_byte_close() {
+    // Given: an upstream etserver, which writes no capability sidecar, never
+    // answers registration and writes the raw upstream router stream.
+    let fixture = Fixture::new_legacy("upstream-router");
     let mut child = fixture.spawn();
     write_credentials(&mut child);
     let mut router = fixture.accept();
-    router.set_read_timeout(Some(TIMEOUT)).unwrap();
-    let registration = read_local_packet(&mut router).unwrap();
-    let user = TerminalUserInfo::decode(registration.payload()).unwrap();
-    assert_eq!(user.fd, None);
+    let user = expect_registration(&mut router, false);
+    assert_eq!(user.ptyactive, None);
     fixture.wait_ready();
     send(
         &mut router,
         TerminalPacketType::TerminalInit,
-        &TermInit {
-            environmentnames: Vec::new(),
-            environmentvalues: Vec::new(),
-            flowcontrol: None,
-
-            no_pty: None,
-            command: None,
-
-            no_shell: None,
-            disconnect_timeout_seconds: None,
-            hadreversetunnels: None,
-        },
+        &TermInit::default(),
     );
+
+    // When: it resizes, types and finally closes with the lone type byte.
+    exercise_session(&mut router, RouterFraming::Upstream, (40, 100), "UPSTREAM");
+    router
+        .write_all(&[TerminalPacketType::TerminalClose as u8])
+        .unwrap();
+
+    // Then: the session ends successfully.
+    let status = child
+        .wait_timeout(TIMEOUT)
+        .unwrap()
+        .expect("etterminal missed upstream TERMINAL_CLOSE");
+    assert!(status.success(), "{status}");
+}
+
+#[test]
+fn old_et_rs_router_packets_still_drive_input_resize_and_close() {
+    // Given: et.rs 0.0.43, which advertises acknowledgements but answers
+    // with a bare success byte and writes every message as a packet.
+    let fixture = Fixture::new("old-et-rs-router");
+    let mut child = fixture.spawn();
+    write_credentials(&mut child);
+    let mut router = fixture.accept();
+    expect_registration(&mut router, true);
+    acknowledge_registration_as_old_et_rs(&mut router);
+    fixture.wait_ready();
     send(
         &mut router,
-        TerminalPacketType::TerminalBuffer,
-        &TerminalBuffer {
-            buffer: Some(b"printf 'MIXED-OLD-ROUTER\\n'; exit\n".to_vec()),
-
-            is_stderr: None,
-        },
+        TerminalPacketType::TerminalInit,
+        &TermInit::default(),
     );
-    let output = collect_until(&mut router, |output| contains(output, b"MIXED-OLD-ROUTER"));
-    assert!(contains(&output, b"MIXED-OLD-ROUTER"));
-    assert!(child.wait_timeout(TIMEOUT).unwrap().unwrap().success());
+    expect_startup(&mut router);
+
+    // When: it resizes, types and closes with packets.
+    exercise_session(&mut router, RouterFraming::Packets, (40, 100), "OLD");
+    close_terminal(&mut router, RouterFraming::Packets);
+
+    // Then: the session ends successfully.
+    let status = child
+        .wait_timeout(TIMEOUT)
+        .unwrap()
+        .expect("etterminal missed packet TERMINAL_CLOSE");
+    assert!(status.success(), "{status}");
+}
+
+#[test]
+fn reregistration_reads_the_router_stream_each_new_etserver_negotiates() {
+    // Given: a session started under a current et.rs etserver.
+    let fixture = Fixture::new("reregistration-framing");
+    let mut child = fixture.spawn();
+    write_credentials(&mut child);
+    let mut router = fixture.accept();
+    assert_eq!(expect_registration(&mut router, true).ptyactive, None);
+    acknowledge_registration(&mut router);
+    fixture.wait_ready();
+    send(
+        &mut router,
+        TerminalPacketType::TerminalInit,
+        &TermInit::default(),
+    );
+    expect_startup(&mut router);
+    exercise_session(&mut router, RouterFraming::Upstream, (40, 100), "FIRST");
+
+    // When: the etserver is replaced by et.rs 0.0.43, which writes packets.
+    drop(router);
+    let mut router = fixture.accept();
+    assert_eq!(expect_registration(&mut router, true).ptyactive, Some(true));
+    acknowledge_registration_as_old_et_rs(&mut router);
+
+    // Then: the live pty reads packets.
+    exercise_session(&mut router, RouterFraming::Packets, (33, 77), "SECOND");
+
+    // When: that one is replaced by upstream etserver, which has no sidecar.
+    std::fs::remove_file(et_net::local::capability_path(&fixture.socket)).unwrap();
+    drop(router);
+    let mut router = fixture.accept();
+    assert_eq!(
+        expect_registration(&mut router, false).ptyactive,
+        Some(true)
+    );
+
+    // Then: the live pty reads the raw upstream stream, close included.
+    exercise_session(&mut router, RouterFraming::Upstream, (21, 61), "THIRD");
+    router
+        .write_all(&[TerminalPacketType::TerminalClose as u8])
+        .unwrap();
+    let status = child
+        .wait_timeout(TIMEOUT)
+        .unwrap()
+        .expect("etterminal missed TERMINAL_CLOSE after re-registering");
+    assert!(status.success(), "{status}");
 }
 
 #[test]
@@ -376,13 +440,8 @@ fn real_terminal_registers_runs_shell_and_resizes_pty() {
     write_credentials(&mut child);
     let mut router = fixture.accept();
     router.set_read_timeout(Some(TIMEOUT)).unwrap();
-    let registration = read_local_packet(&mut router).unwrap();
+    let user = expect_registration(&mut router, true);
     acknowledge_registration(&mut router);
-    assert_eq!(
-        registration.header(),
-        TerminalPacketType::TerminalUserInfo as u8
-    );
-    let user = TerminalUserInfo::decode(registration.payload()).unwrap();
     assert_eq!(user.id.as_deref(), Some(ID));
     assert_eq!(user.passkey.as_deref(), Some(KEY));
     fixture.wait_ready();
@@ -991,8 +1050,34 @@ fn count(output: &[u8], marker: &[u8]) -> usize {
         .count()
 }
 
+/// Answer registration like an et.rs etserver from 0.0.44 on.
 fn acknowledge_registration(router: &mut impl Write) {
+    write_local_packet(
+        router,
+        &registration_status_packet(Ok(RouterFraming::Upstream)),
+    )
+    .unwrap();
+}
+
+/// Answer registration like et.rs 0.0.43 and older: a bare success byte.
+fn acknowledge_registration_as_old_et_rs(router: &mut impl Write) {
     write_local_packet(router, &status_packet(REGISTRATION_STATUS, Ok(()))).unwrap();
+}
+
+/// Read the terminal's registration. With the capability sidecar the
+/// terminal must ask for the upstream router stream; without it (upstream
+/// etserver) it must send neither et.rs extension.
+fn expect_registration(router: &mut impl Read, sidecar: bool) -> TerminalUserInfo {
+    let packet = read_local_packet(router).unwrap();
+    assert_eq!(packet.header(), TerminalPacketType::TerminalUserInfo as u8);
+    let user = TerminalUserInfo::decode(packet.payload()).unwrap();
+    assert_eq!(user.fd, sidecar.then_some(-6), "{user:?}");
+    assert_eq!(
+        user.upstream_router_stream,
+        sidecar.then_some(true),
+        "{user:?}"
+    );
+    user
 }
 
 fn expect_startup(router: &mut impl std::io::Read) {
@@ -1006,6 +1091,66 @@ fn expect_startup(router: &mut impl std::io::Read) {
     });
 }
 
+/// Send a message the way a current etserver does.
 fn send<M: Message>(router: &mut impl Write, kind: TerminalPacketType, message: &M) {
-    write_local_packet(router, &Packet::new(kind as u8, message.encode_to_vec())).unwrap();
+    send_framed(router, kind, message, RouterFraming::Upstream);
+}
+
+/// `TERMINAL_INIT` is always a length-prefixed packet; everything after it is
+/// the router stream in `framing`.
+fn send_framed<M: Message>(
+    router: &mut impl Write,
+    kind: TerminalPacketType,
+    message: &M,
+    framing: RouterFraming,
+) {
+    let packet = Packet::new(kind as u8, message.encode_to_vec());
+    if kind == TerminalPacketType::TerminalInit {
+        write_local_packet(router, &packet).unwrap();
+    } else {
+        write_router_message(router, &packet, framing).unwrap();
+    }
+}
+
+fn close_terminal(router: &mut impl Write, framing: RouterFraming) {
+    write_router_message(
+        router,
+        &Packet::new(TerminalPacketType::TerminalClose as u8, Vec::new()),
+        framing,
+    )
+    .unwrap();
+}
+
+/// Resize the pty and run a command over the router stream in `framing`,
+/// then wait for the new size and `<label>-OK` in the shell's output.
+fn exercise_session(
+    router: &mut std::os::unix::net::UnixStream,
+    framing: RouterFraming,
+    (rows, columns): (i32, i32),
+    label: &str,
+) {
+    send_framed(
+        router,
+        TerminalPacketType::TerminalInfo,
+        &TerminalInfo {
+            row: Some(rows),
+            column: Some(columns),
+            ..TerminalInfo::default()
+        },
+        framing,
+    );
+    send_framed(
+        router,
+        TerminalPacketType::TerminalBuffer,
+        &TerminalBuffer {
+            buffer: Some(format!("stty size; printf '%s-%s\\n' {label} OK\n").into_bytes()),
+            is_stderr: None,
+        },
+        framing,
+    );
+    let size = format!("{rows} {columns}");
+    let marker = format!("{label}-OK");
+    collect_until(router, |output| {
+        contains(output, size.as_bytes()) && contains(output, marker.as_bytes())
+    });
 }

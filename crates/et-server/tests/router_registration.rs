@@ -2,14 +2,17 @@
 
 mod support;
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use et_core::packet::Packet;
 use et_core::proto::{TerminalPacketType, TerminalUserInfo};
-use et_net::local_packet::{read_local_packet, write_local_packet, MAX_LOCAL_PACKET_LEN};
+use et_net::local_packet::{
+    parse_registration_status, read_local_packet, write_local_packet, RouterFraming,
+    MAX_LOCAL_PACKET_LEN, REGISTRATION_STATUS,
+};
 use et_server::path::select_router_path_for;
 use et_server::{Registry, Router, RouterEvent, RouterReject, REGISTRATION_TIMEOUT};
 use prost::Message;
@@ -54,6 +57,7 @@ fn info_with_capability(
         ptyactive: None,
         hadreversetunnels: None,
         disconnect_timeout_seconds: None,
+        upstream_router_stream: None,
     }
 }
 
@@ -294,6 +298,125 @@ fn new_router_sends_no_control_packet_to_legacy_terminal() {
         et_net::local_packet::LocalPacketError::Io(ref io)
             if matches!(io.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
     ));
+    router.shutdown().unwrap();
+}
+
+#[test]
+fn registration_status_names_the_framing_the_terminal_reads() {
+    let dir = TestDir::new();
+    let path = dir.socket();
+    let registry = Registry::new();
+    let selected = select_router_path_for(1000, Some(&path), None, None).unwrap();
+    let mut router = Router::start(selected, registry).unwrap();
+    let (uid, gid) = current_ids();
+    let mut terminals = Vec::new();
+    // et.rs 0.0.43 and older accept only the bare success byte; current
+    // et.rs asks for, and is told about, the upstream raw stream.
+    for (id, upstream_router_stream, payload, framing) in [
+        ("legacyetrs000000", None, &[0u8][..], RouterFraming::Packets),
+        (
+            "currentetrs00000",
+            Some(true),
+            &[0u8, 1][..],
+            RouterFraming::Upstream,
+        ),
+    ] {
+        let mut value = info_with_capability(Some(id), Some(KEY), Some(uid), Some(gid), true);
+        value.upstream_router_stream = upstream_router_stream;
+        let mut terminal = connect_packet(
+            &path,
+            &Packet::new(
+                TerminalPacketType::TerminalUserInfo as u8,
+                value.encode_to_vec(),
+            ),
+        );
+        terminal
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let status = read_local_packet(&mut terminal).unwrap();
+        assert!(!status.is_encrypted());
+        assert_eq!(status.header(), REGISTRATION_STATUS);
+        assert_eq!(status.payload(), payload);
+        assert_eq!(parse_registration_status(&status).unwrap(), framing);
+        assert_eq!(
+            router.recv_event_timeout(Duration::from_secs(2)).unwrap(),
+            RouterEvent::Registered { id: id.to_owned() }
+        );
+        terminals.push(terminal);
+    }
+    router.shutdown().unwrap();
+}
+
+#[test]
+fn rejected_registration_is_answered_only_with_the_status_sentinel() {
+    let dir = TestDir::new();
+    let path = dir.socket();
+    let registry = Registry::new();
+    let selected = select_router_path_for(1000, Some(&path), None, None).unwrap();
+    let mut router = Router::start(selected, registry).unwrap();
+    let (uid, gid) = current_ids();
+    let _original = connect_packet(
+        &path,
+        &Packet::new(
+            TerminalPacketType::TerminalUserInfo as u8,
+            info(Some(ID), Some(KEY), Some(uid), Some(gid)).encode_to_vec(),
+        ),
+    );
+    assert_eq!(
+        router.recv_event_timeout(Duration::from_secs(2)).unwrap(),
+        RouterEvent::Registered { id: ID.to_owned() }
+    );
+
+    for (value, reject) in [
+        (
+            info(Some(ID), Some(KEY), Some(uid), Some(gid)),
+            RouterReject::Duplicate,
+        ),
+        (
+            info(Some("short"), Some(KEY), Some(uid), Some(gid)),
+            RouterReject::InvalidRegistration,
+        ),
+    ] {
+        // An ET C++ terminal treats any packet here as fatal: upstream closes
+        // a refused registration without writing.
+        let mut silent = connect_packet(
+            &path,
+            &Packet::new(
+                TerminalPacketType::TerminalUserInfo as u8,
+                value.encode_to_vec(),
+            ),
+        );
+        silent
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        expect_rejected(&router, reject);
+        let mut received = Vec::new();
+        silent.read_to_end(&mut received).unwrap();
+        assert!(received.is_empty(), "{reject:?}: {received:?}");
+
+        // An et.rs terminal that registered with the sentinel still learns
+        // why it was refused.
+        let mut value = value;
+        value.fd = Some(-6);
+        value.upstream_router_stream = Some(true);
+        let mut answered = connect_packet(
+            &path,
+            &Packet::new(
+                TerminalPacketType::TerminalUserInfo as u8,
+                value.encode_to_vec(),
+            ),
+        );
+        answered
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        expect_rejected(&router, reject);
+        let status = read_local_packet(&mut answered).unwrap();
+        let error = parse_registration_status(&status).unwrap_err();
+        assert!(
+            error.to_string().contains(&format!("{reject:?}")),
+            "{error}"
+        );
+    }
     router.shutdown().unwrap();
 }
 

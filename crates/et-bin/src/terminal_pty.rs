@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use et_core::proto::FlowControlMode;
 use et_net::local::LocalStream;
-use et_net::local_packet::LocalPacketDecoder;
+use et_net::local_packet::{RouterFraming, RouterStreamDecoder};
 #[cfg(unix)]
 use nix::sys::signal::{kill, Signal};
 #[cfg(unix)]
@@ -37,12 +37,15 @@ use crate::terminal_protocol::{
 };
 
 /// Enough state to re-register a live pty after the router socket dies.
+///
+/// Whether the router acknowledges registrations is probed again on every
+/// re-registration: the etserver behind the path may have been swapped
+/// between et.rs and upstream while the session ran.
 #[derive(Clone)]
 pub struct RouterResume {
     pub path: PathBuf,
     pub id: String,
     pub passkey: String,
-    pub registration_ack: bool,
     pub had_reverse_tunnels: bool,
     pub disconnect_timeout_seconds: Option<i32>,
 }
@@ -53,7 +56,12 @@ enum WorkerEvent {
 }
 
 #[allow(dead_code)] // pipe and unit tests; interactive sessions use `run_resuming`
-pub fn run_with_startup<F>(router: LocalStream, term: &str, started: F) -> Result<i32, String>
+pub fn run_with_startup<F>(
+    router: LocalStream,
+    term: &str,
+    framing: RouterFraming,
+    started: F,
+) -> Result<i32, String>
 where
     F: FnOnce(&mut LocalStream) -> Result<(), String>,
 {
@@ -64,12 +72,23 @@ where
         command.arg("-l");
         command
     };
-    run_with_command(router, term, command, Duration::ZERO, None, started)
+    run_with_command(
+        router,
+        term,
+        command,
+        Duration::ZERO,
+        framing,
+        None,
+        started,
+    )
 }
 
+/// Run the session `framing` describes. The framing applies from
+/// `TERMINAL_INIT` on; every re-registration negotiates its own.
 pub fn run_resuming<F>(
     router: LocalStream,
     term: &str,
+    framing: RouterFraming,
     resume: RouterResume,
     started: F,
 ) -> Result<i32, String>
@@ -83,7 +102,15 @@ where
         command.arg("-l");
         command
     };
-    run_with_command(router, term, command, Duration::ZERO, Some(resume), started)
+    run_with_command(
+        router,
+        term,
+        command,
+        Duration::ZERO,
+        framing,
+        Some(resume),
+        started,
+    )
 }
 
 fn run_with_command<F>(
@@ -91,6 +118,7 @@ fn run_with_command<F>(
     term: &str,
     mut command: CommandBuilder,
     output_delay: Duration,
+    framing: RouterFraming,
     mut resume: Option<RouterResume>,
     started: F,
 ) -> Result<i32, String>
@@ -103,10 +131,10 @@ where
         resume.disconnect_timeout_seconds = initialization.disconnect_timeout_seconds;
     }
     if initialization.no_shell {
-        return run_idle(router, started);
+        return run_idle(router, framing, started);
     }
     if initialization.no_pty {
-        return crate::terminal_pipe::run(router, term, initialization, started);
+        return crate::terminal_pipe::run(router, term, framing, initialization, started);
     }
     // Default sessions now also retain interruptible output in userspace.
     match initialization.flow_control {
@@ -156,6 +184,7 @@ where
             child,
             motd,
             output_delay,
+            framing,
             resume,
             started,
         );
@@ -292,6 +321,7 @@ where
     let result = setup.and_then(|()| {
         pump(
             &mut router,
+            framing,
             wake_reader,
             pair.master.as_ref(),
             &mut pty_writer,
@@ -622,6 +652,7 @@ impl CompletionState {
 #[allow(clippy::too_many_arguments)]
 fn pump(
     router: &mut LocalStream,
+    framing: RouterFraming,
     wake_reader: LocalStream,
     master: &dyn portable_pty::MasterPty,
     pty_writer: &mut dyn Write,
@@ -633,6 +664,7 @@ fn pump(
     #[cfg(unix)]
     return pump_poll(
         router,
+        framing,
         wake_reader,
         master,
         pty_writer,
@@ -644,6 +676,7 @@ fn pump(
     #[cfg(windows)]
     return pump_windows(
         router,
+        framing,
         wake_reader,
         master,
         pty_writer,
@@ -658,6 +691,7 @@ fn pump(
 #[allow(clippy::too_many_arguments)]
 fn pump_poll(
     router: &mut LocalStream,
+    framing: RouterFraming,
     mut wake_reader: LocalStream,
     master: &dyn portable_pty::MasterPty,
     pty_writer: &mut dyn Write,
@@ -666,7 +700,7 @@ fn pump_poll(
     router_writer: &Arc<Mutex<LocalStream>>,
     progress: &AtomicUsize,
 ) -> Result<PumpCompletion, String> {
-    let mut decoder = LocalPacketDecoder::new();
+    let mut decoder = RouterStreamDecoder::new(framing);
     let mut completion = CompletionState {
         last_progress: progress.load(Ordering::Acquire),
         ..CompletionState::default()
@@ -698,8 +732,9 @@ fn pump_poll(
         };
         if router_events.intersects(PollFlags::HUP | PollFlags::ERR) {
             if let Some(resume) = resume {
-                *router = reconnect_router(resume, router_writer)?;
-                decoder = LocalPacketDecoder::new();
+                let (recovered, framing) = reconnect_router(resume, router_writer)?;
+                *router = recovered;
+                decoder = RouterStreamDecoder::new(framing);
                 continue;
             }
             return Err("terminal router disconnected".to_owned());
@@ -724,7 +759,6 @@ fn pump_poll(
                     Err(TerminalPacketError::Pty(_)) => {}
                     Err(TerminalPacketError::Protocol(error)) => return Err(error),
                 }
-                decoder = LocalPacketDecoder::new();
             }
         }
     }
@@ -734,8 +768,10 @@ fn pump_poll(
 /// be polled together, so both are checked without blocking on the same 10ms
 /// cadence upstream's `select()` timeout uses.
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 fn pump_windows(
     router: &mut LocalStream,
+    framing: RouterFraming,
     mut wake_reader: LocalStream,
     master: &dyn portable_pty::MasterPty,
     pty_writer: &mut dyn Write,
@@ -745,7 +781,7 @@ fn pump_windows(
     progress: &AtomicUsize,
 ) -> Result<PumpCompletion, String> {
     const IDLE: std::time::Duration = std::time::Duration::from_millis(10);
-    let mut decoder = LocalPacketDecoder::new();
+    let mut decoder = RouterStreamDecoder::new(framing);
     let mut completion = CompletionState {
         last_progress: progress.load(Ordering::Acquire),
         ..CompletionState::default()
@@ -772,13 +808,13 @@ fn pump_windows(
                     Err(TerminalPacketError::Pty(_)) => {}
                     Err(TerminalPacketError::Protocol(error)) => return Err(error),
                 }
-                decoder = LocalPacketDecoder::new();
             }
             Ok(None) => {}
             Err(error) if error == "terminal router disconnected" => {
                 if let Some(resume) = resume {
-                    *router = reconnect_router(resume, router_writer)?;
-                    decoder = LocalPacketDecoder::new();
+                    let (recovered, framing) = reconnect_router(resume, router_writer)?;
+                    *router = recovered;
+                    decoder = RouterStreamDecoder::new(framing);
                     continue;
                 }
                 return Err(error);
@@ -794,8 +830,8 @@ fn pump_windows(
 fn reconnect_router(
     resume: &RouterResume,
     router_writer: &Arc<Mutex<LocalStream>>,
-) -> Result<LocalStream, String> {
-    let stream = reconnect_router_stream(resume)?;
+) -> Result<(LocalStream, RouterFraming), String> {
+    let (stream, framing) = reconnect_router_stream(resume)?;
     let cloned = stream
         .try_clone()
         .map_err(|error| format!("could not clone the recovered router: {error}"))?;
@@ -803,20 +839,20 @@ fn reconnect_router(
         .lock()
         .map_err(|_| "terminal router writer is unavailable".to_owned())?;
     *writer = cloned;
-    Ok(stream)
+    Ok((stream, framing))
 }
 
 /// Re-register with the router, backing off between attempts, and return the
-/// recovered non-blocking stream.
-fn reconnect_router_stream(resume: &RouterResume) -> Result<LocalStream, String> {
+/// recovered non-blocking stream with the framing that registration chose.
+fn reconnect_router_stream(resume: &RouterResume) -> Result<(LocalStream, RouterFraming), String> {
     let mut delay = Duration::from_secs(1);
     loop {
         match try_reconnect(resume) {
-            Ok(stream) => {
+            Ok((stream, framing)) => {
                 stream.set_nonblocking(true).map_err(|error| {
                     format!("could not configure the recovered router: {error}")
                 })?;
-                return Ok(stream);
+                return Ok((stream, framing));
             }
             Err(error) => {
                 et_cli::logging::info(format!("terminal router reconnect failed: {error}"));
@@ -827,22 +863,25 @@ fn reconnect_router_stream(resume: &RouterResume) -> Result<LocalStream, String>
     }
 }
 
-fn try_reconnect(resume: &RouterResume) -> Result<LocalStream, String> {
+fn try_reconnect(resume: &RouterResume) -> Result<(LocalStream, RouterFraming), String> {
+    // Probe before connecting, like the first registration: a replacement
+    // etserver writes its sidecar before it accepts terminals.
+    let registration_ack = et_net::local::supports_registration_ack(&resume.path);
     let mut router = et_net::local::connect(&resume.path)
         .map_err(|error| format!("could not connect terminal router: {error}"))?;
-    crate::terminal::register(
+    let framing = crate::terminal::register(
         &mut router,
         &crate::terminal_credentials::CredentialInput {
             id: resume.id.clone(),
             passkey: resume.passkey.clone(),
             term: String::new(),
         },
-        resume.registration_ack,
+        registration_ack,
         true,
         resume.had_reverse_tunnels,
         resume.disconnect_timeout_seconds,
     )?;
-    Ok(router)
+    Ok((router, framing))
 }
 
 /// `TERMINAL_CLOSE` ends the PTY session successfully.
@@ -860,7 +899,7 @@ fn terminal_close_completion() -> PumpCompletion {
 }
 
 /// `et -W`: no pty and no shell. Discard terminal input and leave on close.
-fn run_idle<F>(mut router: LocalStream, started: F) -> Result<i32, String>
+fn run_idle<F>(mut router: LocalStream, framing: RouterFraming, started: F) -> Result<i32, String>
 where
     F: FnOnce(&mut LocalStream) -> Result<(), String>,
 {
@@ -868,16 +907,13 @@ where
         .set_nonblocking(true)
         .map_err(|error| format!("could not configure idle terminal router: {error}"))?;
     started(&mut router)?;
-    let mut decoder = LocalPacketDecoder::new();
+    let mut decoder = RouterStreamDecoder::new(framing);
     loop {
         match read_ready_packet(&mut router, &mut decoder) {
-            Ok(Some(packet)) => {
-                match crate::terminal_protocol::local_packet_effect(&packet)? {
-                    LocalPacketEffect::Close => return Ok(0),
-                    LocalPacketEffect::Continue => {}
-                }
-                decoder = LocalPacketDecoder::new();
-            }
+            Ok(Some(packet)) => match crate::terminal_protocol::local_packet_effect(&packet)? {
+                LocalPacketEffect::Close => return Ok(0),
+                LocalPacketEffect::Continue => {}
+            },
             Ok(None) => wait_router_readable(&router),
             Err(error) if error.contains("disconnected") => return Ok(0),
             Err(error) => return Err(error),
@@ -1061,9 +1097,9 @@ fn kill_process_group(process_id: Option<u32>) {
 mod tests {
     use super::*;
     use et_core::packet::Packet;
-    use et_core::proto::{TermInit, TerminalBuffer, TerminalPacketType};
+    use et_core::proto::{TermInit, TerminalBuffer, TerminalInfo, TerminalPacketType};
     use et_net::local_packet::{
-        read_local_packet, status_packet, write_local_packet, STARTUP_STATUS,
+        read_local_packet, status_packet, write_local_packet, write_router_message, STARTUP_STATUS,
     };
     use prost::Message;
     use std::io::Cursor;
@@ -1134,8 +1170,15 @@ mod tests {
         command.env("SSH_TTY", "/bootstrap/not-this-tty");
         let (done_tx, done_rx) = mpsc::channel();
         thread::spawn(move || {
-            let result =
-                run_with_command(router, "xterm", command, Duration::ZERO, None, |_| Ok(()));
+            let result = run_with_command(
+                router,
+                "xterm",
+                command,
+                Duration::ZERO,
+                RouterFraming::Upstream,
+                None,
+                |_| Ok(()),
+            );
             done_tx.send(result).unwrap();
         });
         let mut output = Vec::new();
@@ -1226,6 +1269,7 @@ mod tests {
                 "xterm",
                 command,
                 Duration::from_millis(250),
+                RouterFraming::Upstream,
                 None,
                 |writer| {
                     write_local_packet(writer, &status_packet(STARTUP_STATUS, Ok(())))
@@ -1285,8 +1329,9 @@ mod tests {
         .unwrap();
         let (done_tx, done_rx) = mpsc::channel();
         thread::spawn(move || {
-            let result =
-                run_with_startup(router, "xterm", |_| Err("injected setup failure".into()));
+            let result = run_with_startup(router, "xterm", RouterFraming::Upstream, |_| {
+                Err("injected setup failure".into())
+            });
             let _ = done_tx.send(result);
         });
         let error = done_rx
@@ -1304,6 +1349,58 @@ mod tests {
             STARTUP_STATUS
         );
         drop(peer);
+    }
+
+    #[test]
+    fn no_shell_session_follows_the_negotiated_router_framing_to_close() {
+        // Upstream and et.rs from 0.0.44 write the raw upstream stream, with
+        // TERMINAL_CLOSE as a lone type byte; et.rs 0.0.43 writes packets.
+        for framing in [RouterFraming::Upstream, RouterFraming::Packets] {
+            let (router, mut peer) = et_net::local::wake_pair().unwrap();
+            let init = TermInit {
+                no_shell: Some(true),
+                ..TermInit::default()
+            };
+            write_local_packet(
+                &mut peer,
+                &Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec()),
+            )
+            .unwrap();
+            for packet in [
+                Packet::new(
+                    TerminalPacketType::TerminalInfo as u8,
+                    TerminalInfo {
+                        row: Some(30),
+                        column: Some(90),
+                        ..TerminalInfo::default()
+                    }
+                    .encode_to_vec(),
+                ),
+                Packet::new(
+                    TerminalPacketType::TerminalBuffer as u8,
+                    TerminalBuffer {
+                        buffer: Some(b"ignored".to_vec()),
+                        is_stderr: None,
+                    }
+                    .encode_to_vec(),
+                ),
+                Packet::new(TerminalPacketType::TerminalClose as u8, Vec::new()),
+            ] {
+                write_router_message(&mut peer, &packet, framing).unwrap();
+            }
+            let (done_tx, done_rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = done_tx.send(run_with_startup(router, "xterm", framing, |_| Ok(())));
+            });
+            assert_eq!(
+                done_rx
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("no-shell session missed TERMINAL_CLOSE"),
+                Ok(0),
+                "{framing:?}"
+            );
+            drop(peer);
+        }
     }
 
     #[test]

@@ -361,15 +361,18 @@ pub(crate) fn expire_unclaimed_resumes(
         };
         core.raw_sockets.shutdown_inactive_registration(&identity)?;
         // This generation has no session writer. Keep the close bounded without
-        // blocking the table lock or the rest of the lifecycle worker.
+        // blocking the table lock or the rest of the lifecycle worker. A live
+        // pty that re-registered already reads the router stream in its
+        // registration's framing.
         let close = et_core::packet::Packet::new(
             et_core::proto::TerminalPacketType::TerminalClose as u8,
             Vec::new(),
         );
         let sent = terminal.set_nonblocking(true).and_then(|()| {
-            et_net::local_packet::write_local_packet_cancelled(
+            et_net::local_packet::write_router_message_cancelled(
                 &mut terminal,
                 &close,
+                registration.router_framing,
                 &core.shutdown,
                 Instant::now() + Duration::from_millis(100),
             )

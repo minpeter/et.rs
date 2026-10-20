@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use et_core::packet::Packet;
 use et_net::local_packet::{
-    parse_status, status_packet, write_local_packet, LocalPacketDecoder, REGISTRATION_STATUS,
+    parse_status, registration_status_packet, write_local_packet, LocalPacketDecoder,
     STARTUP_STATUS,
 };
 #[cfg(unix)]
@@ -15,7 +15,7 @@ use rustix::event::{poll, PollFd, PollFlags};
 #[cfg(unix)]
 use rustix::net::{recv, RecvFlags};
 
-use crate::registry::{RegistrationIdentity, Registry};
+use crate::registry::{RegisteredTerminal, RegistrationIdentity, Registry};
 use crate::registry_validation::PeerIdentity;
 use crate::router::{
     RouterError, RouterEvent, RouterReject, MAX_PENDING_REGISTRATIONS, REGISTRATION_TIMEOUT,
@@ -209,51 +209,25 @@ impl RouterPoll {
                 ReadOutcome::Pending => {}
                 ReadOutcome::Packet(packet) => {
                     let connection = self.pending.swap_remove(index);
-                    let mut status = connection.stream.try_clone().map_err(RouterError::Io)?;
-                    match router_registration::process(
-                        packet,
-                        connection.stream,
-                        &self.registry,
-                        connection.peer,
-                    ) {
-                        Ok(terminal) => {
-                            if terminal.startup_ack
-                                && write_local_packet(
-                                    &mut status,
-                                    &status_packet(REGISTRATION_STATUS, Ok(())),
-                                )
-                                .is_err()
-                            {
-                                rollback_registration(
-                                    &self.registry,
-                                    &terminal.identity,
-                                    &self.events,
-                                )?;
-                                continue;
-                            }
-                            let id = terminal.identity.id().to_owned();
-                            terminal
-                                .watcher
-                                .set_nonblocking(true)
-                                .map_err(RouterError::Io)?;
-                            self.watched.push(WatchedRegistration {
-                                stream: terminal.watcher,
-                                identity: terminal.identity,
-                                startup: terminal.startup_ack.then(LocalPacketDecoder::new),
-                            });
-                            emit(&self.events, RouterEvent::Registered { id });
-                            if terminal.resumed {
-                                notify_resumed(self.lifecycle.as_ref());
-                            }
-                        }
-                        Err(error) => {
-                            let message = format!("registration rejected: {error:?}");
-                            let _ = write_local_packet(
-                                &mut status,
-                                &status_packet(REGISTRATION_STATUS, Err(&message)),
-                            );
-                            emit(&self.events, RouterEvent::Rejected(error));
-                        }
+                    let Some(terminal) =
+                        complete_registration(connection, packet, &self.registry, &self.events)?
+                    else {
+                        continue;
+                    };
+                    let id = terminal.identity.id().to_owned();
+                    terminal
+                        .watcher
+                        .set_nonblocking(true)
+                        .map_err(RouterError::Io)?;
+                    let startup = startup_watch(&terminal);
+                    self.watched.push(WatchedRegistration {
+                        stream: terminal.watcher,
+                        identity: terminal.identity,
+                        startup,
+                    });
+                    emit(&self.events, RouterEvent::Registered { id });
+                    if terminal.resumed {
+                        notify_resumed(self.lifecycle.as_ref());
                     }
                 }
                 ReadOutcome::Reject => {
@@ -354,43 +328,21 @@ fn run_windows(
                 ReadOutcome::Packet(packet) => {
                     progress = true;
                     let connection = pending.swap_remove(index);
-                    let mut status = connection.stream.try_clone().map_err(RouterError::Io)?;
-                    match router_registration::process(
-                        packet,
-                        connection.stream,
-                        &registry,
-                        connection.peer,
-                    ) {
-                        Ok(terminal) => {
-                            if terminal.startup_ack
-                                && write_local_packet(
-                                    &mut status,
-                                    &status_packet(REGISTRATION_STATUS, Ok(())),
-                                )
-                                .is_err()
-                            {
-                                rollback_registration(&registry, &terminal.identity, &events)?;
-                                continue;
-                            }
-                            let id = terminal.identity.id().to_owned();
-                            watched.push(WatchedRegistration {
-                                stream: terminal.watcher,
-                                identity: terminal.identity,
-                                startup: terminal.startup_ack.then(LocalPacketDecoder::new),
-                            });
-                            emit(&events, RouterEvent::Registered { id });
-                            if terminal.resumed {
-                                notify_resumed(lifecycle.as_ref());
-                            }
-                        }
-                        Err(error) => {
-                            let message = format!("registration rejected: {error:?}");
-                            let _ = write_local_packet(
-                                &mut status,
-                                &status_packet(REGISTRATION_STATUS, Err(&message)),
-                            );
-                            emit(&events, RouterEvent::Rejected(error));
-                        }
+                    let Some(terminal) =
+                        complete_registration(connection, packet, &registry, &events)?
+                    else {
+                        continue;
+                    };
+                    let id = terminal.identity.id().to_owned();
+                    let startup = startup_watch(&terminal);
+                    watched.push(WatchedRegistration {
+                        stream: terminal.watcher,
+                        identity: terminal.identity,
+                        startup,
+                    });
+                    emit(&events, RouterEvent::Registered { id });
+                    if terminal.resumed {
+                        notify_resumed(lifecycle.as_ref());
                     }
                 }
                 ReadOutcome::Reject => {
@@ -576,6 +528,54 @@ fn read_decoder(
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => return Ok(ReadOutcome::Reject),
+        }
+    }
+}
+
+/// Decoder for the `STARTUP_STATUS` an et.rs terminal sends once its new
+/// session starts. A live pty that re-registers after an etserver restart
+/// never sends one, and its stream already carries output for the resumed
+/// bridge: reading it here would steal and corrupt that output.
+fn startup_watch(terminal: &RegisteredTerminal) -> Option<LocalPacketDecoder> {
+    (terminal.startup_ack && !terminal.resumed).then(LocalPacketDecoder::new)
+}
+
+/// Register a read `TERMINAL_USER_INFO` and answer the terminal.
+///
+/// A terminal that registered with the `fd = -6` sentinel gets a
+/// `REGISTRATION_STATUS` either way; success names the framing the router
+/// will write to it. Any other terminal gets nothing: upstream
+/// `UserTerminalRouter::registerTerminal` closes a refused terminal without
+/// writing, and ET C++ `etterminal` treats an unexpected packet as fatal.
+/// Returns `None` once the registration was refused or rolled back.
+fn complete_registration(
+    connection: PendingConnection,
+    packet: Packet,
+    registry: &Registry,
+    events: &SyncSender<RouterEvent>,
+) -> Result<Option<RegisteredTerminal>, RouterError> {
+    let mut status = connection.stream.try_clone().map_err(RouterError::Io)?;
+    match router_registration::process(packet, connection.stream, registry, connection.peer) {
+        Ok(terminal) => {
+            if terminal.startup_ack
+                && write_local_packet(
+                    &mut status,
+                    &registration_status_packet(Ok(terminal.router_framing)),
+                )
+                .is_err()
+            {
+                rollback_registration(registry, &terminal.identity, events)?;
+                return Ok(None);
+            }
+            Ok(Some(terminal))
+        }
+        Err(rejection) => {
+            if rejection.wants_status {
+                let message = format!("registration rejected: {:?}", rejection.reason);
+                let _ = write_local_packet(&mut status, &registration_status_packet(Err(&message)));
+            }
+            emit(events, RouterEvent::Rejected(rejection.reason));
+            Ok(None)
         }
     }
 }

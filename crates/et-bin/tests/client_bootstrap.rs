@@ -2173,6 +2173,13 @@ fn jumphost_starts_a_jump_terminal_and_connects_to_the_jumphost() {
     assert!(jump_command.contains("'etterminal'"), "{jump_command:?}");
     assert!(!jump_command.contains("et.exe"), "{jump_command:?}");
     assert!(jump_command.contains("_xterm-ghostty'"), "{jump_command:?}");
+    // The destination answered with its own credentials (an ET C++
+    // etterminal regenerates the provisional `XXX` pair); the jump terminal
+    // must register that pair, like upstream `SshSetupHandler::SetupSsh`.
+    assert!(
+        jump_command.contains(&format!("'{SERVER_ID}/{SERVER_KEY}_xterm-ghostty'")),
+        "{jump_command:?}"
+    );
     assert!(jump_command.contains("'--jump'"), "{jump_command:?}");
     assert!(
         jump_command.contains("'--dsthost=127.0.0.1'"),

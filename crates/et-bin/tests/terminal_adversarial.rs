@@ -11,7 +11,7 @@ use std::time::Duration;
 use et_core::packet::Packet;
 use et_core::proto::{TermInit, TerminalBuffer, TerminalPacketType};
 use et_net::local_packet::{
-    parse_status, read_local_packet, status_packet, write_local_packet, REGISTRATION_STATUS,
+    parse_status, read_local_packet, registration_status_packet, write_local_packet, RouterFraming,
     STARTUP_STATUS,
 };
 use nix::sys::signal::kill;
@@ -146,10 +146,17 @@ fn background_pid(output: &str) -> Option<i32> {
     })
 }
 
+/// Answer registration like an et.rs etserver from 0.0.44 on.
 fn acknowledge_registration(router: &mut impl Write) {
-    write_local_packet(router, &status_packet(REGISTRATION_STATUS, Ok(()))).unwrap();
+    write_local_packet(
+        router,
+        &registration_status_packet(Ok(RouterFraming::Upstream)),
+    )
+    .unwrap();
 }
 
+/// Write a message where the terminal expects `TERMINAL_INIT`, which is a
+/// length-prefixed packet whatever the router stream framing.
 fn send<M: Message>(router: &mut impl Write, kind: TerminalPacketType, message: &M) {
     write_local_packet(router, &Packet::new(kind as u8, message.encode_to_vec())).unwrap();
 }

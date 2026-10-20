@@ -21,7 +21,7 @@ use et_net::local_packet::{read_local_packet, write_local_packet};
 use et_server::SessionState;
 use prost::Message;
 use runtime_support::{
-    default_payload, initialize, TestRuntime, ID_A, ID_B, KEY_A, KEY_B, TIMEOUT,
+    default_payload, initialize, read_upstream, TestRuntime, ID_A, ID_B, KEY_A, KEY_B, TIMEOUT,
 };
 
 // Deadlock watchdog only. Success is driven by exact bridge-generation and
@@ -48,7 +48,7 @@ fn subscribe_to_terminal_packet(
         ready_tx.send(()).unwrap();
         let mut intervening = Vec::new();
         loop {
-            let packet = match read_local_packet(&mut terminal) {
+            let packet = match read_upstream(&mut terminal) {
                 Ok(packet) => packet,
                 Err(error) => {
                     let _ = event_tx.send(Err(format!(
@@ -188,7 +188,7 @@ fn returning_client_receives_exact_buffered_server_catchup() {
     client
         .write_packet(TerminalPacketType::TerminalInfo as u8, b"post-recovery")
         .unwrap();
-    let forwarded = read_local_packet(&mut terminal).unwrap();
+    let forwarded = read_upstream(&mut terminal).unwrap();
     assert_eq!(forwarded.header(), TerminalPacketType::TerminalInfo as u8);
     assert_eq!(forwarded.payload(), b"post-recovery");
     server.runtime.shutdown().unwrap();
@@ -354,7 +354,7 @@ fn repeated_recovery_does_not_let_stale_hup_disconnect_the_new_stream() {
         client
             .write_packet(TerminalPacketType::TerminalInfo as u8, &[iteration])
             .unwrap();
-        let forwarded = read_local_packet(&mut terminal)
+        let forwarded = read_upstream(&mut terminal)
             .unwrap_or_else(|error| panic!("iteration {iteration}: {error}"));
         assert_eq!(forwarded.header(), TerminalPacketType::TerminalInfo as u8);
         assert_eq!(forwarded.payload(), &[iteration]);
@@ -554,7 +554,7 @@ fn concurrent_returning_recover_does_not_block_accept_path() {
     client
         .write_packet(TerminalPacketType::TerminalInfo as u8, b"post-concurrent")
         .unwrap();
-    let forwarded = read_local_packet(&mut terminal).unwrap();
+    let forwarded = read_upstream(&mut terminal).unwrap();
     assert_eq!(forwarded.payload(), b"post-concurrent");
     server.runtime.shutdown().unwrap();
 }
@@ -661,7 +661,7 @@ fn failed_recover_leaves_live_session_intact() {
     client
         .write_packet(TerminalPacketType::TerminalInfo as u8, b"still-live")
         .unwrap();
-    let forwarded = read_local_packet(&mut terminal).unwrap();
+    let forwarded = read_upstream(&mut terminal).unwrap();
     assert_eq!(forwarded.payload(), b"still-live");
     server.runtime.shutdown().unwrap();
 }

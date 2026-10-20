@@ -165,4 +165,10 @@ message TerminalUserInfo {
   // Preserved from TermInit so a resumed pump keeps the client's per-session
   // disconnect timeout across etserver restart.
   optional int32 disconnect_timeout_seconds = 8;
+  // et.rs only. An et.rs terminal (0.0.44 and newer) that reads the upstream
+  // router stream sets this next to the registration sentinel fd = -6.
+  // et.rs 0.0.43 and older leave it unset and get a length-prefixed packet
+  // for every router message. The tag sits far from upstream's sequential
+  // numbers: et.rs flow control had to move twice when upstream took its tag.
+  optional bool upstream_router_stream = 1000;
 }

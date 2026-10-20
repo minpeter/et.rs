@@ -9,7 +9,7 @@ use clap::Parser;
 use et_core::packet::Packet;
 use et_core::proto::{TerminalPacketType, TerminalUserInfo};
 use et_net::local_packet::{
-    parse_status, read_local_packet, status_packet, write_local_packet, REGISTRATION_STATUS,
+    parse_registration_status, read_local_packet, status_packet, write_local_packet, RouterFraming,
     STARTUP_STATUS,
 };
 use et_server::path::select_router_path;
@@ -106,7 +106,8 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
         let registration_ack = et_net::local::supports_registration_ack(router_path.path());
         let mut router = et_net::local::connect(router_path.path())
             .map_err(|error| clap_error(format!("could not connect terminal router: {error}")))?;
-        register(&mut router, &input, registration_ack, false, false, None).map_err(clap_error)?;
+        let framing = register(&mut router, &input, registration_ack, false, false, None)
+            .map_err(clap_error)?;
         let ready_socket = parsed
             .ready_socket
             .as_deref()
@@ -119,11 +120,10 @@ pub fn run(args: &[OsString]) -> Result<i32, clap::Error> {
             path: router_path.path().to_path_buf(),
             id: input.id.clone(),
             passkey: input.passkey.clone(),
-            registration_ack,
             had_reverse_tunnels: false,
             disconnect_timeout_seconds: None,
         };
-        let result = terminal_pty::run_resuming(router, &input.term, resume, |router| {
+        let result = terminal_pty::run_resuming(router, &input.term, framing, resume, |router| {
             if registration_ack {
                 report_startup(router, Ok(()))?;
             }
@@ -176,6 +176,8 @@ fn run_jump(
         let registration_ack = et_net::local::supports_registration_ack(router_path);
         let mut router = et_net::local::connect(router_path)
             .map_err(|error| clap_error(format!("could not connect terminal router: {error}")))?;
+        // The jumphost relay is length-prefixed packets in both directions,
+        // whatever router stream framing the registration negotiated.
         register(&mut router, input, registration_ack, false, false, None).map_err(clap_error)?;
         let ready_socket = parsed_ready_socket(args)?;
         crate::terminal_daemon::signal(ready_socket).map_err(clap_error)?;
@@ -187,6 +189,7 @@ fn run_jump(
             input,
             &destination_host,
             args.dstport,
+            registration_ack,
             |router| {
                 if registration_ack {
                     report_startup(router, Ok(()))?;
@@ -253,6 +256,13 @@ fn load_credentials(args: &TerminalArgs) -> Result<CredentialInput, String> {
     parse_credential_input(text.trim())
 }
 
+/// Register with the router and return how it frames the router stream.
+///
+/// With `registration_ack` (an et.rs etserver's capability sidecar) the
+/// terminal asks for the upstream stream and reads `REGISTRATION_STATUS`:
+/// et.rs 0.0.43 and older answer a bare success and keep writing
+/// length-prefixed packets. Without it the router is upstream's, which never
+/// answers and always writes the upstream stream.
 pub(crate) fn register(
     router: &mut LocalStream,
     input: &CredentialInput,
@@ -260,7 +270,7 @@ pub(crate) fn register(
     pty_active: bool,
     had_reverse_tunnels: bool,
     disconnect_timeout_seconds: Option<i32>,
-) -> Result<(), String> {
+) -> Result<RouterFraming, String> {
     // Upstream uses these to chown forwarded named pipes; Windows has no
     // POSIX ids, so the session reports zero there.
     let (uid, gid) = registration_identity();
@@ -276,6 +286,7 @@ pub(crate) fn register(
         disconnect_timeout_seconds,
         hadreversetunnels: had_reverse_tunnels.then_some(true),
         ptyactive: pty_active.then_some(true),
+        upstream_router_stream: registration_ack.then_some(true),
     };
     let packet = Packet::new(
         TerminalPacketType::TerminalUserInfo as u8,
@@ -284,7 +295,7 @@ pub(crate) fn register(
     write_local_packet(router, &packet)
         .map_err(|error| format!("could not register terminal: {error}"))?;
     if !registration_ack {
-        return Ok(());
+        return Ok(RouterFraming::Upstream);
     }
     router
         .set_read_timeout(Some(crate::terminal_daemon::registration_timeout()))
@@ -292,7 +303,7 @@ pub(crate) fn register(
     let acknowledgement = read_local_packet(router)
         .map_err(|error| format!("could not read registration acknowledgement: {error}"))
         .and_then(|packet| {
-            parse_status(&packet, REGISTRATION_STATUS)
+            parse_registration_status(&packet)
                 .map_err(|error| format!("terminal registration rejected: {error}"))
         });
     let _ = router.set_read_timeout(None);

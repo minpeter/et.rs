@@ -477,6 +477,7 @@ mod tests {
                 ptyactive: None,
                 hadreversetunnels: None,
                 disconnect_timeout_seconds: None,
+                upstream_router_stream: None,
             }
             .encode_to_vec(),
         );

@@ -1,6 +1,7 @@
 //! Synchronized terminal registration state.
 
 use et_net::local::LocalStream;
+use et_net::local_packet::RouterFraming;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io;
@@ -19,6 +20,8 @@ pub struct Registration {
     pub uid: u32,
     pub gid: u32,
     pub(crate) startup_ack: bool,
+    /// How the router writes to this terminal once its session runs.
+    pub(crate) router_framing: RouterFraming,
     /// The terminal re-registered with a live pty after its router socket died.
     pub(crate) pty_active: bool,
     pub(crate) had_reverse_tunnels: bool,
@@ -33,6 +36,7 @@ impl PartialEq for Registration {
             && self.uid == other.uid
             && self.gid == other.gid
             && self.startup_ack == other.startup_ack
+            && self.router_framing == other.router_framing
             && self.pty_active == other.pty_active
             && self.had_reverse_tunnels == other.had_reverse_tunnels
             && self.disconnect_timeout_seconds == other.disconnect_timeout_seconds
@@ -51,6 +55,7 @@ pub(crate) struct RegisteredTerminal {
     pub(crate) identity: RegistrationIdentity,
     pub(crate) watcher: LocalStream,
     pub(crate) startup_ack: bool,
+    pub(crate) router_framing: RouterFraming,
     /// The terminal re-registered a live PTY after its router socket died,
     /// so its recovery grace must be swept.
     pub(crate) resumed: bool,
@@ -145,6 +150,7 @@ impl Registry {
         match state.registrations.entry(registration.id.clone()) {
             Entry::Vacant(entry) => {
                 let startup_ack = registration.startup_ack;
+                let router_framing = registration.router_framing;
                 let startup = if startup_ack {
                     StartupState::Pending
                 } else {
@@ -161,6 +167,7 @@ impl Registry {
                     identity,
                     watcher,
                     startup_ack,
+                    router_framing,
                     resumed,
                 })
             }
@@ -172,6 +179,7 @@ impl Registry {
                     return Err(RegistrationError::Duplicate);
                 }
                 let startup_ack = registration.startup_ack;
+                let router_framing = registration.router_framing;
                 let startup = if startup_ack {
                     StartupState::Pending
                 } else {
@@ -188,6 +196,7 @@ impl Registry {
                     identity,
                     watcher,
                     startup_ack,
+                    router_framing,
                     resumed,
                 })
             }

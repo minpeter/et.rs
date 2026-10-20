@@ -347,3 +347,161 @@ fn largest_terminal_frame_matches_reference_limit() {
         assert!(encode_local_packet(&packet).is_err());
     }
 }
+
+const TERMINAL_INFO: u8 = TerminalPacketType::TerminalInfo as u8;
+const TERMINAL_CLOSE: u8 = TerminalPacketType::TerminalClose as u8;
+
+/// `Read` that hands out one byte per call and would block before each one.
+struct TrickleReader {
+    bytes: VecDeque<u8>,
+    ready: bool,
+}
+
+impl Read for TrickleReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.ready = !self.ready;
+        if !self.ready {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        match self.bytes.pop_front() {
+            Some(byte) => {
+                buffer[0] = byte;
+                Ok(1)
+            }
+            None => Ok(0),
+        }
+    }
+}
+
+fn router_messages() -> Vec<Packet> {
+    vec![
+        Packet::new(TERMINAL_BUFFER, encode_terminal_buffer(b"ls -l\r", false)),
+        Packet::new(TERMINAL_INFO, vec![0x10, 0x18, 0x18, 0x50]),
+        Packet::new(TERMINAL_BUFFER, Vec::new()),
+        Packet::new(TERMINAL_CLOSE, Vec::new()),
+    ]
+}
+
+#[test]
+fn router_stream_round_trips_through_partial_reads_in_both_framings() {
+    for framing in [RouterFraming::Upstream, RouterFraming::Packets] {
+        let mut wire = Vec::new();
+        for packet in router_messages() {
+            write_router_message(&mut wire, &packet, framing).unwrap();
+        }
+        let mut reader = TrickleReader {
+            bytes: wire.into(),
+            ready: false,
+        };
+        let mut decoder = RouterStreamDecoder::new(framing);
+        let mut decoded = Vec::new();
+        loop {
+            match decoder.read_from(&mut reader) {
+                Ok(Some(packet)) => decoded.push(packet),
+                Ok(None) => {}
+                Err(LocalPacketError::Io(error))
+                    if error.kind() == io::ErrorKind::UnexpectedEof =>
+                {
+                    break
+                }
+                Err(error) => panic!("{framing:?}: {error}"),
+            }
+        }
+        assert_eq!(decoded, router_messages(), "{framing:?}");
+    }
+}
+
+#[test]
+fn upstream_router_stream_matches_terminal_server_bytes() {
+    // Given: upstream `TerminalServer` writes `[type]` + `writeProto` for
+    // input and resizes, and the bare `TERMINAL_CLOSE` byte.
+    let input = encode_terminal_buffer(b"x", false);
+    let mut expected = vec![TERMINAL_BUFFER];
+    expected.extend_from_slice(&(input.len() as i64).to_ne_bytes());
+    expected.extend_from_slice(&input);
+    expected.push(TERMINAL_CLOSE);
+
+    // When: et.rs writes the same two messages upstream-framed.
+    let mut wire = Vec::new();
+    write_router_message(
+        &mut wire,
+        &Packet::new(TERMINAL_BUFFER, input),
+        RouterFraming::Upstream,
+    )
+    .unwrap();
+    write_router_message(
+        &mut wire,
+        &Packet::new(TERMINAL_CLOSE, Vec::new()),
+        RouterFraming::Upstream,
+    )
+    .unwrap();
+
+    // Then: the bytes are identical.
+    assert_eq!(wire, expected);
+}
+
+#[test]
+fn upstream_router_stream_refuses_what_upstream_cannot_frame() {
+    let keep_alive = TerminalPacketType::KeepAlive as u8;
+    for (header, payload_len) in [(keep_alive, 0), (TERMINAL_CLOSE, 1)] {
+        let error = RouterHead::new(header, payload_len, RouterFraming::Upstream).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(RouterHead::new(header, payload_len, RouterFraming::Packets).is_ok());
+    }
+    let largest = MAX_LOCAL_PACKET_LEN - et_core::packet::HEADER_LEN;
+    for framing in [RouterFraming::Upstream, RouterFraming::Packets] {
+        assert!(RouterHead::new(TERMINAL_BUFFER, largest, framing).is_ok());
+        assert!(RouterHead::new(TERMINAL_BUFFER, largest + 1, framing).is_err());
+    }
+
+    let decode = |bytes: Vec<u8>| {
+        RouterStreamDecoder::new(RouterFraming::Upstream).read_from(&mut io::Cursor::new(bytes))
+    };
+    assert!(matches!(
+        decode(vec![keep_alive]),
+        Err(LocalPacketError::UnknownRouterMessage(0))
+    ));
+    let mut negative = vec![TERMINAL_INFO];
+    negative.extend_from_slice(&(-1i64).to_ne_bytes());
+    assert!(matches!(
+        decode(negative),
+        Err(LocalPacketError::NegativeLength)
+    ));
+    let mut oversized = vec![TERMINAL_BUFFER];
+    oversized.extend_from_slice(&((largest + 1) as i64).to_ne_bytes());
+    assert!(matches!(
+        decode(oversized),
+        Err(LocalPacketError::FrameTooLarge { .. })
+    ));
+}
+
+#[test]
+fn registration_status_names_the_router_framing() {
+    // A bare success byte is all et.rs 0.0.43 and older send or accept.
+    let legacy = registration_status_packet(Ok(RouterFraming::Packets));
+    assert_eq!(legacy, status_packet(REGISTRATION_STATUS, Ok(())));
+    assert_eq!(
+        parse_registration_status(&legacy).unwrap(),
+        RouterFraming::Packets
+    );
+    assert!(parse_status(&legacy, REGISTRATION_STATUS).is_ok());
+
+    let upstream = registration_status_packet(Ok(RouterFraming::Upstream));
+    assert_eq!(
+        parse_registration_status(&upstream).unwrap(),
+        RouterFraming::Upstream
+    );
+
+    let rejected = registration_status_packet(Err("duplicate"));
+    assert_eq!(
+        parse_registration_status(&rejected)
+            .unwrap_err()
+            .to_string(),
+        "duplicate"
+    );
+    let unknown = Packet::new(REGISTRATION_STATUS, vec![0, 2]);
+    assert_eq!(
+        parse_registration_status(&unknown).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+}

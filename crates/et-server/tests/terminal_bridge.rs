@@ -8,10 +8,14 @@ use et_core::packet::Packet;
 use et_core::proto::{
     ConnectStatus, FlowControlMode, TermInit, TerminalBuffer, TerminalInfo, TerminalPacketType,
 };
-use et_net::local_packet::{read_local_packet, write_local_packet};
+use et_net::local_packet::{
+    encode_local_packet, read_local_packet, status_packet, write_local_packet, RouterFraming,
+    STARTUP_STATUS,
+};
 use prost::Message;
 use runtime_support::{
-    default_payload, initialize, TestRuntime, ID_A, ID_B, KEY_A, KEY_B, TIMEOUT,
+    default_payload, initialize, read_upstream, TerminalKind, TestRuntime, ID_A, ID_B, KEY_A,
+    KEY_B, TIMEOUT,
 };
 
 #[test]
@@ -52,7 +56,7 @@ fn encrypted_client_and_registered_terminal_exchange_packets() {
             &second_input.encode_to_vec(),
         )
         .unwrap();
-    let local_input = read_local_packet(&mut terminal).unwrap();
+    let local_input = read_upstream(&mut terminal).unwrap();
     assert_eq!(
         TerminalBuffer::decode(local_input.payload())
             .unwrap()
@@ -60,7 +64,7 @@ fn encrypted_client_and_registered_terminal_exchange_packets() {
             .as_deref(),
         Some(b"client-input".as_slice())
     );
-    let local_second = read_local_packet(&mut terminal).unwrap();
+    let local_second = read_upstream(&mut terminal).unwrap();
     assert_eq!(
         TerminalBuffer::decode(local_second.payload())
             .unwrap()
@@ -106,7 +110,7 @@ fn encrypted_client_and_registered_terminal_exchange_packets() {
             &size.encode_to_vec(),
         )
         .unwrap();
-    let local_size = read_local_packet(&mut terminal).unwrap();
+    let local_size = read_upstream(&mut terminal).unwrap();
     assert_eq!(
         TerminalInfo::decode(local_size.payload()).unwrap().row,
         Some(40)
@@ -134,7 +138,7 @@ fn terminal_hup_still_delivers_buffered_final_packet() {
     client
         .write_packet(TerminalPacketType::TerminalInfo as u8, b"bridge-ready")
         .unwrap();
-    let readiness = read_local_packet(&mut terminal).unwrap();
+    let readiness = read_upstream(&mut terminal).unwrap();
     assert_eq!(readiness.payload(), b"bridge-ready");
 
     let final_packets = [
@@ -337,8 +341,7 @@ fn terminal_close_ends_only_that_session() {
     client_a
         .write_packet(TerminalPacketType::TerminalClose as u8, &[])
         .unwrap();
-    let close = read_local_packet(&mut terminal_a).unwrap();
-    assert!(!close.is_encrypted());
+    let close = read_upstream(&mut terminal_a).unwrap();
     assert_eq!(close.header(), TerminalPacketType::TerminalClose as u8);
     assert!(close.payload().is_empty());
     assert_eq!(TerminalPacketType::TerminalClose as u8, 11);
@@ -354,7 +357,7 @@ fn terminal_close_ends_only_that_session() {
             &input.encode_to_vec(),
         )
         .unwrap();
-    let forwarded = read_local_packet(&mut terminal_b).unwrap();
+    let forwarded = read_upstream(&mut terminal_b).unwrap();
     assert_eq!(
         TerminalBuffer::decode(forwarded.payload())
             .unwrap()
@@ -390,7 +393,7 @@ fn unknown_client_packet_is_session_local() {
     );
 
     client_a.write_packet(4, b"nope").unwrap();
-    assert!(read_local_packet(&mut terminal_a).is_err());
+    assert!(read_upstream(&mut terminal_a).is_err());
 
     let input = TerminalBuffer {
         buffer: Some(b"other-session".to_vec()),
@@ -403,7 +406,7 @@ fn unknown_client_packet_is_session_local() {
             &input.encode_to_vec(),
         )
         .unwrap();
-    let forwarded = read_local_packet(&mut terminal_b).unwrap();
+    let forwarded = read_upstream(&mut terminal_b).unwrap();
     assert_eq!(
         TerminalBuffer::decode(forwarded.payload())
             .unwrap()
@@ -412,4 +415,108 @@ fn unknown_client_packet_is_session_local() {
         Some(b"other-session".as_slice())
     );
     server.runtime.shutdown().unwrap();
+}
+
+/// The bytes the router writes for one client packet relayed to a terminal.
+fn router_bytes(framing: RouterFraming, header: TerminalPacketType, payload: &[u8]) -> Vec<u8> {
+    match framing {
+        RouterFraming::Packets => {
+            encode_local_packet(&Packet::new(header as u8, payload.to_vec())).unwrap()
+        }
+        // Upstream `TerminalServer::runTerminal`: the type byte, then
+        // `writeProto`'s native i64 length and protobuf; TERMINAL_CLOSE is
+        // the type byte alone.
+        RouterFraming::Upstream if header == TerminalPacketType::TerminalClose => {
+            vec![header as u8]
+        }
+        RouterFraming::Upstream => {
+            let mut bytes = vec![header as u8];
+            bytes.extend_from_slice(&(payload.len() as i64).to_ne_bytes());
+            bytes.extend_from_slice(payload);
+            bytes
+        }
+    }
+}
+
+#[test]
+fn router_writes_each_registration_kind_in_its_own_framing() {
+    use std::io::Read;
+
+    for kind in [
+        TerminalKind::Upstream,
+        TerminalKind::LegacyEtrs,
+        TerminalKind::Etrs,
+    ] {
+        // Given: a terminal registered as ET C++, legacy et.rs or current
+        // et.rs. `register_as` checks the REGISTRATION_STATUS each gets.
+        let mut server = TestRuntime::start();
+        let mut terminal = server.register_as(ID_A, KEY_A, kind);
+        terminal.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let (stream, response) = server.handshake(ID_A);
+        assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+        let key = passkey_to_key(KEY_A).unwrap();
+        let initializing = std::thread::spawn(move || initialize(stream, &key, default_payload()));
+
+        // TERMINAL_INIT stays a packet, and is the first thing an ET C++
+        // terminal reads: no status precedes it.
+        let init = read_local_packet(&mut terminal).unwrap();
+        assert_eq!(init.header(), TerminalPacketType::TerminalInit as u8);
+        if kind.startup_ack() {
+            write_local_packet(&mut terminal, &status_packet(STARTUP_STATUS, Ok(()))).unwrap();
+        }
+        let (mut client, initial) = initializing.join().unwrap();
+        assert_eq!(initial.error, None);
+
+        // When: the client sends input, a resize and TERMINAL_CLOSE.
+        let input = TerminalBuffer {
+            buffer: Some(b"keys".to_vec()),
+            is_stderr: None,
+        }
+        .encode_to_vec();
+        let size = TerminalInfo {
+            id: None,
+            row: Some(24),
+            column: Some(80),
+            width: None,
+            height: None,
+            command: None,
+            commandversion: None,
+        }
+        .encode_to_vec();
+        client
+            .write_packet(TerminalPacketType::TerminalBuffer as u8, &input)
+            .unwrap();
+        client
+            .write_packet(TerminalPacketType::TerminalInfo as u8, &size)
+            .unwrap();
+        client
+            .write_packet(TerminalPacketType::TerminalClose as u8, &[])
+            .unwrap();
+
+        // Then: the terminal reads exactly those messages in its framing.
+        let framing = kind.framing();
+        let mut expected = router_bytes(framing, TerminalPacketType::TerminalBuffer, &input);
+        expected.extend(router_bytes(
+            framing,
+            TerminalPacketType::TerminalInfo,
+            &size,
+        ));
+        expected.extend(router_bytes(
+            framing,
+            TerminalPacketType::TerminalClose,
+            &[],
+        ));
+        let mut received = vec![0u8; expected.len()];
+        terminal.read_exact(&mut received).unwrap();
+        assert_eq!(received, expected, "{kind:?}");
+        terminal
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+        let mut extra = [0u8; 1];
+        assert!(
+            matches!(terminal.read(&mut extra), Ok(0) | Err(_)),
+            "{kind:?}: unexpected bytes after TERMINAL_CLOSE"
+        );
+        server.runtime.shutdown().unwrap();
+    }
 }

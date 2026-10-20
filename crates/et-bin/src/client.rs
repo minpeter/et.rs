@@ -452,7 +452,10 @@ fn run_client(
             ssh_config: ssh_config.clone(),
             term: request.term.clone(),
         };
-        let jump_invocation = build_jump_invocation(&jump_request, &provisional);
+        // Upstream `SshSetupHandler::SetupSsh` hands the jump terminal the
+        // id/passkey the destination terminal answered with: an ET C++
+        // etterminal replaces the provisional `XXX` credentials with its own.
+        let jump_invocation = build_jump_invocation(&jump_request, &credentials);
         if args.forward_ssh_agent {
             let (jump_credentials, jump_bind) = crate::ssh_agent_bootstrap::run_capturing(
                 runner,

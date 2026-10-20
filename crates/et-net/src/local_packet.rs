@@ -1,4 +1,6 @@
-//! Native-`i64` framing for packets exchanged with local terminal processes.
+//! Native-`i64` framing for packets exchanged with local terminal processes,
+//! and the upstream router stream `etserver` writes to `etterminal` once a
+//! session runs (see [`RouterFraming`]).
 
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,10 +25,14 @@ pub enum LocalPacketError {
     TruncatedPrefix,
     TruncatedPayload,
     NegativeLength,
-    FrameTooLarge { length: i64 },
+    FrameTooLarge {
+        length: i64,
+    },
     MalformedPacket(PacketError),
     TrailingData,
     AlreadyComplete,
+    /// The upstream router stream named a message type it cannot carry.
+    UnknownRouterMessage(u8),
 }
 
 impl std::fmt::Display for LocalPacketError {
@@ -42,6 +48,9 @@ impl std::fmt::Display for LocalPacketError {
             Self::MalformedPacket(error) => write!(f, "malformed local packet: {error}"),
             Self::TrailingData => write!(f, "local registration contains trailing data"),
             Self::AlreadyComplete => write!(f, "local packet decoder is already complete"),
+            Self::UnknownRouterMessage(header) => {
+                write!(f, "unknown router message type {header}")
+            }
         }
     }
 }
@@ -112,6 +121,170 @@ pub fn parse_status(packet: &Packet, expected_header: u8) -> io::Result<()> {
             "malformed local status packet",
         )),
     }
+}
+
+/// How `etserver` frames what it writes to `etterminal` once a session runs:
+/// after `TERMINAL_INIT`, or straight after registration when a live pty
+/// re-registers.
+///
+/// Registration, `TERMINAL_INIT`, `JUMPHOST_INIT`, the jumphost relay and
+/// everything `etterminal` writes stay length-prefixed packets either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouterFraming {
+    /// Upstream `TerminalServer`: `TERMINAL_BUFFER` and `TERMINAL_INFO` are
+    /// the type byte, a native `i64` length and the protobuf, and
+    /// `TERMINAL_CLOSE` is the type byte alone. ET C++ and et.rs from 0.0.44
+    /// write and read this.
+    Upstream,
+    /// et.rs 0.0.43 and older: every message is a length-prefixed packet.
+    Packets,
+}
+
+/// Trailing success byte of a `REGISTRATION_STATUS`: this `etserver` writes
+/// [`RouterFraming::Upstream`]. A bare success byte comes from et.rs 0.0.43
+/// and older, which write [`RouterFraming::Packets`].
+const UPSTREAM_ROUTER_STREAM: u8 = 1;
+
+/// `REGISTRATION_STATUS` for a terminal that registered with the `fd = -6`
+/// sentinel. Success names the framing that terminal will read; only a
+/// terminal that asked for [`RouterFraming::Upstream`] may receive it, because
+/// et.rs 0.0.43 and older reject any success payload but the bare byte.
+pub fn registration_status_packet(result: Result<RouterFraming, &str>) -> Packet {
+    match result {
+        Ok(RouterFraming::Packets) => status_packet(REGISTRATION_STATUS, Ok(())),
+        Ok(RouterFraming::Upstream) => {
+            Packet::new(REGISTRATION_STATUS, vec![0, UPSTREAM_ROUTER_STREAM])
+        }
+        Err(message) => status_packet(REGISTRATION_STATUS, Err(message)),
+    }
+}
+
+/// Parse a `REGISTRATION_STATUS` into the framing `etserver` will write.
+pub fn parse_registration_status(packet: &Packet) -> io::Result<RouterFraming> {
+    if !packet.is_encrypted()
+        && packet.header() == REGISTRATION_STATUS
+        && packet.payload() == [0, UPSTREAM_ROUTER_STREAM]
+    {
+        return Ok(RouterFraming::Upstream);
+    }
+    parse_status(packet, REGISTRATION_STATUS).map(|()| RouterFraming::Packets)
+}
+
+/// Longest [`RouterHead`]: a packet's length prefix and two header bytes.
+const ROUTER_HEAD_MAX: usize = PREFIX_LEN + et_core::packet::HEADER_LEN;
+
+/// The bytes that precede one router message's payload.
+#[derive(Debug, Clone, Copy)]
+pub struct RouterHead {
+    bytes: [u8; ROUTER_HEAD_MAX],
+    len: usize,
+}
+
+impl RouterHead {
+    /// Head for a plaintext message of `payload_len` bytes.
+    ///
+    /// Rejects a message over the 64 KiB local cap. [`RouterFraming::Upstream`]
+    /// also rejects types upstream never writes to a terminal and a payload
+    /// on `TERMINAL_CLOSE`.
+    pub fn new(header: u8, payload_len: usize, framing: RouterFraming) -> io::Result<Self> {
+        let too_large =
+            || io::Error::new(io::ErrorKind::InvalidInput, "local packet exceeds 64 KiB");
+        if payload_len > MAX_LOCAL_PACKET_LEN - et_core::packet::HEADER_LEN {
+            return Err(too_large());
+        }
+        let mut bytes = [0u8; ROUTER_HEAD_MAX];
+        let len = match framing {
+            RouterFraming::Packets => {
+                let length = i64::try_from(et_core::packet::HEADER_LEN + payload_len)
+                    .map_err(|_| too_large())?;
+                bytes[..PREFIX_LEN].copy_from_slice(&length.to_ne_bytes());
+                bytes[PREFIX_LEN + 1] = header;
+                ROUTER_HEAD_MAX
+            }
+            RouterFraming::Upstream => match upstream_router_message(header) {
+                Some(UpstreamMessage::Close) if payload_len == 0 => {
+                    bytes[0] = header;
+                    1
+                }
+                Some(UpstreamMessage::Proto) => {
+                    let length = i64::try_from(payload_len).map_err(|_| too_large())?;
+                    bytes[0] = header;
+                    bytes[1..=PREFIX_LEN].copy_from_slice(&length.to_ne_bytes());
+                    1 + PREFIX_LEN
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("the upstream router stream cannot carry packet type {header}"),
+                    ))
+                }
+            },
+        };
+        Ok(Self { bytes, len })
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UpstreamMessage {
+    /// `[type][i64 length][protobuf]`.
+    Proto,
+    /// `[type]`.
+    Close,
+}
+
+/// Upstream `TerminalServer` writes exactly these three types to a terminal.
+fn upstream_router_message(header: u8) -> Option<UpstreamMessage> {
+    use et_core::proto::TerminalPacketType;
+    if header == TerminalPacketType::TerminalBuffer as u8
+        || header == TerminalPacketType::TerminalInfo as u8
+    {
+        Some(UpstreamMessage::Proto)
+    } else if header == TerminalPacketType::TerminalClose as u8 {
+        Some(UpstreamMessage::Close)
+    } else {
+        None
+    }
+}
+
+/// Write one router message; `WouldBlock` waits like [`write_local_packet`].
+pub fn write_router_message<W: Write>(
+    writer: &mut W,
+    packet: &Packet,
+    framing: RouterFraming,
+) -> io::Result<()> {
+    write_router_message_with(writer, packet, framing, || false)
+}
+
+/// [`write_router_message`] that gives up once `cancelled` is set or
+/// `deadline` passes, like [`write_local_packet_cancelled`].
+pub fn write_router_message_cancelled<W: Write>(
+    writer: &mut W,
+    packet: &Packet,
+    framing: RouterFraming,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+) -> io::Result<()> {
+    write_router_message_with(writer, packet, framing, || {
+        cancelled.load(Ordering::Acquire) || Instant::now() >= deadline
+    })
+}
+
+fn write_router_message_with<W: Write>(
+    writer: &mut W,
+    packet: &Packet,
+    framing: RouterFraming,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<()> {
+    let head = RouterHead::new(packet.header(), packet.payload().len(), framing)?;
+    let mut frame = Vec::with_capacity(head.as_bytes().len() + packet.payload().len());
+    frame.extend_from_slice(head.as_bytes());
+    frame.extend_from_slice(packet.payload());
+    write_all_blocking(writer, &frame, &cancelled)?;
+    flush_blocking(writer, &cancelled)
 }
 
 pub fn write_local_packet<W: Write>(writer: &mut W, packet: &Packet) -> io::Result<()> {
@@ -570,6 +743,131 @@ impl LocalPacketDecoder {
             Err(LocalPacketError::TruncatedPrefix)
         } else {
             Err(LocalPacketError::TruncatedPayload)
+        }
+    }
+}
+
+/// Reads the router stream `etterminal` receives once a session runs.
+///
+/// Unlike [`LocalPacketDecoder`], one decoder reads the whole stream: each
+/// complete message resets it. Every message comes back as a plaintext
+/// [`Packet`], whatever its [`RouterFraming`].
+pub struct RouterStreamDecoder(RouterStream);
+
+enum RouterStream {
+    Packets(LocalPacketDecoder),
+    Upstream(UpstreamRouterDecoder),
+}
+
+impl RouterStreamDecoder {
+    pub fn new(framing: RouterFraming) -> Self {
+        Self(match framing {
+            RouterFraming::Packets => RouterStream::Packets(LocalPacketDecoder::new()),
+            RouterFraming::Upstream => RouterStream::Upstream(UpstreamRouterDecoder::default()),
+        })
+    }
+
+    /// Read until one message is complete. `Ok(None)` means the reader would
+    /// block; the partial message is kept for the next call.
+    pub fn read_from<R: Read>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<Option<Packet>, LocalPacketError> {
+        match &mut self.0 {
+            RouterStream::Packets(decoder) => {
+                let packet = decoder.read_from(reader)?;
+                if packet.is_some() {
+                    *decoder = LocalPacketDecoder::new();
+                }
+                Ok(packet)
+            }
+            RouterStream::Upstream(decoder) => decoder.read_from(reader),
+        }
+    }
+}
+
+/// Upstream `UserTerminalHandler::runUserTerminal`: a type byte, then, except
+/// for `TERMINAL_CLOSE`, `readProto`'s native `i64` length and protobuf.
+#[derive(Default)]
+struct UpstreamRouterDecoder {
+    header: Option<u8>,
+    length: [u8; PREFIX_LEN],
+    length_len: usize,
+    payload: Option<Vec<u8>>,
+    filled: usize,
+}
+
+impl UpstreamRouterDecoder {
+    fn read_from<R: Read>(&mut self, reader: &mut R) -> Result<Option<Packet>, LocalPacketError> {
+        let header = match self.header {
+            Some(header) => header,
+            None => {
+                let mut byte = [0u8; 1];
+                if read_ready(reader, &mut byte)?.is_none() {
+                    return Ok(None);
+                }
+                match upstream_router_message(byte[0]) {
+                    Some(UpstreamMessage::Close) => {
+                        return Ok(Some(Packet::new(byte[0], Vec::new())))
+                    }
+                    Some(UpstreamMessage::Proto) => {
+                        self.header = Some(byte[0]);
+                        byte[0]
+                    }
+                    None => return Err(LocalPacketError::UnknownRouterMessage(byte[0])),
+                }
+            }
+        };
+        while self.payload.is_none() {
+            let start = self.length_len;
+            let Some(count) = read_ready(reader, &mut self.length[start..])? else {
+                return Ok(None);
+            };
+            self.length_len += count;
+            if self.length_len == PREFIX_LEN {
+                self.payload = Some(vec![0; parse_proto_length(self.length)?]);
+            }
+        }
+        if let Some(payload) = self.payload.as_mut() {
+            while self.filled < payload.len() {
+                let Some(count) = read_ready(reader, &mut payload[self.filled..])? else {
+                    return Ok(None);
+                };
+                self.filled += count;
+            }
+        }
+        let packet = Packet::new(header, self.payload.take().unwrap_or_default());
+        *self = Self::default();
+        Ok(Some(packet))
+    }
+}
+
+/// Upstream `readProto` length: the protobuf alone, capped so the message
+/// still fits a 64 KiB local packet.
+fn parse_proto_length(prefix: [u8; PREFIX_LEN]) -> Result<usize, LocalPacketError> {
+    let length = i64::from_ne_bytes(prefix);
+    if length < 0 {
+        return Err(LocalPacketError::NegativeLength);
+    }
+    usize::try_from(length)
+        .ok()
+        .filter(|length| *length <= MAX_LOCAL_PACKET_LEN - et_core::packet::HEADER_LEN)
+        .ok_or(LocalPacketError::FrameTooLarge { length })
+}
+
+/// One `read` into a non-empty `buffer`: `Ok(None)` when it would block, and
+/// end of stream as `UnexpectedEof`.
+fn read_ready<R: Read>(
+    reader: &mut R,
+    buffer: &mut [u8],
+) -> Result<Option<usize>, LocalPacketError> {
+    loop {
+        match reader.read(buffer) {
+            Ok(0) => return Err(LocalPacketError::Io(io::ErrorKind::UnexpectedEof.into())),
+            Ok(count) => return Ok(Some(count)),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(LocalPacketError::Io(error)),
         }
     }
 }

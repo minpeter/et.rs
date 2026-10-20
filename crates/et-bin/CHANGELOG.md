@@ -1,3 +1,43 @@
+## et@0.0.44
+
+### `--jumphost` works when the destination runs ET C++
+
+`et --jumphost` now gives the jump terminal the session id and key the destination's `etterminal` answered with, as upstream does. An ET C++ `etterminal` replaces the client's temporary credentials with its own, so the session previously failed against a C++ destination.
+
+### A jumphost session shows its first output without a keypress
+
+When the destination's first output arrived together with its handshake reply, the jump terminal held that output until something else happened on the connection, so the prompt could stay blank until you pressed a key. The jump terminal now forwards it right away.
+
+### Keystrokes typed while `et` reconnects are no longer lost
+
+While the connection was down, `et` read your keystrokes only to watch for Ctrl-C and dropped everything else. It now sends them to the remote shell, in the order you typed them, once the session recovers, as ET C++ does. Ctrl-C still gives up reconnecting.
+
+### `etserver` and `etterminal` accept what ET C++ sends
+
+On the server host, `etserver` and `etterminal` now accept a message of up to 128 MiB, as upstream does (it was 64 KiB). `etterminal` also sets the session environment the way upstream does: any number of variables, of any length, with names such as `MY-VAR`. It skips only entries the system cannot set. A C++ `et` client with a large `SendEnv`/`SetEnv` environment therefore no longer fails to start a session on an et.rs `etserver` or `etterminal`.
+
+The et.rs `et` client still sends only what et.rs 0.0.43 and older accept, so it keeps working with servers that have not been upgraded.
+
+### No lost output when `etserver` restarts as an older et.rs
+
+When `etserver` restarted as et.rs 0.0.43 or older, for example after a downgrade, a running session's first output could go missing, or the client printed `malformed terminal output` and reconnected again. The new `etterminal` now answers that older server's startup check as soon as it reconnects, so the output reaches the client.
+
+### `et -T` passes the end of your input to the remote command
+
+Like `ssh -T`, `et -T host 'wc -c' < file` now finishes: when the client's stdin ends, the remote command sees end of input. On a terminal, Ctrl-D in `et -T` now ends the command's input instead of closing `et`.
+
+This needs an et.rs client and an et.rs `etterminal`. ET C++ has no way to signal it, so with a C++ client or terminal the command keeps waiting as before.
+
+### No lost or garbled output right after `etserver` restarts
+
+When `etserver` restarted under a live session, the new server sometimes read the session's first output itself, waiting for a startup report that a resumed terminal never sends. That output was lost, or the client printed `malformed terminal output` and had to reconnect a second time. The resumed session now gets all of its output.
+
+### `etserver` and `etterminal` now mix with ET C++
+
+On the server host, `etserver` hands keystrokes, resizes and the close request to `etterminal` over a local socket. et.rs now uses upstream's format on that socket, so an et.rs `etserver` serves a C++ `etterminal` and a C++ `etserver` serves an et.rs `etterminal`, in shell, `-T`, `-W` and jumphost sessions. An et.rs `etserver` also handles a C++ jump terminal the way upstream does.
+
+Sessions started by et.rs 0.0.43 or older keep the old format, so they survive restarting `etserver` after the upgrade, and a new `etterminal` still works with an old `etserver` that has not restarted yet. A live session also survives switching `etserver` between et.rs and C++.
+
 ## et@0.0.43
 
 ### A plain `%exit` line no longer looks like tmux control mode

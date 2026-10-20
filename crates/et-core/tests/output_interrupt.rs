@@ -335,3 +335,20 @@ fn dcs_introducer_and_exit_transition_tmux_control_mode_cleanly() {
     queue.push(terminal(plain.as_bytes())).unwrap();
     assert_eq!(drain(&mut queue), plain.as_bytes());
 }
+
+#[test]
+fn a_plain_exit_line_does_not_enter_tmux_control_mode() {
+    // Upstream #900: `%exit` only ends control mode. Outside it, a line that
+    // reads `%exit` is ordinary output, so later `%` lines must not survive
+    // an interrupt as control data.
+    let mut queue = queue();
+    queue
+        .push(terminal(b"$ printf '%%exit\\n'\n%exit\n"))
+        .unwrap();
+    assert!(queue.pop().is_some());
+
+    let flood = format!("{}\n%Cpu(s): 1.0 us\n", "x".repeat(70 * 1024));
+    queue.push(terminal(flood.as_bytes())).unwrap();
+    assert_eq!(queue.flush_terminal_on_interrupt(), flood.len());
+    assert!(drain(&mut queue).is_empty());
+}

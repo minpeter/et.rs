@@ -779,3 +779,15 @@ commits:
     status: ported
     note: "Merge #879. Bootstrap ssh records session-bind and the forwarded-agent replay uses it. PROTOCOL_VERSION stays 6."
     et_pr: 879
+  - sha: 8caa1e8c1ca833c094ac43837a9bb1272126dca0
+    date: "2026-10-16"
+    kind: product
+    status: ported
+    note: "#900 only the DCS introducer or a known control token arms tmux -CC handling, so top or csh '%' lines are not reordered. et.rs TerminalStream already armed only on ESC P 1000 p or a known token (upstream report #899); a plain '%exit' line no longer arms it either. Difference kept: inside control mode et.rs leaves at the ST after '%exit', not at '%exit', so a Ctrl+C flush cannot drop that terminator. PROTOCOL_VERSION stays 6."
+    et_pr: 900
+  - sha: 7ee361a75fbb3e0900445b110188996fbe950823
+    date: "2026-10-19"
+    kind: product
+    status: ported
+    note: "Merge #900. See 8caa1e8. PROTOCOL_VERSION stays 6."
+    et_pr: 900

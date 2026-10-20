@@ -441,7 +441,8 @@ where
 pub(crate) fn contains_cursor_report_request(bytes: &[u8]) -> bool {
     static FINDER: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
         std::sync::LazyLock::new(|| memchr::memmem::Finder::new(CURSOR_REPORT_REQUEST));
-    FINDER.find(bytes).is_some()
+    // Plain output has no escape at all, which one byte scan settles.
+    memchr::memchr(b'\x1b', bytes).is_some_and(|start| FINDER.find(&bytes[start..]).is_some())
 }
 
 fn command_payload(

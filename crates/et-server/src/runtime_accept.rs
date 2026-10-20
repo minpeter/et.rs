@@ -12,16 +12,38 @@ use crate::runtime_error::RuntimeError;
 use crate::runtime_handler;
 use crate::runtime_lifecycle::Lifecycle;
 use crate::runtime_state::RuntimeCore;
+#[cfg(unix)]
+use crate::{router::RouterError, router_loop::RouterPoll};
+
+/// The terminal router, serviced on the runtime control thread (Unix).
+#[cfg(unix)]
+pub(crate) struct ControlRouter {
+    pub(crate) poll: RouterPoll,
+    /// Tells `Runtime::shutdown` the router stopped, and with what error.
+    pub(crate) stopped: std::sync::mpsc::SyncSender<Result<(), RouterError>>,
+}
+
+#[cfg(unix)]
+impl ControlRouter {
+    /// Close the router (its listener and watched terminals) and report how
+    /// it ended.
+    fn stop(self, result: Result<(), RouterError>) {
+        drop(self.poll);
+        let _ = self.stopped.send(result);
+    }
+}
 
 /// The runtime control thread: accepts on every TCP listener (one thread for
-/// IPv4 and IPv6 alike) and services terminal lifecycle events and resume
-/// expiry between accepts. A shutdown wake stops accepting; lifecycle work
-/// continues until the runtime's final `Shutdown` event.
+/// IPv4 and IPv6 alike), services terminal lifecycle events and resume
+/// expiry between accepts and, on Unix, runs the terminal router. A shutdown
+/// wake stops accepting; the router runs until the runtime stops it and
+/// lifecycle work continues until the runtime's final `Shutdown` event.
 pub(crate) fn run(
     listeners: Vec<TcpListener>,
     mut wake_reader: LocalStream,
     mut lifecycle: Lifecycle,
     core: Arc<RuntimeCore>,
+    #[cfg(unix)] mut router: Option<ControlRouter>,
 ) -> Result<(), RuntimeError> {
     let mut first_error = None;
     // Configure the wakeup independently of the listeners: `drain` reads until
@@ -55,6 +77,8 @@ pub(crate) fn run(
     };
     lifecycle.start();
     let mut ready = Vec::with_capacity(listeners.len());
+    #[cfg(unix)]
+    let mut router_ready = Vec::new();
     loop {
         // Windows cannot poll listeners together with the wake handles, so
         // every listener is tried without blocking on upstream's 10 ms
@@ -66,17 +90,24 @@ pub(crate) fn run(
             true
         };
         #[cfg(unix)]
+        if let Some(router) = router.as_mut() {
+            router.poll.expire();
+        }
+        #[cfg(unix)]
         let lifecycle_woken = match wait(
             &listeners,
             wake_usable.then_some(&wake_reader),
             &lifecycle,
+            router.as_ref().map(|router| &router.poll),
             &mut ready,
+            &mut router_ready,
         ) {
             Ok(woken) => woken,
             Err(error) => {
                 first_error.get_or_insert(error);
                 listeners.clear();
                 ready.clear();
+                router_ready.clear();
                 true
             }
         };
@@ -103,7 +134,29 @@ pub(crate) fn run(
                 }
             }
         });
-        if lifecycle.service(&core, lifecycle_woken) {
+        // Like the dedicated router thread it replaces: the router acts only
+        // on its own readiness (and, on Darwin, every recheck, which probes
+        // watched terminals that can close without readiness); a failed
+        // router stops and its error surfaces when the runtime shuts it down.
+        #[cfg(unix)]
+        if !router_ready.is_empty()
+            && (cfg!(target_os = "macos") || router_ready.iter().any(|flags| !flags.is_empty()))
+        {
+            if let Some(mut control) = router.take() {
+                match control.poll.service(&router_ready) {
+                    Ok(()) => router = Some(control),
+                    Err(error) => control.stop(Err(error)),
+                }
+            }
+        }
+        let stop = lifecycle.service(&core, lifecycle_woken);
+        #[cfg(unix)]
+        if lifecycle.take_router_stop() {
+            if let Some(control) = router.take() {
+                control.stop(Ok(()));
+            }
+        }
+        if stop {
             break;
         }
         #[cfg(windows)]
@@ -117,16 +170,19 @@ pub(crate) fn run(
 }
 
 /// Block until a listener is ready, the runtime wakes us, a lifecycle event
-/// arrives or the next resume sweep (if one is armed) is due. `wake_reader` is
-/// `None` when the runtime wakeup could not be made non-blocking. Fills
-/// listener readiness into `ready` and returns whether the lifecycle wakeup
-/// fired.
+/// arrives, the router has work or the next resume sweep (if one is armed) or
+/// registration expiry is due. `wake_reader` is `None` when the runtime
+/// wakeup could not be made non-blocking. Fills listener readiness into
+/// `ready` and the router's into `router_ready` (empty without a router) and
+/// returns whether the lifecycle wakeup fired.
 #[cfg(unix)]
 fn wait(
     listeners: &[TcpListener],
     wake_reader: Option<&LocalStream>,
     lifecycle: &Lifecycle,
+    router: Option<&RouterPoll>,
     ready: &mut Vec<bool>,
+    router_ready: &mut Vec<PollFlags>,
 ) -> Result<bool, RuntimeError> {
     let mut descriptors: Vec<PollFd<'_>> = listeners
         .iter()
@@ -141,7 +197,15 @@ fn wait(
             PollFlags::IN | PollFlags::HUP,
         )])
         .collect();
-    let deadline = lifecycle.next_sweep();
+    let lifecycle_index = descriptors.len() - 1;
+    let now = std::time::Instant::now();
+    let mut deadline = lifecycle.next_sweep();
+    if let Some(router) = router {
+        router.descriptors(&mut descriptors);
+        if let Some(expiry) = router.timeout() {
+            deadline = Some(deadline.map_or(now + expiry, |deadline| deadline.min(now + expiry)));
+        }
+    }
     loop {
         // Recomputed on every retry so interrupted polls keep the deadline.
         let timeout = deadline.map(|deadline| poll_timeout(deadline, std::time::Instant::now()));
@@ -162,17 +226,20 @@ fn wait(
             .iter()
             .map(|descriptor| descriptor.revents().contains(PollFlags::IN)),
     );
-    // The lifecycle wakeup is always the last descriptor.
-    Ok(descriptors
-        .last()
-        .is_some_and(|descriptor| !descriptor.revents().is_empty()))
+    router_ready.clear();
+    router_ready.extend(
+        descriptors[lifecycle_index + 1..]
+            .iter()
+            .map(PollFd::revents),
+    );
+    Ok(!descriptors[lifecycle_index].revents().is_empty())
 }
 
 /// Time left until `deadline` as a poll timeout; zero once it has passed.
 #[cfg(unix)]
 fn poll_timeout(deadline: std::time::Instant, now: std::time::Instant) -> rustix::event::Timespec {
     rustix::event::Timespec::try_from(deadline.saturating_duration_since(now))
-        .expect("one-second sweep interval fits timespec")
+        .expect("sweep and registration deadlines fit timespec")
 }
 
 fn accept_ready(listener: &TcpListener, core: &Arc<RuntimeCore>) -> Result<(), RuntimeError> {

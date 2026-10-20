@@ -392,8 +392,13 @@ fn fill_transport(stream: &TcpStream) -> usize {
     }
 }
 
-fn run_exit_pump<R, F>(connection: &mut Connection, stdio_forward: bool, input: R, reconnect: F)
-where
+fn run_exit_pump<R, F>(
+    connection: &mut Connection,
+    stdio_forward: bool,
+    binary_stdio: bool,
+    input: R,
+    reconnect: F,
+) where
     R: Read + std::os::fd::AsFd,
     F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
 {
@@ -408,7 +413,7 @@ where
             flow_control: et_cli::client::FlowControlMode::None,
             terminal_enabled: false,
             auto_cursor_report: false,
-            binary_stdio: true,
+            binary_stdio,
             terminal_modes: &mut TerminalModeState::default(),
             hangup: &crate::client_hangup::HangupClose::disabled(),
             remote_exit: &crate::client_terminal::RemoteExit::new(true),
@@ -429,7 +434,7 @@ fn stdio_exit_finishes_close_under_transport_backpressure() {
     let (done_tx, done_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
         let mut connection = Connection::new_client(client, &[19; 32]);
-        run_exit_pump(&mut connection, true, io::stdin(), |_| {
+        run_exit_pump(&mut connection, true, true, io::stdin(), |_| {
             panic!("healthy transport must not recover")
         });
         done_tx.send(connection.write_pending()).unwrap();
@@ -472,7 +477,7 @@ fn stdio_exit_recovers_failed_pending_frame_before_close() {
     });
     let mut replacement = Some(replacement);
     let mut recoveries = 0;
-    run_exit_pump(&mut connection, true, io::stdin(), |connection| {
+    run_exit_pump(&mut connection, true, true, io::stdin(), |connection| {
         recoveries += 1;
         connection.recover(replacement.take().unwrap()).unwrap();
         Ok(ReconnectOutcome::Recovered)
@@ -508,7 +513,7 @@ fn stdio_exit_replays_close_when_probe_detects_disconnection() {
     });
     let mut replacement = Some(replacement);
     let mut recoveries = 0;
-    run_exit_pump(&mut connection, true, io::stdin(), |connection| {
+    run_exit_pump(&mut connection, true, true, io::stdin(), |connection| {
         recoveries += 1;
         assert_eq!(connection.writer_sequence(), 1);
         connection.recover(replacement.take().unwrap()).unwrap();
@@ -535,7 +540,7 @@ fn stdio_exit_does_not_enqueue_close_after_recovery_ends_session() {
         .shutdown(std::net::Shutdown::Both)
         .unwrap();
     let mut recoveries = 0;
-    run_exit_pump(&mut connection, true, io::stdin(), |_| {
+    run_exit_pump(&mut connection, true, true, io::stdin(), |_| {
         recoveries += 1;
         Ok(ReconnectOutcome::SessionEnded)
     });
@@ -566,7 +571,8 @@ impl Read for ChunkedPipe {
 }
 
 #[test]
-fn stdin_in_hup_drains_all_chunks_and_pending_frames_then_waits_for_remote_exit() {
+fn stdin_in_hup_drains_all_chunks_and_pending_frames_then_sends_one_eof_and_waits_for_remote_exit()
+{
     let (input, mut output) = io::pipe().unwrap();
     let expected: Vec<u8> = (0..4096).map(|n| (n % 251) as u8).collect();
     output.write_all(&expected).unwrap();
@@ -586,6 +592,7 @@ fn stdin_in_hup_drains_all_chunks_and_pending_frames_then_waits_for_remote_exit(
         run_exit_pump(
             &mut connection,
             false,
+            true,
             ChunkedPipe {
                 pipe: input,
                 read: read_tx,
@@ -611,6 +618,11 @@ fn stdin_in_hup_drains_all_chunks_and_pending_frames_then_waits_for_remote_exit(
                 .unwrap(),
         );
     }
+    // `-T`: once every chunk is through, exactly one empty TERMINAL_BUFFER
+    // tells the remote command its stdin ended.
+    let eof = peer.read_packet().unwrap();
+    assert_eq!(eof.header(), TerminalPacketType::TerminalBuffer as u8);
+    assert_eq!(eof.payload(), [0x0a, 0x00]);
     let after_eof = done_rx.recv_timeout(Duration::from_millis(200));
     peer.write_packet(
         TerminalPacketType::TerminalExitStatus as u8,
@@ -624,7 +636,11 @@ fn stdin_in_hup_drains_all_chunks_and_pending_frames_then_waits_for_remote_exit(
     assert!(after_eof.is_err(), "pipe EOF ended the remote session");
     assert!(!completed.unwrap());
     assert_eq!(received, expected);
-    assert_eq!(peer.reader_sequence(), 4);
+    assert!(
+        peer.read_packet().is_err(),
+        "client sent more after its stdin EOF"
+    );
+    assert_eq!(peer.reader_sequence(), 5);
 }
 
 struct ObservedInput {
@@ -658,7 +674,7 @@ fn non_tty_eof_or_read_error_disables_input_but_keeps_keepalive_forwarding_and_r
         PortForwardDestinationRequest, PortForwardDestinationResponse, SocketEndpoint,
     };
 
-    for fail_read in [false, true] {
+    for (binary_stdio, fail_read) in [(false, false), (false, true), (true, false), (true, true)] {
         // Character-device poll readiness differs on Darwin. A socket with an
         // unread byte gives both platforms persistent IN; inject EOF/EBADF at
         // the Read seam and verify neither spins nor ends the ET transport.
@@ -685,7 +701,7 @@ fn non_tty_eof_or_read_error_disables_input_but_keeps_keepalive_forwarding_and_r
                     flow_control: et_cli::client::FlowControlMode::None,
                     terminal_enabled: false,
                     auto_cursor_report: false,
-                    binary_stdio: true,
+                    binary_stdio,
                     terminal_modes: &mut TerminalModeState::default(),
                     hangup: &crate::client_hangup::HangupClose::disabled(),
                     remote_exit: &crate::client_terminal::RemoteExit::new(false),
@@ -710,6 +726,13 @@ fn non_tty_eof_or_read_error_disables_input_but_keeps_keepalive_forwarding_and_r
             done_tx.send((result, recoveries)).unwrap();
         });
         observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        if binary_stdio {
+            // `-T` reports the end of input exactly once, before anything
+            // else; PTY mode never sends it.
+            let eof = peer.read_packet().unwrap();
+            assert_eq!(eof.header(), TerminalPacketType::TerminalBuffer as u8);
+            assert_eq!(eof.payload(), [0x0a, 0x00]);
+        }
         let keepalive = peer.read_packet().unwrap();
         assert_eq!(keepalive.header(), TerminalPacketType::KeepAlive as u8);
         peer.write_packet(TerminalPacketType::KeepAlive as u8, &[])
@@ -758,7 +781,7 @@ fn non_tty_eof_or_read_error_disables_input_but_keeps_keepalive_forwarding_and_r
 }
 
 #[test]
-fn real_tty_eof_still_ends_the_session() {
+fn real_tty_eof_still_ends_a_pty_session() {
     let pair = portable_pty::native_pty_system()
         .openpty(portable_pty::PtySize::default())
         .unwrap();
@@ -772,15 +795,59 @@ fn real_tty_eof_still_ends_the_session() {
     let (done_tx, done_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
         let mut connection = Connection::new_client(client, &[19; 32]);
-        run_exit_pump(&mut connection, false, input, |_| {
+        run_exit_pump(&mut connection, false, false, input, |_| {
             panic!("TTY EOF must not reconnect")
         });
-        done_tx.send(()).unwrap();
+        done_tx.send(connection.writer_sequence()).unwrap();
     });
     let completed = done_rx.recv_timeout(Duration::from_secs(3));
     let _ = control.shutdown(std::net::Shutdown::Both);
     worker.join().unwrap();
-    completed.expect("real TTY EOF must still end the session");
+    let sent = completed.expect("real TTY EOF must still end the session");
+    assert_eq!(sent, 0, "PTY-mode EOF must not send an EOF packet");
+}
+
+#[test]
+fn binary_stdio_tty_eof_sends_one_eof_and_waits_for_remote_exit() {
+    // `ssh -T` semantics: Ctrl-D on a canonical terminal ends the remote
+    // command's input, not the session.
+    let pair = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize::default())
+        .unwrap();
+    let input = std::fs::File::open(pair.master.tty_name().unwrap()).unwrap();
+    assert!(input.is_terminal());
+    let mut master = pair.master.take_writer().unwrap();
+    master.write_all(b"\x04").unwrap();
+    let (client, server) = tcp_streams();
+    let control = client.try_clone().unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let mut connection = Connection::new_client(client, &[19; 32]);
+        run_exit_pump(&mut connection, false, true, input, |_| {
+            panic!("TTY EOF must not reconnect")
+        });
+        done_tx.send(()).unwrap();
+    });
+    let mut peer = Connection::new_server(server, &[19; 32]);
+    let eof = peer.read_packet().unwrap();
+    assert_eq!(eof.header(), TerminalPacketType::TerminalBuffer as u8);
+    assert_eq!(eof.payload(), [0x0a, 0x00]);
+    let after_eof = done_rx.recv_timeout(Duration::from_millis(200));
+    peer.write_packet(
+        TerminalPacketType::TerminalExitStatus as u8,
+        &et_core::proto::TerminalExitStatus { exitcode: Some(0) }.encode_to_vec(),
+    )
+    .unwrap();
+    let completed = done_rx.recv_timeout(Duration::from_secs(3));
+    let _ = control.shutdown(std::net::Shutdown::Both);
+    worker.join().unwrap();
+    drop(master);
+    assert!(after_eof.is_err(), "-T terminal EOF ended the session");
+    completed.expect("remote exit status must end the session");
+    assert!(
+        peer.read_packet().is_err(),
+        "client sent more after its stdin EOF"
+    );
 }
 
 #[test]

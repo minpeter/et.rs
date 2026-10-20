@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use et_core::proto::TerminalBuffer;
+use et_core::proto::{TerminalBuffer, TerminalPacketType};
 use et_net::local_packet::read_local_packet;
 use prost::Message;
 
@@ -213,6 +213,12 @@ pub fn collect_until(router: &mut impl Read, done: impl Fn(&[u8]) -> bool) -> Ve
     let mut output = Vec::new();
     while !done(&output) {
         let packet = read_local_packet(router).unwrap();
+        assert_eq!(
+            packet.header(),
+            TerminalPacketType::TerminalBuffer as u8,
+            "expected terminal output, got payload {:?}",
+            packet.payload()
+        );
         output.extend(
             TerminalBuffer::decode(packet.payload())
                 .unwrap()

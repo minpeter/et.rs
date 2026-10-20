@@ -42,7 +42,7 @@ enum PipeEvent {
 }
 
 pub(crate) fn run<F>(
-    mut router: LocalStream,
+    router: LocalStream,
     term: &str,
     framing: RouterFraming,
     initialization: TerminalInitialization,
@@ -59,11 +59,25 @@ where
         return Err("pipe command contains NUL".to_owned());
     }
 
-    let mut child = spawn_command(&command, term, &initialization.environment)?;
+    let child = spawn_command(&command, term, &initialization.environment)?;
     #[cfg(target_os = "linux")]
     if let Some(pidfd) = terminal_pipe_poll::watch(&child) {
         return terminal_pipe_poll::run(router, framing, child, pidfd, started);
     }
+    run_threaded(router, framing, child, started)
+}
+
+/// Threaded runtime: a thread per output pipe plus a child waiter. Linux
+/// kernels with `pidfd_open` use `terminal_pipe_poll` instead.
+fn run_threaded<F>(
+    mut router: LocalStream,
+    framing: RouterFraming,
+    mut child: Child,
+    started: F,
+) -> Result<i32, String>
+where
+    F: FnOnce(&mut LocalStream) -> Result<(), String>,
+{
     let stdin = child
         .stdin
         .take()
@@ -329,6 +343,8 @@ fn pump(
         .map_err(|error| format!("could not configure pipe wakeup: {error}"))?;
     let mut decoder = RouterStreamDecoder::new(framing);
     let mut pending = Vec::new();
+    // The client's stdin ended (an empty TERMINAL_BUFFER, `-T` EOF).
+    let mut input_ended = false;
     let mut stdout_done = false;
     let mut child_status = None;
     loop {
@@ -338,12 +354,10 @@ fn pump(
                 return Ok(PipeStatus::Exited(status));
             }
         }
-        if stdout_done {
+        if (stdout_done || input_ended) && pending.is_empty() {
             // Flush any input already accepted, then close stdin. A redirected
             // last command (`cat >file`) EOFs stdout while still reading.
-            if pending.is_empty() {
-                stdin.take();
-            }
+            stdin.take();
         }
         if stdout_done && stdin.is_none() {
             if let Some(status) = child_status {
@@ -351,7 +365,10 @@ fn pump(
             }
         }
 
-        let accept_input = stdin.is_some() && !stdout_done && pending.len() < MAX_PENDING_INPUT;
+        // After stdin closes on client EOF, keep reading the router: later
+        // input is ignored, TERMINAL_CLOSE still ends the session.
+        let accept_input =
+            (stdin.is_some() || input_ended) && !stdout_done && pending.len() < MAX_PENDING_INPUT;
         // Windows polls on a timer, so this readiness flag is only consumed by
         // the Unix `poll_pipe` call below.
         #[cfg(unix)]
@@ -371,7 +388,7 @@ fn pump(
 
         drain_wakeup(&mut wake_reader)?;
         apply_events(events, &mut stdout_done, &mut child_status)?;
-        if stdout_done && pending.is_empty() {
+        if (stdout_done || input_ended) && pending.is_empty() {
             stdin.take();
         }
         if stdout_done {
@@ -387,7 +404,7 @@ fn pump(
                 let Some(packet) = read_ready_packet(router, &mut decoder)? else {
                     break;
                 };
-                if take_input(packet, stdin, &mut pending)? {
+                if take_input(packet, stdin, &mut pending, &mut input_ended)? {
                     // TERMINAL_CLOSE ends the pipe session successfully.
                     // Cleanup kills the child; its signal status is not the
                     // session status.
@@ -421,10 +438,18 @@ fn apply_events(
     Ok(saw)
 }
 
+/// Apply one router message to the command's stdin. Returns `true` for
+/// TERMINAL_CLOSE.
+///
+/// An empty TERMINAL_BUFFER (`buffer` present, no bytes) is the client's
+/// `-T` stdin EOF, like OpenSSH's channel EOF: stdin closes once the input
+/// before it has been written, and later input is ignored. No other client
+/// sends an empty buffer; the PTY runtimes keep ignoring it.
 fn take_input(
     packet: Packet,
     stdin: &mut Option<ChildStdin>,
     pending: &mut Vec<u8>,
+    input_ended: &mut bool,
 ) -> Result<bool, String> {
     if local_packet_effect(&packet)? == LocalPacketEffect::Close {
         return Ok(true);
@@ -433,15 +458,29 @@ fn take_input(
         return Ok(false);
     }
     if packet.header() == TerminalPacketType::TerminalBuffer as u8 {
-        if let Some((bytes, _)) = et_core::packet::decode_terminal_buffer(packet.payload()) {
-            write_or_stage(stdin, pending, bytes)?;
+        let decoded;
+        let bytes = match et_core::packet::decode_terminal_buffer(packet.payload()) {
+            Some((bytes, _)) => bytes,
+            None => {
+                decoded = TerminalBuffer::decode(packet.payload())
+                    .map_err(|_| "TERMINAL_BUFFER protobuf is malformed".to_owned())?;
+                match decoded.buffer.as_deref() {
+                    Some(bytes) => bytes,
+                    None => return Ok(false),
+                }
+            }
+        };
+        if *input_ended {
             return Ok(false);
         }
-        let message = TerminalBuffer::decode(packet.payload())
-            .map_err(|_| "TERMINAL_BUFFER protobuf is malformed".to_owned())?;
-        if let Some(bytes) = message.buffer {
-            write_or_stage(stdin, pending, &bytes)?;
+        if bytes.is_empty() {
+            *input_ended = true;
+            if pending.is_empty() {
+                stdin.take();
+            }
+            return Ok(false);
         }
+        write_or_stage(stdin, pending, bytes)?;
         return Ok(false);
     }
     Err("unsupported local terminal packet type".to_owned())
@@ -793,5 +832,100 @@ mod tests {
             terminal_pty::run_with_startup(router, "xterm", RouterFraming::Upstream, |_| Ok(()))
                 .unwrap_err();
         assert!(error.contains("non-empty"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum Runtime {
+        #[cfg(target_os = "linux")]
+        Poll,
+        Threaded,
+    }
+
+    #[cfg(unix)]
+    const RUNTIMES: &[Runtime] = &[
+        #[cfg(target_os = "linux")]
+        Runtime::Poll,
+        Runtime::Threaded,
+    ];
+
+    #[cfg(unix)]
+    fn run_on(
+        runtime: Runtime,
+        router: LocalStream,
+        framing: RouterFraming,
+        command: &str,
+    ) -> Result<i32, String> {
+        let child = spawn_command(command, "xterm", &[])?;
+        match runtime {
+            #[cfg(target_os = "linux")]
+            Runtime::Poll => {
+                let pidfd = terminal_pipe_poll::watch(&child).expect("pidfd_open");
+                terminal_pipe_poll::run(router, framing, child, pidfd, |_| Ok(()))
+            }
+            Runtime::Threaded => run_threaded(router, framing, child, |_| Ok(())),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_buffer_closes_stdin_after_pending_input_on_every_runtime_and_framing() {
+        // `et -T host 'wc -c' < file`: the client ends its input with an
+        // empty TERMINAL_BUFFER. More than a pipe buffer of input precedes
+        // it, so stdin may close only after the staged bytes are written.
+        let input: Vec<u8> = (0..200_000u32).map(|n| (n % 251) as u8).collect();
+        let buffer = |bytes: &[u8]| {
+            Packet::new(
+                TerminalPacketType::TerminalBuffer as u8,
+                et_core::packet::encode_terminal_buffer(bytes, false),
+            )
+        };
+        for &runtime in RUNTIMES {
+            for framing in [RouterFraming::Upstream, RouterFraming::Packets] {
+                let (router, mut peer) = et_net::local::wake_pair().unwrap();
+                peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let (done_tx, done_rx) = mpsc::channel();
+                thread::spawn(move || {
+                    let _ = done_tx.send(run_on(runtime, router, framing, "wc -c"));
+                });
+                let mut writer = peer.try_clone().unwrap();
+                let sent = input.clone();
+                let feeder = thread::spawn(move || {
+                    for chunk in sent.chunks(60_000) {
+                        write_router_message(&mut writer, &buffer(chunk), framing).unwrap();
+                    }
+                    write_router_message(&mut writer, &buffer(&[]), framing).unwrap();
+                    // Input after EOF is ignored; the session may already
+                    // be gone, so a failed write is fine.
+                    let _ = write_router_message(&mut writer, &buffer(b"late"), framing);
+                });
+                let mut output = Vec::new();
+                let code = loop {
+                    let packet = read_local_packet(&mut peer).unwrap_or_else(|error| {
+                        panic!("{runtime:?} {framing:?}: command never saw EOF: {error}")
+                    });
+                    if packet.header() == TerminalPacketType::TerminalExitStatus as u8 {
+                        break et_core::proto::TerminalExitStatus::decode(packet.payload())
+                            .unwrap()
+                            .exitcode;
+                    }
+                    let message = TerminalBuffer::decode(packet.payload()).unwrap();
+                    assert_ne!(message.is_stderr, Some(true), "{message:?}");
+                    output.extend(message.buffer.unwrap());
+                };
+                feeder.join().unwrap();
+                assert_eq!(
+                    String::from_utf8_lossy(&output).trim(),
+                    input.len().to_string(),
+                    "{runtime:?} {framing:?}"
+                );
+                assert_eq!(code, Some(0), "{runtime:?} {framing:?}");
+                assert_eq!(
+                    done_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                    Ok(0),
+                    "{runtime:?} {framing:?}"
+                );
+            }
+        }
     }
 }

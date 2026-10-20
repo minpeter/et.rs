@@ -17,13 +17,16 @@ use et_core::proto::{
 };
 use et_net::connection::Connection;
 use et_net::handshake::{read_request, response_status, write_response};
-use et_net::local_packet::MAX_LOCAL_PACKET_LEN;
 use prost::Message;
 
 const SERVER_ID: &str = "abcdefghijklmnop";
 const SERVER_KEY: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
 const VALID_MARKER: &str = "IDPASSKEY:abcdefghijklmnop/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef\n";
 const RESOLVED_CONFIG: &str = "host server-alias\nuser config-user\nhostname 127.0.0.1\nport 22\n";
+/// Largest TERMINAL_INIT / JUMPHOST_INIT the client may make `etserver`
+/// build: what every et.rs etserver and etterminal through 0.0.43 accept,
+/// independent of the current local packet cap.
+const MAX_INIT_PACKET_LEN: usize = 64 * 1024;
 
 struct TestDir(PathBuf);
 
@@ -1388,7 +1391,7 @@ fn effective_setenv_shares_terminal_and_jumphost_packet_budgets() {
             assert!(
                 Packet::new(TerminalPacketType::TerminalInit as u8, term.encode_to_vec())
                     .wire_len()
-                    <= MAX_LOCAL_PACKET_LEN
+                    <= MAX_INIT_PACKET_LEN
             );
             if jump {
                 assert_eq!(payload.jumphost, Some(true));
@@ -1398,7 +1401,7 @@ fn effective_setenv_shares_terminal_and_jumphost_packet_budgets() {
                         payload.encode_to_vec()
                     )
                     .wire_len()
-                        <= MAX_LOCAL_PACKET_LEN
+                        <= MAX_INIT_PACKET_LEN
                 );
             }
         }
@@ -1715,8 +1718,8 @@ fn posix_client_bounds_locale_to_local_terminal_packet() {
         term_init.encode_to_vec(),
     );
     assert!(
-        packet.wire_len() <= MAX_LOCAL_PACKET_LEN,
-        "{} > {MAX_LOCAL_PACKET_LEN}",
+        packet.wire_len() <= MAX_INIT_PACKET_LEN,
+        "{} > {MAX_INIT_PACKET_LEN}",
         packet.wire_len()
     );
 }
@@ -2017,7 +2020,7 @@ fn excessive_unique_tunnel_environment_names_fail_before_ssh_bootstrap() {
 #[test]
 fn oversized_tunnel_environment_name_exceeds_local_packet_limit() {
     let fake = FakeSsh::new();
-    let environment_name = format!("E{}", "T".repeat(MAX_LOCAL_PACKET_LEN));
+    let environment_name = format!("E{}", "T".repeat(MAX_INIT_PACKET_LEN));
     let output = fake
         .command(RESOLVED_CONFIG, VALID_MARKER, 0, "")
         .env("TERM", "xterm-256color")
@@ -2032,6 +2035,11 @@ fn oversized_tunnel_environment_name_exceeds_local_packet_limit() {
     assert_eq!(output.status.code(), Some(2));
     assert!(
         stderr(&output).contains("terminal environment packet needs at least"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains(&format!("maximum is {MAX_INIT_PACKET_LEN}")),
         "{}",
         stderr(&output)
     );
@@ -2060,6 +2068,11 @@ fn oversized_jumphost_initialization_fails_before_ssh_bootstrap() {
     assert_eq!(output.status.code(), Some(2));
     assert!(
         stderr(&output).contains("jumphost initialization packet needs at least"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains(&format!("maximum is {MAX_INIT_PACKET_LEN}")),
         "{}",
         stderr(&output)
     );

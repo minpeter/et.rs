@@ -5,10 +5,18 @@ use std::io::Write;
 use std::io::{Cursor, ErrorKind, Read};
 
 use et_core::packet::Packet;
+use et_core::proto::TerminalPacketType;
 use et_net::local_packet::{
-    read_local_packet, write_local_packet, LocalPacketDecoder, LocalPacketError,
-    MAX_LOCAL_PACKET_LEN,
+    read_local_packet, write_local_packet, write_router_message, LocalPacketDecoder,
+    LocalPacketError, RouterFraming, RouterStreamDecoder, MAX_LOCAL_PACKET_LEN,
+    MAX_REGISTRATION_LEN,
 };
+
+/// Upstream `SocketHandler` reads a packet, header included, or a router
+/// stream protobuf of up to 128 MiB.
+const UPSTREAM_MAX_LEN: usize = 128 * 1024 * 1024;
+const TERMINAL_BUFFER: u8 = TerminalPacketType::TerminalBuffer as u8;
+const TERMINAL_CLOSE: u8 = TerminalPacketType::TerminalClose as u8;
 
 #[test]
 fn local_packet_roundtrip_uses_native_i64_framing() {
@@ -65,6 +73,145 @@ fn writer_rejects_packets_above_the_local_cap() {
     let packet = Packet::new(8, vec![0; MAX_LOCAL_PACKET_LEN]);
     let error = write_local_packet(&mut Vec::new(), &packet).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
+}
+
+#[test]
+fn lengths_up_to_128_mib_are_accepted_and_longer_ones_rejected() {
+    let too_large = |result: Result<_, LocalPacketError>| {
+        matches!(
+            result,
+            Err(LocalPacketError::FrameTooLarge { limit, .. }) if limit == UPSTREAM_MAX_LEN
+        )
+    };
+    for (length, accepted) in [(UPSTREAM_MAX_LEN, true), (UPSTREAM_MAX_LEN + 1, false)] {
+        let prefix = (length as i64).to_ne_bytes();
+        let mut upstream = vec![TERMINAL_BUFFER];
+        upstream.extend_from_slice(&prefix);
+
+        let blocking = read_local_packet(&mut Cursor::new(prefix));
+        let fed = LocalPacketDecoder::new().feed(&prefix).map(|_| ());
+        let read = LocalPacketDecoder::new().read_from(&mut Cursor::new(prefix));
+        let packets =
+            RouterStreamDecoder::new(RouterFraming::Packets).read_from(&mut Cursor::new(prefix));
+        let raw =
+            RouterStreamDecoder::new(RouterFraming::Upstream).read_from(&mut Cursor::new(upstream));
+        if accepted {
+            assert!(matches!(blocking, Err(LocalPacketError::TruncatedPayload)));
+            assert!(fed.is_ok());
+            for result in [read, packets, raw] {
+                assert!(
+                    matches!(&result, Err(LocalPacketError::Io(error)) if error.kind() == ErrorKind::UnexpectedEof),
+                    "{result:?}"
+                );
+            }
+        } else {
+            assert!(too_large(blocking.map(|_| ())));
+            assert!(too_large(fed));
+            for result in [read, packets, raw] {
+                assert!(too_large(result.map(|_| ())));
+            }
+        }
+    }
+}
+
+#[test]
+fn decoder_limit_bounds_the_whole_packet() {
+    for (length, accepted) in [
+        (MAX_REGISTRATION_LEN, true),
+        (MAX_REGISTRATION_LEN + 1, false),
+    ] {
+        let prefix = (length as i64).to_ne_bytes();
+        let fed = LocalPacketDecoder::with_limit(MAX_REGISTRATION_LEN).feed(&prefix);
+        let read = LocalPacketDecoder::with_limit(MAX_REGISTRATION_LEN)
+            .read_from(&mut Cursor::new(prefix));
+        if accepted {
+            assert!(matches!(fed, Ok(None)));
+            assert!(matches!(read, Err(LocalPacketError::Io(_))));
+        } else {
+            for result in [fed, read] {
+                assert!(matches!(
+                    result,
+                    Err(LocalPacketError::FrameTooLarge { limit, .. }) if limit == MAX_REGISTRATION_LEN
+                ));
+            }
+        }
+    }
+}
+
+/// `Read` that would block before every `step`-byte piece of `bytes`.
+struct Stutter {
+    bytes: Vec<u8>,
+    offset: usize,
+    step: usize,
+    ready: bool,
+}
+
+impl Read for Stutter {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.ready = !self.ready;
+        if !self.ready {
+            return Err(ErrorKind::WouldBlock.into());
+        }
+        let count = self
+            .step
+            .min(buffer.len())
+            .min(self.bytes.len() - self.offset);
+        buffer[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
+        self.offset += count;
+        Ok(count)
+    }
+}
+
+#[test]
+fn messages_over_64_kib_round_trip_in_both_framings() {
+    let output: Vec<u8> = (0..1024 * 1024 + 3)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let messages = [
+        Packet::new(
+            TERMINAL_BUFFER,
+            et_core::packet::encode_terminal_buffer(&output, false),
+        ),
+        Packet::new(TERMINAL_BUFFER, vec![7; 200 * 1024]),
+        Packet::new(TERMINAL_CLOSE, Vec::new()),
+    ];
+
+    // Length-prefixed packets, read blocking and fed in pieces.
+    let mut wire = Vec::new();
+    write_local_packet(&mut wire, &messages[0]).unwrap();
+    assert_eq!(
+        read_local_packet(&mut Cursor::new(&wire)).unwrap(),
+        messages[0]
+    );
+    let mut decoder = LocalPacketDecoder::new();
+    let mut fed = None;
+    for piece in wire.chunks(8192) {
+        assert!(fed.is_none());
+        fed = decoder.feed(piece).unwrap();
+    }
+    assert_eq!(fed.as_ref(), Some(&messages[0]));
+
+    // The router stream in either framing, through partial nonblocking reads.
+    for framing in [RouterFraming::Upstream, RouterFraming::Packets] {
+        let mut wire = Vec::new();
+        for message in &messages {
+            write_router_message(&mut wire, message, framing).unwrap();
+        }
+        let mut reader = Stutter {
+            bytes: wire,
+            offset: 0,
+            step: 5000,
+            ready: false,
+        };
+        let mut decoder = RouterStreamDecoder::new(framing);
+        let mut decoded = Vec::new();
+        while decoded.len() < messages.len() {
+            if let Some(message) = decoder.read_from(&mut reader).unwrap() {
+                decoded.push(message);
+            }
+        }
+        assert_eq!(decoded, messages, "{framing:?}");
+    }
 }
 
 /// Regression test: `set_nonblocking(true)` on a local stream applies to

@@ -11,7 +11,7 @@ use et_core::packet::Packet;
 use et_core::proto::{TerminalPacketType, TerminalUserInfo};
 use et_net::local_packet::{
     parse_registration_status, read_local_packet, write_local_packet, RouterFraming,
-    MAX_LOCAL_PACKET_LEN, REGISTRATION_STATUS,
+    MAX_LOCAL_PACKET_LEN, MAX_REGISTRATION_LEN, REGISTRATION_STATUS,
 };
 use et_server::path::select_router_path_for;
 use et_server::{Registry, Router, RouterEvent, RouterReject, REGISTRATION_TIMEOUT};
@@ -475,6 +475,7 @@ fn malformed_local_frames_are_capped_and_classified() {
 
     for prefix in [
         (-1i64).to_ne_bytes(),
+        (MAX_REGISTRATION_LEN as i64 + 1).to_ne_bytes(),
         (MAX_LOCAL_PACKET_LEN as i64 + 1).to_ne_bytes(),
     ] {
         let mut stream = UnixStream::connect(&path).unwrap();
@@ -487,6 +488,76 @@ fn malformed_local_frames_are_capped_and_classified() {
     stream.write_all(&[0; 7]).unwrap();
     stream.shutdown(Shutdown::Write).unwrap();
     expect_rejected(&router, RouterReject::MalformedFrame);
+    router.shutdown().unwrap();
+}
+
+/// A field number `TerminalUserInfo` does not define.
+const PADDING_TAG: u32 = 99_999;
+
+/// `value` padded with an unknown field, which protobuf parsers skip, to a
+/// registration packet of exactly `packet_len` bytes, header included.
+fn padded_registration(value: &TerminalUserInfo, packet_len: usize) -> Packet {
+    let encoded = value.encode_to_vec();
+    (0..packet_len)
+        .map(|padding| {
+            let mut payload = encoded.clone();
+            prost::encoding::encode_key(
+                PADDING_TAG,
+                prost::encoding::WireType::LengthDelimited,
+                &mut payload,
+            );
+            prost::encoding::encode_varint(padding as u64, &mut payload);
+            payload.resize(payload.len() + padding, b'p');
+            Packet::new(TerminalPacketType::TerminalUserInfo as u8, payload)
+        })
+        .find(|packet| packet.wire_len() == packet_len)
+        .expect("padding reaches the packet length")
+}
+
+#[test]
+fn registration_packets_are_capped_at_the_upstream_registration_length() {
+    let dir = TestDir::new();
+    let path = dir.socket();
+    let registry = Registry::new();
+    let selected = select_router_path_for(1000, Some(&path), None, None).unwrap();
+    let mut router = Router::start(selected, registry.clone()).unwrap();
+    let (uid, gid) = current_ids();
+    // An et.rs registration, which the router answers whenever it reads one.
+    let value = info_with_capability(Some(ID), Some(KEY), Some(uid), Some(gid), true);
+
+    // Given: a registration one byte over upstream's MAX_REGISTRATION_LENGTH.
+    let mut oversized = connect_packet(
+        &path,
+        &padded_registration(&value, MAX_REGISTRATION_LEN + 1),
+    );
+    oversized
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+
+    // Then: it is refused as a malformed frame, without a reply.
+    expect_rejected(&router, RouterReject::MalformedFrame);
+    let mut byte = [0u8; 1];
+    match oversized.read(&mut byte) {
+        Ok(0) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("oversized registration was answered: {other:?}"),
+    }
+    assert!(registry.is_empty().unwrap());
+
+    // And: one exactly at the limit registers.
+    let mut terminal = connect_packet(&path, &padded_registration(&value, MAX_REGISTRATION_LEN));
+    terminal
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let status = read_local_packet(&mut terminal).unwrap();
+    assert_eq!(
+        parse_registration_status(&status).unwrap(),
+        RouterFraming::Packets
+    );
+    assert_eq!(
+        router.recv_event_timeout(Duration::from_secs(2)).unwrap(),
+        RouterEvent::Registered { id: ID.to_owned() }
+    );
     router.shutdown().unwrap();
 }
 

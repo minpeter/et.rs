@@ -7,8 +7,8 @@ use et_cli::tunnel::{parse_dynamic_forward, parse_tunnels};
 use et_core::proto::{InitialPayload, PortForwardSourceRequest, SocketEndpoint};
 use et_net::forward::ForwardSource;
 
+use crate::client_environment::{portable_environment_name, MAX_ENVIRONMENT, MAX_INIT_PACKET_LEN};
 use crate::ssh_config::ResolvedSshConfig;
-use crate::terminal_protocol::{valid_environment_name, MAX_ENVIRONMENT};
 
 #[derive(Debug)]
 pub enum ForwardConfigError {
@@ -40,13 +40,11 @@ impl std::fmt::Display for ForwardConfigError {
             ),
             Self::EnvironmentPacketTooLarge(length) => write!(
                 formatter,
-                "terminal environment packet needs at least {length} bytes; maximum is {}",
-                et_net::local_packet::MAX_LOCAL_PACKET_LEN
+                "terminal environment packet needs at least {length} bytes; maximum is {MAX_INIT_PACKET_LEN}"
             ),
             Self::JumphostPacketTooLarge(length) => write!(
                 formatter,
-                "jumphost initialization packet needs at least {length} bytes; maximum is {}",
-                et_net::local_packet::MAX_LOCAL_PACKET_LEN
+                "jumphost initialization packet needs at least {length} bytes; maximum is {MAX_INIT_PACKET_LEN}"
             ),
         }
     }
@@ -256,7 +254,7 @@ fn validate_environment_names(
         .iter()
         .filter_map(|request| request.environmentvariable.as_deref())
     {
-        if !valid_environment_name(name) {
+        if !portable_environment_name(name) {
             return Err(ForwardConfigError::InvalidEnvironmentName(name.to_owned()));
         }
         names.insert(name);

@@ -403,13 +403,16 @@ fn reregistration_reads_the_router_stream_each_new_etserver_negotiates() {
     expect_startup(&mut router);
     exercise_session(&mut router, RouterFraming::Upstream, (40, 100), "FIRST");
 
-    // When: the etserver is replaced by et.rs 0.0.43, which writes packets.
+    // When: the etserver is replaced by et.rs 0.0.43, which writes packets
+    // and waits for a STARTUP_STATUS after every `fd = -6` registration.
     drop(router);
     let mut router = fixture.accept();
     assert_eq!(expect_registration(&mut router, true).ptyactive, Some(true));
     acknowledge_registration_as_old_et_rs(&mut router);
 
-    // Then: the live pty reads packets.
+    // Then: the live pty answers it before anything else (an old etserver
+    // would otherwise swallow the first output) and reads packets.
+    expect_startup(&mut router);
     exercise_session(&mut router, RouterFraming::Packets, (33, 77), "SECOND");
 
     // When: that one is replaced by upstream etserver, which has no sidecar.
@@ -421,8 +424,20 @@ fn reregistration_reads_the_router_stream_each_new_etserver_negotiates() {
         Some(true)
     );
 
-    // Then: the live pty reads the raw upstream stream, close included.
+    // Then: the live pty reads the raw upstream stream, with no status.
     exercise_session(&mut router, RouterFraming::Upstream, (21, 61), "THIRD");
+
+    // When: a current et.rs etserver comes back. It does not wait for a
+    // STARTUP_STATUS on resume and would reject one.
+    et_net::local::write_registration_ack_capability(&fixture.socket).unwrap();
+    drop(router);
+    let mut router = fixture.accept();
+    assert_eq!(expect_registration(&mut router, true).ptyactive, Some(true));
+    acknowledge_registration(&mut router);
+
+    // Then: only shell output follows (`collect_until` requires buffers),
+    // and the raw upstream stream, close included, drives the pty.
+    exercise_session(&mut router, RouterFraming::Upstream, (19, 59), "FOURTH");
     router
         .write_all(&[TerminalPacketType::TerminalClose as u8])
         .unwrap();
@@ -430,6 +445,77 @@ fn reregistration_reads_the_router_stream_each_new_etserver_negotiates() {
         .wait_timeout(TIMEOUT)
         .unwrap()
         .expect("etterminal missed TERMINAL_CLOSE after re-registering");
+    assert!(status.success(), "{status}");
+}
+
+// `/proc/$$/environ`: the shell drops non-portable names (`MY-VAR`) from
+// the environment it passes on, so read what etterminal gave it instead.
+#[cfg(target_os = "linux")]
+#[test]
+fn terminal_init_environment_is_applied_like_upstream_setenv() {
+    // Given: TERMINAL_INIT with more than 128 entries, a value over 4096
+    // bytes, non-portable names, and entries setenv(3) rejects. Upstream
+    // calls setenv for each and ignores failures; et.rs 0.0.43 refused the
+    // whole session.
+    let fixture = Fixture::new("environment-parity");
+    let mut child = fixture.spawn();
+    write_credentials(&mut child);
+    let mut router = fixture.accept();
+    expect_registration(&mut router, true);
+    acknowledge_registration(&mut router);
+    fixture.wait_ready();
+    let big = "v".repeat(5000);
+    let mut entries: Vec<(String, String)> = (0..200)
+        .map(|index| (format!("ET_ENV_{index:03}"), format!("value-{index}")))
+        .collect();
+    for (name, value) in [
+        ("ET_ENV_BIG", big.as_str()),
+        ("MY-VAR", "dash"),
+        ("1ABC", "digit"),
+        ("ET_BROKEN=NAME", "skipped"),
+        ("", "skipped"),
+        ("ET_NUL_VALUE", "a\0b"),
+    ] {
+        entries.push((name.to_owned(), value.to_owned()));
+    }
+
+    // When: the pipe command prints the environment it was started with.
+    send(
+        &mut router,
+        TerminalPacketType::TerminalInit,
+        &TermInit {
+            environmentnames: entries.iter().map(|(name, _)| name.clone()).collect(),
+            environmentvalues: entries.iter().map(|(_, value)| value.clone()).collect(),
+            no_pty: Some(true),
+            command: Some("tr '\\000' '\\n' </proc/$$/environ".to_owned()),
+            ..TermInit::default()
+        },
+    );
+
+    // Then: it starts, every applicable entry is set and the rest are skipped.
+    expect_startup(&mut router);
+    let mut output = Vec::new();
+    loop {
+        let packet = read_local_packet(&mut router).unwrap();
+        if packet.header() == TerminalPacketType::TerminalExitStatus as u8 {
+            let status = et_core::proto::TerminalExitStatus::decode(packet.payload()).unwrap();
+            assert_eq!(status.exitcode, Some(0));
+            break;
+        }
+        assert_eq!(packet.header(), TerminalPacketType::TerminalBuffer as u8);
+        let buffer = TerminalBuffer::decode(packet.payload()).unwrap();
+        assert_ne!(buffer.is_stderr, Some(true), "{buffer:?}");
+        output.extend(buffer.buffer.unwrap());
+    }
+    let output = String::from_utf8(output).unwrap();
+    let lines: std::collections::HashSet<&str> = output.lines().collect();
+    for (name, value) in entries.iter().take(203) {
+        let line = format!("{name}={value}");
+        assert!(lines.contains(line.as_str()), "missing {name}: {output}");
+    }
+    assert!(!output.contains("ET_BROKEN"), "{output}");
+    assert!(!output.contains("ET_NUL_VALUE"), "{output}");
+    let status = child.wait_timeout(TIMEOUT).unwrap().unwrap();
     assert!(status.success(), "{status}");
 }
 

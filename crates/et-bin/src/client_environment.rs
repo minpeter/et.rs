@@ -3,12 +3,32 @@ use std::collections::{BTreeMap, BTreeSet};
 use et_cli::tunnel::MAX_UNIX_SOCKET_PATH;
 use et_core::packet::Packet;
 use et_core::proto::{InitialPayload, TermInit, TerminalPacketType};
-use et_net::local_packet::MAX_LOCAL_PACKET_LEN;
 use prost::Message;
 
-use crate::terminal_protocol::{valid_environment_name, MAX_ENVIRONMENT, MAX_ENV_VALUE};
+// Emission limits. They bound only what this client asks `etserver` to put
+// in TERMINAL_INIT / JUMPHOST_INIT, sized to what every et.rs etserver and
+// etterminal through 0.0.43 accept (128 portable names, 4096-byte values,
+// 64 KiB packets). Current terminals accept more, like upstream, but a client
+// cannot know which version runs on the server host.
+
+/// Largest serialized TERMINAL_INIT / JUMPHOST_INIT (header included) the
+/// server will build from this client's environment and tunnels: what every
+/// et.rs etserver and etterminal through 0.0.43 accept.
+pub(crate) const MAX_INIT_PACKET_LEN: usize = 64 * 1024;
+/// Environment entries sent: what every et.rs etterminal through 0.0.43 accepts.
+pub(crate) const MAX_ENVIRONMENT: usize = 128;
+/// Environment value bytes sent: what every et.rs etterminal through 0.0.43 accepts.
+pub(crate) const MAX_ENV_VALUE: usize = 4096;
 
 const MAX_LOSSY_FORWARD_ENV_VALUE: usize = MAX_UNIX_SOCKET_PATH * 3;
+
+/// Portable `[A-Za-z_][A-Za-z0-9_]*` names: the only ones every et.rs
+/// etterminal through 0.0.43 accepts, so the only ones this client sends.
+pub(crate) fn portable_environment_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
 
 pub(crate) fn normalize_terminal_type(term: Option<&str>) -> String {
     match term.filter(|term| !term.is_empty()) {
@@ -44,7 +64,7 @@ fn select_send_environment(
     let mut selected: Vec<_> = environment
         .into_iter()
         .filter(|(name, value)| {
-            valid_environment_name(name)
+            portable_environment_name(name)
                 && value.len() <= MAX_ENV_VALUE
                 && !value.contains('\0')
                 && patterns
@@ -130,7 +150,7 @@ pub(crate) fn bounded_locale_environment(
             .saturating_add(encoded_string_field_len(name.len()))
             .saturating_add(encoded_string_field_len(*value_len));
     }
-    if packet_len > MAX_LOCAL_PACKET_LEN {
+    if packet_len > MAX_INIT_PACKET_LEN {
         return Err(packet_len);
     }
 
@@ -143,7 +163,7 @@ pub(crate) fn bounded_locale_environment(
             continue;
         }
         let addition = encoded_string_field_len(name.len()) + encoded_string_field_len(value.len());
-        if packet_len.saturating_add(addition) <= MAX_LOCAL_PACKET_LEN {
+        if packet_len.saturating_add(addition) <= MAX_INIT_PACKET_LEN {
             packet_len += addition;
             selected.push((name, value));
         }
@@ -164,7 +184,7 @@ pub(crate) fn bound_jumphost_locale_environment(
             modeled.encode_to_vec(),
         )
         .wire_len();
-        if packet_len <= MAX_LOCAL_PACKET_LEN {
+        if packet_len <= MAX_INIT_PACKET_LEN {
             return Ok(());
         }
         let Some((name, _)) = locale.pop() else {
@@ -193,14 +213,14 @@ fn varint_len(mut value: usize) -> usize {
 mod tests {
     use super::{
         bound_jumphost_locale_environment, locale_environment_capacity, locale_priority,
-        normalize_terminal_type, reserved_environment_value_lengths, MAX_LOSSY_FORWARD_ENV_VALUE,
+        normalize_terminal_type, reserved_environment_value_lengths, MAX_INIT_PACKET_LEN,
+        MAX_LOSSY_FORWARD_ENV_VALUE,
     };
     use et_core::packet::Packet;
     use et_core::proto::{
         FlowControlMode, InitialPayload, PortForwardSourceRequest, SocketEndpoint, TermInit,
         TerminalPacketType,
     };
-    use et_net::local_packet::MAX_LOCAL_PACKET_LEN;
     use prost::Message;
 
     #[test]
@@ -259,7 +279,7 @@ mod tests {
     fn first_environment_value_wins_even_when_it_does_not_fit() {
         let selected = super::bounded_locale_environment(
             [
-                ("LANG".into(), "x".repeat(MAX_LOCAL_PACKET_LEN)),
+                ("LANG".into(), "x".repeat(MAX_INIT_PACKET_LEN)),
                 ("LANG".into(), "fallback-must-not-win".into()),
                 ("APP".into(), "first".into()),
                 ("APP".into(), "last".into()),
@@ -309,9 +329,9 @@ mod tests {
             ("LANG".to_owned(), "ko_KR.UTF-8".to_owned()),
         ];
         locale.extend((0..15).map(|index| (format!("LC_000_{index:03}"), "x".repeat(4096))));
-        assert!(jumphost_packet_len(&payload, &locale) > MAX_LOCAL_PACKET_LEN);
+        assert!(jumphost_packet_len(&payload, &locale) > MAX_INIT_PACKET_LEN);
         bound_jumphost_locale_environment(&payload, &mut locale).unwrap();
-        assert!(jumphost_packet_len(&payload, &locale) <= MAX_LOCAL_PACKET_LEN);
+        assert!(jumphost_packet_len(&payload, &locale) <= MAX_INIT_PACKET_LEN);
         for name in ["LC_ALL", "LC_CTYPE", "LANG"] {
             assert!(locale.iter().any(|(candidate, _)| candidate == name));
         }
@@ -335,7 +355,7 @@ mod tests {
             // exactly on the local framing limit.
             let reserved = std::collections::BTreeMap::new();
             let name = "LANG".to_owned();
-            let value_len = (MAX_LOCAL_PACKET_LEN - 32..MAX_LOCAL_PACKET_LEN)
+            let value_len = (MAX_INIT_PACKET_LEN - 32..MAX_INIT_PACKET_LEN)
                 .find(|value_len| {
                     let init = TermInit {
                         environmentnames: vec![name.clone()],
@@ -351,7 +371,7 @@ mod tests {
                     };
                     Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec())
                         .wire_len()
-                        == MAX_LOCAL_PACKET_LEN
+                        == MAX_INIT_PACKET_LEN
                 })
                 .unwrap();
 
@@ -380,7 +400,7 @@ mod tests {
             assert!(
                 Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec(),)
                     .wire_len()
-                    <= MAX_LOCAL_PACKET_LEN
+                    <= MAX_INIT_PACKET_LEN
             );
         }
     }
@@ -389,7 +409,7 @@ mod tests {
     fn absent_flow_control_keeps_the_existing_exact_boundary() {
         let reserved = std::collections::BTreeMap::new();
         let name = "LANG".to_owned();
-        let value_len = (MAX_LOCAL_PACKET_LEN - 32..MAX_LOCAL_PACKET_LEN)
+        let value_len = (MAX_INIT_PACKET_LEN - 32..MAX_INIT_PACKET_LEN)
             .find(|value_len| {
                 let init = TermInit {
                     environmentnames: vec![name.clone()],
@@ -404,7 +424,7 @@ mod tests {
                     hadreversetunnels: None,
                 };
                 Packet::new(TerminalPacketType::TerminalInit as u8, init.encode_to_vec()).wire_len()
-                    == MAX_LOCAL_PACKET_LEN
+                    == MAX_INIT_PACKET_LEN
             })
             .unwrap();
 

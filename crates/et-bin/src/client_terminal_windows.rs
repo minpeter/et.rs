@@ -91,6 +91,9 @@ where
     // Keep the next producer's preference across partial-write completion.
     let mut local_turn = true;
     let mut interrupt_input = et_core::output_interrupt::InterruptInput::default();
+    // `-T` redirected stdin ended (EOF or an unusable handle); the empty
+    // TERMINAL_BUFFER that tells the remote command waits for the transport.
+    let mut input_eof_pending = false;
     let mut bytes_since_ack: usize = 0;
     let mut delivery_gate = crate::delivery_gate::DeliveryGate::default();
     loop {
@@ -302,6 +305,42 @@ where
                 }
                 if disconnected {
                     raw_input = None;
+                    input_eof_pending = binary_stdio;
+                }
+            }
+        }
+        if input_eof_pending && !connection.write_pending() {
+            // Like `ssh -T`, the remote command sees EOF on its stdin. It goes
+            // through replay like other input and is sent exactly once.
+            input_eof_pending = false;
+            let payload = encoded_buffer(&[]);
+            match write_owned(
+                connection,
+                TerminalPacketType::TerminalBuffer as u8,
+                &payload,
+                &mut reconnect,
+                terminal_enabled,
+            )? {
+                OwnedWriteOutcome::Written => {
+                    bytes_since_ack = bytes_since_ack.saturating_add(payload.len());
+                }
+                OwnedWriteOutcome::Recovered => {
+                    reconnect_needed = false;
+                    last_received = Instant::now();
+                    next_keepalive = last_received + interval;
+                }
+                OwnedWriteOutcome::SessionEnded => {
+                    return finish_remote_completion(
+                        console_output,
+                        pending_output,
+                        pending_forward,
+                        terminal_enabled,
+                        binary_stdio,
+                        terminal_modes,
+                        forwarder,
+                        None,
+                        remote_exit,
+                    )
                 }
             }
         }

@@ -325,26 +325,43 @@ fn oversized_terminal_frame_is_rejected_without_overflow() {
 
 #[test]
 fn largest_terminal_frame_matches_reference_limit() {
-    // Packet header (2) + tag (1) + three-byte varint (3) + output + suffix.
+    // Packet header (2) + tag (1) + four-byte varint (4) + output + suffix.
     for (largest, is_stderr) in [
-        (MAX_LOCAL_PACKET_LEN - 6, false),
-        (MAX_LOCAL_PACKET_LEN - 8, true),
+        (MAX_LOCAL_PACKET_LEN - 7, false),
+        (MAX_LOCAL_PACKET_LEN - 9, true),
     ] {
-        let output = sample(largest);
-        let mut frame = new_frame(&output, is_stderr);
-        let mut writer = ShortWriter::new(4096, true);
-        drive(&mut frame, &mut writer, &output).unwrap();
-        assert_eq!(writer.bytes, reference(&output, is_stderr));
+        let frame = TerminalBufferFrame::new(largest, is_stderr).unwrap();
+        assert_eq!(frame.total_len(), PREFIX_LEN + MAX_LOCAL_PACKET_LEN);
+        let mut head = Vec::from((MAX_LOCAL_PACKET_LEN as i64).to_ne_bytes());
+        head.extend_from_slice(&[0, TERMINAL_BUFFER, 0x0a]);
+        prost::encoding::encode_varint(largest as u64, &mut head);
+        assert_eq!(frame.head[..frame.head_len], head[..]);
+        assert_eq!(frame.suffix.len(), if is_stderr { 2 } else { 0 });
 
         let error = TerminalBufferFrame::new(largest + 1, is_stderr)
             .err()
-            .expect("frame over 64 KiB was accepted");
+            .expect("frame over the local cap was accepted");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        let packet = Packet::new(
-            TERMINAL_BUFFER,
-            encode_terminal_buffer(&sample(largest + 1), is_stderr),
-        );
-        assert!(encode_local_packet(&packet).is_err());
+    }
+    // The generic writer draws the same line.
+    let oversized = Packet::new(
+        TERMINAL_BUFFER,
+        vec![0; MAX_LOCAL_PACKET_LEN - et_core::packet::HEADER_LEN + 1],
+    );
+    assert!(encode_local_packet(&oversized).is_err());
+}
+
+#[test]
+fn terminal_frame_over_64_kib_matches_reference() {
+    let output = sample(1024 * 1024 + 3);
+    for is_stderr in [false, true] {
+        let mut frame = new_frame(&output, is_stderr);
+        let mut writer = ShortWriter::new(48 * 1024 + 7, true);
+        drive(&mut frame, &mut writer, &output).unwrap();
+        assert_eq!(writer.bytes, reference(&output, is_stderr));
+        let packet = read_local_packet(&mut &writer.bytes[..]).unwrap();
+        let body = TerminalBuffer::decode(packet.payload()).unwrap();
+        assert_eq!(body.buffer.as_deref(), Some(&output[..]));
     }
 }
 
@@ -448,10 +465,16 @@ fn upstream_router_stream_refuses_what_upstream_cannot_frame() {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(RouterHead::new(header, payload_len, RouterFraming::Packets).is_ok());
     }
-    let largest = MAX_LOCAL_PACKET_LEN - et_core::packet::HEADER_LEN;
-    for framing in [RouterFraming::Upstream, RouterFraming::Packets] {
+    for (framing, largest) in [
+        (RouterFraming::Upstream, MAX_LOCAL_PACKET_LEN),
+        (
+            RouterFraming::Packets,
+            MAX_LOCAL_PACKET_LEN - et_core::packet::HEADER_LEN,
+        ),
+    ] {
         assert!(RouterHead::new(TERMINAL_BUFFER, largest, framing).is_ok());
-        assert!(RouterHead::new(TERMINAL_BUFFER, largest + 1, framing).is_err());
+        let error = RouterHead::new(TERMINAL_BUFFER, largest + 1, framing).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     let decode = |bytes: Vec<u8>| {
@@ -468,7 +491,7 @@ fn upstream_router_stream_refuses_what_upstream_cannot_frame() {
         Err(LocalPacketError::NegativeLength)
     ));
     let mut oversized = vec![TERMINAL_BUFFER];
-    oversized.extend_from_slice(&((largest + 1) as i64).to_ne_bytes());
+    oversized.extend_from_slice(&((MAX_LOCAL_PACKET_LEN + 1) as i64).to_ne_bytes());
     assert!(matches!(
         decode(oversized),
         Err(LocalPacketError::FrameTooLarge { .. })
@@ -504,4 +527,179 @@ fn registration_status_names_the_router_framing() {
         parse_registration_status(&unknown).unwrap_err().kind(),
         io::ErrorKind::InvalidData
     );
+}
+
+/// `Read` that hands out queued chunks and then would block, or reports end
+/// of stream with `eof`. It records the largest buffer it was asked to fill.
+struct ChunkReader {
+    chunks: VecDeque<Vec<u8>>,
+    eof: bool,
+    largest_buffer: usize,
+}
+
+impl ChunkReader {
+    fn new<const N: usize>(chunks: [Vec<u8>; N], eof: bool) -> Self {
+        Self {
+            chunks: chunks.into(),
+            eof,
+            largest_buffer: 0,
+        }
+    }
+}
+
+impl Read for ChunkReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.largest_buffer = self.largest_buffer.max(buffer.len());
+        let Some(chunk) = self.chunks.front_mut() else {
+            return if self.eof {
+                Ok(0)
+            } else {
+                Err(io::ErrorKind::WouldBlock.into())
+            };
+        };
+        let count = chunk.len().min(buffer.len());
+        buffer[..count].copy_from_slice(&chunk[..count]);
+        chunk.drain(..count);
+        if chunk.is_empty() {
+            self.chunks.pop_front();
+        }
+        Ok(count)
+    }
+}
+
+#[test]
+fn a_declared_length_is_not_allocated_before_its_bytes_arrive() {
+    // Given: a peer that declares the largest packet but sends 100 bytes.
+    let mut head = Vec::from((MAX_LOCAL_PACKET_LEN as i64).to_ne_bytes());
+    head.extend_from_slice(&[0, TERMINAL_BUFFER]);
+    let mut upstream_head = vec![TERMINAL_BUFFER];
+    upstream_head.extend_from_slice(&(MAX_LOCAL_PACKET_LEN as i64).to_ne_bytes());
+    let sent = sample(100);
+
+    // Then: no decoder holds more than one read step for it.
+    let mut decoder = LocalPacketDecoder::new();
+    let mut reader = ChunkReader::new([head.clone(), sent.clone()], false);
+    assert!(decoder.read_from(&mut reader).unwrap().is_none());
+    assert_eq!(decoder.filled, sent.len());
+    let capacity = decoder.payload.capacity();
+    assert!(capacity <= PAYLOAD_READ_STEP, "read_from holds {capacity}");
+
+    let mut decoder = LocalPacketDecoder::new();
+    assert!(decoder.feed(&head).unwrap().is_none());
+    assert!(decoder.feed(&sent).unwrap().is_none());
+    let capacity = decoder.payload.capacity();
+    assert!(capacity <= PAYLOAD_READ_STEP, "feed holds {capacity}");
+
+    let mut decoder = RouterStreamDecoder::new(RouterFraming::Upstream);
+    let mut reader = ChunkReader::new([upstream_head, sent.clone()], false);
+    assert!(decoder.read_from(&mut reader).unwrap().is_none());
+    let RouterStream::Upstream(upstream) = &decoder.0 else {
+        unreachable!()
+    };
+    assert_eq!(upstream.filled, sent.len());
+    let capacity = upstream.payload.capacity();
+    assert!(capacity <= PAYLOAD_READ_STEP, "upstream holds {capacity}");
+
+    // And: the blocking reader never asks for more than one step at a time.
+    let mut reader = ChunkReader::new([head, sent], true);
+    assert!(matches!(
+        read_local_packet(&mut reader),
+        Err(LocalPacketError::TruncatedPayload)
+    ));
+    assert!(
+        reader.largest_buffer <= PAYLOAD_READ_STEP,
+        "read_local_packet read into {} bytes",
+        reader.largest_buffer
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Via {
+    ReadFrom,
+    Feed,
+    Upstream,
+}
+
+/// The payload a decoder holds between reads.
+#[derive(Debug)]
+struct Held {
+    len: usize,
+    capacity: usize,
+    filled: usize,
+    ptr: *const u8,
+}
+
+/// Decode `packet` arriving `chunk` bytes at a time, calling `check` with
+/// what the decoder holds while it waits for the next chunk.
+fn decode_in_chunks(
+    via: Via,
+    packet: &Packet,
+    chunk: usize,
+    mut check: impl FnMut(Held),
+) -> Packet {
+    let framing = match via {
+        Via::Upstream => RouterFraming::Upstream,
+        Via::ReadFrom | Via::Feed => RouterFraming::Packets,
+    };
+    let mut wire = Vec::new();
+    write_router_message(&mut wire, packet, framing).unwrap();
+    let mut reader = ChunkReader::new([], false);
+    let mut local = LocalPacketDecoder::new();
+    let mut router = RouterStreamDecoder::new(RouterFraming::Upstream);
+    for bytes in wire.chunks(chunk) {
+        if !matches!(via, Via::Feed) {
+            reader.chunks.push_back(bytes.to_vec());
+        }
+        let decoded = match via {
+            Via::ReadFrom => local.read_from(&mut reader).unwrap(),
+            Via::Feed => local.feed(bytes).unwrap(),
+            Via::Upstream => router.read_from(&mut reader).unwrap(),
+        };
+        if let Some(decoded) = decoded {
+            return decoded;
+        }
+        let (payload, filled) = match (&router.0, via) {
+            (RouterStream::Upstream(upstream), Via::Upstream) => {
+                (&upstream.payload, upstream.filled)
+            }
+            _ => (&local.payload, local.filled),
+        };
+        check(Held {
+            len: payload.len(),
+            capacity: payload.capacity(),
+            filled,
+            ptr: payload.as_ptr(),
+        });
+    }
+    panic!("{via:?}: packet incomplete");
+}
+
+#[test]
+fn payload_grows_with_the_bytes_received() {
+    for via in [Via::ReadFrom, Via::Feed, Via::Upstream] {
+        // Over one step: what the decoder holds follows what arrived.
+        let large = Packet::new(TERMINAL_BUFFER, sample(1024 * 1024 + 5));
+        let decoded = decode_in_chunks(via, &large, 7919, |held| {
+            assert!(
+                held.len <= held.filled + PAYLOAD_READ_STEP,
+                "{via:?}: {held:?}"
+            );
+            assert!(
+                held.capacity <= 2 * (held.filled + PAYLOAD_READ_STEP),
+                "{via:?}: {held:?}"
+            );
+        });
+        assert_eq!(decoded, large, "{via:?}");
+
+        // Up to one step: one allocation of the exact size, handed over
+        // without a copy.
+        let small = Packet::new(TERMINAL_BUFFER, sample(60_000));
+        let mut buffer = None;
+        let decoded = decode_in_chunks(via, &small, 7919, |held| {
+            assert_eq!(held.capacity, 60_000, "{via:?}: {held:?}");
+            assert_eq!(*buffer.get_or_insert(held.ptr), held.ptr, "{via:?}");
+        });
+        assert_eq!(decoded, small, "{via:?}");
+        assert_eq!(buffer, Some(decoded.payload().as_ptr()), "{via:?}");
+    }
 }

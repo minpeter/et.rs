@@ -192,6 +192,67 @@ fn pending_local_input_yields_to_forwarding_before_more_local_input() {
     );
 }
 
+#[test]
+fn binary_stdio_redirected_eof_sends_one_eof_and_waits_for_remote_exit() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    let control = client.try_clone().unwrap();
+    let mut connection = Connection::new_client(client, &[19; 32]);
+    let mut peer = Connection::new_server(server, &[19; 32]);
+    peer.set_io_timeout(Some(Duration::from_secs(5))).unwrap();
+    // Redirected stdin that delivers one chunk, then ends.
+    let (input_tx, input_rx) = mpsc::sync_channel(1);
+    input_tx.send(b"last line\n".to_vec()).unwrap();
+    drop(input_tx);
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        INPUT.with(|input| *input.borrow_mut() = Some(input_rx));
+        let result = pump(
+            &mut connection,
+            crate::client_terminal_loop::PumpOptions {
+                read_stdin: false,
+                keepalive_seconds: 30,
+                flow_control: et_cli::client::FlowControlMode::None,
+                terminal_enabled: false,
+                auto_cursor_report: false,
+                binary_stdio: true,
+                terminal_modes: &mut TerminalModeState::default(),
+                hangup: &crate::client_hangup::HangupClose::disabled(),
+                remote_exit: &crate::client_terminal::RemoteExit::new(true),
+                stdio_forward: false,
+            },
+            &mut Forwarder::start(Vec::new()).unwrap(),
+            |_| panic!("healthy transport must not recover"),
+        );
+        done_tx
+            .send(result.map_err(|error| error.to_string()))
+            .unwrap();
+    });
+    let data = next_data_packet(&mut peer);
+    assert_eq!(
+        et_core::proto::TerminalBuffer::decode(data.payload())
+            .unwrap()
+            .buffer
+            .unwrap(),
+        b"last line\n"
+    );
+    let eof = next_data_packet(&mut peer);
+    assert_eq!(eof.header(), TerminalPacketType::TerminalBuffer as u8);
+    assert_eq!(eof.payload(), [0x0a, 0x00]);
+    let after_eof = done_rx.recv_timeout(Duration::from_millis(200));
+    peer.write_packet(
+        TerminalPacketType::TerminalExitStatus as u8,
+        &et_core::proto::TerminalExitStatus { exitcode: Some(3) }.encode_to_vec(),
+    )
+    .unwrap();
+    let completed = done_rx.recv_timeout(Duration::from_secs(3));
+    let _ = control.shutdown(Shutdown::Both);
+    worker.join().unwrap();
+    assert!(after_eof.is_err(), "stdin EOF ended the -T session");
+    assert_eq!(completed.unwrap(), Ok(3));
+}
+
 fn next_data_packet(peer: &mut Connection) -> et_core::packet::Packet {
     loop {
         let packet = peer.read_packet().unwrap();

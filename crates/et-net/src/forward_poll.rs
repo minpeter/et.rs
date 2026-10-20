@@ -55,14 +55,15 @@ const READS_PER_CYCLE: usize = 128;
 /// Smallest piece a pending message is split into, see [`pipelined_split`].
 const PIPELINE_CHUNK: usize = 16 * 1024;
 
-/// How to read the bytes a socket had queued when it became readable: as
-/// `(split_bytes, split_len)`, read the first `split_bytes` in `split_len`
-/// pieces and anything after them in full packets. A message of at most four
-/// full packets is read in four parts (each at least [`PIPELINE_CHUNK`]), so
-/// the peer decrypts and forwards the first part while the rest is still
-/// being encrypted and sent; a 64 KiB request/response round trip otherwise
-/// pays the whole message's crypto serially at every hop. Larger or unknown
-/// backlogs (bulk transfers) and data arriving later use full packets.
+/// How to read what a socket still had queued after a full first piece of
+/// [`PIPELINE_CHUNK`]: as `(split_bytes, split_len)`, read the next
+/// `split_bytes` in `split_len` pieces and anything after them in full
+/// packets. A message of at most four full packets is read in parts of at
+/// least [`PIPELINE_CHUNK`], so the peer decrypts and forwards the first part
+/// while the rest is still being encrypted and sent; a 64 KiB
+/// request/response round trip otherwise pays the whole message's crypto
+/// serially at every hop. Larger or unknown backlogs (bulk transfers) and
+/// data arriving later use full packets.
 fn pipelined_split(available: Option<u64>) -> (usize, usize) {
     let full = crate::forward_io::FORWARD_READ_LEN;
     match available.and_then(|bytes| usize::try_from(bytes).ok()) {
@@ -109,6 +110,8 @@ pub(crate) struct SocketIo {
     credit_bytes: i64,
     credit_packets: i64,
     credit_flush_at: Option<Instant>,
+    /// The last read filled its whole buffer, so more may still be queued.
+    last_read_full: bool,
 }
 
 pub(crate) enum ReadOutcome {
@@ -161,6 +164,7 @@ impl SocketIo {
             credit_bytes: 0,
             credit_packets: 0,
             credit_flush_at: None,
+            last_read_full: false,
         })
     }
 
@@ -295,6 +299,7 @@ impl SocketIo {
             match self.stream.read_shared(&mut scratch[..limit]) {
                 Ok(0) => return Ok(ReadOutcome::Eof),
                 Ok(count) => {
+                    self.last_read_full = count == scratch.len();
                     if let Some(replies) = self.bind_replies.as_mut() {
                         let forwarded = replies.consume(&scratch[..count]).map_err(|()| {
                             io::Error::new(
@@ -861,15 +866,17 @@ impl Worker {
             return Ok(SocketVerdict::Drop);
         }
         if event.readable {
-            let (mut split_bytes, split_len) =
-                pipelined_split(rustix::io::ioctl_fionread(&*socket.stream).ok());
+            // The first read takes one pipeline piece, so a message that fits
+            // in it (the interactive case) needs no FIONREAD probe; a full
+            // piece asks how much is still queued and splits that.
+            let mut split: Option<(usize, usize)> = None;
             let mut reads = 0;
             while socket.read_interest() && reads < READS_PER_CYCLE && !self.outbound_backlog_full()
             {
-                let read_len = if split_bytes > 0 {
-                    split_len
-                } else {
-                    crate::forward_io::FORWARD_READ_LEN
+                let read_len = match split {
+                    None => PIPELINE_CHUNK,
+                    Some((bytes, len)) if bytes > 0 => len,
+                    Some(_) => crate::forward_io::FORWARD_READ_LEN,
                 };
                 let outcome = {
                     let scratch = &mut self.read_scratch[..read_len];
@@ -878,7 +885,13 @@ impl Worker {
                 match outcome {
                     Ok(ReadOutcome::Data(payload)) => {
                         let is_small = payload.len() <= 4096;
-                        split_bytes = split_bytes.saturating_sub(payload.len());
+                        split = Some(match split {
+                            None if socket.last_read_full => {
+                                pipelined_split(rustix::io::ioctl_fionread(&*socket.stream).ok())
+                            }
+                            None => (0, crate::forward_io::FORWARD_READ_LEN),
+                            Some((bytes, len)) => (bytes.saturating_sub(payload.len()), len),
+                        });
                         self.emit_raw(TerminalPacketType::PortForwardData as u8, payload)?;
                         reads += 1;
                         if is_small {

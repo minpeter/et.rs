@@ -360,6 +360,37 @@ where
                 DisplayOutcome::Pending(packet) => pending_output = Some(packet),
             }
         }
+        // The direct console is written on this thread, by `try_write` as
+        // well as on readiness below. Its write errors and confirmed cursor
+        // reports surface here before the loop sleeps, not through a wake.
+        if console_output.is_direct() {
+            check_live_console(&console_output, remote_exit)?;
+            if auto_cursor_report {
+                let reports = console_output
+                    .take_cursor_reports()
+                    .map_err(|error| terminal_io("reading console confirmations", error))?;
+                if send_cursor_reports(
+                    reports,
+                    connection,
+                    &mut reconnect,
+                    &mut stream,
+                    terminal_enabled,
+                    &mut pending_cursor_reports,
+                )? {
+                    return finish_remote_completion(
+                        console_output,
+                        pending_output,
+                        pending_forward,
+                        terminal_enabled,
+                        binary_stdio,
+                        terminal_modes,
+                        forwarder,
+                        None,
+                        remote_exit,
+                    );
+                }
+            }
+        }
         // The transport is shared by every forwarded socket AND the session
         // keepalives, so forwarding congestion must never suppress its reads:
         // that is what let two saturated endpoints wait on each other until
@@ -405,11 +436,13 @@ where
             }
         }
         let (network, resize, output_ready, output_status, forward_events, input) = {
-            let mut descriptors = vec![
-                PollFd::new(&stream, network_flags),
-                PollFd::new(console_output.wake(), PollFlags::IN | PollFlags::HUP),
-                PollFd::new(console_output.status_wake(), PollFlags::IN | PollFlags::HUP),
-            ];
+            let mut descriptors = vec![PollFd::new(&stream, network_flags)];
+            console_output
+                .poll_descriptors(&mut descriptors)
+                .map_err(|error| terminal_io("checking console output", error))?;
+            // The worker polls two wakes; the direct console polls stdout
+            // only while output is queued for it.
+            let console_end = descriptors.len();
             if producers_polled {
                 descriptors.push(PollFd::new(&*wake, PollFlags::IN | PollFlags::HUP));
                 descriptors.push(PollFd::new(forward_wake, PollFlags::IN | PollFlags::HUP));
@@ -465,15 +498,22 @@ where
                     .map(PollFd::revents)
                     .unwrap_or(PollFlags::empty())
             };
-            // Index 4 is the forwarding wake; try_outbound drains it below.
+            let console_revents = |index: usize| {
+                if index < console_end {
+                    revents(index)
+                } else {
+                    PollFlags::empty()
+                }
+            };
+            // `console_end + 1` is the forwarding wake; try_outbound drains it below.
             (
                 revents(0),
-                revents(3),
-                revents(1),
-                revents(2),
-                revents(4),
+                revents(console_end),
+                console_revents(1),
+                console_revents(2),
+                revents(console_end + 1),
                 if producers_polled && read_stdin {
-                    revents(5)
+                    revents(console_end + 2)
                 } else {
                     PollFlags::empty()
                 },
@@ -485,39 +525,34 @@ where
             probe.progressed()?;
         }
         let mut reconnect_needed = network.intersects(PollFlags::HUP | PollFlags::ERR);
-        if output_ready.intersects(PollFlags::IN | PollFlags::HUP) {
+        if !output_ready.is_empty() {
             console_output
-                .drain_wake()
-                .map_err(|error| terminal_io("draining console output wakeup", error))?;
+                .service_ready()
+                .map_err(|error| terminal_io("servicing console output", error))?;
             check_live_console(&console_output, remote_exit)?;
             if auto_cursor_report {
-                for _ in 0..console_output
+                let reports = console_output
                     .take_cursor_reports()
-                    .map_err(|error| terminal_io("reading console confirmations", error))?
-                {
-                    if connection.write_pending() {
-                        pending_cursor_reports += 1;
-                    } else if matches!(
-                        write_cursor_report(
-                            connection,
-                            &mut reconnect,
-                            &mut stream,
-                            terminal_enabled,
-                        )?,
-                        OwnedWriteOutcome::SessionEnded
-                    ) {
-                        return finish_remote_completion(
-                            console_output,
-                            pending_output,
-                            pending_forward,
-                            terminal_enabled,
-                            binary_stdio,
-                            terminal_modes,
-                            forwarder,
-                            None,
-                            remote_exit,
-                        );
-                    }
+                    .map_err(|error| terminal_io("reading console confirmations", error))?;
+                if send_cursor_reports(
+                    reports,
+                    connection,
+                    &mut reconnect,
+                    &mut stream,
+                    terminal_enabled,
+                    &mut pending_cursor_reports,
+                )? {
+                    return finish_remote_completion(
+                        console_output,
+                        pending_output,
+                        pending_forward,
+                        terminal_enabled,
+                        binary_stdio,
+                        terminal_modes,
+                        forwarder,
+                        None,
+                        remote_exit,
+                    );
                 }
             }
             if let Some(packet) = pending_output.take() {
@@ -595,7 +630,10 @@ where
         let network_ready = inbound_ready
             || connection.has_buffered_read()
             || network.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
-            || (output_ready.intersects(PollFlags::IN | PollFlags::HUP)
+            // Console progress that admitted a held packet resumes reads the
+            // poll did not watch for; otherwise `network` already tells.
+            || (!output_ready.is_empty()
+                && !network_flags.contains(PollFlags::IN)
                 && pending_output.is_none())
             || (cfg!(target_vendor = "apple")
                 && resize.is_empty()
@@ -1174,16 +1212,15 @@ fn finish_remote_completion(
         }
 
         let (output_ready, output_status) = {
-            let mut descriptors = [
-                PollFd::new(
-                    forwarder
-                        .wake()
-                        .map_err(|error| terminal_text(error.to_string()))?,
-                    PollFlags::IN | PollFlags::HUP,
-                ),
-                PollFd::new(output.wake(), PollFlags::IN | PollFlags::HUP),
-                PollFd::new(output.status_wake(), PollFlags::IN | PollFlags::HUP),
-            ];
+            let mut descriptors = vec![PollFd::new(
+                forwarder
+                    .wake()
+                    .map_err(|error| terminal_text(error.to_string()))?,
+                PollFlags::IN | PollFlags::HUP,
+            )];
+            output
+                .poll_descriptors(&mut descriptors)
+                .map_err(|error| terminal_io("checking console output", error))?;
             let timeout = Timespec::try_from(Duration::from_millis(100))
                 .map_err(|_| terminal_text("completion wait exceeds poll range"))?;
             match poll(&mut descriptors, Some(&timeout)) {
@@ -1196,12 +1233,18 @@ fn finish_remote_completion(
                     ));
                 }
             }
-            (descriptors[1].revents(), descriptors[2].revents())
+            let revents = |index: usize| {
+                descriptors
+                    .get(index)
+                    .map(PollFd::revents)
+                    .unwrap_or(PollFlags::empty())
+            };
+            (revents(1), revents(2))
         };
-        if output_ready.intersects(PollFlags::IN | PollFlags::HUP) {
+        if !output_ready.is_empty() {
             output
-                .drain_wake()
-                .map_err(|error| terminal_io("draining console output wakeup", error))?;
+                .service_ready()
+                .map_err(|error| terminal_io("servicing console output", error))?;
         }
         if output_status.intersects(PollFlags::IN | PollFlags::HUP) {
             output
@@ -1209,6 +1252,33 @@ fn finish_remote_completion(
                 .map_err(|error| terminal_io("draining console status wakeup", error))?;
         }
     }
+}
+
+/// Sends `count` confirmed cursor reports, or counts them while a frame is
+/// pending. Returns `true` when the session ended.
+#[cfg(unix)]
+fn send_cursor_reports<F>(
+    count: usize,
+    connection: &mut Connection,
+    reconnect: &mut F,
+    stream: &mut std::net::TcpStream,
+    send_terminal_size: bool,
+    pending_cursor_reports: &mut usize,
+) -> Result<bool, ClientError>
+where
+    F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
+{
+    for _ in 0..count {
+        if connection.write_pending() {
+            *pending_cursor_reports += 1;
+        } else if matches!(
+            write_cursor_report(connection, reconnect, stream, send_terminal_size)?,
+            OwnedWriteOutcome::SessionEnded
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(unix)]

@@ -51,6 +51,9 @@ pub(crate) struct RegisteredTerminal {
     pub(crate) identity: RegistrationIdentity,
     pub(crate) watcher: LocalStream,
     pub(crate) startup_ack: bool,
+    /// The terminal re-registered a live PTY after its router socket died,
+    /// so its recovery grace must be swept.
+    pub(crate) resumed: bool,
 }
 
 struct StoredRegistration {
@@ -137,6 +140,7 @@ impl Registry {
             .set_nonblocking(true)
             .map_err(RegistrationError::Io)?;
         let identity = registration.identity();
+        let resumed = registration.pty_active;
         let mut state = self.lock()?;
         match state.registrations.entry(registration.id.clone()) {
             Entry::Vacant(entry) => {
@@ -157,6 +161,7 @@ impl Registry {
                     identity,
                     watcher,
                     startup_ack,
+                    resumed,
                 })
             }
             Entry::Occupied(mut entry) => {
@@ -183,6 +188,7 @@ impl Registry {
                     identity,
                     watcher,
                     startup_ack,
+                    resumed,
                 })
             }
         }
@@ -303,6 +309,15 @@ impl Registry {
             .filter(|stored| stored.info.pty_active)
             .map(|stored| (stored.info.clone(), stored.registered_at))
             .collect())
+    }
+
+    /// Whether any registered terminal resumed a live PTY.
+    pub(crate) fn has_resumed(&self) -> Result<bool, RegistrationError> {
+        Ok(self
+            .lock()?
+            .registrations
+            .values()
+            .any(|stored| stored.info.pty_active))
     }
 
     pub(crate) fn clone_stream(

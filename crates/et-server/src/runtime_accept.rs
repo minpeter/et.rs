@@ -28,7 +28,7 @@ pub(crate) fn run(
     // `WouldBlock`, which would block forever on a blocking socket and keep
     // `Runtime::shutdown` from joining this thread. Without a non-blocking
     // wakeup it is neither polled nor drained; shutdown is still observed via
-    // the lifecycle wakeup or the next resume sweep.
+    // the lifecycle wakeup.
     let wake_usable = match wake_reader.set_nonblocking(true) {
         Ok(()) => true,
         Err(source) => {
@@ -117,9 +117,10 @@ pub(crate) fn run(
 }
 
 /// Block until a listener is ready, the runtime wakes us, a lifecycle event
-/// arrives or the next resume sweep is due. `wake_reader` is `None` when the
-/// runtime wakeup could not be made non-blocking. Fills listener readiness
-/// into `ready` and returns whether the lifecycle wakeup fired.
+/// arrives or the next resume sweep (if one is armed) is due. `wake_reader` is
+/// `None` when the runtime wakeup could not be made non-blocking. Fills
+/// listener readiness into `ready` and returns whether the lifecycle wakeup
+/// fired.
 #[cfg(unix)]
 fn wait(
     listeners: &[TcpListener],
@@ -143,8 +144,8 @@ fn wait(
     let deadline = lifecycle.next_sweep();
     loop {
         // Recomputed on every retry so interrupted polls keep the deadline.
-        let timeout = poll_timeout(deadline, std::time::Instant::now());
-        match poll(&mut descriptors, Some(&timeout)) {
+        let timeout = deadline.map(|deadline| poll_timeout(deadline, std::time::Instant::now()));
+        match poll(&mut descriptors, timeout.as_ref()) {
             Ok(_) => break,
             Err(error) if error == rustix::io::Errno::INTR => {}
             Err(error) => {

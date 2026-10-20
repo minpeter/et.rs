@@ -439,10 +439,9 @@ where
 }
 
 pub(crate) fn contains_cursor_report_request(bytes: &[u8]) -> bool {
-    bytes.contains(&b'\x1b')
-        && bytes
-            .windows(CURSOR_REPORT_REQUEST.len())
-            .any(|window| window == CURSOR_REPORT_REQUEST)
+    static FINDER: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
+        std::sync::LazyLock::new(|| memchr::memmem::Finder::new(CURSOR_REPORT_REQUEST));
+    FINDER.find(bytes).is_some()
 }
 
 fn command_payload(
@@ -774,10 +773,20 @@ impl TerminalModeState {
         let Ok(mut state) = self.0.lock() else {
             return;
         };
-        if state.alternate_prefix_len == 0 && !bytes.contains(&b'\x1b') {
-            return;
-        }
-        for &byte in bytes {
+        // Bytes outside a candidate prefix never change the state: jump
+        // straight to the next ESC with a SIMD scan.
+        let mut rest = bytes;
+        loop {
+            if state.alternate_prefix_len == 0 {
+                let Some(escape) = memchr::memchr(PREFIX[0], rest) else {
+                    return;
+                };
+                rest = &rest[escape..];
+            }
+            let Some((&byte, tail)) = rest.split_first() else {
+                return;
+            };
+            rest = tail;
             if state.alternate_prefix_len == PREFIX.len() {
                 match byte {
                     b'h' => state.alternate_screen = true,

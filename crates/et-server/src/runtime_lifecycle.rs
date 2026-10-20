@@ -13,8 +13,15 @@ use crate::session_slot::Slot;
 
 pub(crate) enum LifecycleEvent {
     TerminalDisconnected(RegistrationIdentity),
+    /// A terminal re-registered a live PTY: its recovery grace needs sweeps.
+    TerminalResumed,
     Shutdown,
 }
+
+/// Recovery grace is measured in minutes. While a resumed terminal is
+/// registered, a one-second pass keeps expiry prompt without churning the
+/// registry lock at 10 Hz.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 #[cfg(target_os = "linux")]
 #[derive(Debug, PartialEq, Eq)]
@@ -108,7 +115,9 @@ impl LifecycleSender {
 pub(crate) struct Lifecycle {
     events: Receiver<LifecycleEvent>,
     wake: LocalStream,
-    next_sweep: Instant,
+    /// When the next resume-expiry sweep is due; `None` while no resumed
+    /// terminal is registered, so an idle server never wakes for it.
+    next_sweep: Option<Instant>,
     sweep_failed: bool,
     first_error: Option<RuntimeError>,
 }
@@ -126,7 +135,7 @@ pub(crate) fn channel() -> std::io::Result<(LifecycleSender, Lifecycle)> {
         Lifecycle {
             events: receiver,
             wake,
-            next_sweep: Instant::now(),
+            next_sweep: None,
             sweep_failed: false,
             first_error: None,
         },
@@ -145,9 +154,9 @@ impl Lifecycle {
         &self.wake
     }
 
-    /// When the next resume-expiry sweep is due.
+    /// When the next resume-expiry sweep is due, if any.
     #[cfg(unix)]
-    pub(crate) fn next_sweep(&self) -> Instant {
+    pub(crate) fn next_sweep(&self) -> Option<Instant> {
         self.next_sweep
     }
 
@@ -155,7 +164,7 @@ impl Lifecycle {
     /// runtime asked for shutdown (or every sender is gone).
     pub(crate) fn service(&mut self, core: &RuntimeCore, woken: bool) -> bool {
         let now = Instant::now();
-        if now >= self.next_sweep {
+        if self.next_sweep.is_some_and(|due| now >= due) {
             match expire_unclaimed_resumes(core, now) {
                 Ok(()) => self.sweep_failed = false,
                 Err(error) if !self.sweep_failed => {
@@ -166,9 +175,10 @@ impl Lifecycle {
                 }
                 Err(_) => {}
             }
-            // Recovery grace is measured in minutes. A one-second pass keeps
-            // expiry prompt without churning the registry lock at 10 Hz.
-            self.next_sweep = now + Duration::from_secs(1);
+            // Keep sweeping while a resumed terminal remains (or the registry
+            // cannot tell); the router re-arms the sweep for the next one.
+            self.next_sweep =
+                (!matches!(core.registry.has_resumed(), Ok(false))).then(|| now + SWEEP_INTERVAL);
         }
         if woken {
             drain_wake(&mut self.wake);
@@ -177,6 +187,9 @@ impl Lifecycle {
             match self.events.try_recv() {
                 Ok(LifecycleEvent::TerminalDisconnected(identity)) => {
                     terminal_disconnected(core, &identity, &mut self.first_error);
+                }
+                Ok(LifecycleEvent::TerminalResumed) => {
+                    self.next_sweep.get_or_insert(now + SWEEP_INTERVAL);
                 }
                 Ok(LifecycleEvent::Shutdown) | Err(TryRecvError::Disconnected) => return true,
                 Err(TryRecvError::Empty) => return false,

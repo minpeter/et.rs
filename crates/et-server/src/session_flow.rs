@@ -59,6 +59,10 @@ struct WriterState {
     unrecoverable: bool,
     default_buffering: bool,
     input: et_core::output_interrupt::InterruptInput,
+    /// A blocking writer is parked in [`FlowControl::next_item`]. Only it
+    /// needs an enqueue wake: the Unix session loop pumps output itself, and
+    /// an unconditional notify costs a futex syscall per packet.
+    writer_waiting: bool,
 }
 
 /// Refusals the bridge is waiting on; a writer completion signals it once the
@@ -150,6 +154,7 @@ impl FlowControl {
                 unrecoverable: false,
                 default_buffering: limit == CONNECTED_LANE_BYTES,
                 input: et_core::output_interrupt::InterruptInput::default(),
+                writer_waiting: false,
             }),
             wake: Condvar::new(),
             #[cfg(test)]
@@ -183,7 +188,7 @@ impl FlowControl {
             Ok(()) => {
                 #[cfg(test)]
                 self.run_enqueue_hook();
-                let should_wake = was_empty && !state.in_flight;
+                let should_wake = was_empty && !state.in_flight && state.writer_waiting;
                 drop(state);
                 if should_wake {
                     self.wake.notify_one();
@@ -464,8 +469,10 @@ impl FlowControl {
     }
 
     fn next_item(&self) -> Option<(Packet, bool)> {
-        let state = self.state.lock().ok()?;
+        let mut state = self.state.lock().ok()?;
+        state.writer_waiting = true;
         let mut state = self.wake.wait_while(state, writer_must_wait).ok()?;
+        state.writer_waiting = false;
         self.take_item(&mut state)
     }
 

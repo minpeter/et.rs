@@ -1,4 +1,9 @@
 //! Bounded, interruptible local console output, including default sessions.
+//!
+//! On Linux a FIFO or terminal stdout is written by the session loop itself
+//! (the direct console), as upstream `TerminalClient::run` drains its
+//! `WriteBuffer` from its select loop. Other outputs keep the
+//! `et-console-output` worker thread.
 
 #[path = "client_output_interrupt.rs"]
 mod output_interrupt;
@@ -19,10 +24,19 @@ use std::time::{Duration, Instant};
 use et_cli::client::FlowControlMode;
 #[cfg(unix)]
 use et_net::local::LocalStream;
+#[cfg(unix)]
+use rustix::event::{PollFd, PollFlags};
 
 const OUTPUT_BYTES: usize = 64 * 1024;
 const OUTPUT_PACKETS: usize = 4096;
 pub(crate) const GRACEFUL_DRAIN_STALL_TIMEOUT: Duration = Duration::from_secs(1);
+/// Queued packets one vectored write to the direct console covers.
+#[cfg(target_os = "linux")]
+const WRITE_SLICES: usize = 64;
+/// Delivered packet buffers the direct console keeps for reuse, so a
+/// saturated terminal does not allocate one per queued packet.
+#[cfg(target_os = "linux")]
+const SPARE_BUFFERS: usize = 4;
 
 // Delivery is distinct from progress: a buffered sink must flush before a
 // completed packet can affect terminal cleanup or cursor-report accounting.
@@ -59,11 +73,21 @@ impl<T: Write + Send> ConsoleWriter for T {
 
 struct OutputEntry {
     bytes: Vec<u8>,
+    /// Prefix of `bytes` the direct console already wrote. The worker takes
+    /// whole entries out of the queue, so for it this stays 0.
+    sent: usize,
     terminal_modes: crate::client_terminal::TerminalModeState,
+}
+
+impl OutputEntry {
+    fn unsent(&self) -> &[u8] {
+        &self.bytes[self.sent..]
+    }
 }
 
 struct State {
     queue: VecDeque<OutputEntry>,
+    /// Unsent queued bytes.
     bytes: usize,
     stopping: bool,
     error: Option<io::Error>,
@@ -72,10 +96,10 @@ struct State {
     worker_progress: usize,
     stream: et_core::output_interrupt::TerminalStream,
     skip_until_newline: bool,
+    /// A packet was refused for lack of room and is held by the caller.
     waiting_for_capacity: bool,
-    /// The worker owns a snapshot it has not finished writing; the session
-    /// loop must not write around it.
-    writing: bool,
+    #[cfg(target_os = "linux")]
+    spare: Vec<Vec<u8>>,
 }
 
 struct Shared {
@@ -83,6 +107,45 @@ struct Shared {
     wake: Condvar,
     worker_progress: std::sync::atomic::AtomicUsize,
     stopping_fast: std::sync::atomic::AtomicBool,
+}
+
+impl Shared {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(State {
+                queue: VecDeque::new(),
+                bytes: 0,
+                stopping: false,
+                error: None,
+                cursor_reports: 0,
+                worker_done: false,
+                worker_progress: 0,
+                stream: et_core::output_interrupt::TerminalStream::default(),
+                skip_until_newline: false,
+                waiting_for_capacity: false,
+                #[cfg(target_os = "linux")]
+                spare: Vec::new(),
+            }),
+            wake: Condvar::new(),
+            worker_progress: std::sync::atomic::AtomicUsize::new(0),
+            stopping_fast: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn lock(&self) -> io::Result<std::sync::MutexGuard<'_, State>> {
+        self.state
+            .lock()
+            .map_err(|_| io::Error::other("console output worker unavailable"))
+    }
+}
+
+/// The worker's wake descriptors polled by the session loop.
+#[cfg(unix)]
+struct WorkerWakes {
+    /// Queue capacity freed or cursor reports confirmed.
+    capacity: LocalStream,
+    /// The worker stopped on a write error.
+    status: LocalStream,
 }
 
 #[derive(Clone, Copy)]
@@ -95,15 +158,13 @@ pub(crate) enum ConsoleCompletion {
 pub(crate) struct ConsoleOutput {
     mode: FlowControlMode,
     shared: Option<Arc<Shared>>,
+    /// `None` for the direct console, which has no worker to wake the loop.
     #[cfg(unix)]
-    capacity_wake: LocalStream,
-    #[cfg(unix)]
-    status_wake: LocalStream,
+    wakes: Option<WorkerWakes>,
     cancel: Option<Box<dyn FnOnce() + Send>>,
     graceful_finish: Option<Box<dyn FnOnce() -> io::Result<()> + Send>>,
     worker: Option<thread::JoinHandle<()>>,
-    /// Non-blocking descriptor for writing an idle console straight from the
-    /// session loop, skipping the worker hand-off.
+    /// Non-blocking stdout the session loop writes itself; no worker runs.
     #[cfg(target_os = "linux")]
     direct: Option<File>,
 }
@@ -112,73 +173,27 @@ impl ConsoleOutput {
     pub(crate) fn stdout(mode: FlowControlMode) -> io::Result<Self> {
         #[cfg(unix)]
         {
+            let file = File::from(rustix::io::dup(io::stdout().lock().as_fd())?);
             #[cfg(target_os = "linux")]
-            let (file, nonblocking, terminal) = {
-                use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
-                use std::os::unix::io::AsRawFd;
-                let dup_file = File::from(rustix::io::dup(io::stdout().lock().as_fd())?);
-                let is_fifo = dup_file.metadata().is_ok_and(|m| m.file_type().is_fifo());
-                let is_terminal = rustix::termios::isatty(&dup_file);
-                // A FIFO or terminal reopened through /proc is a separate open
-                // file description, so O_NONBLOCK never leaks into the
-                // inherited stdout the parent shell keeps using.
-                if is_fifo || is_terminal {
-                    let raw = io::stdout().lock().as_raw_fd();
-                    match std::fs::OpenOptions::new()
-                        .write(true)
-                        .custom_flags(
-                            (rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOCTTY).bits()
-                                as i32,
-                        )
-                        .open(format!("/proc/self/fd/{raw}"))
-                    {
-                        // The worker writes a terminal through the inherited
-                        // blocking description (see `write_terminal`).
-                        Ok(file) => (file, true, is_terminal.then_some(dup_file)),
-                        Err(_) => (dup_file, false, None),
-                    }
-                } else {
-                    (dup_file, false, None)
-                }
-            };
-            #[cfg(not(target_os = "linux"))]
-            let (file, nonblocking) = (
-                File::from(rustix::io::dup(io::stdout().lock().as_fd())?),
-                false,
-            );
-            // Only a non-blocking descriptor may be written from the session
-            // loop: a full terminal must never stall network and input.
-            #[cfg(target_os = "linux")]
-            let direct = if nonblocking {
-                Some(file.try_clone()?)
-            } else {
-                None
-            };
+            if let Some(direct) = reopen_nonblocking(&file) {
+                return Ok(Self::direct(mode, direct));
+            }
             let (cancel_reader, mut cancel_writer) = et_net::local::wake_pair()?;
             let cancel = Box::new(move || {
                 let _ = cancel_writer.write_all(&[1]);
             });
-            #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-            let mut output = Self::new_with_lifecycle(
+            Self::new_with_lifecycle(
                 mode,
                 Box::new(CancellableStdout {
                     file,
                     cancel: cancel_reader,
                     discard_device: None,
-                    nonblocking,
                     #[cfg(target_os = "linux")]
                     stdout_kind: None,
-                    #[cfg(target_os = "linux")]
-                    terminal,
                 }),
                 cancel,
                 Box::new(|| Ok(())),
-            )?;
-            #[cfg(target_os = "linux")]
-            {
-                output.direct = direct;
-            }
-            Ok(output)
+            )
         }
         #[cfg(windows)]
         {
@@ -205,6 +220,21 @@ impl ConsoleOutput {
                 Box::new(move || cancel_windows_helper(&cancel_child)),
                 Box::new(move || wait_windows_helper(&graceful_child)),
             )
+        }
+    }
+
+    /// Console output the session loop writes to the non-blocking `file`
+    /// itself: no worker thread, no wake descriptors.
+    #[cfg(target_os = "linux")]
+    fn direct(mode: FlowControlMode, file: File) -> Self {
+        Self {
+            mode,
+            shared: Some(Arc::new(Shared::new())),
+            wakes: None,
+            cancel: None,
+            graceful_finish: None,
+            worker: None,
+            direct: Some(file),
         }
     }
 
@@ -253,24 +283,7 @@ impl ConsoleOutput {
             signal.set_nonblocking(true)?;
             (wake, signal)
         };
-        let shared = Arc::new(Shared {
-            state: Mutex::new(State {
-                queue: VecDeque::new(),
-                bytes: 0,
-                stopping: false,
-                error: None,
-                cursor_reports: 0,
-                worker_done: false,
-                worker_progress: 0,
-                stream: et_core::output_interrupt::TerminalStream::default(),
-                skip_until_newline: false,
-                waiting_for_capacity: false,
-                writing: false,
-            }),
-            wake: Condvar::new(),
-            worker_progress: std::sync::atomic::AtomicUsize::new(0),
-            stopping_fast: std::sync::atomic::AtomicBool::new(false),
-        });
+        let shared = Arc::new(Shared::new());
         let mut writer = writer(&shared);
         let worker_shared = Arc::clone(&shared);
         let worker = thread::Builder::new()
@@ -289,9 +302,10 @@ impl ConsoleOutput {
             mode,
             shared: Some(shared),
             #[cfg(unix)]
-            capacity_wake,
-            #[cfg(unix)]
-            status_wake,
+            wakes: Some(WorkerWakes {
+                capacity: capacity_wake,
+                status: status_wake,
+            }),
             cancel: Some(cancel),
             graceful_finish: Some(graceful_finish),
             worker: Some(worker),
@@ -328,10 +342,7 @@ impl ConsoleOutput {
         } else {
             bytes
         };
-        let mut state = shared
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("console output worker unavailable"))?;
+        let mut state = shared.lock()?;
         if let Some(error) = state.error.take() {
             return Err(error);
         }
@@ -342,7 +353,7 @@ impl ConsoleOutput {
             ));
         }
         if state.skip_until_newline {
-            let Some(newline) = retained.iter().position(|byte| *byte == b'\n') else {
+            let Some(newline) = memchr::memchr(b'\n', retained) else {
                 return Ok(true);
             };
             retained = &retained[newline + 1..];
@@ -360,44 +371,29 @@ impl ConsoleOutput {
                 while state.bytes.saturating_add(retained.len()) > OUTPUT_BYTES
                     || state.queue.len() >= OUTPUT_PACKETS
                 {
-                    let Some(removed) = state.queue.pop_front() else {
+                    // A partly written entry is already on the console.
+                    let oldest = usize::from(state.queue.front().is_some_and(|e| e.sent != 0));
+                    let Some(removed) = state.queue.remove(oldest) else {
                         break;
                     };
-                    state.bytes -= removed.bytes.len();
-                }
-            }
-        }
-        // An idle console takes the packet straight from the session loop:
-        // nothing queued or in flight can be overtaken, and the descriptor is
-        // non-blocking. A short write queues the rest for the worker. Cursor
-        // report requests keep the worker's delivery accounting, and write
-        // errors surface through the worker exactly as before.
-        #[cfg(target_os = "linux")]
-        if let Some(direct) = &self.direct {
-            if state.queue.is_empty()
-                && !state.writing
-                && !crate::client_terminal::contains_cursor_report_request(retained)
-            {
-                if let Ok(written) = rustix::io::write(direct, retained) {
-                    if written != 0 {
-                        state.skip_until_newline = false;
-                        state.stream.observe(&retained[..written]);
-                        terminal_modes.observe(&retained[..written]);
-                        retained = &retained[written..];
-                    }
-                    if retained.is_empty() {
-                        return Ok(true);
-                    }
+                    state.bytes -= removed.unsent().len();
                 }
             }
         }
         // Only commit the terminator after admission; a held packet must
         // retry with the same skip state when the queue is still full.
-        let was_empty = state.queue.is_empty();
         state.skip_until_newline = false;
+        #[cfg(target_os = "linux")]
+        if let Some(direct) = &self.direct {
+            state.waiting_for_capacity = false;
+            state.write_packet(shared, direct, retained, terminal_modes);
+            return Ok(true);
+        }
+        let was_empty = state.queue.is_empty();
         state.bytes += retained.len();
         state.queue.push_back(OutputEntry {
             bytes: retained.to_vec(),
+            sent: 0,
             terminal_modes: terminal_modes.clone(),
         });
         drop(state);
@@ -411,15 +407,24 @@ impl ConsoleOutput {
         self.shared.is_some()
     }
 
-    /// Bytes still queued for the console worker. Synchronous writers have none.
+    /// The session loop writes this console itself (see `poll_descriptors`).
+    pub(crate) fn is_direct(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.direct.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    /// Bytes still queued for the console. Synchronous writers have none.
     pub(crate) fn has_pending_data(&self) -> io::Result<bool> {
         let Some(shared) = &self.shared else {
             return Ok(false);
         };
-        let state = shared
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("console output worker unavailable"))?;
+        let state = shared.lock()?;
         Ok(state.bytes > 0 || !state.queue.is_empty())
     }
 
@@ -427,10 +432,7 @@ impl ConsoleOutput {
         let Some(shared) = &self.shared else {
             return Ok(0);
         };
-        let mut state = shared
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("console output worker unavailable"))?;
+        let mut state = shared.lock()?;
         Ok(std::mem::take(&mut state.cursor_reports))
     }
 
@@ -465,14 +467,18 @@ impl ConsoleOutput {
     }
 
     fn finish_gracefully_with_stall(&mut self, already_stalled: bool) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(direct) = self.direct.take() {
+            return match self.shared.take() {
+                Some(shared) => finish_direct(&shared, &direct, already_stalled),
+                None => Ok(()),
+            };
+        }
         let Some(shared) = self.shared.clone() else {
             return Ok(());
         };
         {
-            let mut state = shared
-                .state
-                .lock()
-                .map_err(|_| io::Error::other("console output worker unavailable"))?;
+            let mut state = shared.lock()?;
             state.stopping = true;
             shared
                 .stopping_fast
@@ -514,16 +520,14 @@ impl ConsoleOutput {
         let Some(shared) = &self.shared else {
             return Ok(());
         };
-        let mut state = shared
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("console output worker unavailable"))?;
-        match state.error.take() {
+        match shared.lock()?.error.take() {
             Some(error) => Err(error),
             None => Ok(()),
         }
     }
 
+    /// Count of writes that moved console bytes, by the worker or the
+    /// session loop; completion uses it to detect a stalled console.
     pub(crate) fn worker_progress(&self) -> io::Result<usize> {
         let Some(shared) = &self.shared else {
             return Ok(0);
@@ -533,29 +537,59 @@ impl ConsoleOutput {
             .load(std::sync::atomic::Ordering::Acquire))
     }
 
+    /// Appends the descriptors whose readiness lets console output progress:
+    /// the worker's capacity and status wakes, in that order, or the direct
+    /// console's stdout for `POLLOUT` while output is queued for it.
     #[cfg(unix)]
-    pub(crate) fn wake(&self) -> &LocalStream {
-        &self.capacity_wake
+    pub(crate) fn poll_descriptors<'a>(
+        &'a self,
+        descriptors: &mut Vec<PollFd<'a>>,
+    ) -> io::Result<()> {
+        if let Some(wakes) = &self.wakes {
+            descriptors.push(PollFd::new(&wakes.capacity, PollFlags::IN | PollFlags::HUP));
+            descriptors.push(PollFd::new(&wakes.status, PollFlags::IN | PollFlags::HUP));
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(direct) = &self.direct {
+            if self.has_pending_data()? {
+                descriptors.push(PollFd::new(direct, PollFlags::OUT));
+            }
+        }
+        Ok(())
     }
 
+    /// Handles readiness of the first descriptor from `poll_descriptors`:
+    /// drains the worker's capacity wake, or writes queued output to the
+    /// direct console. A write error is kept for `check_error`, as the
+    /// worker keeps it.
     #[cfg(unix)]
-    pub(crate) fn status_wake(&self) -> &LocalStream {
-        &self.status_wake
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn drain_wake(&mut self) -> io::Result<()> {
-        drain_stream(&mut self.capacity_wake)
+    pub(crate) fn service_ready(&mut self) -> io::Result<()> {
+        if let Some(wakes) = &mut self.wakes {
+            return drain_stream(&mut wakes.capacity);
+        }
+        #[cfg(target_os = "linux")]
+        if let (Some(direct), Some(shared)) = (&self.direct, &self.shared) {
+            shared.lock()?.write_queued(shared, direct);
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
     pub(crate) fn drain_status_wake(&mut self) -> io::Result<()> {
-        drain_stream(&mut self.status_wake)
+        match &mut self.wakes {
+            Some(wakes) => drain_stream(&mut wakes.status),
+            None => Ok(()),
+        }
     }
 }
 
 impl Drop for ConsoleOutput {
     fn drop(&mut self) {
+        // Without a worker there is nothing to stop: the direct console's
+        // queue is discarded with it, as cancelling the worker discards it.
+        if self.worker.is_none() {
+            return;
+        }
         let shared = self.shared.clone();
         if let Some(shared) = &shared {
             if let Ok(mut state) = shared.state.lock() {
@@ -623,7 +657,6 @@ fn run_writer(
             // be observed before interrupt filtering can inspect the next queue.
             let entries: Vec<_> = state.queue.drain(..).collect();
             state.bytes = 0;
-            state.writing = true;
             let notify_capacity = std::mem::replace(&mut state.waiting_for_capacity, false);
             for entry in &entries {
                 state.stream.observe(&entry.bytes);
@@ -670,10 +703,10 @@ fn run_writer(
                 signal_capacity(capacity_signal);
             }
         });
-        let notify_capacity = shared.state.lock().is_ok_and(|mut state| {
-            state.writing = false;
-            std::mem::replace(&mut state.waiting_for_capacity, false)
-        });
+        let notify_capacity = shared
+            .state
+            .lock()
+            .is_ok_and(|mut state| std::mem::replace(&mut state.waiting_for_capacity, false));
         #[cfg(unix)]
         if notify_capacity {
             signal_capacity(capacity_signal);
@@ -896,6 +929,223 @@ fn copy_windows_helper_output(
     }
 }
 
+/// A FIFO or terminal stdout reopened through `/proc` with `O_NONBLOCK`.
+/// The reopen is a separate open file description, so `O_NONBLOCK` never
+/// leaks into the inherited stdout the parent shell keeps using.
+#[cfg(target_os = "linux")]
+fn reopen_nonblocking(stdout: &File) -> Option<File> {
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+    use std::os::unix::io::AsRawFd;
+    let is_fifo = stdout.metadata().is_ok_and(|m| m.file_type().is_fifo());
+    if !is_fifo && !rustix::termios::isatty(stdout) {
+        return None;
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags((rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOCTTY).bits() as i32)
+        .open(format!("/proc/self/fd/{}", stdout.as_raw_fd()))
+        .ok()
+}
+
+/// The direct console: the session loop writes without blocking and does
+/// the worker's delivery accounting on exactly the bytes written.
+#[cfg(target_os = "linux")]
+impl State {
+    /// Writes an admitted packet straight through when nothing is queued
+    /// ahead of it and queues whatever the console did not take.
+    fn write_packet(
+        &mut self,
+        shared: &Shared,
+        file: &File,
+        bytes: &[u8],
+        terminal_modes: &crate::client_terminal::TerminalModeState,
+    ) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut sent = 0;
+        if self.queue.is_empty() {
+            match write_retrying(file, bytes) {
+                Ok(0) => return self.fail(io::ErrorKind::WriteZero.into()),
+                Ok(count) => {
+                    report_direct_progress(shared);
+                    self.stream.observe(&bytes[..count]);
+                    terminal_modes.observe(&bytes[..count]);
+                    if count == bytes.len() {
+                        self.cursor_reports += usize::from(
+                            crate::client_terminal::contains_cursor_report_request(bytes),
+                        );
+                        return;
+                    }
+                    sent = count;
+                }
+                Err(rustix::io::Errno::AGAIN) => {}
+                Err(error) => return self.fail(error.into()),
+            }
+        }
+        let mut buffer = self.spare.pop().unwrap_or_default();
+        buffer.extend_from_slice(bytes);
+        self.bytes += bytes.len() - sent;
+        self.queue.push_back(OutputEntry {
+            bytes: buffer,
+            sent,
+            terminal_modes: terminal_modes.clone(),
+        });
+    }
+
+    /// Writes queued output, several packets per vectored write, until the
+    /// console stops taking all of it. Returns whether any byte moved.
+    fn write_queued(&mut self, shared: &Shared, file: &File) -> bool {
+        let mut progressed = false;
+        while !self.queue.is_empty() {
+            let mut slices = [io::IoSlice::new(&[]); WRITE_SLICES];
+            let mut count = 0;
+            let mut offered = 0;
+            for (slice, entry) in slices.iter_mut().zip(&self.queue) {
+                *slice = io::IoSlice::new(entry.unsent());
+                offered += slice.len();
+                count += 1;
+            }
+            let result = loop {
+                match rustix::io::writev(file, &slices[..count]) {
+                    Err(rustix::io::Errno::INTR) => {}
+                    result => break result,
+                }
+            };
+            match result {
+                Ok(0) => {
+                    self.fail(io::ErrorKind::WriteZero.into());
+                    break;
+                }
+                Ok(written) => {
+                    progressed = true;
+                    report_direct_progress(shared);
+                    self.delivered(written);
+                    // A short write means the console is full; asking again
+                    // would only return EAGAIN.
+                    if written < offered {
+                        break;
+                    }
+                }
+                Err(rustix::io::Errno::AGAIN) => break,
+                Err(error) => {
+                    self.fail(error.into());
+                    break;
+                }
+            }
+        }
+        progressed
+    }
+
+    /// Accounts `count` bytes written from the front of the queue.
+    fn delivered(&mut self, mut count: usize) {
+        self.bytes -= count;
+        while count != 0 {
+            let Some(entry) = self.queue.front_mut() else {
+                break;
+            };
+            let end = entry.bytes.len().min(entry.sent + count);
+            let written = &entry.bytes[entry.sent..end];
+            self.stream.observe(written);
+            entry.terminal_modes.observe(written);
+            count -= written.len();
+            entry.sent = end;
+            self.retire_delivered();
+        }
+    }
+
+    /// Retires fully written entries: like the worker, a packet counts its
+    /// cursor report request only once all of it reached the console.
+    fn retire_delivered(&mut self) {
+        while self
+            .queue
+            .front()
+            .is_some_and(|entry| entry.sent == entry.bytes.len())
+        {
+            let Some(entry) = self.queue.pop_front() else {
+                break;
+            };
+            self.cursor_reports += usize::from(
+                crate::client_terminal::contains_cursor_report_request(&entry.bytes),
+            );
+            if self.spare.len() < SPARE_BUFFERS {
+                let mut buffer = entry.bytes;
+                buffer.clear();
+                self.spare.push(buffer);
+            }
+        }
+    }
+
+    /// Stops admission after a write error, as the worker does. The rest of
+    /// the queue can never be written, and keeping it would keep `POLLOUT`
+    /// polled on a broken descriptor.
+    fn fail(&mut self, error: io::Error) {
+        self.error = Some(error);
+        self.stopping = true;
+        self.queue.clear();
+        self.bytes = 0;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_retrying(file: &File, bytes: &[u8]) -> rustix::io::Result<usize> {
+    loop {
+        match rustix::io::write(file, bytes) {
+            Err(rustix::io::Errno::INTR) => {}
+            result => return result,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn report_direct_progress(shared: &Shared) {
+    shared
+        .worker_progress
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// Delivers the direct console's queue on completion, bounded like the
+/// worker's graceful drain: give up once the console takes nothing for
+/// `GRACEFUL_DRAIN_STALL_TIMEOUT`, and drop the rest as cancelling the
+/// worker does.
+#[cfg(target_os = "linux")]
+fn finish_direct(shared: &Shared, file: &File, already_stalled: bool) -> io::Result<()> {
+    let mut state = shared.lock()?;
+    state.stopping = true;
+    let mut deadline = Instant::now() + GRACEFUL_DRAIN_STALL_TIMEOUT;
+    while !already_stalled && !state.queue.is_empty() && state.error.is_none() {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let timeout = rustix::time::Timespec::try_from(deadline - now)
+            .map_err(|_| io::Error::other("console drain wait exceeds poll range"))?;
+        let mut descriptors = [PollFd::new(file, PollFlags::OUT)];
+        match rustix::event::poll(&mut descriptors, Some(&timeout)) {
+            Ok(0) => {}
+            Ok(_) => {
+                if state.write_queued(shared, file) {
+                    deadline = Instant::now() + GRACEFUL_DRAIN_STALL_TIMEOUT;
+                }
+            }
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if let Some(error) = state.error.take() {
+        return Err(error);
+    }
+    if !state.queue.is_empty() {
+        state.queue.clear();
+        state.bytes = 0;
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "console output cancelled",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn drain_stream(stream: &mut LocalStream) -> io::Result<()> {
     let mut bytes = [0u8; 64];
@@ -917,34 +1167,21 @@ enum StdoutKind {
     Other,
 }
 
+/// Blocking stdout the worker writes (regular files, sockets, or a FIFO or
+/// terminal whose non-blocking reopen failed), interruptible by `cancel`.
 #[cfg(unix)]
 struct CancellableStdout {
     file: File,
     cancel: LocalStream,
     discard_device: Option<bool>,
-    nonblocking: bool,
     #[cfg(target_os = "linux")]
     stdout_kind: Option<StdoutKind>,
-    /// Blocking descriptor of a terminal stdout, written by `write_terminal`.
-    #[cfg(target_os = "linux")]
-    terminal: Option<File>,
 }
 #[cfg(unix)]
 impl Write for CancellableStdout {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        use rustix::event::{poll, PollFd, PollFlags};
+        use rustix::event::poll;
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
-        #[cfg(target_os = "linux")]
-        if let Some(terminal) = &self.terminal {
-            return write_terminal(terminal, &self.cancel, bytes);
-        }
-        if self.nonblocking {
-            match rustix::io::write(&self.file, bytes) {
-                Ok(count) => return Ok(count),
-                Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => {}
-                Err(error) => return Err(io::Error::from(error)),
-            }
-        }
         let mut descriptors = [
             PollFd::new(&self.file, PollFlags::OUT),
             PollFd::new(&self.cancel, PollFlags::IN | PollFlags::HUP),
@@ -992,13 +1229,6 @@ impl Write for CancellableStdout {
                     ));
                 }
                 Ok(_) if descriptors[0].revents().contains(PollFlags::OUT) => {
-                    if self.nonblocking {
-                        match rustix::io::write(&self.file, bytes) {
-                            Ok(count) => return Ok(count),
-                            Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => continue,
-                            Err(error) => return Err(io::Error::from(error)),
-                        }
-                    }
                     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
                     let mut max_chunk = 4096usize;
                     #[cfg(target_os = "linux")]
@@ -1029,58 +1259,6 @@ impl Write for CancellableStdout {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
-    }
-}
-
-/// One worker write to a terminal. A PTY takes output only as fast as its
-/// reader drains the line discipline, 4 KiB at a time, so non-blocking writes
-/// cost a poll and a write per 4 KiB (16 syscalls and wakeups per 64 KiB
-/// batch). Wait for room while staying cancellable, then let one blocking
-/// write on the inherited description move the whole batch (at most
-/// `OUTPUT_BYTES`); a stalled terminal delays cancellation by at most that
-/// write, which the bounded graceful drain already tolerates. If another
-/// process left the shared description non-blocking, this degrades to
-/// partial writes, never to a wrong result.
-#[cfg(target_os = "linux")]
-fn write_terminal(terminal: &File, cancel: &LocalStream, bytes: &[u8]) -> io::Result<usize> {
-    use rustix::event::{poll, PollFd, PollFlags};
-    let mut descriptors = [
-        PollFd::new(terminal, PollFlags::OUT),
-        PollFd::new(cancel, PollFlags::IN | PollFlags::HUP),
-    ];
-    loop {
-        match poll(&mut descriptors, None) {
-            Ok(_)
-                if descriptors[1]
-                    .revents()
-                    .intersects(PollFlags::IN | PollFlags::HUP) =>
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "console output cancelled",
-                ));
-            }
-            Ok(_)
-                if descriptors[0]
-                    .revents()
-                    .intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) =>
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "console output is unavailable",
-                ));
-            }
-            Ok(_) if descriptors[0].revents().contains(PollFlags::OUT) => {
-                match rustix::io::write(terminal, bytes) {
-                    Ok(count) => return Ok(count),
-                    Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => {}
-                    Err(error) => return Err(io::Error::from(error)),
-                }
-            }
-            Ok(_) => {}
-            Err(error) if error == rustix::io::Errno::INTR => {}
-            Err(error) => return Err(io::Error::from(error)),
-        }
     }
 }
 

@@ -188,6 +188,9 @@ fn run_poll(
                                 startup: terminal.startup_ack.then(LocalPacketDecoder::new),
                             });
                             emit(&events, RouterEvent::Registered { id });
+                            if terminal.resumed {
+                                notify_resumed(lifecycle.as_ref());
+                            }
                         }
                         Err(error) => {
                             let message = format!("registration rejected: {error:?}");
@@ -318,6 +321,9 @@ fn run_windows(
                                 startup: terminal.startup_ack.then(LocalPacketDecoder::new),
                             });
                             emit(&events, RouterEvent::Registered { id });
+                            if terminal.resumed {
+                                notify_resumed(lifecycle.as_ref());
+                            }
                         }
                         Err(error) => {
                             let message = format!("registration rejected: {error:?}");
@@ -408,6 +414,13 @@ fn disconnect_watched(
         }
     }
     Ok(())
+}
+
+/// The runtime sweeps a resumed terminal's recovery grace; arm that sweep.
+fn notify_resumed(lifecycle: Option<&LifecycleSender>) {
+    if let Some(sender) = lifecycle {
+        sender.send(LifecycleEvent::TerminalResumed);
+    }
 }
 
 fn accept_ready(

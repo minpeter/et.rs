@@ -5,7 +5,9 @@
 //! before Wi-Fi is back), every attempt fails with a transient error. The
 //! client used to exit with "could not reach the ET server" after the first
 //! failed attempt; it must instead keep retrying until the link returns,
-//! without writing client-local reconnect status into the terminal.
+//! without writing client-local reconnect status into the terminal. Input
+//! typed while the link is down must reach the shell after recovery, in
+//! order, like the upstream client's queued input.
 
 // The shared stack helper exports more than this test needs.
 #[allow(dead_code)]
@@ -82,41 +84,30 @@ fn client_retries_reconnect_through_network_outage() {
         .write_all(b"printf 'FIRST-PID:%s\\n' \"$$\"\n")
         .unwrap();
     let (mut output, first_pid) = receive_number(&output_rx, Vec::new(), b"FIRST-PID:");
+    // Start a line before the outage; the shell's echo proves it arrived.
+    writer.write_all(b"echo \"JOINED:BEFORE").unwrap();
+    output = receive_marker(&output_rx, output, b"JOINED:BEFORE");
 
     // Drop the link and refuse every reconnect attempt for a while, like a
     // laptop that wakes from sleep before its network is back.
     proxy.outage();
     proxy.wait_for_refused(2);
+    // Finish the line while the link is down. Two more refused attempts
+    // mean a whole retry wait ran after these bytes were typed, so the wait
+    // (not the recovered session) is what read them.
+    writer.write_all(b"-$((7*9))-TYPED\"\n").unwrap();
+    proxy.wait_for_refused(4);
     proxy.restore();
 
-    // Input typed while the link is down is dropped, so keep asking until
-    // the recovered session answers.
-    let mut after_pid = None;
-    for _ in 0..15 {
-        writer
-            .write_all(b"printf 'AFTER-PID:%s\\n' \"$$\"\n")
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            if let Some(value) = marker_number(&output, b"AFTER-PID:") {
-                after_pid = Some(value);
-                break;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match output_rx.recv_timeout(remaining) {
-                Ok(chunk) => output.extend(chunk),
-                Err(_) => break,
-            }
-        }
-        if after_pid.is_some() {
-            break;
-        }
-    }
+    // The kept input runs first, completing the line started before the
+    // outage; only the shell's evaluation prints `63`, never the echo.
+    output = receive_marker(&output_rx, output, b"JOINED:BEFORE-63-TYPED");
+    writer
+        .write_all(b"printf 'AFTER-PID:%s\\n' \"$$\"\n")
+        .unwrap();
+    let (mut output, after_pid) = receive_number(&output_rx, output, b"AFTER-PID:");
     // Same shell process: the session recovered instead of restarting.
-    assert_eq!(Some(first_pid), after_pid, "output={}", text(&output));
+    assert_eq!(first_pid, after_pid, "output={}", text(&output));
 
     writer.write_all(b"exit\n").unwrap();
     let status = child.wait().unwrap();
@@ -296,6 +287,23 @@ fn receive_number(
             )
         }));
     }
+}
+
+fn receive_marker(
+    receiver: &mpsc::Receiver<Vec<u8>>,
+    mut output: Vec<u8>,
+    marker: &[u8],
+) -> Vec<u8> {
+    while !output.windows(marker.len()).any(|window| window == marker) {
+        output.extend(receiver.recv_timeout(TIMEOUT).unwrap_or_else(|error| {
+            panic!(
+                "timed out waiting for {}: {error}; output={}",
+                String::from_utf8_lossy(marker),
+                String::from_utf8_lossy(&output)
+            )
+        }));
+    }
+    output
 }
 
 fn marker_number(output: &[u8], marker: &[u8]) -> Option<u32> {

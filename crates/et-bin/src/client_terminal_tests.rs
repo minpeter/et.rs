@@ -75,6 +75,7 @@ fn unavailable_initial_terminal_size_does_not_skip_command_validation() {
             close_on_hangup: false,
             no_pty: false,
             stdio_forward: false,
+            reconnect_input: &super::ReconnectInput::default(),
         },
         et_net::forward::Forwarder::start(Vec::new()).unwrap(),
         |_| panic!("a size observation must not reconnect"),
@@ -128,6 +129,7 @@ fn unavailable_live_terminal_size_keeps_the_pump_alive() {
             ended += 1;
             Ok(ReconnectOutcome::SessionEnded)
         },
+        &super::ReconnectInput::default(),
     )
     .unwrap();
     server.join().unwrap();

@@ -55,6 +55,37 @@ pub struct TerminalOptions<'a> {
     pub no_pty: bool,
     /// `et -W`: stdio is owned by the forwarder, not the console.
     pub stdio_forward: bool,
+    /// Input the reconnect wait read while the link was down. The Unix loop
+    /// sends it after recovery, ahead of newer stdin.
+    pub reconnect_input: &'a ReconnectInput,
+}
+
+/// Terminal input read while waiting between reconnect attempts, kept in
+/// order until the recovered session can send it (upstream queues the same
+/// input in its `BackedWriter`). The reconnect wait and the terminal loop
+/// share one thread, so the buffer is never borrowed across them.
+#[derive(Default)]
+#[cfg_attr(windows, allow(dead_code))]
+pub struct ReconnectInput(std::cell::RefCell<Vec<u8>>);
+
+#[cfg(unix)]
+impl ReconnectInput {
+    pub(crate) fn keep(&self, bytes: &[u8]) {
+        self.0.borrow_mut().extend_from_slice(bytes);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.borrow().is_empty()
+    }
+
+    /// Move the oldest kept bytes into `out`; returns how many were moved.
+    pub(crate) fn take_into(&self, out: &mut [u8]) -> usize {
+        let mut kept = self.0.borrow_mut();
+        let count = kept.len().min(out.len());
+        out[..count].copy_from_slice(&kept[..count]);
+        kept.drain(..count);
+        count
+    }
 }
 
 /// Whether a finished command's remote status should become the process code.
@@ -164,6 +195,7 @@ where
         close_on_hangup,
         no_pty,
         stdio_forward,
+        reconnect_input,
     } = options;
     let remote_exit = RemoteExit::new(wants_remote_exit_status(command, no_exit, stdio_forward));
     let reconnect_ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -277,6 +309,7 @@ where
             },
             &mut forwarder,
             reconnect,
+            reconnect_input,
         );
         signal_hook::low_level::unregister(resize_signal);
         result
@@ -299,6 +332,9 @@ where
         &mut forwarder,
         reconnect,
     );
+    // Windows' reconnect wait leaves console input queued; nothing is kept.
+    #[cfg(windows)]
+    let _ = reconnect_input;
     finished(
         raw_mode.finish(result, close_message, terminal_modes.alternate_screen()),
         &remote_exit,

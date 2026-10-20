@@ -258,6 +258,9 @@ pub fn attach_saved(
             close_on_hangup: args.close_on_hangup,
             no_pty: false,
             stdio_forward: false,
+            // A saved-session attach reconnects once, without the retry
+            // wait, so it never keeps input.
+            reconnect_input: &crate::client_terminal::ReconnectInput::default(),
         },
         forwarder,
         reconnect_session,

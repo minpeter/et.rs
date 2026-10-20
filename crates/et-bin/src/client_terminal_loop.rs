@@ -142,6 +142,7 @@ pub fn pump<F>(
     options: PumpOptions<'_>,
     forwarder: &mut Forwarder,
     reconnect: F,
+    reconnect_input: &crate::client_terminal::ReconnectInput,
 ) -> Result<i32, ClientError>
 where
     F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
@@ -152,6 +153,7 @@ where
         options,
         forwarder,
         reconnect,
+        reconnect_input,
         io::stdin(),
         true,
     )
@@ -171,17 +173,26 @@ where
     R: Read + std::os::fd::AsFd,
 {
     pump_with_stdin_mode(
-        connection, wake, options, forwarder, reconnect, stdin, false,
+        connection,
+        wake,
+        options,
+        forwarder,
+        reconnect,
+        &crate::client_terminal::ReconnectInput::default(),
+        stdin,
+        false,
     )
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn pump_with_stdin_mode<F, R>(
     connection: &mut Connection,
     wake: &mut UnixStream,
     options: PumpOptions<'_>,
     forwarder: &mut Forwarder,
     mut reconnect: F,
+    reconnect_input: &crate::client_terminal::ReconnectInput,
     mut stdin: R,
     unbuffered_fd: bool,
 ) -> Result<i32, ClientError>
@@ -466,6 +477,11 @@ where
         // wake fd would spin this loop until the frame deadline. A delivery
         // backlog parks them the same way until the server acknowledges.
         let producers_polled = !connection.write_pending() && !delivery_blocked;
+        // Input kept by the reconnect wait is ready without stdin readiness.
+        let kept_input = producers_polled && read_stdin && !reconnect_input.is_empty();
+        if kept_input {
+            deadline = Instant::now();
+        }
         if producers_polled {
             forwarder.collect_fast_poll_routes(&mut fast_poll);
             // Forwarding timers (idle window credit, parked accepts) and
@@ -892,33 +908,40 @@ where
         }
         let ack_due = bytes_since_ack >= et_core::keepalive::ACK_INTERVAL_BYTES
             && !remote_exit.session_ended();
-        if !connection.write_pending() && !ack_due && input.contains(PollFlags::IN) {
+        if !connection.write_pending() && !ack_due && (kept_input || input.contains(PollFlags::IN))
+        {
             let mut bytes = [0u8; 65_472];
             let read_len = if binary_stdio {
                 bytes.len()
             } else {
                 INPUT_CHUNK
             };
-            let count = match if unbuffered_fd && binary_stdio {
-                rustix::io::read(stdin.as_fd(), &mut bytes[..read_len]).map_err(io::Error::from)
+            // Input kept while reconnecting predates anything still unread
+            // on stdin, so it goes first, through the same path.
+            let count = if kept_input {
+                reconnect_input.take_into(&mut bytes[..read_len])
             } else {
-                stdin.read(&mut bytes[..read_len])
-            } {
-                Ok(count) => count,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                    ) =>
-                {
-                    continue;
+                match if unbuffered_fd && binary_stdio {
+                    rustix::io::read(stdin.as_fd(), &mut bytes[..read_len]).map_err(io::Error::from)
+                } else {
+                    stdin.read(&mut bytes[..read_len])
+                } {
+                    Ok(count) => count,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(_) if !stdin_is_terminal => {
+                        read_stdin = false;
+                        input_eof_pending = binary_stdio;
+                        continue;
+                    }
+                    Err(error) => return Err(terminal_io("reading terminal input", error)),
                 }
-                Err(_) if !stdin_is_terminal => {
-                    read_stdin = false;
-                    input_eof_pending = binary_stdio;
-                    continue;
-                }
-                Err(error) => return Err(terminal_io("reading terminal input", error)),
             };
             if count == 0 {
                 // `-T` ends only the remote command's input, like `ssh -T`,

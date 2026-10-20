@@ -80,8 +80,10 @@ fn client_retries_reconnect_through_network_outage() {
     });
     wait_for_file(&client_ready, b"ready");
 
+    // A short prompt keeps the partial line's echo below from wrapping:
+    // CI hosts (macOS runners) have prompts long enough to wrap at 90 columns.
     writer
-        .write_all(b"printf 'FIRST-PID:%s\\n' \"$$\"\n")
+        .write_all(b"PS1='> '; printf 'FIRST-PID:%s\\n' \"$$\"\n")
         .unwrap();
     let (mut output, first_pid) = receive_number(&output_rx, Vec::new(), b"FIRST-PID:");
     // Start a line before the outage; the shell's echo proves it arrived.

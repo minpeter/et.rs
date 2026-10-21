@@ -156,7 +156,7 @@ fn run_mode_poll(
     // while the bridge runs.
     let mut output = OutputPump::new(&session);
     loop {
-        if session.is_shutting_down() {
+        if session.is_shutting_down() || session.retire_if_unreachable()? {
             return Ok(());
         }
         // Retry the held packet first: draining the forwarder's outbound
@@ -207,6 +207,7 @@ fn run_mode_poll(
                 && lookahead_terminal.is_none()
                 && session.can_buffer_write((READ_BUFFER * 2) as i64)?,
             pending_local.is_some(),
+            terminal_closing,
         );
         if pending_outbound.is_empty() {
             forwarder.collect_fast_poll_routes(&mut fast_poll);
@@ -598,7 +599,7 @@ fn run_mode_windows(
     let mut close_after_local = false;
     let mut terminal_input_closed = false;
     loop {
-        if session.is_shutting_down() {
+        if session.is_shutting_down() || session.retire_if_unreachable()? {
             return Ok(());
         }
         if close_expired_disconnect(
@@ -1002,7 +1003,7 @@ fn wait(
     wake: &LocalStream,
     forward_wake: &LocalStream,
     client: Option<&std::net::TcpStream>,
-    terminal_flags: PollFlags,
+    terminal_flags: Option<PollFlags>,
     client_policy: (PollFlags, Option<Duration>),
     fast_poll: Option<&et_net::forward::FastPollState>,
 ) -> Result<(PollFlags, PollFlags, PollFlags, PollFlags), SessionError> {
@@ -1020,10 +1021,13 @@ fn wait(
         Timespec::try_from(duration).expect("forwarding retry duration fits timespec")
     });
     let mut descriptors = vec![
-        PollFd::new(terminal, terminal_flags),
         PollFd::new(wake, PollFlags::IN | PollFlags::HUP),
         PollFd::new(forward_wake, PollFlags::IN | PollFlags::HUP),
     ];
+    if let Some(flags) = terminal_flags {
+        descriptors.push(PollFd::new(terminal, flags));
+    }
+    let client_index = descriptors.len();
     if let Some(client) = client {
         descriptors.push(PollFd::new(client, client_flags));
     }
@@ -1043,12 +1047,17 @@ fn wait(
     if let Some(fast_poll) = fast_poll {
         fast_poll.record_revents(&descriptors[fast_offset..]);
     }
+    let terminal_events = match terminal_flags {
+        Some(_) => descriptors[2].revents(),
+        None => PollFlags::empty(),
+    };
     Ok((
+        terminal_events,
         descriptors[0].revents(),
         descriptors[1].revents(),
-        descriptors[2].revents(),
         descriptors
-            .get(3)
+            .get(client_index)
+            .filter(|_| client.is_some())
             .map(PollFd::revents)
             .unwrap_or(PollFlags::empty()),
     ))
@@ -1107,8 +1116,19 @@ fn wait_until(timeout: Option<Duration>, at: std::time::Instant) -> Option<Durat
     Some(timeout.map_or(until, |timeout| timeout.min(until)))
 }
 
+/// Upstream leaves the terminal out of `select()` while it cannot take the
+/// terminal's output. poll() reports HUP whatever was asked, so a hung-up
+/// terminal this pass neither reads nor writes stays out of the set rather
+/// than waking the loop at once on every pass.
 #[cfg(unix)]
-fn terminal_poll_flags(accept_output: bool, local_write_pending: bool) -> PollFlags {
+fn terminal_poll_flags(
+    accept_output: bool,
+    local_write_pending: bool,
+    hung_up: bool,
+) -> Option<PollFlags> {
+    if hung_up && !accept_output && !local_write_pending {
+        return None;
+    }
     let mut flags = PollFlags::HUP | PollFlags::ERR;
     if accept_output {
         flags |= PollFlags::IN;
@@ -1116,7 +1136,7 @@ fn terminal_poll_flags(accept_output: bool, local_write_pending: bool) -> PollFl
     if local_write_pending {
         flags |= PollFlags::OUT;
     }
-    flags
+    Some(flags)
 }
 
 fn forward_error(error: et_net::forward::ForwardError) -> SessionError {
@@ -1521,10 +1541,25 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn pending_local_write_polls_both_terminal_directions() {
-        let flags = terminal_poll_flags(true, true);
+        let flags = terminal_poll_flags(true, true, false).unwrap();
 
         assert!(flags.contains(PollFlags::IN));
         assert!(flags.contains(PollFlags::OUT));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hung_up_terminal_is_polled_only_while_the_bridge_uses_it() {
+        // poll() reports HUP for any polled descriptor, so an idle hung-up
+        // terminal in the set would wake every pass.
+        assert_eq!(terminal_poll_flags(false, false, true), None);
+        assert!(terminal_poll_flags(false, false, false).is_some());
+        assert!(terminal_poll_flags(true, false, true)
+            .unwrap()
+            .contains(PollFlags::IN));
+        assert!(terminal_poll_flags(false, true, true)
+            .unwrap()
+            .contains(PollFlags::OUT));
     }
 
     #[cfg(unix)]

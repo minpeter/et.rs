@@ -437,3 +437,103 @@ fn unclaimed_sweep_does_not_close_starting_active_or_fresh_terminals() {
         runtime.shutdown().unwrap();
     }
 }
+
+#[test]
+fn terminal_hup_releases_session_whose_held_output_no_client_can_recover() {
+    // A full output queue, and an exit status held behind queued output, are
+    // both retained only for a client that recovers. Once the terminal hangs
+    // up the router drops the slot, so no client can.
+    for exit_status in [false, true] {
+        // Given: an active session whose client transport is gone.
+        let directory = TestDirectory::new();
+        let router_path = select_router_path_for(
+            rustix::process::getuid().as_raw(),
+            Some(&directory.socket()),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut runtime = Runtime::start(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, router_path).unwrap();
+        let address = runtime.tcp_addresses()[0];
+        let mut terminal = register(&directory.socket(), &runtime.handle());
+        let (stream, response) = handshake(address);
+        assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+        let mut client = Connection::new_client(stream, &passkey_to_key(KEY).unwrap());
+        let payload = InitialPayload {
+            jumphost: Some(false),
+            reversetunnels: Vec::new(),
+            environmentvariables: HashMap::new(),
+            flowcontrol: None,
+            no_pty: None,
+            command: None,
+            supports_exit_status: Some(true),
+            no_shell: None,
+            disconnect_timeout_seconds: None,
+        };
+        client.write_packet(253, &payload.encode_to_vec()).unwrap();
+        client.read_packet().unwrap();
+        read_local_packet(&mut terminal).unwrap();
+        let deadline = Instant::now() + TIMEOUT;
+        let session = loop {
+            if let Some(session) = runtime.core.sessions.active(ID).unwrap() {
+                break session;
+            }
+            assert!(Instant::now() < deadline, "session never became active");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        drop(client);
+        while session.connection_state().unwrap().0 {
+            assert!(Instant::now() < deadline, "client drop was not noticed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // When: the terminal produces output nobody drains, then hangs up.
+        let hangup = terminal.try_clone().unwrap();
+        let output = Packet::new(
+            TerminalPacketType::TerminalBuffer as u8,
+            TerminalBuffer {
+                buffer: Some(vec![b'x'; 4096]),
+                is_stderr: None,
+            }
+            .encode_to_vec(),
+        );
+        let writer = std::thread::spawn(move || {
+            if exit_status {
+                write_local_packet(&mut terminal, &output).unwrap();
+                let status = et_core::proto::TerminalExitStatus { exitcode: Some(0) };
+                let status = Packet::new(
+                    TerminalPacketType::TerminalExitStatus as u8,
+                    status.encode_to_vec(),
+                );
+                write_local_packet(&mut terminal, &status).unwrap();
+            } else {
+                // Blocks once the bridge stops reading; HUP ends it.
+                while write_local_packet(&mut terminal, &output).is_ok() {}
+            }
+        });
+        if exit_status {
+            writer.join().unwrap();
+            hangup.shutdown(std::net::Shutdown::Both).unwrap();
+        } else {
+            while session.can_buffer_write(64 * 1024).unwrap() {
+                assert!(Instant::now() < deadline, "terminal output never filled");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            hangup.shutdown(std::net::Shutdown::Both).unwrap();
+            writer.join().unwrap();
+        }
+
+        // Then: the bridge ends and releases the session.
+        let released = std::sync::Arc::downgrade(&session);
+        drop(session);
+        let deadline = Instant::now() + TIMEOUT;
+        while released.upgrade().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "bridge kept an unrecoverable session (exit_status={exit_status})"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        runtime.shutdown().unwrap();
+    }
+}

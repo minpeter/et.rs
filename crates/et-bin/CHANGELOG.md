@@ -1,3 +1,19 @@
+## et@0.0.46
+
+### `et -N` port forwards are no longer capped at about 12 MiB/s, and large uploads to ET C++ servers no longer stall
+
+`et -N` (and `-M`/`--ctl` sessions) sent one forwarded packet and then slept for 5 ms, which held every forward to about 12 MiB/s even on loopback. These sessions now keep sending while there is data and wake as soon as the connection or a forwarded socket is ready, like ET C++'s client loop. On loopback, `-N -L` uploads went from 12 to about 590 MiB/s and downloads from 150 to about 430 MiB/s. Interactive sessions with `-L` were not affected.
+
+Uploading through `-L` to an ET C++ server could also stop for good before the end. The last 16 MiB of a large transfer stayed queued in the client once the local application stopped writing. The client now sends that data too.
+
+### Reconnects no longer freeze the session for about 5 seconds
+
+When an ET C++ client reconnected to `etserver`, the server held the recovered session until that client sent something new. Usually that was the client's next keepalive, about 5 seconds later. Until then the server did not send terminal output, and keystrokes typed during the outage did not reach the shell. The handshake already proves which clients hold the session key, so the server now resumes those sessions at once, as ET C++ does. Older clients without that handshake now resume at once if they had input queued, because those queued packets also prove the key.
+
+The `et` client had a similar stall: if the server's first packets after a reconnect arrived together, `et` showed them only at its next keepalive. It now handles them at once.
+
+On loopback, reconnecting an ET C++ client to `etserver` went from 5.7 s to about 0.2 s, and the occasional 5 s reconnects of `et` (about one in five) no longer happen.
+
 ## et@0.0.45
 
 ### `etserver` no longer burns a CPU core on a session whose shell exited while the client was away

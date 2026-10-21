@@ -1,9 +1,13 @@
 core:changelogs:
-  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n### `etserver` no longer burns a CPU core on a session whose shell exited while the client was away\n\nWhen the client's connection dropped and the shell then exited with output the server could not deliver yet, such as a full output buffer or the final exit status, the session's thread kept waking without pause, using a whole CPU core until `etserver` stopped. Stopping `etserver` could then hang on that thread. Like ET C++, the server now stops watching a terminal it cannot read from. A session that no client can resume any more now ends.\n"
-    filename: hung-up-session-cpu.md
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n### `et -N` port forwards are no longer capped at about 12 MiB/s, and large uploads to ET C++ servers no longer stall\n\n`et -N` (and `-M`/`--ctl` sessions) sent one forwarded packet and then slept for 5 ms, which held every forward to about 12 MiB/s even on loopback. These sessions now keep sending while there is data and wake as soon as the connection or a forwarded socket is ready, like ET C++'s client loop. On loopback, `-N -L` uploads went from 12 to about 590 MiB/s and downloads from 150 to about 430 MiB/s. Interactive sessions with `-L` were not affected.\n\nUploading through `-L` to an ET C++ server could also stop for good before the end. The last 16 MiB of a large transfer stayed queued in the client once the local application stopped writing. The client now sends that data too.\n"
+    filename: forward-only-throughput.md
+    v: 0.0.0
+  - content: "---\npackages:\n  et:\n    type: patch\n---\n\n### Reconnects no longer freeze the session for about 5 seconds\n\nWhen an ET C++ client reconnected to `etserver`, the server held the recovered session until that client sent something new. Usually that was the client's next keepalive, about 5 seconds later. Until then the server did not send terminal output, and keystrokes typed during the outage did not reach the shell. The handshake already proves which clients hold the session key, so the server now resumes those sessions at once, as ET C++ does. Older clients without that handshake now resume at once if they had input queued, because those queued packets also prove the key.\n\nThe `et` client had a similar stall: if the server's first packets after a reconnect arrived together, `et` showed them only at its next keepalive. It now handles them at once.\n\nOn loopback, reconnecting an ET C++ client to `etserver` went from 5.7 s to about 0.2 s, and the occasional 5 s reconnects of `et` (about one in five) no longer happen.\n"
+    filename: recovery-without-client-traffic.md
     v: 0.0.0
 core:packages:
   - changelogIds:
-      - hung-up-session-cpu.md
+      - forward-only-throughput.md
+      - recovery-without-client-traffic.md
     id: cargo:et
     updated: true

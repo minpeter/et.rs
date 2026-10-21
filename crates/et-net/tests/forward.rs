@@ -633,6 +633,67 @@ fn try_receive_reports_backpressure_and_outbound_drain_recovers() {
     forwarder.shutdown().unwrap();
 }
 
+/// An upstream C++ peer advertises no window, so one bulk upload outruns the
+/// outbound channel into the worker's spill. Once the application stops
+/// writing, no socket event wakes the worker again: the session draining
+/// the channel must, or the spilled tail never leaves (`et -N -L` to an
+/// upstream server stranded the last 16 MiB of every large upload).
+#[cfg(unix)]
+#[test]
+fn spilled_upload_tail_reaches_the_session_after_the_writer_goes_quiet() {
+    // Above the 256-packet outbound channel, below channel plus spill so the
+    // writer finishes without the session draining anything.
+    const TRANSFER_BYTES: usize = 24 * 1024 * 1024;
+    let source_port = reserve_port();
+    let source = Forwarder::start(vec![request(source_port, 9)]).unwrap();
+    let mut application = TcpStream::connect((Ipv4Addr::LOCALHOST, source_port)).unwrap();
+    let destination_request = source.wait_outbound(TIMEOUT).unwrap();
+    let fd = PortForwardDestinationRequest::decode(destination_request.payload())
+        .unwrap()
+        .fd
+        .unwrap();
+    source
+        .receive(Packet::new(
+            TerminalPacketType::PortForwardDestinationResponse as u8,
+            et_core::proto::PortForwardDestinationResponse {
+                clientfd: Some(fd),
+                socketid: Some(7),
+                error: None,
+                window: None,
+            }
+            .encode_to_vec(),
+        ))
+        .unwrap();
+    application.set_write_timeout(Some(TIMEOUT)).unwrap();
+    application.write_all(&vec![1_u8; TRANSFER_BYTES]).unwrap();
+    // Let the worker read the kernel backlog into its spill and park. The
+    // assertion below does not depend on this; it only makes the parked
+    // state (the one that used to strand data) the state under test.
+    thread::sleep(Duration::from_millis(200));
+
+    // Drain like the client's local session loop: non-blocking pops only.
+    let deadline = Instant::now() + TIMEOUT;
+    let mut relayed = 0_usize;
+    while relayed < TRANSFER_BYTES {
+        assert!(
+            Instant::now() < deadline,
+            "spilled tail never reached the session: {relayed} of {TRANSFER_BYTES} bytes"
+        );
+        match source.try_outbound().unwrap() {
+            Some(packet) => {
+                relayed += PortForwardData::decode(packet.payload())
+                    .unwrap()
+                    .buffer
+                    .map_or(0, |buffer| buffer.len());
+            }
+            None => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    assert_eq!(relayed, TRANSFER_BYTES);
+    drop(application);
+    source.shutdown().unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn imported_local_bind_failure_obeys_strict_policy_transactionally() {

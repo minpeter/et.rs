@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{self, IsTerminal, Read};
+use std::net::TcpStream;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -15,6 +16,7 @@ use et_core::proto::{TerminalBuffer, TerminalExitStatus, TerminalPacketType as K
 use et_net::connection::{Connection, WritePacketError};
 use et_net::forward::{is_forward_packet, Forwarder};
 use prost::Message;
+use rustix::event::{poll, PollFd, PollFlags, Timespec};
 
 use crate::error::ClientError;
 use crate::initial_connect::ReconnectOutcome;
@@ -24,6 +26,10 @@ use crate::local_mux::{self as mux, ExitMarker};
 
 const MAX_CLIENTS: usize = 16;
 const MAX_PENDING: usize = 64;
+/// Longest an idle pump turn waits. The transport and forwarding wake are
+/// polled, so their traffic wakes the loop at once; local IPC, the
+/// passenger, and timers are serviced at least this often.
+const IDLE_WAIT: Duration = Duration::from_millis(5);
 
 pub fn enabled(args: &ClientArgs) -> bool {
     args.ctl || mux::master(args) || args.no_remote_command
@@ -697,6 +703,11 @@ where
             .push(signal_hook::flag::register(signal, stopped.clone()).map_err(error)?);
     }
     let mut pending_forward = None;
+    let mut stream = connection.try_clone_stream().map_err(error)?;
+    let forward_wake = forwarder
+        .wake()
+        .and_then(|wake| wake.try_clone().map_err(Into::into))
+        .map_err(error)?;
     let mut pending_output: Option<Vec<u8>> = None;
     let mut last_received = Instant::now();
     let mut keepalive = Instant::now();
@@ -765,6 +776,7 @@ where
             if runtime.stopping.is_none() && Instant::now() >= retry {
                 match reconnect(connection) {
                     Ok(ReconnectOutcome::Recovered) => {
+                        stream = connection.try_clone_stream().map_err(error)?;
                         last_received = Instant::now();
                         keepalive = Instant::now();
                     }
@@ -852,7 +864,7 @@ where
             }
             if let Some(packet) = runtime.pending.pop_front() {
                 match connection.start_write_packet_owned(packet.header(), packet.payload()) {
-                    Ok(()) => {}
+                    Ok(()) => progressed = true,
                     Err(WritePacketError::ReplayOwned(e))
                         if crate::client_terminal::connection_ended(&e) => {}
                     Err(WritePacketError::BeforeReplay(e))
@@ -870,10 +882,53 @@ where
         }
         // All batches above are bounded and service IPC on every turn. A
         // fixed sleep after progress throttles short PTY packets and partial
-        // pipe writes; sleep only when input/output could not advance.
+        // pipe writes; wait only when input/output could not advance, and
+        // let transport or forwarding readiness end the wait early.
         if !progressed {
-            std::thread::sleep(Duration::from_millis(5));
+            let accepts_outbound = !connection.write_pending()
+                && runtime.pending.len() < MAX_PENDING
+                && runtime.stopping.is_none();
+            let reads_transport = pending_forward.is_none() && pending_output.is_none();
+            wait_idle(
+                &stream,
+                connection.write_pending(),
+                reads_transport,
+                accepts_outbound.then_some(&forward_wake),
+            )?;
         }
+    }
+}
+
+/// Upstream `TerminalClient::run` polls the transport and every forwarded
+/// socket with a 10 ms cap instead of sleeping, so forwarding is
+/// event-driven. This loop keeps its IPC cadence but wakes on transport
+/// readability (when it would read), writability (while a frame is
+/// pending), and outbound forwarding packets (when it would send one).
+fn wait_idle(
+    stream: &TcpStream,
+    write_pending: bool,
+    reads_transport: bool,
+    forward_wake: Option<&UnixStream>,
+) -> Result<(), ClientError> {
+    let mut transport = PollFlags::empty();
+    if reads_transport {
+        transport |= PollFlags::IN;
+    }
+    if write_pending {
+        transport |= PollFlags::OUT;
+    }
+    let mut descriptors = Vec::with_capacity(2);
+    if !transport.is_empty() {
+        descriptors.push(PollFd::new(stream, transport));
+    }
+    if let Some(wake) = forward_wake {
+        descriptors.push(PollFd::new(wake, PollFlags::IN));
+    }
+    let timeout = Timespec::try_from(IDLE_WAIT).map_err(error)?;
+    match poll(&mut descriptors, Some(&timeout)) {
+        Ok(_) => Ok(()),
+        Err(errno) if errno == rustix::io::Errno::INTR => Ok(()),
+        Err(errno) => Err(error(io::Error::from(errno))),
     }
 }
 

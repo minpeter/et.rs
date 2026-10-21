@@ -958,10 +958,34 @@ impl Worker {
 
     /// Hand spilled outbound packets back to the session. Stops at the first
     /// one that still does not fit, keeping emission order.
+    ///
+    /// The worker loop calls this before every `poll(2)`. Packets left over
+    /// are flagged in `spill_pending` so the session's next pop wakes the
+    /// worker: no socket or command event may ever arrive (the local sender
+    /// already finished), and the spill would otherwise strand its tail.
     pub(super) fn flush_outbound_spill(&mut self) -> Result<(), ForwardError> {
         if self.engine {
             return Ok(());
         }
+        self.send_spilled()?;
+        if !self.outbound_spill.is_empty() {
+            // Publish, then retry: a pop after the store sees the flag and
+            // wakes us; a pop before it freed a slot this retry fills.
+            self.spill_pending.store(true, Ordering::SeqCst);
+            self.send_spilled()?;
+        }
+        if self.outbound_spill.is_empty() {
+            self.spill_pending.store(false, Ordering::SeqCst);
+        } else if !self
+            .wake_signalled
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let _ = (&*self.outbound_wake).write(&[1]);
+        }
+        Ok(())
+    }
+
+    fn send_spilled(&mut self) -> Result<(), ForwardError> {
         while let Some(packet) = self.outbound_spill.pop_front() {
             match self.outbound.try_send(packet) {
                 Ok(()) => {}
@@ -973,13 +997,6 @@ impl Worker {
                     return Err(ForwardError::Unavailable);
                 }
             }
-        }
-        if !self.outbound_spill.is_empty()
-            && !self
-                .wake_signalled
-                .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            let _ = (&*self.outbound_wake).write(&[1]);
         }
         Ok(())
     }

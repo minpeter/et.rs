@@ -8,6 +8,17 @@ use et_net::connection::{RecoveryExchange, WritePacketError, DEFAULT_RECOVERY_TI
 
 use super::{ActiveSession, SessionError, RECOVERY_LOCK_TIMEOUT};
 
+/// What already proved that a returning client holds the session key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PeerProof {
+    /// The `ConnectAuth` challenge verified the passkey during the handshake,
+    /// exactly as upstream `ServerConnection::authenticateClient` does.
+    Handshake,
+    /// Legacy peer without the challenge capability: a packet that decrypts
+    /// under the session key must arrive before the stream is installed.
+    Required,
+}
+
 impl ActiveSession {
     /// Acquire the single-flight recover permit without speaking on the wire.
     ///
@@ -53,14 +64,15 @@ impl ActiveSession {
     ///
     /// The connection mutex is held only for soft-disconnect/snapshot and for
     /// installing the new stream, not for sequence exchange or peer auth.
-    fn recover_body(&self, stream: TcpStream) -> Result<(), SessionError> {
-        self.recover_body_with(stream, RecoveryExchange::default())
+    fn recover_body(&self, stream: TcpStream, proof: PeerProof) -> Result<(), SessionError> {
+        self.recover_body_with(stream, RecoveryExchange::default(), proof)
     }
 
     fn recover_body_with(
         &self,
         stream: TcpStream,
         exchange: RecoveryExchange,
+        proof: PeerProof,
     ) -> Result<(), SessionError> {
         // Phase 1: soft-disconnect and snapshot under a short lock.
         let mut candidate = {
@@ -81,14 +93,20 @@ impl ActiveSession {
         };
 
         // Phase 2: recovery network I/O without the session connection lock.
-        candidate
+        let revived = candidate
             .run_recovery_handshake_with(DEFAULT_RECOVERY_TIMEOUT, exchange)
             .map_err(SessionError::Connection)?;
-        // Any packet that decrypts with the session key authenticates the
-        // returning client; it is requeued and handled by the session loop.
-        candidate
-            .authenticate_peer(DEFAULT_RECOVERY_TIMEOUT)
-            .map_err(SessionError::Connection)?;
+        // A legacy client proves the key with any packet that decrypts under
+        // it: a revived catchup packet already did. Otherwise wait for its
+        // first live packet, which is requeued for the session loop. A
+        // challenge-authenticated client is never held here: upstream clients
+        // send nothing live after recovery until input or their next
+        // keepalive, so waiting stalled output and replayed input for seconds.
+        if proof == PeerProof::Required && revived == 0 {
+            candidate
+                .authenticate_peer(DEFAULT_RECOVERY_TIMEOUT)
+                .map_err(SessionError::Connection)?;
+        }
         if self.output_flow().is_some() {
             candidate
                 .minimize_output_buffering()
@@ -199,10 +217,10 @@ pub(crate) struct RecoverPermit<'a> {
 
 impl RecoverPermit<'_> {
     /// Run the recovery handshake and install the new stream.
-    pub(crate) fn complete(self, stream: TcpStream) -> Result<(), SessionError> {
+    pub(crate) fn complete(self, stream: TcpStream, proof: PeerProof) -> Result<(), SessionError> {
         // `self` drops after this returns (or panics), clearing `recovering`
         // and flushing any straggler hold packets.
-        self.session.recover_body(stream)
+        self.session.recover_body(stream, proof)
     }
 
     /// Recover, optionally zeroing sequence history with a negotiated salt.
@@ -210,8 +228,9 @@ impl RecoverPermit<'_> {
         self,
         stream: TcpStream,
         exchange: RecoveryExchange,
+        proof: PeerProof,
     ) -> Result<(), SessionError> {
-        self.session.recover_body_with(stream, exchange)
+        self.session.recover_body_with(stream, exchange, proof)
     }
 }
 

@@ -782,6 +782,103 @@ fn non_tty_eof_or_read_error_disables_input_but_keeps_keepalive_forwarding_and_r
     }
 }
 
+/// Recovery reads the server's first live packet to authenticate it and
+/// requeues it; the packets after it often arrive in the same segment and
+/// wait in the reader with no socket readability left. The loop must process
+/// them at once rather than sleeping until its next keepalive.
+#[test]
+fn packets_buffered_by_recovery_are_handled_without_waiting_for_socket_readiness() {
+    use et_core::proto::{
+        PortForwardDestinationRequest, PortForwardDestinationResponse, SocketEndpoint,
+    };
+
+    const KEEPALIVE_SECONDS: u32 = 5;
+    let (client, server) = tcp_streams();
+    let mut peer = Connection::new_server(server, &[19; 32]);
+    let (recovered_client, recovered_server) = tcp_streams();
+    let mut recovered_peer = Connection::new_server(recovered_server, &[19; 32]);
+    let destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    // Queued before the client reconnects so one read takes both packets.
+    recovered_peer
+        .write_packet(TerminalPacketType::KeepAlive as u8, &[])
+        .unwrap();
+    recovered_peer
+        .write_packet(
+            TerminalPacketType::PortForwardDestinationRequest as u8,
+            &PortForwardDestinationRequest {
+                destination: Some(SocketEndpoint {
+                    name: Some("127.0.0.1".to_owned()),
+                    port: Some(i32::from(destination.local_addr().unwrap().port())),
+                }),
+                fd: Some(94),
+                window: None,
+            }
+            .encode_to_vec(),
+        )
+        .unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let mut connection = Connection::new_client(client, &[19; 32]);
+        let mut recovered_client = Some(recovered_client);
+        let (mut wake, _writer) = UnixStream::pair().unwrap();
+        wake.set_nonblocking(true).unwrap();
+        let (idle_stdin, _stdin_peer) = UnixStream::pair().unwrap();
+        let result = pump_with_stdin(
+            &mut connection,
+            &mut wake,
+            PumpOptions {
+                read_stdin: false,
+                keepalive_seconds: KEEPALIVE_SECONDS,
+                flow_control: et_cli::client::FlowControlMode::None,
+                terminal_enabled: false,
+                auto_cursor_report: false,
+                binary_stdio: false,
+                terminal_modes: &mut TerminalModeState::default(),
+                hangup: &crate::client_hangup::HangupClose::disabled(),
+                remote_exit: &crate::client_terminal::RemoteExit::new(false),
+                stdio_forward: false,
+            },
+            &mut Forwarder::start(Vec::new()).unwrap(),
+            |connection| {
+                let Some(stream) = recovered_client.take() else {
+                    return Ok(ReconnectOutcome::SessionEnded);
+                };
+                *connection = Connection::new_client(stream, &[19; 32]);
+                // As `reconnect::recover_connection` does.
+                connection
+                    .authenticate_peer(Duration::from_secs(3))
+                    .map_err(crate::error::ClientError::Transport)?;
+                Ok(ReconnectOutcome::Recovered)
+            },
+            idle_stdin,
+        );
+        done_tx.send(result).unwrap();
+    });
+    let dropped = Instant::now();
+    peer.shutdown().unwrap();
+
+    recovered_peer
+        .set_io_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let response = loop {
+        let packet = recovered_peer.read_packet().unwrap();
+        if packet.header() == TerminalPacketType::PortForwardDestinationResponse as u8 {
+            break PortForwardDestinationResponse::decode(packet.payload()).unwrap();
+        }
+        assert_eq!(packet.header(), TerminalPacketType::KeepAlive as u8);
+    };
+    let elapsed = dropped.elapsed();
+    assert_eq!(response.clientfd, Some(94));
+    assert!(
+        elapsed < Duration::from_secs(u64::from(KEEPALIVE_SECONDS) / 2),
+        "buffered packet waited {elapsed:?} for the keepalive timer"
+    );
+    recovered_peer.shutdown().unwrap();
+    let result = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    worker.join().unwrap();
+    assert!(result.is_ok(), "{result:?}");
+}
+
 #[test]
 fn real_tty_eof_still_ends_a_pty_session() {
     let pair = portable_pty::native_pty_system()

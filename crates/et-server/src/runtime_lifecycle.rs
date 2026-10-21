@@ -257,20 +257,26 @@ fn terminal_disconnected(
                 "id={}: removed session after terminal disconnect",
                 identity.id()
             ));
-            if let Some(SessionConnection::Starting(stream)) = removed.connection {
-                match stream.shutdown(std::net::Shutdown::Both) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
-                    Err(error) => {
-                        crate::diag::info(format!(
-                            "id={}: error shutting down session connection: {error}",
-                            identity.id()
-                        ));
-                        first_error.get_or_insert(RuntimeError::Session(
-                            crate::session::SessionError::Io(error),
-                        ));
+            match removed.connection {
+                Some(SessionConnection::Starting(stream)) => {
+                    match stream.shutdown(std::net::Shutdown::Both) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
+                        Err(error) => {
+                            crate::diag::info(format!(
+                                "id={}: error shutting down session connection: {error}",
+                                identity.id()
+                            ));
+                            first_error.get_or_insert(RuntimeError::Session(
+                                crate::session::SessionError::Io(error),
+                            ));
+                        }
                     }
                 }
+                // The bridge keeps draining to a connected client; without
+                // one, nothing it holds can be recovered any more.
+                Some(SessionConnection::Active(session)) => session.detach(),
+                None => {}
             }
         }
         Ok(None) => {

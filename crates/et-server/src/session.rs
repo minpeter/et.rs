@@ -130,10 +130,14 @@ pub(crate) struct ActiveSession {
     recover_hold: Mutex<Vec<(u8, Vec<u8>)>>,
     recover_hold_bytes: AtomicU64,
     shutdown: AtomicBool,
-    /// Set only by [`ActiveSession::shutdown`] (full session teardown).
-    /// Distinct from [`Self::shutdown`]: `finish_terminal` also sets that
-    /// flag so the bridge can drain HUP, and recover must still complete.
+    /// Set by [`ActiveSession::shutdown`] (full session teardown) and when a
+    /// detached session with no client retires. Distinct from
+    /// [`Self::shutdown`]: `finish_terminal` also sets that flag so the
+    /// bridge can drain HUP, and recover must still complete.
     torn_down: AtomicBool,
+    /// The router removed this session's slot after its terminal hung up,
+    /// so no returning client can look the session up any more.
+    detached: AtomicBool,
     /// Only one recover may run at a time. Concurrent returning clients used
     /// to queue on the connection mutex for minutes after a blackhole write.
     recovering: AtomicBool,
@@ -265,6 +269,7 @@ impl ActiveSession {
             recover_hold_bytes: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             torn_down: AtomicBool::new(false),
+            detached: AtomicBool::new(false),
             recovering: AtomicBool::new(false),
             recover_admission: Mutex::new(()),
             #[cfg(test)]
@@ -300,6 +305,34 @@ impl ActiveSession {
 
     pub(crate) fn kill_requested(&self) -> bool {
         self.kill_requested.load(Ordering::Acquire)
+    }
+
+    /// The router dropped this session's slot after its terminal hung up.
+    /// Wakes the bridge so a session without a client stops waiting for one.
+    pub(crate) fn detach(&self) {
+        self.detached.store(true, Ordering::Release);
+        let _ = self.signal();
+    }
+
+    /// Whether a detached session can end now: no client is connected and
+    /// none is recovering, so nothing the bridge still holds can reach a
+    /// client. Closes recover admission in the same step, so a handler that
+    /// looked the session up before it was detached cannot start a recover
+    /// that expects that output.
+    pub(crate) fn retire_if_unreachable(&self) -> Result<bool, SessionError> {
+        if !self.detached.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let _admission = self
+            .recover_admission
+            .lock()
+            .map_err(|_| SessionError::Unavailable)?;
+        // A finished recover installs its stream before it clears the flag.
+        if self.recovering.load(Ordering::Acquire) || self.connection_state()?.0 {
+            return Ok(false);
+        }
+        self.torn_down.store(true, Ordering::Release);
+        Ok(true)
     }
 
     /// Upstream `disconnectDeadlineReached`: a non-positive timeout never

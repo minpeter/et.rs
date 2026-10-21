@@ -780,6 +780,103 @@ server) unless noted:
 | `-D` SOCKS5 CONNECT, 256 KiB echoed | pass | pass |
 | `-L`/`-R` 8 MiB each way and a 64-byte round trip, every client/`etserver`/`etterminal` mix | pass | pass |
 
+### Forward-only session throughput and spilled upload tails (et.rs 0.0.46)
+
+Upstream
+[`TerminalClient::run`](https://github.com/MisterTea/EternalTerminal/blob/7ee361a75fbb3e0900445b110188996fbe950823/src/terminal/TerminalClient.cpp#L535-L556)
+runs every client mode, `-N` included, from one loop. Each turn it polls the
+transport and every forwarded socket with a 10 ms cap, so forwarding wakes on
+readiness. In et.rs, `-N`, `-M` and `--ctl` sessions run the local session
+pump (`crates/et-bin/src/local_session.rs`). That pump sent one forwarding
+packet per turn. A started write did not count as progress, so the turn ended
+in a fixed 5 ms sleep, which capped every `-N` forward at about 64 KiB / 5 ms.
+The pump now counts a started write as progress. An idle turn waits in
+`poll(2)` on the transport (read while it can take packets, write while a
+frame is pending) and on the forwarding wake (while it can take an outbound
+packet). The 5 ms cap stays because local IPC, the passenger and timers are
+still serviced on that cadence. Interactive sessions already polled
+forwarding descriptors through the session engine and are unchanged.
+
+Upstream writes forwarding data synchronously from `PortForwardHandler::update`
+and has no outbound queue between the forwarder and the session, so the second
+fix has no upstream counterpart. The et.rs forwarding worker thread parks
+packets that do not fit the 256-packet outbound channel in a spill queue. It
+retried the spill only when a socket or command event woke it. With a peer
+that advertises no window (ET C++), one bulk upload fills the spill. Once the
+local application went quiet, no further event arrived, and the spilled tail
+(up to 256 packets, about 16 MiB) never reached the transport. Before
+sleeping, the worker now publishes `spill_pending`. The session's next pop
+from that channel force-wakes the worker. Windowed et.rs peers bound
+per-socket in-flight data, but enough parallel sockets could reach the same
+state.
+
+Live check (2026-10-21, loopback, release build, 512 MiB per run; ET C++ is
+master 7ee361a built with upstream's vcpkg defaults):
+
+| `-N -L` upload, client → server | Before | After |
+| --- | --- | --- |
+| et.rs → et.rs | 12 MiB/s | 557–620 MiB/s |
+| et.rs → ET C++ | stalled 16 MiB short of the end | 467–507 MiB/s |
+| ET C++ → et.rs | 342–366 MiB/s | 342–365 MiB/s |
+| ET C++ → ET C++ (reference) | 341–370 MiB/s | — |
+
+`-N -L` downloads (256 MiB) went from 150 to 431 MiB/s for et.rs → et.rs. For
+et.rs → ET C++ they stayed at about 300–320 MiB/s. Interactive `-L` sessions
+measured 537–563 MiB/s (et.rs server) and 385–398 MiB/s (ET C++ server)
+before and after. The per-socket credit window (`WINDOW_BYTES`) was not a
+limit at these rates and is unchanged.
+
+No wire, handshake, crypto or `PROTOCOL_VERSION` change.
+
+### Recovery without waiting for client traffic (et.rs 0.0.46)
+
+Upstream
+[`ServerConnection::clientHandler`](https://github.com/MisterTea/EternalTerminal/blob/7ee361a75fbb3e0900445b110188996fbe950823/src/base/ServerConnection.cpp#L105-L238)
+verifies a returning client's `ConnectAuth` proof (#793). It then runs
+`recoverClient` (sequence and catchup exchange) and resumes at once. Legacy
+peers without the challenge capability are not authenticated at all. After
+every recovery, `etserver` waited for one live packet that decrypts under the
+session key (`Connection::authenticate_peer`) before it installed the new
+stream. Upstream clients send nothing live after recovery until the user
+types or the next keepalive arrives. Their input typed during the outage
+travels in the catchup, not as live traffic. So an ET C++ client got no
+terminal output for 5.1–6.0 s after each reconnect: terminal output stayed in
+the recover hold, and the replayed keystrokes waited too.
+
+The server now skips that wait in two cases:
+
+- The challenge already verified the passkey (`PeerProof::Handshake`). This
+  matches upstream.
+- A legacy peer's catchup was non-empty. `BackedReader::revive` decrypts every
+  catchup packet under the session key, which is the same proof.
+
+Only a legacy peer with an empty catchup still waits for its first live
+packet. That is stricter than upstream, which trusts legacy peers outright,
+and is an intentional difference.
+
+The et.rs client also authenticates recovery with the server's first live
+packet and requeues it. Upstream's client keeps no such wait. The packets
+after it often arrive in the same segment and then wait in the reader with
+no socket readability left. The client loop slept on the socket until its
+next keepalive deadline (5 s by default). This happened in about one
+reconnect in five, against both servers. The loop now treats packets
+already decoded in the reader as ready input
+(`crates/et-bin/src/client_terminal_loop.rs`). `et -N` and `--ctl` sessions
+read every turn and were not affected.
+
+Live check (2026-10-22, loopback, load average 40–57; a TCP relay between
+client and `etserver` resets the connection, then one key is typed and timed
+until it echoes):
+
+| Client → server | Before | After |
+| --- | --- | --- |
+| ET C++ → et.rs (15 resets) | 5085–6021 ms, median 5701 | 111–305 ms, median 187 |
+| et.rs → ET C++ (15 resets) | 4 of 15 took 5068–5143 ms | 15–120 ms, median 100, none slow |
+| et.rs → et.rs (15 resets) | 2 of 15 took 5017–5019 ms | 11–113 ms, median 26, none slow |
+| ET C++ → ET C++ (reference) | 103–198 ms | 129–240 ms |
+
+No wire, handshake, crypto or `PROTOCOL_VERSION` change.
+
 ## Ledger (classified 2026-10-14)
 
 Twenty commits after [`e02aefa`](https://github.com/MisterTea/EternalTerminal/commit/e02aefa2301a9544fe7a40564e612dcf122291e1).

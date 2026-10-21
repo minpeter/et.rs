@@ -98,7 +98,11 @@ impl Connection {
     ///
     /// Server order: write our catchup, then read the peer's. Pass
     /// [`RecoveryExchange::client`] from the client so it reads first.
-    pub fn run_recovery_handshake(&mut self, timeout: Duration) -> Result<(), ConnError> {
+    ///
+    /// Returns how many peer catchup packets were revived. Each one decrypted
+    /// under the session key, so a nonzero count already proves the peer
+    /// holds it (see [`Self::authenticate_peer`]).
+    pub fn run_recovery_handshake(&mut self, timeout: Duration) -> Result<usize, ConnError> {
         self.run_recovery_handshake_with(timeout, RecoveryExchange::default())
     }
 
@@ -106,7 +110,7 @@ impl Connection {
         &mut self,
         timeout: Duration,
         exchange: RecoveryExchange,
-    ) -> Result<(), ConnError> {
+    ) -> Result<usize, ConnError> {
         let deadline = recovery_deadline(timeout)?;
         match self.exchange_recovery(deadline, exchange) {
             Ok(remote_catchup) => {
@@ -117,10 +121,11 @@ impl Connection {
                 } else {
                     remote_catchup.buffer
                 };
+                let revived = catchup.len();
                 self.reader().revive(catchup)?;
                 self.writer.revive();
                 self.set_io_timeout(None)?;
-                Ok(())
+                Ok(revived)
             }
             Err(error) => {
                 let _ = self.stream.shutdown(Shutdown::Both);

@@ -465,8 +465,12 @@ where
         if connection.write_pending() {
             network_flags |= PollFlags::OUT;
         }
+        // Packets can wait in the reader with no socket readability left:
+        // recovery requeues the packet that authenticated the server, often
+        // read in the same segment as the output after it. Sleeping on the
+        // socket then left them until the next keepalive.
         if (!connection.write_pending() && outbound_ready && !delivery_blocked)
-            || (inbound_ready
+            || ((inbound_ready || connection.has_buffered_read())
                 && pending_output.is_none()
                 && pending_forward.len() < FORWARD_BACKLOG_CAPACITY)
         {

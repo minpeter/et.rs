@@ -337,6 +337,13 @@ pub(crate) fn handle(
             }
             #[cfg(test)]
             run_after_returning_status_hook(&id);
+            // The challenge already proved the passkey; legacy peers prove it
+            // with a packet that decrypts under the session key.
+            let proof = if decision.is_some() {
+                crate::session::PeerProof::Handshake
+            } else {
+                crate::session::PeerProof::Required
+            };
             let recovered = if let Some(salt) = reset_salt {
                 permit.complete_with(
                     stream,
@@ -344,9 +351,10 @@ pub(crate) fn handle(
                         read_peer_catchup_first: false,
                         reset_salt: Some(salt),
                     },
+                    proof,
                 )
             } else {
-                permit.complete(stream)
+                permit.complete(stream, proof)
             };
             match recovered {
                 Ok(()) => {

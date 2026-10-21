@@ -16,7 +16,7 @@ use et_core::proto::{
 };
 use et_net::connection::DEFAULT_LIVE_WRITE_TIMEOUT;
 use et_net::framing_io::{read_proto_limited, write_proto};
-use et_net::handshake::client_request;
+use et_net::handshake::{client_handshake, client_request};
 use et_net::local_packet::{read_local_packet, write_local_packet};
 use et_server::SessionState;
 use prost::Message;
@@ -191,6 +191,81 @@ fn returning_client_receives_exact_buffered_server_catchup() {
     let forwarded = read_upstream(&mut terminal).unwrap();
     assert_eq!(forwarded.header(), TerminalPacketType::TerminalInfo as u8);
     assert_eq!(forwarded.payload(), b"post-recovery");
+    server.runtime.shutdown().unwrap();
+}
+
+/// Start an active session and drop its transport, as a lost network does.
+fn active_session_then_drop(server: &TestRuntime) -> (et_net::connection::Connection, UnixStream) {
+    let mut terminal = server.register(ID_A, KEY_A);
+    terminal.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let key = passkey_to_key(KEY_A).unwrap();
+    let (mut client, initial) = initialize(stream, &key, default_payload());
+    assert_eq!(initial.error, None);
+    server
+        .handle
+        .wait_for_state(ID_A, SessionState::Active, TIMEOUT)
+        .unwrap();
+    let init = read_local_packet(&mut terminal).unwrap();
+    assert_eq!(init.header(), TerminalPacketType::TerminalInit as u8);
+    client.shutdown().unwrap();
+    (client, terminal)
+}
+
+/// Upstream C++ clients send nothing live after recovery until the user
+/// types or their next keepalive (seconds later). A client the `ConnectAuth`
+/// challenge already authenticated must get its session back at once.
+#[test]
+fn challenge_authenticated_recovery_does_not_wait_for_live_client_traffic() {
+    let mut server = TestRuntime::start();
+    let (mut client, _terminal) = active_session_then_drop(&server);
+
+    let mut stream = std::net::TcpStream::connect(server.address).unwrap();
+    runtime_support::bound(&stream);
+    let key = passkey_to_key(KEY_A).unwrap();
+    let response =
+        client_handshake(&mut stream, ID_A, &key, false, Instant::now() + TIMEOUT).unwrap();
+    assert_eq!(response.status, Some(ConnectStatus::ReturningClient as i32));
+    client.recover(stream).unwrap();
+    client.set_io_timeout(Some(TIMEOUT)).unwrap();
+    // Output produced after the exchange (not catchup), with no live packet
+    // from the client, must still reach it.
+    server
+        .handle
+        .send_packet(ID_A, TerminalPacketType::TerminalBuffer as u8, b"after")
+        .unwrap();
+    loop {
+        let packet = client
+            .read_packet()
+            .expect("server held the recovered session waiting for client traffic");
+        if packet.header() == TerminalPacketType::TerminalBuffer as u8 {
+            assert_eq!(packet.payload(), b"after");
+            break;
+        }
+        assert_eq!(packet.header(), TerminalPacketType::KeepAlive as u8);
+    }
+    server.runtime.shutdown().unwrap();
+}
+
+/// A legacy client's catchup packet decrypts under the session key, which is
+/// the proof the live-packet wait exists for; input typed during the outage
+/// must reach the terminal without waiting for more client traffic.
+#[test]
+fn legacy_recovery_with_client_catchup_does_not_wait_for_live_client_traffic() {
+    let mut server = TestRuntime::start();
+    let (mut client, mut terminal) = active_session_then_drop(&server);
+    client
+        .write_packet(TerminalPacketType::TerminalInfo as u8, b"typed-offline")
+        .unwrap();
+
+    let (returning, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::ReturningClient as i32));
+    client.recover(returning).unwrap();
+    let forwarded = read_upstream(&mut terminal)
+        .expect("server held the recovered session waiting for client traffic");
+    assert_eq!(forwarded.header(), TerminalPacketType::TerminalInfo as u8);
+    assert_eq!(forwarded.payload(), b"typed-offline");
     server.runtime.shutdown().unwrap();
 }
 

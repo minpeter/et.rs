@@ -103,6 +103,7 @@ mod session_recovery;
 use session_flow::FlowControl;
 #[cfg(unix)]
 pub(crate) use session_flow::OutputPump;
+pub(crate) use session_recovery::PeerProof;
 
 pub(crate) struct ActiveSession {
     connection: Mutex<Connection>,
@@ -800,7 +801,7 @@ mod tests {
         let (candidate, _) = extra.accept().unwrap();
         let _extra_peer = extra_peer.join().unwrap();
         assert!(matches!(
-            permit.complete(candidate),
+            permit.complete(candidate, PeerProof::Required),
             Err(SessionError::Unavailable)
         ));
         assert!(!session.recovering.load(Ordering::Acquire));

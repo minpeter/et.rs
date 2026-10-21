@@ -642,6 +642,65 @@ fn no_shell_master_forwards_unix_sockets_and_rejects_shell_passengers() {
 }
 
 #[test]
+fn no_shell_master_forward_round_trips_do_not_sleep_after_each_write() {
+    // `-N` runs the local session pump. A started transport write did not
+    // count as progress, so every turn that sent a forwarding packet ended in
+    // a fixed 5 ms sleep: each round trip through an `-N` forward cost at
+    // least 5 ms (and bulk transfers were capped at 64 KiB / 5 ms), however
+    // fast or idle the machine. Round trips, unlike bulk throughput, keep
+    // that floor far from a loaded machine's real cost.
+    const ROUND_TRIPS: u32 = 300;
+    const OLD_FLOOR: Duration = Duration::from_millis(5 * ROUND_TRIPS as u64);
+    let stack = Stack::start();
+    let socket = stack.root.join("mux");
+    let echo = TcpListener::bind("127.0.0.1:0").unwrap();
+    let destination = echo.local_addr().unwrap().port();
+    let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
+    let source = reserved.local_addr().unwrap().port();
+    drop(reserved);
+    let spec = format!("127.0.0.1:{source}:127.0.0.1:{destination}");
+    let started = output(
+        stack
+            .client()
+            .args(["-M", "-f", "-NT", "-S"])
+            .arg(&socket)
+            .args(["-o", "ControlPersist=yes", "--tunnel", &spec, "127.0.0.1"]),
+    );
+    assert!(started.status.success(), "{started:?}");
+    let echo_worker = std::thread::spawn(move || {
+        let (mut socket, _) = echo.accept().unwrap();
+        socket.set_nodelay(true).unwrap();
+        socket.set_read_timeout(Some(LIMIT)).unwrap();
+        let mut buffer = [0; 64];
+        while socket.read_exact(&mut buffer).is_ok() {
+            socket.write_all(&buffer).unwrap();
+        }
+    });
+    let mut forward = TcpStream::connect(("127.0.0.1", source)).unwrap();
+    forward.set_nodelay(true).unwrap();
+    forward.set_read_timeout(Some(LIMIT)).unwrap();
+    let mut round_trip = |message: &[u8; 64]| {
+        forward.write_all(message).unwrap();
+        let mut reply = [0; 64];
+        forward.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, message);
+    };
+    // The first exchange opens the tunnel's destination socket.
+    round_trip(&[0; 64]);
+    let began = Instant::now();
+    for index in 1..=ROUND_TRIPS {
+        round_trip(&[index as u8; 64]);
+    }
+    let elapsed = began.elapsed();
+    drop(forward);
+    echo_worker.join().unwrap();
+    assert!(
+        elapsed < OLD_FLOOR,
+        "{ROUND_TRIPS} round trips through an -N forward took {elapsed:?}"
+    );
+}
+
+#[test]
 fn generated_control_handle_uses_host_and_no_persist_does_not_save_credentials() {
     let stack = Stack::start();
     let socket = stack.root.join("ctl");

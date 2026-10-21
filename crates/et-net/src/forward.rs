@@ -461,6 +461,11 @@ pub struct Forwarder {
     wake_writer: Arc<UnixStream>,
     #[cfg(unix)]
     wake_signalled: Arc<AtomicBool>,
+    /// Set by the worker thread before it sleeps with packets spilled past
+    /// the full outbound channel. Popping from that channel is the only
+    /// thing that makes room, so the popper must wake the worker.
+    #[cfg(unix)]
+    spill_pending: Arc<AtomicBool>,
     /// The worker, once a session loop took it over (see `Engine`).
     #[cfg(unix)]
     engine: Mutex<Option<Box<Engine>>>,
@@ -613,6 +618,10 @@ fn start_forwarder_hook(
     #[cfg(unix)]
     let worker_wake_signalled = wake_signalled.clone();
     #[cfg(unix)]
+    let spill_pending = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    let worker_spill_pending = spill_pending.clone();
+    #[cfg(unix)]
     let (handover_request, handover_request_rx) = channel::bounded(1);
     #[cfg(unix)]
     let (handover_reply_tx, handover_reply) = channel::bounded(1);
@@ -689,6 +698,7 @@ fn start_forwarder_hook(
                             reply,
                         },
                         wake_signalled: worker_wake_signalled,
+                        spill_pending: worker_spill_pending,
                     },
                     wake_writer,
                     (session_user, worker_shutdown.clone()),
@@ -729,6 +739,8 @@ fn start_forwarder_hook(
         wake_writer: forwarder_wake_writer,
         #[cfg(unix)]
         wake_signalled,
+        #[cfg(unix)]
+        spill_pending,
         #[cfg(unix)]
         engine: Mutex::new(None),
         #[cfg(unix)]
@@ -1193,7 +1205,11 @@ impl Forwarder {
             result.map(Some)
         } else {
             match self.outbound.try_recv() {
-                Ok(result) => result.map(Some),
+                Ok(result) => {
+                    #[cfg(unix)]
+                    self.resume_spilled_worker();
+                    result.map(Some)
+                }
                 Err(channel::TryRecvError::Empty) => {
                     #[cfg(unix)]
                     if self.wake_signalled.load(Ordering::Acquire) {
@@ -1224,7 +1240,23 @@ impl Forwarder {
         }
         #[cfg(unix)]
         self.commands.flush_wake();
-        wait_outbound_from(&self.priority, &self.outbound, timeout)
+        let packet = wait_outbound_from(&self.priority, &self.outbound, timeout);
+        #[cfg(unix)]
+        if packet.is_ok() {
+            self.resume_spilled_worker();
+        }
+        packet
+    }
+
+    /// Wake a worker thread that parked spilled packets behind the full
+    /// outbound channel; the pop that just happened made room for them.
+    #[cfg(unix)]
+    fn resume_spilled_worker(&self) {
+        if self.spill_pending.load(Ordering::SeqCst)
+            && self.spill_pending.swap(false, Ordering::SeqCst)
+        {
+            self.commands.force_wake();
+        }
     }
 
     /// `wait_outbound` for a session-driven engine: pump it on this thread.

@@ -620,6 +620,8 @@ pub(crate) struct WorkerChannels {
     pub(crate) handover: poll::HandoverLink,
     #[cfg(unix)]
     pub(crate) wake_signalled: Arc<AtomicBool>,
+    #[cfg(unix)]
+    pub(crate) spill_pending: Arc<AtomicBool>,
 }
 
 /// Run the forwarding worker until shutdown. On Unix the worker may instead
@@ -649,6 +651,8 @@ pub(crate) fn run(
         handover,
         #[cfg(unix)]
         wake_signalled,
+        #[cfg(unix)]
+        spill_pending,
     } = channels;
     #[cfg(unix)]
     let (session_user, shutdown) = control;
@@ -667,6 +671,7 @@ pub(crate) fn run(
         worker.listeners = listeners;
         worker.next_client_fd = next_client_fd;
         worker.wake_signalled = wake_signalled.clone();
+        worker.spill_pending = spill_pending;
         worker.handover_request = handover.request;
         match worker.run(sources, commands, session_user, stdio_open)? {
             Some(commands) => {
@@ -770,6 +775,9 @@ struct Worker {
     outbound_spill: std::collections::VecDeque<crate::forward::Outbound>,
     #[cfg(unix)]
     wake_signalled: Arc<AtomicBool>,
+    /// Shared with the forwarder; see `Forwarder::spill_pending`.
+    #[cfg(unix)]
+    pub(super) spill_pending: Arc<AtomicBool>,
     #[cfg(unix)]
     pub(super) defer_outbound_wake: bool,
     #[cfg(unix)]
@@ -885,6 +893,8 @@ impl Worker {
             outbound_spill: std::collections::VecDeque::new(),
             #[cfg(unix)]
             wake_signalled: Arc::new(AtomicBool::new(false)),
+            #[cfg(unix)]
+            spill_pending: Arc::new(AtomicBool::new(false)),
             #[cfg(unix)]
             defer_outbound_wake: false,
             #[cfg(unix)]

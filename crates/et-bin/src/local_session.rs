@@ -779,7 +779,9 @@ where
     }
     drop(signal_writer);
     let interval = Duration::from_secs(args.keepalive.into());
-    let silence = Duration::from_secs(u64::from(args.keepalive) * 3);
+    // Upstream's two-step dead-link detection, shared with the interactive
+    // loops (see `keepalive_clock`).
+    let clock = crate::keepalive_clock::KeepaliveClock::new(interval, Instant::now());
     let mut pending_forward = VecDeque::with_capacity(FORWARD_BACKLOG);
     let mut stream = connection.try_clone_stream().map_err(error)?;
     let forward_wake = forwarder
@@ -792,8 +794,6 @@ where
     let mut inbound_ready = false;
     let mut pending_output: Option<Vec<u8>> = None;
     let mut transport_ready = true;
-    let mut last_received = Instant::now();
-    let mut keepalive = Instant::now();
     let mut retry = Instant::now();
     loop {
         if stopped.load(std::sync::atomic::Ordering::Relaxed) && runtime.stopping.is_none() {
@@ -809,9 +809,8 @@ where
             .map_err(error)?;
         progressed |= runtime.pump_passenger();
         if let Some(bytes) = pending_output.take() {
-            // Local backpressure is not transport silence. Keep servicing IPC,
-            // outgoing keepalives and forwarding while the consumer catches up.
-            last_received = Instant::now();
+            // Local backpressure is not transport silence: the clock takes no
+            // verdict while transport reads are paused behind this output.
             if runtime.output_blocked(bytes.len()) {
                 pending_output = Some(bytes);
             } else {
@@ -860,8 +859,7 @@ where
                 match reconnect(connection) {
                     Ok(ReconnectOutcome::Recovered) => {
                         stream = connection.try_clone_stream().map_err(error)?;
-                        last_received = Instant::now();
-                        keepalive = Instant::now();
+                        clock.alive(Instant::now());
                         progressed = true;
                     }
                     Ok(ReconnectOutcome::SessionEnded) => return Ok(0),
@@ -889,7 +887,7 @@ where
                 match connection.try_read_packet() {
                     Ok(Some(packet)) => {
                         progressed = true;
-                        last_received = Instant::now();
+                        clock.alive(Instant::now());
                         if packet.header() == Kind::KeepAlive as u8 {
                             if let Some(ack) = et_core::keepalive::decode_ack(packet.payload()) {
                                 connection.acknowledge_delivery(ack);
@@ -950,14 +948,16 @@ where
             }
             if connection.connected()
                 && !connection.write_pending()
-                && keepalive.elapsed() >= interval
+                && clock.probe_due(Instant::now())
                 && runtime.stopping.is_none()
             {
-                runtime.pending.push_front(Packet::new(
-                    Kind::KeepAlive as u8,
-                    connection.keepalive_ack().to_vec(),
-                ));
-                keepalive = Instant::now();
+                let ack =
+                    connection.next_keepalive_ack(et_core::keepalive::AckSide::Initiator, false);
+                let payload = et_core::keepalive::ack_bytes(&ack).to_vec();
+                runtime
+                    .pending
+                    .push_front(Packet::new(Kind::KeepAlive as u8, payload));
+                clock.probe_sent(Instant::now());
                 bytes_since_ack = 0;
             }
             // Keepalives and IPC traffic go ahead of forwarding data.
@@ -1008,14 +1008,21 @@ where
                 && bytes_since_ack >= et_core::keepalive::ACK_INTERVAL_BYTES
             {
                 bytes_since_ack = 0;
-                keepalive = Instant::now();
-                let ack = Packet::new(Kind::KeepAlive as u8, connection.keepalive_ack().to_vec());
+                // Volume acknowledgements are not probes: they leave the clock.
+                let ack =
+                    connection.next_keepalive_ack(et_core::keepalive::AckSide::Initiator, true);
+                let ack = Packet::new(
+                    Kind::KeepAlive as u8,
+                    et_core::keepalive::ack_bytes(&ack).to_vec(),
+                );
                 if let Some(packet) = send(connection, ack)? {
                     runtime.pending.push_front(packet);
                 }
                 progressed = true;
             }
-            if last_received.elapsed() > silence {
+            let reading = pending_output.is_none() && pending_forward.len() < FORWARD_BACKLOG;
+            if clock.dead(Instant::now(), reading) {
+                et_cli::logging::info("missed a keepalive, reconnecting");
                 connection.disconnect();
             }
             // A lost transport retries at once rather than after a wait.
@@ -1035,14 +1042,14 @@ where
             connected && pending_output.is_none() && pending_forward.len() < FORWARD_BACKLOG;
         let now = Instant::now();
         let mut deadline = if connected {
-            let mut deadline = connection
-                .pending_write_deadline()
-                .unwrap_or(keepalive + interval)
-                .min(last_received + silence);
-            if let Some(release) = delivery_gate.release_at(interval) {
-                deadline = deadline.min(release);
+            let mut deadline = connection.pending_write_deadline();
+            if let Some(at) = clock.wake_at(reads_transport, !write_pending) {
+                deadline = earliest(deadline, at);
             }
-            Some(deadline)
+            if let Some(release) = delivery_gate.release_at(interval) {
+                deadline = earliest(deadline, release);
+            }
+            deadline
         } else if runtime.stopping.is_none() {
             Some(retry)
         } else {

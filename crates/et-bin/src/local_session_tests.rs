@@ -536,3 +536,49 @@ fn no_shell_pump_acknowledges_by_volume_and_bounds_unacknowledged_forwarding() {
     assert_eq!(session.join().unwrap().unwrap(), 0);
     uploader.join().unwrap();
 }
+
+#[test]
+fn no_shell_pump_declares_a_silent_link_dead_after_two_keepalive_intervals() {
+    use std::net::{Ipv4Addr, TcpListener, TcpStream};
+
+    // Given: an `-N` session whose server stays connected but never answers.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let _silent_server = listener.accept().unwrap().0;
+    let started = Instant::now();
+    let session = std::thread::spawn(move || {
+        let mut connection = Connection::new_client(client, &[29; 32]);
+        let mut forwarder = Forwarder::start(Vec::new()).unwrap();
+        let args = ClientArgs::try_parse_from(["et", "-N", "-k", "1", "host"]).unwrap();
+        let mut runtime = Runtime::new(
+            &args,
+            Prepared {
+                mux: None,
+                ctl: None,
+            },
+        )
+        .unwrap();
+        let mut reconnect_at = None;
+        let result = pump(
+            &mut connection,
+            &args,
+            &mut forwarder,
+            &mut runtime,
+            &mut |_: &mut Connection| {
+                reconnect_at.get_or_insert_with(Instant::now);
+                Ok(ReconnectOutcome::SessionEnded)
+            },
+        );
+        (result, reconnect_at)
+    });
+
+    // Then: like upstream, one interval to the probe and one more for the
+    // verdict (the former three-interval rule waited 3 s).
+    let (result, reconnect_at) = session.join().unwrap();
+    assert_eq!(result.unwrap(), 0);
+    let waited = reconnect_at.expect("pump never reconnected") - started;
+    assert!(
+        (Duration::from_millis(1900)..Duration::from_millis(2700)).contains(&waited),
+        "reconnected after {waited:?}"
+    );
+}

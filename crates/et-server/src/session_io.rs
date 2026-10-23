@@ -19,7 +19,6 @@ impl ActiveSession {
             .ok_or(SessionError::Unavailable)
     }
 
-    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn try_clone_stream(&self) -> Result<(TcpStream, u64), SessionError> {
         let connection = self
             .connection

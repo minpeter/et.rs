@@ -193,6 +193,56 @@ fn detected_disconnect_buffers_write_exactly_once() {
     assert_eq!(server.writer_sequence(), 1);
 }
 
+/// A peer that ends a session sends its last packets and then closes. A
+/// write probe that finds that EOF must not discard what the reader already
+/// received: `et -T` lost its last output and exit status that way whenever
+/// an acknowledgement went out between the final read and the EOF.
+#[cfg(target_os = "linux")]
+#[test]
+fn write_probe_at_peer_eof_keeps_already_received_packets_readable() {
+    use et_core::proto::TerminalPacketType;
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+
+    // Given: the server sent its last output and exit status, then closed,
+    // and the client has read both, but only consumed the first.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client_stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server_stream, _) = listener.accept().unwrap();
+    let observer = client_stream.try_clone().unwrap();
+    let mut client = Connection::new_client(client_stream, &[8; 32]);
+    let mut server = Connection::new_server(server_stream, &[8; 32]);
+    server
+        .write_packet(TerminalPacketType::TerminalBuffer as u8, b"last output")
+        .unwrap();
+    server
+        .write_packet(TerminalPacketType::TerminalExitStatus as u8, b"exit status")
+        .unwrap();
+    server.shutdown().unwrap();
+    let mut closed = [PollFd::new(&observer, PollFlags::RDHUP)];
+    let timeout = Timespec {
+        tv_sec: 3,
+        tv_nsec: 0,
+    };
+    poll(&mut closed, Some(&timeout)).unwrap();
+    assert!(closed[0].revents().contains(PollFlags::RDHUP));
+    let first = client.try_read_packet().unwrap().unwrap();
+    assert_eq!(first.payload(), b"last output");
+
+    // When: the client sends a keep-alive, whose probe sees the EOF.
+    client
+        .write_packet(TerminalPacketType::KeepAlive as u8, &[])
+        .unwrap();
+
+    // Then: the exit status is still read before the EOF is reported.
+    let second = client.try_read_packet().unwrap();
+    assert_eq!(
+        second.as_ref().map(|packet| packet.payload()),
+        Some(b"exit status".as_slice())
+    );
+    assert!(client.try_read_packet().is_err());
+    assert!(!client.connected());
+}
+
 /// ANT-2026-VAMER5RC: a bad attacker-supplied sequence is a caught error, and
 /// the live victim socket is not closed before recover succeeds.
 #[test]

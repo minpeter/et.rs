@@ -2,8 +2,9 @@
 //!
 //! The replay backup must hold every frame the server has not read. Kernel
 //! socket buffers autotune far past the connected backup cap on fast links,
-//! so without a bound a multi-tunnel upload pins the whole cap and can even
-//! trim frames a recovery would still request. Once the server has proven it
+//! and unacknowledged frames are only trimmed at the 64 MiB hard cap, so
+//! without a bound a multi-tunnel upload pins tens of MiB of replay heap.
+//! Once the server has proven it
 //! acknowledges delivery (an et.rs keep-alive payload, see
 //! [`et_core::keepalive`]), the client pauses its producers (stdin, forwarded
 //! sockets) while [`MAX_UNACKNOWLEDGED_BYTES`] are outstanding; the data waits

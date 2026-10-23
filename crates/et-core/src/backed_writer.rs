@@ -6,12 +6,13 @@
 //!
 //! Wire-facing caps match upstream exactly (64 MiB disconnect buffer, 76 MiB
 //! recovery total, and the catchup entry limits validated on receive). The
-//! *connected* backup retention deliberately diverges from upstream's 64 MiB:
-//! while the transport is up, a reconnecting peer can only be missing data
-//! that was in flight (bounded by kernel socket buffers, typically <= 4 MiB),
-//! so retaining 64 MiB per session mostly wastes daemon memory. The connected
-//! backup is therefore trimmed to 8 MiB / 32 Ki packets; the disconnected
-//! catchup path keeps upstream's full 64 MiB.
+//! hard replay cap is upstream's 64 MiB ([`MAX_BACKUP_BYTES`]). While
+//! connected, history the peer has *acknowledged* is additionally trimmed to
+//! 8 MiB / 32 Ki packets, so a session whose peer acknowledges does not pin
+//! 64 MiB of already-delivered output. Unacknowledged packets are only ever
+//! dropped by the hard cap: a peer that stops reading may still need all of
+//! them on reconnect, and peers that never acknowledge (upstream clients)
+//! get exactly upstream's 64 MiB behavior.
 
 use std::collections::VecDeque;
 
@@ -22,21 +23,18 @@ pub const DISCONNECT_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
 pub const MAX_RECOVERY_BACKUP_BYTES: i64 = 76 * 1024 * 1024;
 pub const MAX_BACKUP_PACKETS: usize = 262_144;
 pub const MAX_DISCONNECT_PACKETS: usize = 262_144;
-/// Replay history kept while connected; must comfortably exceed the largest
-/// amount of written-but-undelivered data a live TCP connection can hold.
-/// Kernel buffers alone can exceed 8 MiB on an autotuned loopback, so
-/// writers whose peer acknowledges delivery also stop producing at
-/// [`MAX_UNACKNOWLEDGED_BYTES`] (see [`BackedWriter::delivery_backlog`]).
+/// Acknowledged replay history kept while connected. Packets the peer has
+/// not acknowledged are never trimmed by this cap, only by
+/// [`MAX_BACKUP_BYTES`] / [`MAX_BACKUP_PACKETS`].
 pub const CONNECTED_BACKUP_BYTES: i64 = 8 * 1024 * 1024;
 pub const CONNECTED_BACKUP_PACKETS: usize = 32_768;
 /// Unacknowledged bytes after which an acknowledging peer's writer should
 /// stop producing until the next acknowledgement. The acknowledged slack kept
 /// beside them is at most [`ACK_RETAIN_SLACK_BYTES`], or the
 /// [`ACK_RETAIN_FLOOR_PACKETS`] most recent acknowledged frames when those
-/// alone are larger (<= 1 MiB of 64 KiB frames), so the total stays well
-/// inside [`CONNECTED_BACKUP_BYTES`]: the connected cap never trims a packet
-/// the peer could still request, and the replay memory a bulk transfer pins
-/// is bounded regardless of how much the kernel is willing to buffer.
+/// alone are larger (<= 1 MiB of 64 KiB frames), and the replay memory a bulk
+/// transfer pins stays bounded regardless of how much the kernel is willing
+/// to buffer.
 pub const MAX_UNACKNOWLEDGED_BYTES: i64 = 4 * 1024 * 1024;
 /// Upper bound on acknowledged packets retained beyond an acknowledged
 /// sequence (see [`BackedWriter::acknowledge`]).
@@ -116,8 +114,8 @@ pub struct BackedWriter {
     /// Latest plausible peer acknowledgement; `None` until the peer proves it
     /// acknowledges at all (legacy peers never do).
     acknowledged: Option<i64>,
-    /// Wire bytes written after `acknowledged`, including packets the
-    /// connected cap already dropped from `backup`.
+    /// Wire bytes written after `acknowledged`, including packets the hard
+    /// cap already dropped from `backup`.
     unacknowledged_bytes: i64,
 }
 
@@ -186,12 +184,26 @@ impl BackedWriter {
         self.backup.push_front(std::sync::Arc::clone(&frame));
         self.backup_size += packet_wire_len as i64;
         self.sequence += 1;
-        while self.backup_size > CONNECTED_BACKUP_BYTES
-            || self.backup.len() > CONNECTED_BACKUP_PACKETS
+        // Trim acknowledged history to the connected caps; unacknowledged
+        // packets (all of them for a peer that never acknowledges) may still
+        // be requested on reconnect and only yield to the hard cap.
+        let unacknowledged = self.acknowledged.map_or(usize::MAX, |acked| {
+            usize::try_from(self.sequence - acked).unwrap_or(usize::MAX)
+        });
+        while (self.backup_size > CONNECTED_BACKUP_BYTES
+            || self.backup.len() > CONNECTED_BACKUP_PACKETS)
+            && self.backup.len() > unacknowledged
         {
-            if let Some(old) = self.backup.pop_back() {
-                self.backup_size -= (old.len() - 4) as i64;
-            }
+            let Some(old) = self.backup.pop_back() else {
+                break;
+            };
+            self.backup_size -= (old.len() - 4) as i64;
+        }
+        while self.backup_size > MAX_BACKUP_BYTES || self.backup.len() > MAX_BACKUP_PACKETS {
+            let Some(old) = self.backup.pop_back() else {
+                break;
+            };
+            self.backup_size -= (old.len() - 4) as i64;
         }
         self.release_slack_capacity();
         WriterOutcome::Send(frame)
@@ -236,7 +248,7 @@ impl BackedWriter {
     /// acknowledged packets: at least [`ACK_RETAIN_FLOOR_PACKETS`] of them,
     /// and beyond that only while they fit [`ACK_RETAIN_SLACK_BYTES`]. An idle
     /// session's backup therefore stays near-empty and a bulk transfer stops
-    /// pinning the full connected cap. Ignored while disconnected (a
+    /// pinning the acknowledged connected cap. Ignored while disconnected (a
     /// reconnect may replay any of it) and for implausible sequences.
     pub fn acknowledge(&mut self, acknowledged: i64) {
         if !self.connected || acknowledged < 0 || acknowledged > self.sequence {
@@ -297,8 +309,8 @@ impl BackedWriter {
         // Drop the oldest history the way a connected write trims, so a quick
         // reconnect cannot stack another disconnect buffer on an untrimmed
         // backup (upstream #890 / e3e49d5). Newest packets stay: they are the
-        // catchup a retry may still need. The live 8 MiB cap still applies on
-        // the next connected write.
+        // catchup a retry may still need. Connected writes keep enforcing the
+        // same hard cap plus the acknowledged-history cap.
         while self.backup_size > MAX_BACKUP_BYTES {
             let Some(old) = self.backup.pop_back() else {
                 break;
@@ -414,32 +426,64 @@ mod tests {
     }
 
     #[test]
-    fn connected_backup_trims_to_connected_byte_cap() {
+    fn connected_backup_without_acknowledgements_keeps_upstream_cap() {
+        // A peer that never acknowledges (upstream client) keeps 64 MiB.
         let mut w = writer(true);
-        let chunk = vec![0u8; 3 * 1024 * 1024];
+        let chunk = vec![0u8; 4 * 1024 * 1024 - 64];
         for _ in 0..3 {
-            assert!(matches!(
-                w.write_packet(0, &chunk).unwrap(),
-                WriterOutcome::Send(_)
-            ));
+            w.write_packet(0, &chunk).unwrap();
         }
-        // 9 MiB written while connected; only ~6 MiB (2 packets) is retained.
+        assert_eq!(w.recover(0).unwrap().len(), 3);
+        for _ in 3..17 {
+            w.write_packet(0, &chunk).unwrap();
+        }
+        // 17 x ~4 MiB exceeds 64 MiB: only the oldest packet is gone.
         assert_eq!(w.recover(0), Err(RecoverError::TooFarBehind));
-        assert_eq!(w.recover(1).unwrap().len(), 2);
+        assert_eq!(w.recover(1).unwrap().len(), 16);
     }
 
     #[test]
-    fn connected_backup_trims_to_connected_packet_cap() {
+    fn connected_backup_keeps_unacknowledged_packets_beyond_connected_cap() {
         let mut w = writer(true);
-        let extra = 10;
-        for _ in 0..CONNECTED_BACKUP_PACKETS + extra {
+        let chunk = vec![0u8; 1024 * 1024];
+        w.write_packet(0, &chunk).unwrap();
+        w.acknowledge(1);
+        for _ in 0..12 {
+            w.write_packet(0, &chunk).unwrap();
+        }
+        assert_eq!(w.recover(1).unwrap().len(), 12);
+    }
+
+    #[test]
+    fn connected_backup_trims_acknowledged_history_to_connected_byte_cap() {
+        let mut w = writer(true);
+        let chunk = vec![0u8; 3 * 1024 * 1024];
+        for _ in 0..3 {
+            w.write_packet(0, &chunk).unwrap();
+        }
+        w.acknowledge(2);
+        w.write_packet(0, &chunk).unwrap();
+        // 12 MiB: acknowledged packets 1 and 2 are trimmed, 3 and 4 stay.
+        assert_eq!(w.recover(2).unwrap().len(), 2);
+        assert_eq!(w.recover(1), Err(RecoverError::TooFarBehind));
+    }
+
+    #[test]
+    fn connected_backup_trims_acknowledged_history_to_connected_packet_cap() {
+        let mut w = writer(true);
+        for _ in 0..CONNECTED_BACKUP_PACKETS + 10 {
+            w.write_packet(0, b"").unwrap();
+        }
+        let acked = w.sequence();
+        w.acknowledge(acked);
+        for _ in 0..CONNECTED_BACKUP_PACKETS + 10 {
             w.write_packet(0, b"").unwrap();
         }
         assert_eq!(
-            w.recover(extra as i64).unwrap().len(),
-            CONNECTED_BACKUP_PACKETS
+            w.recover(acked).unwrap().len(),
+            CONNECTED_BACKUP_PACKETS + 10
         );
-        assert_eq!(w.recover(extra as i64 - 1), Err(RecoverError::TooFarBehind));
+        assert_eq!(w.recover(acked - 1), Err(RecoverError::TooFarBehind));
     }
 
     #[test]

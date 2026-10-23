@@ -700,6 +700,93 @@ fn no_shell_master_forward_round_trips_do_not_sleep_after_each_write() {
     );
 }
 
+#[cfg(target_os = "linux")]
+fn master_pid(stack: &Stack, socket: &Path) -> u32 {
+    let checked = output(&mut stack.mux(socket, "check"));
+    assert!(checked.status.success(), "{checked:?}");
+    let text = String::from_utf8_lossy(&checked.stdout).into_owned();
+    text.split("pid=")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .and_then(|pid| pid.parse().ok())
+        .unwrap_or_else(|| panic!("no master pid in {text:?}"))
+}
+
+#[cfg(target_os = "linux")]
+fn threads(pid: u32) -> Vec<(String, u64)> {
+    fs::read_dir(format!("/proc/{pid}/task"))
+        .unwrap()
+        .filter_map(|task| {
+            let path = task.ok()?.path();
+            let name = fs::read_to_string(path.join("comm")).ok()?;
+            let status = fs::read_to_string(path.join("status")).ok()?;
+            let switches = status
+                .lines()
+                .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))?
+                .trim()
+                .parse()
+                .ok()?;
+            Some((name.trim().to_owned(), switches))
+        })
+        .collect()
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn no_shell_master_forwards_on_its_session_thread_and_sleeps_while_idle() {
+    // Upstream `TerminalClient::run` serves `-N` forwarding from its one
+    // poll set. The pump left it on the `et-forwarding` worker thread (two
+    // thread hops per round trip) and woke every 5 ms with nothing to do.
+    let stack = Stack::start();
+    let socket = stack.root.join("mux");
+    let echo = TcpListener::bind("127.0.0.1:0").unwrap();
+    let destination = echo.local_addr().unwrap().port();
+    let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
+    let source = reserved.local_addr().unwrap().port();
+    drop(reserved);
+    let spec = format!("127.0.0.1:{source}:127.0.0.1:{destination}");
+    let started = output(
+        stack
+            .client()
+            .args(["-M", "-f", "-NT", "-S"])
+            .arg(&socket)
+            .args(["-o", "ControlPersist=yes", "--tunnel", &spec, "127.0.0.1"]),
+    );
+    assert!(started.status.success(), "{started:?}");
+    let pid = master_pid(&stack, &socket);
+    let echo_worker = std::thread::spawn(move || {
+        let (mut socket, _) = echo.accept().unwrap();
+        socket.set_read_timeout(Some(LIMIT)).unwrap();
+        let mut buffer = [0; 64];
+        while socket.read_exact(&mut buffer).is_ok() {
+            socket.write_all(&buffer).unwrap();
+        }
+    });
+    let mut forward = TcpStream::connect(("127.0.0.1", source)).unwrap();
+    forward.set_read_timeout(Some(LIMIT)).unwrap();
+    forward.write_all(&[7; 64]).unwrap();
+    let mut reply = [0; 64];
+    forward.read_exact(&mut reply).unwrap();
+    assert_eq!(reply, [7; 64]);
+    let names: Vec<_> = threads(pid).into_iter().map(|(name, _)| name).collect();
+    assert!(
+        !names.iter().any(|name| name == "et-forwarding"),
+        "-N forwarding still runs on a worker thread: {names:?}"
+    );
+    // Idle with the forwarded stream open: only timers (keepalive) and
+    // readiness may wake the process, not a fixed polling cadence.
+    let before: u64 = threads(pid).iter().map(|(_, switches)| switches).sum();
+    std::thread::sleep(Duration::from_secs(2));
+    let woke = threads(pid)
+        .iter()
+        .map(|(_, switches)| switches)
+        .sum::<u64>()
+        - before;
+    assert!(woke < 40, "idle -N master woke {woke} times in 2 s");
+    drop(forward);
+    echo_worker.join().unwrap();
+}
+
 #[test]
 fn generated_control_handle_uses_host_and_no_persist_does_not_save_credentials() {
     let stack = Stack::start();

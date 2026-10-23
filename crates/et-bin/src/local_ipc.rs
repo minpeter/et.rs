@@ -202,6 +202,13 @@ impl Listener {
     }
 }
 
+/// Pollable for pending connections; [`Listener::accept`] never blocks.
+impl AsFd for Listener {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.socket.as_fd()
+    }
+}
+
 impl Drop for Listener {
     fn drop(&mut self) {
         let parent = self

@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use et_net::local::LocalStream;
 use et_net::local_packet::{RouterFraming, RouterStreamDecoder, TerminalBufferFrame};
+use et_server::idle_memory::{IdleRelease, ReleaseScope};
 use portable_pty::{Child, ChildKiller, MasterPty};
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
@@ -117,6 +118,8 @@ where
         completion: CompletionState::default(),
         progress: 0,
         output_start: Instant::now() + output_delay,
+        // This loop is the terminal process's only thread.
+        idle: IdleRelease::new(ReleaseScope::Process, Instant::now()),
     };
     let setup = session
         .configure()
@@ -187,6 +190,8 @@ struct Session {
     /// Router writes accepted; extends the post-exit drain while it moves.
     progress: usize,
     output_start: Instant,
+    /// Returns the allocator memory of a quiet session; see `idle_memory`.
+    idle: IdleRelease,
 }
 
 struct Ready {
@@ -238,7 +243,13 @@ impl Session {
             if delayed {
                 deadline = Some(deadline.map_or(self.output_start, |d| d.min(self.output_start)));
             }
+            if let Some(release_at) = self.idle.deadline() {
+                deadline = Some(deadline.map_or(release_at, |d| d.min(release_at)));
+            }
             let ready = self.wait(router_flags, pty_flags, deadline)?;
+            let active =
+                !(ready.router.is_empty() && ready.pty.is_empty() && ready.child.is_empty());
+            self.idle.after_wait(active, Instant::now());
 
             if ready
                 .child

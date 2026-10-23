@@ -422,6 +422,7 @@ dependencies = [
  "signal-hook",
  "socket2",
  "sysinfo",
+ "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
  "wait-timeout",

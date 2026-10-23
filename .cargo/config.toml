@@ -15,8 +15,10 @@
 #   throughput within +/-6% of narenas:4 either way and server CPU within 2%,
 #   while server RSS stayed 5-22% lower (16 x -R: 73 vs 91 MB).
 # - dirty_decay_ms:1000 — the server already switches to 1 s at runtime
-#   (et-server runtime_lifecycle.rs); apply the same 1 s to the client and
-#   terminal roles instead of jemalloc's 10 s default.
+#   (et-server idle_memory.rs); apply the same 1 s to the client and
+#   terminal roles instead of jemalloc's 10 s default. Idle session loops
+#   also return their thread caches and purge (same file); the allocator is
+#   built without its unused `stats` tables (et-server Cargo.toml).
 #
 # An explicitly exported JEMALLOC_SYS_WITH_MALLOC_CONF still takes precedence.
 JEMALLOC_SYS_WITH_MALLOC_CONF = "narenas:1,dirty_decay_ms:1000"

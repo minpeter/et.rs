@@ -3,6 +3,8 @@ use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use et_core::packet::Packet;
 use et_core::proto::{TerminalInfo, TerminalPacketType};
@@ -15,6 +17,8 @@ use rustix::event::{poll, PollFd, PollFlags};
 #[cfg(unix)]
 use rustix::time::Timespec;
 
+#[cfg(unix)]
+use crate::idle_memory::{IdleRelease, ReleaseScope};
 #[cfg(unix)]
 use crate::session::OutputPump;
 use crate::session::{ActiveSession, SessionError, SessionWriteError};
@@ -155,6 +159,8 @@ fn run_mode_poll(
     // This loop writes the client transport too; nothing else touches it
     // while the bridge runs.
     let mut output = OutputPump::new(&session);
+    // A quiet session returns its thread cache; see `idle_memory`.
+    let mut idle = IdleRelease::new(ReleaseScope::Thread, Instant::now());
     loop {
         if session.is_shutting_down() || session.retire_if_unreachable()? {
             return Ok(());
@@ -235,7 +241,10 @@ fn run_mode_poll(
         if let Some(expiry) = session.disconnect_deadline(connected) {
             client_policy.1 = wait_until(client_policy.1, expiry);
         }
-        let (terminal_events, wake_events, forward_events, client_events) = wait(
+        if let Some(release_at) = idle.deadline() {
+            client_policy.1 = wait_until(client_policy.1, release_at);
+        }
+        let (terminal_events, wake_events, forward_events, client_events, ready) = wait(
             &terminal,
             &wake,
             forwarder.wake().map_err(forward_error)?,
@@ -244,6 +253,7 @@ fn run_mode_poll(
             client_policy,
             pending_outbound.is_empty().then_some(&fast_poll),
         )?;
+        idle.after_wait(ready, Instant::now());
         let woken = wake_events.intersects(PollFlags::IN | PollFlags::HUP);
         if woken {
             drain(&mut wake)?;
@@ -997,6 +1007,8 @@ fn connection_ended(error: &io::Error) -> bool {
     )
 }
 
+/// One poll; returns the terminal, wake, forwarding wake and client events,
+/// and whether any descriptor (forwarded sockets included) was ready.
 #[cfg(unix)]
 fn wait(
     terminal: &LocalStream,
@@ -1006,7 +1018,7 @@ fn wait(
     terminal_flags: Option<PollFlags>,
     client_policy: (PollFlags, Option<Duration>),
     fast_poll: Option<&et_net::forward::FastPollState>,
-) -> Result<(PollFlags, PollFlags, PollFlags, PollFlags), SessionError> {
+) -> Result<(PollFlags, PollFlags, PollFlags, PollFlags, bool), SessionError> {
     let (client_flags, timeout) = client_policy;
     // Forwarding timers (idle window credit, parked accepts) and packets it
     // already holds bound the wait as well.
@@ -1037,13 +1049,13 @@ fn wait(
     }
     // poll() is never restarted by SA_RESTART; retry on EINTR instead of
     // tearing the session down when a signal interrupts the wait.
-    loop {
+    let ready = loop {
         match poll(&mut descriptors, timeout.as_ref()) {
-            Ok(_) => break,
+            Ok(ready) => break ready,
             Err(error) if error == rustix::io::Errno::INTR => {}
             Err(error) => return Err(SessionError::Io(io::Error::from(error))),
         }
-    }
+    };
     if let Some(fast_poll) = fast_poll {
         fast_poll.record_revents(&descriptors[fast_offset..]);
     }
@@ -1060,6 +1072,7 @@ fn wait(
             .filter(|_| client.is_some())
             .map(PollFd::revents)
             .unwrap_or(PollFlags::empty()),
+        ready > 0,
     ))
 }
 
@@ -1647,5 +1660,55 @@ mod tests {
 
         assert!(!flags.contains(PollFlags::IN));
         assert_eq!(timeout, Some(Duration::from_millis(10)));
+    }
+
+    /// An idle session's thread used to keep every object its last burst
+    /// freed in its allocator cache, ~70 KiB per session in `etserver`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn quiet_bridge_returns_its_thread_cache() {
+        use et_net::connection::Connection;
+        use et_net::local_packet::write_local_packet;
+        use std::net::{Ipv4Addr, TcpListener, TcpStream};
+        use std::thread;
+        use tikv_jemalloc_ctl::{Access, AsName};
+
+        // Given: a bridge that relayed terminal output to its client.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let server = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (client, _) = listener.accept().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let (terminal, mut terminal_peer) = et_net::local::wake_pair().unwrap();
+        let session = Arc::new(
+            ActiveSession::new(Connection::new_server(server, &[23; 32]), &terminal, None).unwrap(),
+        );
+        let mut peer = Connection::new_client(client, &[23; 32]);
+        session.start_output();
+        let bridge_session = Arc::clone(&session);
+        let bridge = thread::spawn(move || {
+            let _ = run_mode(
+                bridge_session,
+                terminal,
+                Forwarder::start(Vec::new()).unwrap(),
+                BridgeMode::Jumphost,
+            );
+            let enabled: bool = b"thread.tcache.enabled\0".name().read().unwrap();
+            enabled
+        });
+        write_local_packet(
+            &mut terminal_peer,
+            &Packet::new(TerminalPacketType::TerminalBuffer as u8, vec![7; 4096]),
+        )
+        .unwrap();
+        assert_eq!(peer.read_packet().unwrap().payload(), &[7; 4096][..]);
+
+        // When: the session stays quiet past the release delay.
+        thread::sleep(crate::idle_memory::IDLE_RELEASE_DELAY + Duration::from_millis(500));
+        session.shutdown().unwrap();
+
+        // Then: the bridge thread had handed its cache back.
+        assert!(!bridge.join().unwrap(), "idle bridge kept its thread cache");
     }
 }

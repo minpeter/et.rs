@@ -502,14 +502,16 @@ fn write_pending_local(
 ///
 /// Keep-alive acknowledgements are per-hop: any payload the client attached
 /// was already consumed by the jumphost etserver, so replace it with this
-/// hop's own reader sequence, letting the destination trim its replay backup.
-fn destination_packet(destination: &Connection, packet: Packet) -> Packet {
+/// hop's own acknowledgement when it carries news, letting the destination
+/// trim its replay backup.
+fn destination_packet(destination: &mut Connection, packet: Packet) -> Packet {
     if packet.header() != TerminalPacketType::KeepAlive as u8 {
         return packet;
     }
+    let ack = destination.next_keepalive_ack(et_core::keepalive::AckSide::Initiator, false);
     Packet::new(
         TerminalPacketType::KeepAlive as u8,
-        destination.keepalive_ack().to_vec(),
+        et_core::keepalive::ack_bytes(&ack).to_vec(),
     )
 }
 

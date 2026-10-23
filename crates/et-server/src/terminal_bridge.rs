@@ -871,8 +871,11 @@ fn enqueue_outbound(
             .is_some_and(|queued| queued.header() == TerminalPacketType::KeepAlive as u8)
     {
         // Keep-alive acknowledgements are cumulative, so the newest response
-        // supersedes an older unsent response without growing the queue.
-        *pending.back_mut().expect("checked above") = packet;
+        // supersedes an older unsent response without growing the queue. An
+        // empty response says nothing the queued one does not.
+        if !packet.payload().is_empty() {
+            *pending.back_mut().expect("checked above") = packet;
+        }
     } else {
         debug_assert!(pending.len() < FORWARD_BACKLOG_CAPACITY);
         pending.push_back(packet);
@@ -1214,8 +1217,8 @@ fn jumphost_client_packet(session: &ActiveSession, packet: Packet) -> Result<Pac
 /// Normalize a jump-terminal packet relayed towards the client.
 ///
 /// A keep-alive echo returning from the destination acknowledges the previous
-/// hop; replace its payload with this hop's reader sequence so the client can
-/// trim its own replay backup.
+/// hop; replace its payload with this hop's acknowledgement (when it carries
+/// news) so the client can trim its own replay backup.
 fn jumphost_terminal_packet(
     session: &ActiveSession,
     packet: Packet,
@@ -1225,7 +1228,7 @@ fn jumphost_terminal_packet(
     }
     Ok(Packet::new(
         TerminalPacketType::KeepAlive as u8,
-        session.keepalive_ack()?.to_vec(),
+        session.keepalive_echo(None)?,
     ))
 }
 
@@ -1271,15 +1274,13 @@ fn forward_client_packet(
     match client_terminal_disposition(packet.header()) {
         ClientTerminalDisposition::Relay => Ok(ClientForward::ToTerminal(packet)),
         ClientTerminalDisposition::KeepAlive => {
-            if let Some(ack) = et_core::keepalive::decode_ack(packet.payload()) {
-                session.acknowledge_delivery(ack)?;
-            }
-            // The echo acknowledges everything read from the client, letting
-            // an et.rs client trim its own replay backup. Legacy peers
-            // (upstream C++, released et.rs) ignore the payload.
+            // The echo acknowledges everything read from the client when that
+            // is news, letting an et.rs client trim its own replay backup.
+            // Upstream C++ clients never acknowledge and get empty echoes.
+            let echo = session.keepalive_echo(et_core::keepalive::decode_ack(packet.payload()))?;
             Ok(ClientForward::KeepAlive(Packet::new(
                 TerminalPacketType::KeepAlive as u8,
-                session.keepalive_ack()?.to_vec(),
+                echo,
             )))
         }
         ClientTerminalDisposition::CloseSession => Ok(ClientForward::CloseSession),

@@ -50,6 +50,8 @@ pub const MAX_SOCKET_READ: usize = 256 * 1024;
 /// of server RSS (ET-C++: 18 MB) for 2-3% more server CPU than 256 KiB reads.
 pub const SERVER_MAX_SOCKET_READ: usize = 96 * 1024;
 
+const KEEP_ALIVE: u8 = crate::proto::TerminalPacketType::KeepAlive as u8;
+
 #[derive(Clone)]
 pub struct BackedReader {
     crypto: CryptoHandler,
@@ -58,6 +60,8 @@ pub struct BackedReader {
     filled: usize,
     replay: VecDeque<Packet>,
     sequence: i64,
+    /// `sequence` right after the latest packet that was not a keep-alive.
+    data_sequence: i64,
     connected: bool,
     /// Size of the next socket read, adapted to how full recent reads were.
     read_hint: usize,
@@ -78,6 +82,7 @@ impl BackedReader {
             filled: 0,
             replay: VecDeque::new(),
             sequence: 0,
+            data_sequence: 0,
             connected,
             read_hint: MIN_SOCKET_READ,
             read_requested: 0,
@@ -241,6 +246,7 @@ impl BackedReader {
         }
         let packet = result?;
         self.sequence += 1;
+        self.note_data(&packet);
         Ok(ReadItem::Packet(packet))
     }
 
@@ -264,6 +270,7 @@ impl BackedReader {
         self.filled = 0;
         self.replay.clear();
         self.sequence = 0;
+        self.data_sequence = 0;
         self.connected = false;
         Ok(())
     }
@@ -276,12 +283,16 @@ impl BackedReader {
             decoded.push_back(packet);
         }
         let n = catchup.len();
+        let carries_data = decoded.iter().any(|packet| packet.header() != KEEP_ALIVE);
         self.partial.clear();
         self.offset = 0;
         self.filled = 0;
         self.crypto = crypto;
         self.replay.append(&mut decoded);
         self.sequence += n as i64;
+        if carries_data {
+            self.data_sequence = self.sequence;
+        }
         self.connected = true;
         Ok(())
     }
@@ -304,6 +315,19 @@ impl BackedReader {
 
     pub fn sequence(&self) -> i64 {
         self.sequence
+    }
+
+    /// [`Self::sequence`] right after the latest packet read that was not a
+    /// keep-alive, so an acknowledgement can tell whether it covers more than
+    /// keep-alives (see [`crate::keepalive::AckSchedule`]).
+    pub fn data_sequence(&self) -> i64 {
+        self.data_sequence
+    }
+
+    fn note_data(&mut self, packet: &Packet) {
+        if packet.header() != KEEP_ALIVE {
+            self.data_sequence = self.sequence;
+        }
     }
 
     pub fn connected(&self) -> bool {

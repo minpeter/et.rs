@@ -156,15 +156,23 @@ impl ActiveSession {
         Ok(())
     }
 
-    /// Keep-alive payload acknowledging everything read from the client.
-    pub(crate) fn keepalive_ack(
+    /// Apply a client keep-alive's delivery acknowledgement, if any, and
+    /// build the echo's payload: this side's acknowledgement when it tells
+    /// the client something new, otherwise upstream's empty payload (see
+    /// [`et_core::keepalive::AckSchedule`]).
+    pub(crate) fn keepalive_echo(
         &self,
-    ) -> Result<[u8; et_core::keepalive::ACK_PAYLOAD_LEN], SessionError> {
-        Ok(self
-            .reader
+        acknowledged: Option<i64>,
+    ) -> Result<Vec<u8>, SessionError> {
+        let mut connection = self
+            .connection
             .lock()
-            .map_err(|_| SessionError::Unavailable)?
-            .keepalive_ack())
+            .map_err(|_| SessionError::Unavailable)?;
+        if let Some(sequence) = acknowledged {
+            connection.acknowledge_delivery(sequence);
+        }
+        let ack = connection.next_keepalive_ack(et_core::keepalive::AckSide::Responder, false);
+        Ok(et_core::keepalive::ack_bytes(&ack).to_vec())
     }
 
     pub(crate) fn can_buffer_write(&self, bytes: i64) -> Result<bool, SessionError> {

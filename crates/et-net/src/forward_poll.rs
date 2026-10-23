@@ -40,9 +40,9 @@ use super::{Command, CommandReceiver, ForwardError, PendingAccept, Role, Worker,
 
 /// Queued network-to-socket buffers per socket, matching the bound of the
 /// writer channel the threaded model used.
-const OUT_QUEUE_PACKETS: usize = 64;
+pub(super) const OUT_QUEUE_PACKETS: usize = 128;
 /// Idle sockets flush sub-threshold window credit after this delay. Liveness
-/// never waits on it: the return thresholds are a quarter of the advertised
+/// never waits on it: the return thresholds are an eighth of the advertised
 /// window, so a stalled sender always has threshold credit pending. It only
 /// returns the remainder of a stream that paused, so it is long enough that
 /// a request/response exchange does not pay an extra credit packet (and a

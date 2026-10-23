@@ -27,16 +27,23 @@ use crate::forward_io::{close_write, spawn_io_direct, subtract_saturating, Activ
 
 /// Per-socket receive window.
 ///
-/// Both limits must stay below the socket's 64-slot writer channel. A byte
-/// limit alone is insufficient because legal one-byte reads can create far
-/// more packets than the queue can absorb.
-pub(super) const WINDOW_BYTES: i64 = 2 * 1024 * 1024;
-pub(super) const WINDOW_PACKETS: i64 = 63;
+/// The packet limit must stay below the socket's 128-slot output queue
+/// (writer channel in the threaded model). A byte limit alone is
+/// insufficient because legal one-byte reads can create far more packets
+/// than the queue can absorb.
+///
+/// Upstream ET has no per-socket window at all; this one only has to cover
+/// the bandwidth-delay product of a WAN link. 4 MiB per RTT is ~80 MiB/s at
+/// 50 ms. Worst-case buffered forwarding memory is MAX_ACTIVE_SOCKETS times
+/// this window.
+pub(super) const WINDOW_BYTES: i64 = 4 * 1024 * 1024;
+pub(super) const WINDOW_PACKETS: i64 = 127;
 
-/// Return credit once this much has drained, so a full window costs a bounded
-/// number of control packets instead of one per data packet.
-pub(crate) const CREDIT_RETURN_THRESHOLD: i64 = WINDOW_BYTES / 4;
-pub(crate) const PACKET_CREDIT_RETURN_THRESHOLD: i64 = WINDOW_PACKETS / 4;
+/// Return credit once an eighth of the window has drained, so a full window
+/// costs a bounded number of control packets instead of one per data packet,
+/// while the credit held back from the sender stays small.
+pub(crate) const CREDIT_RETURN_THRESHOLD: i64 = WINDOW_BYTES / 8;
+pub(crate) const PACKET_CREDIT_RETURN_THRESHOLD: i64 = WINDOW_PACKETS / 8;
 
 pub(super) fn advertised_window() -> PortForwardWindow {
     PortForwardWindow {

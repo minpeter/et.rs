@@ -22,8 +22,12 @@ use et_net::forward::Forwarder;
 use prost::Message;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
-const WINDOW_BYTES: usize = 2 * 1024 * 1024;
-const WINDOW_PACKETS: usize = 63;
+const WINDOW_BYTES: usize = 4 * 1024 * 1024;
+const WINDOW_PACKETS: usize = 127;
+/// The window before it was sized for a 50 ms WAN bandwidth-delay product.
+const PREVIOUS_WINDOW_BYTES: usize = 2 * 1024 * 1024;
+/// How long the full-window source must stay silent without credit.
+const STALL_PROBE: Duration = Duration::from_millis(300);
 const TRANSFER_BYTES: usize = 2 * WINDOW_BYTES;
 
 #[test]
@@ -70,6 +74,15 @@ fn window_throttles_only_the_full_socket_and_delivery_releases_it() {
     assert!(
         relayed == WINDOW_BYTES || packets == WINDOW_PACKETS,
         "source must reach one negotiated window before delivery"
+    );
+    assert!(
+        relayed > PREVIOUS_WINDOW_BYTES,
+        "a single socket must keep more than {PREVIOUS_WINDOW_BYTES} bytes in flight, got {relayed}"
+    );
+    // Without credit the full window must hold: no further data leaves.
+    assert!(
+        source.wait_outbound(STALL_PROBE).is_err(),
+        "source sent past its window without credit"
     );
     release_tx.send(()).unwrap();
     while relayed < TRANSFER_BYTES {

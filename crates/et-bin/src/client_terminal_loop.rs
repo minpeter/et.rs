@@ -41,8 +41,6 @@ use crate::initial_connect::ReconnectOutcome;
 #[cfg(unix)]
 const INPUT_CHUNK: usize = 16 * 1024;
 #[cfg(unix)]
-const MISSED_KEEPALIVES: u32 = 3;
-#[cfg(unix)]
 const FORWARD_BACKLOG_CAPACITY: usize = 257;
 
 #[cfg(unix)]
@@ -191,7 +189,7 @@ fn pump_with_stdin_mode<F, R>(
     wake: &mut UnixStream,
     options: PumpOptions<'_>,
     forwarder: &mut Forwarder,
-    mut reconnect: F,
+    mut reconnect_transport: F,
     reconnect_input: &crate::client_terminal::ReconnectInput,
     mut stdin: R,
     unbuffered_fd: bool,
@@ -222,9 +220,16 @@ where
     }
     .map_err(|error| terminal_io("starting console output worker", error))?;
     let interval = Duration::from_secs(u64::from(keepalive_seconds.max(1)));
-    let silence = interval.saturating_mul(MISSED_KEEPALIVES);
-    let mut last_received = Instant::now();
-    let mut next_keepalive = last_received + interval;
+    let keepalive = crate::keepalive_clock::KeepaliveClock::new(interval, Instant::now());
+    // Every recovery, whichever write or verdict started it, gives the new
+    // transport a fresh keep-alive interval.
+    let mut reconnect = |connection: &mut Connection| -> Result<ReconnectOutcome, ClientError> {
+        let outcome = reconnect_transport(connection)?;
+        if outcome == ReconnectOutcome::Recovered {
+            keepalive.alive(Instant::now());
+        }
+        Ok(outcome)
+    };
     let mut stream = connection.try_clone_stream().map_err(terminal_error)?;
     // A bounded FIFO with one spill slot keeps transport reads live when both
     // forwarding workers saturate simultaneously, without reordering packets.
@@ -351,10 +356,7 @@ where
                 OwnedWriteOutcome::Written => {
                     bytes_since_ack = bytes_since_ack.saturating_add(payload.len());
                 }
-                OwnedWriteOutcome::Recovered => {
-                    last_received = Instant::now();
-                    next_keepalive = last_received + interval;
-                }
+                OwnedWriteOutcome::Recovered => {}
                 OwnedWriteOutcome::SessionEnded => {
                     return finish_remote_completion(
                         console_output,
@@ -452,11 +454,15 @@ where
             pending_output.is_some(),
             pending_forward.len() >= FORWARD_BACKLOG_CAPACITY,
         );
-        let mut deadline = connection
-            .pending_write_deadline()
-            .unwrap_or(next_keepalive);
-        if pending_output.is_none() {
-            deadline = deadline.min(last_received + silence);
+        // Wake for the keep-alive probe or verdict; with a probe outstanding
+        // while output is held, just re-check after an interval.
+        let reading = pending_output.is_none();
+        let mut deadline = Instant::now() + interval;
+        if let Some(at) = connection.pending_write_deadline() {
+            deadline = deadline.min(at);
+        }
+        if let Some(at) = keepalive.wake_at(reading, !connection.write_pending()) {
+            deadline = deadline.min(at);
         }
         // A stalled delivery gate releases after `interval` without progress.
         if let Some(release) = delivery_gate.release_at(interval) {
@@ -722,7 +728,7 @@ where
             read_batch += 1;
             match connection.try_read_packet() {
                 Ok(Some(packet)) => {
-                    last_received = Instant::now();
+                    keepalive.alive(Instant::now());
                     if packet.header() == TerminalPacketType::KeepAlive as u8 {
                         if let Some(ack) = et_core::keepalive::decode_ack(packet.payload()) {
                             connection.acknowledge_delivery(ack);
@@ -819,7 +825,10 @@ where
                 }
             }
         }
-        if producers_polled && !input.contains(PollFlags::IN) && Instant::now() < next_keepalive {
+        if producers_polled
+            && !input.contains(PollFlags::IN)
+            && !keepalive.probe_due(Instant::now())
+        {
             local_turn = false;
         }
         if !reconnect_needed
@@ -862,10 +871,7 @@ where
                     OwnedWriteOutcome::Written => {
                         bytes_since_ack = bytes_since_ack.saturating_add(packet.payload().len());
                     }
-                    OwnedWriteOutcome::Recovered => {
-                        last_received = Instant::now();
-                        next_keepalive = last_received + interval;
-                    }
+                    OwnedWriteOutcome::Recovered => {}
                     OwnedWriteOutcome::SessionEnded => {
                         return finish_remote_completion(
                             console_output,
@@ -886,7 +892,11 @@ where
             }
         }
         let now = Instant::now();
-        if pending_output.is_none() && now.saturating_duration_since(last_received) >= silence {
+        // Upstream `TerminalClient::run`: a probe still unanswered when the
+        // keep-alive deadline passes again means the link is dead. Held
+        // output stops transport reads, so it never yields a verdict.
+        if !reconnect_needed && keepalive.dead(now, pending_output.is_none()) {
+            et_cli::logging::info("missed a keepalive, reconnecting");
             reconnect_needed = true;
         }
         if reconnect_needed {
@@ -906,8 +916,6 @@ where
                     remote_exit,
                 );
             }
-            last_received = Instant::now();
-            next_keepalive = last_received + interval;
             continue;
         }
         let ack_due = bytes_since_ack >= et_core::keepalive::ACK_INTERVAL_BYTES
@@ -978,10 +986,7 @@ where
                 OwnedWriteOutcome::Written => {
                     bytes_since_ack = bytes_since_ack.saturating_add(payload.len());
                 }
-                OwnedWriteOutcome::Recovered => {
-                    last_received = Instant::now();
-                    next_keepalive = last_received + interval;
-                }
+                OwnedWriteOutcome::Recovered => {}
                 OwnedWriteOutcome::SessionEnded => {
                     return finish_remote_completion(
                         console_output,
@@ -1019,23 +1024,23 @@ where
             input_eof_pending = binary_stdio;
         }
         let now = Instant::now();
-        // Acknowledge by volume as well as on the idle interval, including
-        // under continuous inbound: the server trims its replay backup on the
-        // payload and its echo trims ours.
-        if !connection.write_pending()
-            && (now >= next_keepalive
-                || (!remote_exit.session_ended()
-                    && bytes_since_ack >= et_core::keepalive::ACK_INTERVAL_BYTES))
-        {
+        // Acknowledge by volume as well as probe on the idle deadline,
+        // including under continuous inbound: the server trims its replay
+        // backup on the payload and its echo trims ours.
+        let probe = keepalive.probe_due(now);
+        let volume = !remote_exit.session_ended()
+            && bytes_since_ack >= et_core::keepalive::ACK_INTERVAL_BYTES;
+        if !connection.write_pending() && (probe || volume) {
             bytes_since_ack = 0;
-            // The payload acknowledges everything read so far, so the server
-            // can trim its replay backup; legacy servers ignore it.
-            let ack = connection.keepalive_ack();
+            // The payload acknowledges everything read so far when that is
+            // news to the server, so it can trim its replay backup; legacy
+            // servers get upstream's empty keep-alive.
+            let ack = connection.next_keepalive_ack(et_core::keepalive::AckSide::Initiator, volume);
             if matches!(
                 write_owned(
                     connection,
                     TerminalPacketType::KeepAlive as u8,
-                    &ack,
+                    et_core::keepalive::ack_bytes(&ack),
                     &mut reconnect,
                     &mut stream,
                     terminal_enabled,
@@ -1054,7 +1059,9 @@ where
                     remote_exit,
                 );
             }
-            next_keepalive = Instant::now() + interval;
+            if probe {
+                keepalive.probe_sent(Instant::now());
+            }
         }
         if producers_polled {
             local_turn = false;

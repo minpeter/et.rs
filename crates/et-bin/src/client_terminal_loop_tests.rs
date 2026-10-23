@@ -3,7 +3,8 @@
 use super::*;
 use std::io::Write;
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 
 use crate::client_terminal::send_buffer;
@@ -780,6 +781,63 @@ fn non_tty_eof_or_read_error_disables_input_but_keeps_keepalive_forwarding_and_r
             "closed input was polled again"
         );
     }
+}
+
+/// A silent link is declared dead when a keep-alive probe stays unanswered
+/// for a whole interval: two intervals after the last packet read (upstream
+/// `TerminalClient::run`), not three. Typing into the dead link meanwhile
+/// must not postpone the verdict, as upstream's reset-on-write would.
+#[test]
+fn silent_link_reconnects_two_intervals_after_the_last_packet_even_while_typing() {
+    let (client, server) = tcp_streams();
+    // The peer stays connected but never answers.
+    let _silent_peer = Connection::new_server(server, &[19; 32]);
+    let (stdin, mut typist) = UnixStream::pair().unwrap();
+    let typing = Arc::new(AtomicBool::new(true));
+    let typing_flag = Arc::clone(&typing);
+    let keys = thread::spawn(move || {
+        while typing_flag.load(Ordering::SeqCst) {
+            if typist.write_all(b"k").is_err() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    });
+    let started = Instant::now();
+    let mut connection = Connection::new_client(client, &[19; 32]);
+    let (mut wake, _writer) = UnixStream::pair().unwrap();
+    wake.set_nonblocking(true).unwrap();
+    let mut reconnected = None;
+    let result = pump_with_stdin(
+        &mut connection,
+        &mut wake,
+        PumpOptions {
+            read_stdin: true,
+            keepalive_seconds: 1,
+            flow_control: et_cli::client::FlowControlMode::None,
+            terminal_enabled: false,
+            auto_cursor_report: false,
+            binary_stdio: false,
+            terminal_modes: &mut TerminalModeState::default(),
+            hangup: &crate::client_hangup::HangupClose::disabled(),
+            remote_exit: &crate::client_terminal::RemoteExit::new(false),
+            stdio_forward: false,
+        },
+        &mut Forwarder::start(Vec::new()).unwrap(),
+        |_connection| {
+            reconnected.get_or_insert_with(Instant::now);
+            Ok(ReconnectOutcome::SessionEnded)
+        },
+        stdin,
+    );
+    typing.store(false, Ordering::SeqCst);
+    keys.join().unwrap();
+    assert!(result.is_ok(), "{result:?}");
+    let silence = reconnected.expect("the silent link was never declared dead") - started;
+    assert!(
+        silence >= Duration::from_millis(1900) && silence < Duration::from_millis(2700),
+        "reconnect started {silence:?} after the last packet"
+    );
 }
 
 /// Recovery reads the server's first live packet to authenticate it and

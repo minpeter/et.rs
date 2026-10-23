@@ -8,6 +8,7 @@ use et_core::backed_writer::{
     MAX_RECOVERY_BACKUP_BYTES,
 };
 use et_core::crypto::EPOCH_SALT_BYTES;
+use et_core::keepalive::AckSchedule;
 use et_core::packet::Packet;
 use et_core::proto::{CatchupBuffer, SequenceHeader};
 use prost::Message;
@@ -88,6 +89,7 @@ impl Connection {
             reader: std::sync::Arc::new(std::sync::Mutex::new(self.reader().clone())),
             live_write_timeout: self.live_write_timeout,
             pending_live: None,
+            acks: AckSchedule::default(),
         };
         candidate.disconnect();
         candidate
@@ -151,6 +153,7 @@ impl Connection {
             )));
         }
         self.disconnect();
+        self.acks = AckSchedule::default();
         let deadline = recovery_deadline(timeout)?;
         match self.exchange_recovery(deadline, exchange) {
             Ok(remote_catchup) => {

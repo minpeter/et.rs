@@ -62,11 +62,15 @@ fn recover_connection(
     connection
         .set_io_timeout(Some(remaining))
         .map_err(ClientError::Transport)?;
-    // The proof keep-alive carries a delivery acknowledgement so the server
-    // trims its replay backup right after recovery; legacy servers ignore it.
-    let ack = connection.keepalive_ack();
+    // The proof keep-alive is the first on the new transport, so it carries
+    // the delivery acknowledgement and the server trims its replay backup
+    // right after recovery; legacy servers ignore it.
+    let ack = connection.next_keepalive_ack(et_core::keepalive::AckSide::Initiator, false);
     connection
-        .write_packet_live(TerminalPacketType::KeepAlive as u8, &ack)
+        .write_packet_live(
+            TerminalPacketType::KeepAlive as u8,
+            et_core::keepalive::ack_bytes(&ack),
+        )
         .map_err(|error| transport_error(deadline, "authenticating recovery", error))?;
     // Any packet that decrypts with the session key authenticates the server;
     // it is requeued and handled by the session loop. Upstream C++ servers

@@ -9,6 +9,7 @@ use et_core::backed_writer::{BackedWriter, RecoverError, WriterOutcome};
 use et_core::crypto::{
     CryptoHandler, EncryptError, DIR_CLIENT_TO_SERVER, DIR_SERVER_TO_CLIENT, KEY_LEN,
 };
+use et_core::keepalive::{AckSchedule, AckSide};
 use et_core::packet::Packet;
 use socket2::SockRef;
 #[path = "connection_pending.rs"]
@@ -50,6 +51,9 @@ pub struct Connection {
     reader: Arc<Mutex<BackedReader>>,
     live_write_timeout: Duration,
     pending_live: Option<pending::PendingWrite>,
+    /// Which keep-alives on this transport carry the delivery
+    /// acknowledgement; a recovered transport starts a fresh schedule.
+    acks: AckSchedule,
 }
 
 /// Receive half of a [`Connection`].
@@ -79,11 +83,6 @@ impl ConnectionReader {
 
     pub fn has_buffered_read(&self) -> bool {
         lock_reader(&self.reader).has_buffered_data()
-    }
-
-    /// Keep-alive payload acknowledging everything read so far.
-    pub fn keepalive_ack(&self) -> [u8; et_core::keepalive::ACK_PAYLOAD_LEN] {
-        et_core::keepalive::encode_ack(lock_reader(&self.reader).sequence())
     }
 }
 
@@ -168,6 +167,7 @@ impl Connection {
             )),
             live_write_timeout: DEFAULT_LIVE_WRITE_TIMEOUT,
             pending_live: None,
+            acks: AckSchedule::default(),
         }
     }
 
@@ -544,6 +544,24 @@ impl Connection {
     /// Keep-alive payload acknowledging everything read so far.
     pub fn keepalive_ack(&self) -> [u8; et_core::keepalive::ACK_PAYLOAD_LEN] {
         et_core::keepalive::encode_ack(self.reader().sequence())
+    }
+
+    /// Acknowledgement for the next keep-alive this side writes, or `None`
+    /// for upstream's empty payload when it would tell the peer nothing new
+    /// (see [`AckSchedule`]). `volume` marks an acknowledgement sent because
+    /// [`et_core::keepalive::ACK_INTERVAL_BYTES`] were read or written.
+    pub fn next_keepalive_ack(
+        &mut self,
+        side: AckSide,
+        volume: bool,
+    ) -> Option<[u8; et_core::keepalive::ACK_PAYLOAD_LEN]> {
+        let (sequence, data_sequence) = {
+            let reader = self.reader();
+            (reader.sequence(), reader.data_sequence())
+        };
+        let peer_acknowledges = self.writer.delivery_backlog().is_some();
+        self.acks
+            .next(side, sequence, data_sequence, peer_acknowledges, volume)
     }
 
     pub fn set_io_timeout(&self, timeout: Option<Duration>) -> Result<(), ConnError> {

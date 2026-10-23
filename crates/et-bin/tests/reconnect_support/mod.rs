@@ -108,18 +108,32 @@ type Relays = (
     thread::JoinHandle<io::Result<u64>>,
 );
 
+/// Relay both directions. When either side closes, close both, as a real
+/// proxy does: a client must not need keep-alive silence to notice.
 fn relay(
     client: &TcpStream,
     backend: &TcpStream,
     traffic: mpsc::SyncSender<(Instant, usize)>,
 ) -> io::Result<Relays> {
+    fn close_both(first: &TcpStream, second: &TcpStream) {
+        let _ = first.shutdown(Shutdown::Both);
+        let _ = second.shutdown(Shutdown::Both);
+    }
     let mut client_reader = client.try_clone()?;
     let mut client_writer = client.try_clone()?;
     let mut backend_reader = backend.try_clone()?;
     let mut backend_writer = backend.try_clone()?;
     Ok((
-        thread::spawn(move || copy_client(&mut client_reader, &mut backend_writer, &traffic)),
-        thread::spawn(move || io::copy(&mut backend_reader, &mut client_writer)),
+        thread::spawn(move || {
+            let copied = copy_client(&mut client_reader, &mut backend_writer, &traffic);
+            close_both(&client_reader, &backend_writer);
+            copied
+        }),
+        thread::spawn(move || {
+            let copied = io::copy(&mut backend_reader, &mut client_writer);
+            close_both(&backend_reader, &client_writer);
+            copied
+        }),
     ))
 }
 

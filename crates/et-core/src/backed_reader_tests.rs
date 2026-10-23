@@ -243,3 +243,33 @@ fn socket_reads_grow_for_bulk_and_release_the_buffer_once_traffic_is_small() {
     assert_eq!(reader.prepare_socket_read().len(), MIN_SOCKET_READ);
     assert!(reader.partial.capacity() <= 2 * MIN_SOCKET_READ);
 }
+
+#[test]
+fn data_sequence_follows_the_latest_packet_that_is_not_a_keepalive() {
+    let keepalive = crate::proto::TerminalPacketType::KeepAlive as u8;
+    let output = crate::proto::TerminalPacketType::TerminalBuffer as u8;
+    let (mut writer, mut reader) = pair();
+    let mut read = |header: u8, reader: &mut BackedReader| {
+        let WriterOutcome::Send(frame) = writer.write_packet(header, b"x").unwrap() else {
+            panic!();
+        };
+        reader.feed(&frame);
+        assert!(matches!(reader.pop().unwrap(), ReadItem::Packet(_)));
+    };
+    read(keepalive, &mut reader);
+    assert_eq!((reader.sequence(), reader.data_sequence()), (1, 0));
+    read(output, &mut reader);
+    read(keepalive, &mut reader);
+    assert_eq!((reader.sequence(), reader.data_sequence()), (3, 2));
+
+    // Catchup counts like live reads.
+    let key = [5u8; KEY_LEN];
+    let mut writer = BackedWriter::new(CryptoHandler::new(&key, DIR_CLIENT_TO_SERVER), false);
+    writer.write_packet(keepalive, &[]).unwrap();
+    let mut reader = BackedReader::new(CryptoHandler::new(&key, DIR_CLIENT_TO_SERVER), true);
+    reader.revive(writer.recover(0).unwrap()).unwrap();
+    assert_eq!((reader.sequence(), reader.data_sequence()), (1, 0));
+    writer.write_packet(output, b"output").unwrap();
+    reader.revive(writer.recover(1).unwrap()).unwrap();
+    assert_eq!((reader.sequence(), reader.data_sequence()), (2, 2));
+}

@@ -1002,6 +1002,26 @@ upstream code. Protocol v6 and the generated wire fixtures are unchanged.
 - Summed RSS is dominated by shared binary and libc pages and does not reflect
   per-session cost.
 
+**Session end delivers the last output.**
+- The server side follows upstream `TerminalServer::finishSession`
+  (`TerminalServer.cpp:868-910`).
+  - Before: `etserver` closed the client socket as soon as `finish_terminal` had
+    queued the last output and `TERMINAL_EXIT_STATUS`. A client keep-alive arriving
+    at the closed socket made the kernel send RST, which discarded the unsent tail,
+    so `et -T` exited 0 with a short stdout.
+  - Now, like upstream (which holds the connection up to 1 s after terminal EOF),
+    the server keeps the half-closed transport open for up to 1 s, reading and
+    dropping client bytes, and closes as soon as the client closes.
+  - Client traffic does not extend the wait, so a relay that does not pass on the
+    half-close cannot hold the session open.
+- The client fix follows upstream `BackedReader`, which never peeks on write and
+  only reports EOF from a read.
+  - Before: `et`'s write-path probe (`Connection::refresh_connectivity`) discarded
+    complete packets already read when it saw the peer's EOF.
+  - Now it only invalidates the writer; the reader returns those packets, then EOF.
+- Results: on a loaded host, 500 MB `et -T` transfers lost their tail in 40 of 800
+  runs before, and in 0 of 800 after.
+
 ## Ledger (classified 2026-10-14)
 
 Twenty commits after [`e02aefa`](https://github.com/MisterTea/EternalTerminal/commit/e02aefa2301a9544fe7a40564e612dcf122291e1).

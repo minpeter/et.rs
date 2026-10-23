@@ -594,6 +594,11 @@ impl Connection {
         self.reader().sequence()
     }
 
+    /// Before a live write, find out whether the peer is gone so the frame
+    /// goes to replay only. A peer close or reset ends live writes, but the
+    /// reader keeps the packets it already received: a peer that ends a
+    /// session sends its last output and closes, and the read path reports
+    /// that EOF only after those packets, as upstream's reader does.
     fn refresh_connectivity(&mut self) -> Result<(), ConnError> {
         if !self.writer.connected() {
             return Ok(());
@@ -616,7 +621,7 @@ impl Connection {
             self.stream.peek(&mut byte)
         };
         match probe {
-            Ok(0) => self.disconnect(),
+            Ok(0) => self.writer.invalidate(),
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -629,7 +634,7 @@ impl Connection {
                         | io::ErrorKind::NotConnected
                 ) =>
             {
-                self.disconnect();
+                self.writer.invalidate();
             }
             Err(error) => {
                 self.disconnect();

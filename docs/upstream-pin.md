@@ -165,10 +165,15 @@ Unknown client packet types stay `SessionError` (session-local, same as the
 [et.rs #100](https://github.com/minpeter/et.rs/pull/100). Rust stages terminal output
 before assigning replay sequences, flushes unsent floods at the 64 KiB threshold,
 preserves small output and tmux response/control lines, and prioritizes tmux
-responses ahead of queued pane output. Native socket buffers remain small.
-The connected staging queue is capped at 2 MiB rather than upstream's 16 MB
-`WriteBuffer`: it only has to keep the bounded transport send buffer fed, and a
-larger cap just keeps more stale, interruptible output resident in etserver.
+responses ahead of queued pane output. The interrupt drain-discard
+(`drainDiscardReadableBytes`, `drainDiscardJumphostTerminalBuffers`) was missing
+until et.rs 0.0.47; see "Benchmark round 2" below. Live output sockets set
+upstream's 32 KiB `TCP_NOTSENT_LOWAT` on Linux and keep a bounded send buffer
+(1 MiB requested on Linux, 256 KiB elsewhere).
+The connected staging queue is capped at 2 MiB (1 MiB per lane), and the bridge
+stops reading terminal output at 256 KiB staged, rather than upstream's 16 MB `WriteBuffer`:
+it only has to keep the bounded transport send buffer fed, and a larger cap just
+keeps more stale, interruptible output resident in etserver.
 The implementation reuses Rust's existing bounded queues and cancellation rather
 than copying the C++ event loop. Protocol v6 and generated wire fixtures are unchanged.
 
@@ -876,6 +881,126 @@ until it echoes):
 | ET C++ → ET C++ (reference) | 103–198 ms | 129–240 ms |
 
 No wire, handshake, crypto or `PROTOCOL_VERSION` change.
+
+### Benchmark round 2 (et.rs 0.0.47)
+
+A cross-implementation benchmark (et.rs 0.0.46, ET C++ master
+[`7ee361a`](https://github.com/MisterTea/EternalTerminal/commit/7ee361a75fbb3e0900445b110188996fbe950823),
+OpenSSH 10.2p1) found the gaps below. Each fix was reviewed against the cited
+upstream code. Protocol v6 and the generated wire fixtures are unchanged.
+
+**Terminal output over a WAN, Ctrl-C and echo under a flood.**
+- The rest of `#804` is now ported: `drainDiscardReadableBytes` and
+  `drainDiscardJumphostTerminalBuffers` (`TerminalServer.cpp:82-99,289-302,570-596`,
+  `TerminalInterruptDrain.hpp:21-51`).
+  - When client input carrying an interrupt flushes at least 64 KiB of unsent
+    output, the bridge (Unix, Windows and jumphost) first reads the terminal
+    output already waiting on the terminal socket, plus the packets it holds.
+    It drops every droppable byte, then writes the interrupt to the terminal.
+  - Exit status and other non-output packets keep their order.
+  - Intentional difference: one drain reads at most 1 MiB. Upstream drains until
+    the socket is empty, which a fast producer could stretch indefinitely.
+- The client drops its unpainted console queue on every interrupt, as
+  `TerminalClient::run` does with `filterDroppable` (`TerminalClient.cpp:581-584`).
+  Before, it only did so above 64 KiB.
+- On Linux, live output sockets set `TCP_NOTSENT_LOWAT` to 32 KiB, like
+  `TcpSocketHandlerUnix.cpp:10-24`.
+  - Intentional difference: they also request a 1 MiB `SO_SNDBUF`, through
+    `SO_SNDBUFFORCE` when privileged; upstream sets no send buffer.
+  - Why: upstream's own output loop runs at about 5 MB/s, so it never fills a WAN
+    path. With an autotuned buffer, et.rs queued up to 10 MB that Ctrl-C could not
+    drop, and Ctrl-C at RTT 50 ms took up to 1.1 s.
+  - The former 256 KiB cap held RTT 50 ms output to about 6.3 MB/s; with 1 MiB it
+    measured 13.8 MB/s, with the Ctrl-C median at 63 ms (max 72 ms).
+  - Other platforms keep the 256 KiB cap: socket2 exposes `TCP_NOTSENT_LOWAT`
+    only on Linux.
+- The connected bridge reads at most 256 KiB of terminal output ahead.
+- Client connections read at most 64 KiB per socket read, like upstream's
+  `BackedReader`.
+- Measured result: keystroke echo during a flood went from 58 to 18 ms.
+
+**Replay history.**
+- Upstream `BackedWriter` keeps 64 MiB (`BackedWriter.hpp:32`) and trims only at
+  that cap.
+- et.rs trimmed the connected backup to 8 MiB / 32,768 packets even when the peer
+  had not received those packets. A client whose stdout was blocked for about
+  10 s, with a large kernel receive buffer, then fell "too far behind server" on
+  reconnect and lost the session.
+- Now only *acknowledged* history is trimmed to 8 MiB / 32,768 packets.
+  Unacknowledged packets go only at upstream's 64 MiB / 262,144-packet hard cap,
+  so peers that never acknowledge (ET C++ clients) get upstream's retention exactly.
+
+**Dead-link detection.**
+- This follows upstream `TerminalClient::run` (`TerminalClient.cpp:468-469,687-698`).
+  One keep-alive interval after the last packet read, the client sends a probe. If
+  the probe is still unanswered one interval later, it reconnects.
+- That is two intervals (10 s by default) instead of et.rs's former three. It is
+  shared by the Unix, Windows and local-session (`-N`/`-M`/`--ctl`) loops in
+  `crates/et-bin/src/keepalive_clock.rs`.
+- Intentional differences:
+  - Any packet read answers the probe. Upstream clears `waitingOnKeepalive` only
+    on a keep-alive reply.
+  - Sending never moves the deadline. Upstream restarts it at `:580,:611,:725,:731`,
+    so typing into a dead link could postpone the probe and the verdict.
+- As before, no verdict is taken while held console output stops transport reads.
+- Reconnect pacing stays as upstream's: a 3 s connect timeout plus a 1 s retry
+  sleep (`TcpSocketHandler.cpp:90`, `ClientConnection.cpp:276`).
+
+**Keep-alive acknowledgements.**
+- The 8-byte delivery ack (et.rs-only) now rides only on keep-alives where it is
+  news (`et_core::keepalive::AckSchedule`):
+  - the first keep-alive of each connection, including the recovery proof;
+  - the first one after any non-keep-alive packet;
+  - every `ACK_RETAIN_FLOOR_PACKETS` keep-alives;
+  - volume acks.
+- etserver attaches it only after its client has acknowledged. So ET C++ peers
+  get upstream's empty `KEEP_ALIVE` (`TerminalServer.cpp:603-608`) from etserver,
+  and from `et` after its first keep-alive.
+
+**Forward-only sessions.**
+- `et -N`, `-M` and `--ctl` now serve forwarding from the session loop, as upstream
+  `TerminalClient::run` does from one PollSet (`TerminalClient.cpp:540-556,718-734`).
+  - The local session pump takes the forwarding worker over on its first poll.
+  - It drains up to 128 outbound packets per turn.
+  - It sends acknowledging keep-alives every 512 KiB and applies the client
+    delivery gate.
+- The 5 ms idle cap is gone. The pump polls its IPC listeners, peers, passenger
+  and a signal-hook wake pipe, and sleeps until readiness or its next timer.
+- Intentional differences:
+  - An attached passenger still caps the wait at 5 ms, because its terminal size
+    is sampled, not signalled.
+  - During a transport outage, forwarding keeps accepting and reading up to the
+    engine backlog, but nothing goes to replay until recovery.
+- Loopback results:
+  - 64 B round trip p50: 207 → 163 µs.
+  - Idle wakeups: about 195/s → 0.4/s.
+  - A single 512 MiB upload now runs on one core, the same limit as interactive
+    `-L` sessions, and peaks about 8% lower.
+
+**Port-forward window (et.rs-only; upstream has no per-socket window).**
+- Each forwarded socket advertises a 4 MiB / 127-packet window, up from
+  2 MiB / 63. It returns credit every eighth of the window (512 KiB or 15 packets).
+- The per-socket output queue has 128 slots, as do the writer and committed
+  channels in the Windows threaded model.
+- This sizes the window for a 50 ms bandwidth-delay product; the old window held
+  a single `-N -L` upload to about 23 MiB/s on that link.
+- `decode_window` clamps peer windows to ours, so older et.rs peers interoperate
+  unchanged.
+
+**Idle-session memory (Linux, et.rs-only).**
+- ET C++ uses glibc malloc and never trims.
+- In et.rs, the session bridge and the per-session terminal loops (PTY and `-T`)
+  use `et_server::idle_memory::IdleRelease`:
+  - After 1 s without I/O, a loop disables its jemalloc thread cache, which
+    flushes and frees it. The single-threaded terminal process also purges dirty
+    pages.
+  - A lone keep-alive afterwards is handled without the cache, so idle sessions
+    get no extra wakeups. Two events within 1 s re-enable it.
+- The shipped jemalloc no longer enables its `stats` feature, which only tests use.
+- With 50 idle loopback sessions, per-session USS went from 836 to 676 KiB. ET C++
+  measured 1239 KiB.
+- Summed RSS is dominated by shared binary and libc pages and does not reflect
+  per-session cost.
 
 ## Ledger (classified 2026-10-14)
 

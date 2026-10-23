@@ -555,7 +555,9 @@ fn terminal_hup_releases_session_whose_held_output_no_client_can_recover() {
 fn ended_terminal_keeps_the_transport_open_until_the_client_reads_its_last_output() {
     // Given: an `et -T` session whose client window is smaller than the
     // command's last output, so most of it waits in etserver's send queue.
-    const OUTPUT: usize = 48 * 1024;
+    // What waits unsent stays below the 32 KiB unsent-data low-water mark,
+    // so the bridge can still queue the exit status after it and end.
+    const OUTPUT: usize = 36 * 1024;
     let directory = TestDirectory::new();
     let router_path = select_router_path_for(
         rustix::process::getuid().as_raw(),

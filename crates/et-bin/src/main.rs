@@ -101,6 +101,7 @@ mod detach;
 mod error;
 mod forward_config;
 mod initial_connect;
+mod keepalive_clock;
 #[cfg(unix)]
 mod local_control;
 #[cfg(unix)]

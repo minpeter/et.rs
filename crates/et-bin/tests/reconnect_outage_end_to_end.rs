@@ -17,7 +17,8 @@ mod reconnect_stack;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -153,8 +154,193 @@ fn client_retries_reconnect_through_network_outage() {
     stack.shutdown();
 }
 
+/// A link that goes silent without any TCP error (an address change, a NAT
+/// dropping the flow) is found only by keep-alives. Like upstream
+/// `TerminalClient::run`, the client probes one interval after the last
+/// packet it read and reconnects when that probe is still unanswered one
+/// interval later: two intervals, not three.
+#[test]
+fn client_reconnects_two_keepalive_intervals_after_the_link_goes_silent() {
+    let mut stack = Stack::start();
+    let proxy = BlackholeProxy::start(stack.port);
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 30,
+            cols: 90,
+            pixel_width: 900,
+            pixel_height: 600,
+        })
+        .unwrap();
+    let mut client = CommandBuilder::new(env!("CARGO_BIN_EXE_et"));
+    client.args([
+        "--terminal-path",
+        stack.terminal.to_str().unwrap(),
+        "--serverfifo",
+        stack.router.to_str().unwrap(),
+        "--logdir",
+        stack.directory.to_str().unwrap(),
+        "--keepalive=1",
+        "--port",
+        &proxy.port.to_string(),
+        "127.0.0.1",
+    ]);
+    client.env(
+        "PATH",
+        format!(
+            "{}:{}",
+            stack.directory.display(),
+            std::env::var("PATH").unwrap()
+        ),
+    );
+    client.env("TERM", "xterm-256color");
+    client.env("ET_SSH_COUNT", &stack.ssh_count);
+    let client_ready = stack.directory.join("client-ready");
+    client.env("ET_SSH_READY", &client_ready);
+    let mut child = pair.slave.spawn_command(client).unwrap();
+    drop(pair.slave);
+    let mut writer = pair.master.take_writer().unwrap();
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let (output_tx, output_rx) = mpsc::sync_channel(64);
+    thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(count) if output_tx.send(chunk[..count].to_vec()).is_err() => break,
+                Ok(_) => {}
+            }
+        }
+    });
+    wait_for_file(&client_ready, b"ready");
+    writer
+        .write_all(b"PS1='> '; printf 'FIRST-PID:%s\\n' \"$$\"\n")
+        .unwrap();
+    let (output, first_pid) = receive_number(&output_rx, Vec::new(), b"FIRST-PID:");
+    // Let the idle keep-alive exchange settle into its cadence.
+    thread::sleep(Duration::from_millis(2500));
+
+    let last_delivered = proxy.blackhole();
+    let reconnected = proxy.wait_for_reconnect();
+    let silence = reconnected.saturating_duration_since(last_delivered);
+    // One interval to the probe, one more for its reply, plus scheduling.
+    assert!(
+        silence >= Duration::from_millis(1900) && silence < Duration::from_millis(2700),
+        "reconnect started {silence:?} after the last packet reached the client"
+    );
+
+    writer
+        .write_all(b"printf 'AFTER-PID:%s\\n' \"$$\"\n")
+        .unwrap();
+    let (mut output, after_pid) = receive_number(&output_rx, output, b"AFTER-PID:");
+    assert_eq!(first_pid, after_pid, "output={}", text(&output));
+    writer.write_all(b"exit\n").unwrap();
+    let status = child.wait().unwrap();
+    while let Ok(chunk) = output_rx.recv_timeout(TIMEOUT) {
+        output.extend(chunk);
+    }
+    assert!(
+        status.success(),
+        "status={status:?} output={}",
+        text(&output)
+    );
+    stack.shutdown();
+}
+
 fn text(output: &[u8]) -> String {
     String::from_utf8_lossy(output).into_owned()
+}
+
+/// TCP relay whose first connection can go silent: bytes in both directions
+/// are read and dropped, and nothing is closed, so neither end sees an error.
+/// Later connections relay normally.
+struct BlackholeProxy {
+    port: u16,
+    silent: Arc<AtomicBool>,
+    /// When the last byte of the first connection reached the client.
+    last_delivered: Arc<Mutex<Instant>>,
+    accepted: mpsc::Receiver<Instant>,
+}
+
+impl BlackholeProxy {
+    fn start(backend_port: u16) -> Self {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let silent = Arc::new(AtomicBool::new(false));
+        let last_delivered = Arc::new(Mutex::new(Instant::now()));
+        let (accepted_tx, accepted) = mpsc::channel();
+        let (relay_silent, relay_delivered) = (Arc::clone(&silent), Arc::clone(&last_delivered));
+        thread::spawn(move || {
+            for (index, client) in listener.incoming().enumerate() {
+                let Ok(client) = client else { return };
+                let _ = accepted_tx.send(Instant::now());
+                let Ok(backend) = TcpStream::connect((Ipv4Addr::LOCALHOST, backend_port)) else {
+                    return;
+                };
+                // Only the first connection goes silent.
+                let silent = if index == 0 {
+                    Arc::clone(&relay_silent)
+                } else {
+                    Arc::new(AtomicBool::new(false))
+                };
+                let delivered = (index == 0).then(|| Arc::clone(&relay_delivered));
+                let (client_reader, backend_writer) =
+                    (client.try_clone().unwrap(), backend.try_clone().unwrap());
+                let upstream_silent = Arc::clone(&silent);
+                thread::spawn(move || {
+                    forward(client_reader, backend_writer, &upstream_silent, None)
+                });
+                thread::spawn(move || forward(backend, client, &silent, delivered.as_deref()));
+            }
+        });
+        Self {
+            port,
+            silent,
+            last_delivered,
+            accepted,
+        }
+    }
+
+    /// Silence the first connection; returns when it last delivered a byte
+    /// to the client.
+    fn blackhole(&self) -> Instant {
+        // The first connection is the session itself.
+        self.accepted.recv_timeout(TIMEOUT).unwrap();
+        let delivered = self.last_delivered.lock().unwrap();
+        self.silent.store(true, Ordering::SeqCst);
+        *delivered
+    }
+
+    fn wait_for_reconnect(&self) -> Instant {
+        self.accepted.recv_timeout(TIMEOUT).unwrap()
+    }
+}
+
+/// Copy `from` into `to` until EOF, dropping everything once `silent`.
+fn forward(
+    mut from: TcpStream,
+    mut to: TcpStream,
+    silent: &AtomicBool,
+    delivered: Option<&Mutex<Instant>>,
+) {
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let count = match from.read(&mut buffer) {
+            Ok(0) | Err(_) => return,
+            Ok(count) => count,
+        };
+        // Deliver under the lock, so `blackhole` sees either no delivery or
+        // the time of this one.
+        let guard = delivered.map(|delivered| delivered.lock().unwrap());
+        if silent.load(Ordering::SeqCst) {
+            continue;
+        }
+        if to.write_all(&buffer[..count]).is_err() {
+            return;
+        }
+        if let Some(mut at) = guard {
+            *at = Instant::now();
+        }
+    }
 }
 
 /// TCP relay that can simulate a network outage: while down it accepts and
@@ -243,14 +429,20 @@ type Relays = (
     thread::JoinHandle<io::Result<u64>>,
 );
 
+/// Relay both directions. When either side closes, close both, as a real
+/// proxy does: a client must not need keep-alive silence to notice.
 fn relay(client: &TcpStream, backend: &TcpStream) -> io::Result<Relays> {
-    let mut client_reader = client.try_clone()?;
-    let mut client_writer = client.try_clone()?;
-    let mut backend_reader = backend.try_clone()?;
-    let mut backend_writer = backend.try_clone()?;
+    fn copy_then_close(mut from: TcpStream, mut to: TcpStream) -> io::Result<u64> {
+        let copied = io::copy(&mut from, &mut to);
+        let _ = from.shutdown(Shutdown::Both);
+        let _ = to.shutdown(Shutdown::Both);
+        copied
+    }
+    let (client_reader, client_writer) = (client.try_clone()?, client.try_clone()?);
+    let (backend_reader, backend_writer) = (backend.try_clone()?, backend.try_clone()?);
     Ok((
-        thread::spawn(move || io::copy(&mut client_reader, &mut backend_writer)),
-        thread::spawn(move || io::copy(&mut backend_reader, &mut client_writer)),
+        thread::spawn(move || copy_then_close(client_reader, backend_writer)),
+        thread::spawn(move || copy_then_close(backend_reader, client_writer)),
     ))
 }
 

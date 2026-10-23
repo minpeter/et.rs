@@ -73,6 +73,28 @@ impl ActiveSession {
         Ok(packet)
     }
 
+    /// Whether the client input just read flushed output on interrupt. The
+    /// bridge then drains the terminal before writing that input, as
+    /// upstream `TerminalServer::runTerminal` does.
+    pub(crate) fn take_interrupt_drain(&self) -> Result<bool, SessionError> {
+        match self.output_flow() {
+            Some(flow) => flow.take_interrupt_drain(),
+            None => Ok(false),
+        }
+    }
+
+    /// Stage terminal output drained after an interrupt flush and drop it,
+    /// keeping only what a tmux control client still needs.
+    pub(crate) fn discard_drained_terminal(
+        &self,
+        drained: Vec<et_core::packet::Packet>,
+    ) -> Result<(), SessionError> {
+        match self.output_flow() {
+            Some(flow) => flow.discard_drained_terminal(drained),
+            None => Ok(()),
+        }
+    }
+
     pub(crate) fn note_bridge_generation(&self, generation: u64) -> Result<(), SessionError> {
         let mut observed = self
             .bridge_generation

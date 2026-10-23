@@ -41,9 +41,15 @@ impl std::error::Error for ReadError {}
 pub const MIN_SOCKET_READ: usize = 16 * 1024;
 /// Largest socket read; a bulk stream reaches it after two full reads. Reads
 /// align to frame boundaries (see `aligned_read_len`), so the cap only trades
-/// syscalls and wakeups against buffer memory: a client keeps it, a server
-/// connection uses [`SERVER_MAX_SOCKET_READ`].
+/// syscalls and wakeups against buffer memory. Connections use
+/// [`CLIENT_MAX_SOCKET_READ`] or [`SERVER_MAX_SOCKET_READ`].
 pub const MAX_SOCKET_READ: usize = 256 * 1024;
+/// Socket read cap of a client connection, upstream's `BackedReader` read
+/// size. Terminal output the client has read but not painted cannot be
+/// dropped by Ctrl+C and delays the echo of every keystroke behind it; what
+/// stays in the kernel instead also holds back the server through TCP flow
+/// control.
+pub const CLIENT_MAX_SOCKET_READ: usize = 64 * 1024;
 /// Socket read cap of a server connection. A server multiplexes many
 /// sessions, so this buffer is what a bulk upload adds per session: one
 /// aligned 64 KiB-packet frame per read keeps 16 concurrent uploads at 17 MB

@@ -10,14 +10,8 @@ impl ConsoleOutput {
             return Ok(0);
         };
         let mut state = shared.lock()?;
-        // The direct console has no writer-owned batch outside its queue, so
-        // a packet held back for lack of room also means the backlog reached
-        // the threshold.
-        if state.bytes < et_core::output_interrupt::FLUSH_THRESHOLD
-            && !(self.is_direct() && state.waiting_for_capacity)
-        {
-            return Ok(0);
-        }
+        // Upstream `TerminalClient::run` filters `consoleOut` on every
+        // interrupt (`filterDroppable`), whatever its size.
         let mut bytes = Vec::with_capacity(state.bytes);
         for entry in &state.queue {
             bytes.extend_from_slice(entry.unsent());

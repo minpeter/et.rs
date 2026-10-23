@@ -16,19 +16,27 @@ use super::{ActiveSession, SessionError, FLOW_CONTROL_BUFFER_BYTES};
 
 /// Unsent output staged while the client is connected, summed over both
 /// output lanes. Upstream's `TerminalServer` WriteBuffer caps this at 16 MB,
-/// but the queue only has to keep the bounded (256 KiB, `TCP_NOTSENT_LOWAT`)
-/// transport send buffer fed; anything beyond that is resident memory that
-/// only grows when the client is slower than the producer, and stale output
-/// Ctrl+C must discard. The producer is held back by terminal/pipe
-/// backpressure instead of the daemon heap. This bounds admission: output
-/// staged while disconnected drains after reconnection rather than being
-/// evicted.
+/// but the queue only has to keep the transport fed between writes (its
+/// unsent bytes are bounded by `TCP_NOTSENT_LOWAT` on Linux); anything beyond
+/// that is resident memory that only grows when the client is slower than
+/// the producer, and stale output Ctrl+C must discard. The producer is held
+/// back by terminal/pipe backpressure instead of the daemon heap. This bounds
+/// admission: output staged while disconnected drains after reconnection
+/// rather than being evicted.
 pub(super) const CONNECTED_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 /// `OutputQueue` bounds its terminal and control lanes independently, so
 /// terminal floods never starve keepalives or forwarding. Each connected lane
 /// gets half of [`CONNECTED_OUTPUT_BYTES`]; 1 MiB still spans several
-/// transport send-buffer refills.
+/// transport send-buffer refills and admits the largest single packet a
+/// terminal or jump terminal relays.
 const CONNECTED_LANE_BYTES: usize = CONNECTED_OUTPUT_BYTES / 2;
+/// Terminal output the bridge reads ahead while a default-buffered client is
+/// connected. Admission still takes one packet up to the whole lane, but
+/// the bridge stops reading the terminal past this, so a keystroke echo
+/// waits behind less flood: during a `yes` flood, echo dropped from about
+/// 25 to 15 ms against reading up to the 1 MiB lane, throughput unchanged.
+/// Eight times the unsent-byte bound still keeps the transport fed.
+const CONNECTED_TERMINAL_READ_AHEAD: usize = 256 * 1024;
 /// Per-lane bound while no client is connected; both lanes together may
 /// stage twice this until reconnection.
 const DISCONNECTED_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
@@ -59,6 +67,10 @@ struct WriterState {
     unrecoverable: bool,
     default_buffering: bool,
     input: et_core::output_interrupt::InterruptInput,
+    /// An interrupt flush dropped output, so the bridge must drain and
+    /// discard what the terminal already emitted before it delivers that
+    /// input (upstream `drainDiscardReadableBytes`).
+    interrupt_drain: bool,
     /// A blocking writer is parked in [`FlowControl::next_item`]. Only it
     /// needs an enqueue wake: the Unix session loop pumps output itself, and
     /// an unconditional notify costs a futex syscall per packet.
@@ -97,6 +109,12 @@ impl WriterState {
         }
     }
 
+    /// Terminal bytes past which the bridge stops reading the terminal, if
+    /// that is below the lane bound.
+    fn terminal_read_ahead(&self) -> Option<usize> {
+        (self.default_buffering && self.connected).then_some(CONNECTED_TERMINAL_READ_AHEAD)
+    }
+
     /// Clears the bridge waits whose refusal has cleared and reports whether
     /// any did. Each refused lane resumes on its own occupancy: half of its
     /// byte budget and packet slots free, so a saturated stream refills in
@@ -106,7 +124,11 @@ impl WriterState {
         let drained = self.queue.is_empty();
         let mut ready = false;
         if self.bridge_waiting.terminal
-            && (drained || self.queue.can_resume(OutputLane::Terminal, resume_bytes))
+            && (drained
+                || (self.queue.can_resume(OutputLane::Terminal, resume_bytes)
+                    && self
+                        .terminal_read_ahead()
+                        .is_none_or(|ahead| self.queue.terminal_bytes() <= ahead / 2)))
         {
             self.bridge_waiting.terminal = false;
             ready = true;
@@ -154,6 +176,7 @@ impl FlowControl {
                 unrecoverable: false,
                 default_buffering: limit == CONNECTED_LANE_BYTES,
                 input: et_core::output_interrupt::InterruptInput::default(),
+                interrupt_drain: false,
                 writer_waiting: false,
             }),
             wake: Condvar::new(),
@@ -347,20 +370,41 @@ impl FlowControl {
         }
     }
 
-    pub(super) fn observe_input(&self, bytes: &[u8]) -> Result<usize, SessionError> {
+    pub(super) fn observe_input(&self, bytes: &[u8]) -> Result<(), SessionError> {
         let mut state = self.state.lock().map_err(|_| SessionError::Unavailable)?;
-        let dropped = if state.input.feed(bytes) {
-            state.queue.flush_terminal_on_interrupt()
-        } else {
-            0
-        };
+        if state.input.feed(bytes) && state.queue.flush_terminal_on_interrupt() > 0 {
+            state.interrupt_drain = true;
+        }
         self.wake.notify_all();
-        Ok(dropped)
+        Ok(())
+    }
+
+    /// Whether input observed since the last call flushed output on
+    /// interrupt, so the bridge must drain the terminal before writing it.
+    pub(super) fn take_interrupt_drain(&self) -> Result<bool, SessionError> {
+        let mut state = self.state.lock().map_err(|_| SessionError::Unavailable)?;
+        Ok(std::mem::take(&mut state.interrupt_drain))
+    }
+
+    /// Queue terminal output drained after an interrupt flush and drop
+    /// every droppable terminal byte; see
+    /// [`OutputQueue::discard_drained_terminal`].
+    pub(super) fn discard_drained_terminal(
+        &self,
+        drained: Vec<Packet>,
+    ) -> Result<(), SessionError> {
+        let mut state = self.state.lock().map_err(|_| SessionError::Unavailable)?;
+        state.queue.discard_drained_terminal(drained);
+        Ok(())
     }
 
     pub(super) fn can_accept_terminal(&self, bytes: usize) -> Result<bool, SessionError> {
         let mut state = self.state.lock().map_err(|_| SessionError::Unavailable)?;
-        let ok = state.stop == StopMode::Running && state.queue.can_accept_terminal(bytes);
+        let ok = state.stop == StopMode::Running
+            && state.queue.can_accept_terminal(bytes)
+            && state
+                .terminal_read_ahead()
+                .is_none_or(|ahead| state.queue.terminal_bytes().saturating_add(bytes) <= ahead);
         if !ok {
             state.bridge_waiting.terminal = true;
         }

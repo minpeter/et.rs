@@ -29,6 +29,28 @@ pub use recovery::{RecoveryExchange, DEFAULT_RECOVERY_TIMEOUT, MAX_RECOVERY_PROT
 /// and recovery can proceed.
 pub const DEFAULT_LIVE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const FLOW_CONTROL_LIVE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Unsent-byte bound for live output, as upstream
+/// `TcpSocketHandler::minimizeKernelBuffering` (`TcpSocketHandlerUnix.cpp`):
+/// output not yet handed to TCP stays in the session queue, where Ctrl+C
+/// can still drop it.
+#[cfg(target_os = "linux")]
+pub const OUTPUT_NOTSENT_LOWAT_BYTES: u32 = 32 * 1024;
+/// Requested `SO_SNDBUF` for live output; the kernel doubles it.
+///
+/// Upstream sets no send buffer and leaves it to autotune. Its own output
+/// loop stays near 5 MB/s, so it never fills a WAN path; et.rs keeps up with
+/// the link, and an autotuned buffer then grows in-flight data, plus the
+/// client's receive backlog behind it, to many megabytes that Ctrl+C cannot
+/// drop (RTT 50 ms: up to 10 MB after Ctrl+C, prompt up to 1.1 s later).
+/// On Linux, 1 MiB still carries about 14 MB/s at RTT 50 ms with the prompt
+/// back in about one RTT; below `TCP_NOTSENT_LOWAT` it only bounds data in
+/// flight. Without `TCP_NOTSENT_LOWAT` (socket2 exposes it on Linux only)
+/// the buffer is also the unsent queue, so it stays at 256 KiB: above one
+/// 64 KiB forwarding frame, so a full packet does not stall the session
+/// loop's write batch on every iteration.
+#[cfg(target_os = "linux")]
+pub const FLOW_CONTROL_SOCKET_BUFFER_BYTES: usize = 1024 * 1024;
+#[cfg(not(target_os = "linux"))]
 pub const FLOW_CONTROL_SOCKET_BUFFER_BYTES: usize = 256 * 1024;
 
 #[derive(Debug)]
@@ -134,7 +156,7 @@ impl Connection {
             key,
             DIR_CLIENT_TO_SERVER,
             DIR_SERVER_TO_CLIENT,
-            et_core::backed_reader::MAX_SOCKET_READ,
+            et_core::backed_reader::CLIENT_MAX_SOCKET_READ,
         )
     }
 
@@ -570,19 +592,30 @@ impl Connection {
         Ok(())
     }
 
-    /// Keep opt-in flow-control backlog in the application queue instead of
-    /// letting the kernel send queue autotune to multiple megabytes. The cap
-    /// stays above a single forwarding frame so one full packet does not stall
-    /// the session loop's write batch on every iteration.
+    /// Keep live output backlog in the application queue, where Ctrl+C can
+    /// drop it, instead of the kernel send queue, and bound data in flight
+    /// (see [`FLOW_CONTROL_SOCKET_BUFFER_BYTES`]).
     pub fn minimize_output_buffering(&mut self) -> Result<(), ConnError> {
         self.live_write_timeout = FLOW_CONTROL_LIVE_WRITE_TIMEOUT;
         let socket = SockRef::from(&*self.stream);
+        #[cfg(target_os = "linux")]
+        {
+            socket
+                .set_tcp_notsent_lowat(OUTPUT_NOTSENT_LOWAT_BYTES)
+                .map_err(ConnError::Io)?;
+            // `SO_SNDBUF` is clamped to `net.core.wmem_max`, 208 KiB on stock
+            // kernels; a privileged etserver may exceed it, like autotuning.
+            match rustix::net::sockopt::set_socket_send_buffer_size_force(
+                &*self.stream,
+                FLOW_CONTROL_SOCKET_BUFFER_BYTES,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(rustix::io::Errno::PERM) => {}
+                Err(error) => return Err(ConnError::Io(error.into())),
+            }
+        }
         socket
             .set_send_buffer_size(FLOW_CONTROL_SOCKET_BUFFER_BYTES)
-            .map_err(ConnError::Io)?;
-        #[cfg(target_os = "linux")]
-        socket
-            .set_tcp_notsent_lowat((FLOW_CONTROL_SOCKET_BUFFER_BYTES / 4) as u32)
             .map_err(ConnError::Io)?;
         Ok(())
     }

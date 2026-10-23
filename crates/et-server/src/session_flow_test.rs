@@ -917,3 +917,40 @@ fn connected_default_output_bounds_both_lanes_by_one_total() {
     assert!(terminal_staged > 0 && control_staged > 0);
     assert!(terminal_staged + control_staged <= super::session_flow::CONNECTED_OUTPUT_BYTES);
 }
+
+#[test]
+fn connected_default_output_stops_terminal_reads_long_before_the_lane_is_full() {
+    // Given: connected default buffering, fed the way the bridge reads the
+    // terminal: only while the flow accepts another 32 KiB read.
+    let flow = FlowControl::new_default();
+    let chunk = terminal_output(16 * 1024);
+    let cost = chunk.wire_len() + std::mem::size_of::<u32>();
+    let mut staged = 0;
+    while flow.can_accept_terminal(32 * 1024).unwrap() {
+        flow.enqueue(chunk.clone()).unwrap();
+        staged += cost;
+    }
+
+    // Then: a keystroke echo queues behind well under half the terminal lane.
+    assert!(staged > 0);
+    assert!(staged * 4 <= super::session_flow::CONNECTED_OUTPUT_BYTES);
+
+    // And: the bridge is woken only once delivery drained the read-ahead to
+    // half, so it refills in a batch rather than per packet.
+    let mut completed = 0;
+    loop {
+        let packet = flow.next_packet().unwrap();
+        let (running, signal) =
+            flow.complete_with_signal(packet, &FlowWriteResult::Delivered, true);
+        assert!(running);
+        completed += 1;
+        if signal {
+            break;
+        }
+    }
+    assert!(completed * cost * 2 >= staged);
+    assert!(flow.can_accept_terminal(32 * 1024).unwrap());
+
+    // And: a single packet larger than the read-ahead is still admitted.
+    flow.enqueue(terminal_output(512 * 1024)).unwrap();
+}

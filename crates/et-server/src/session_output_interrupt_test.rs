@@ -5,12 +5,15 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use et_core::packet::Packet;
-use et_core::proto::{TerminalBuffer, TerminalPacketType};
+use et_core::proto::{TerminalBuffer, TerminalExitStatus, TerminalPacketType};
 use et_net::connection::Connection;
+use et_net::forward::Forwarder;
+use et_net::local_packet::{read_local_packet, write_local_packet, RouterFraming};
 use prost::Message;
 use rustix::event::{poll, PollFd, PollFlags};
 
 use super::{ActiveSession, OutputPump};
+use crate::terminal_bridge::BridgeMode;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -113,6 +116,110 @@ fn output_interrupt_preserves_small_terminal_output() {
     }
     assert_eq!(bytes, b"small output\nET_CTRL_C_OK");
     assert_eq!(controls, vec![control()]);
+}
+
+#[test]
+fn output_interrupt_discards_output_the_terminal_already_emitted() {
+    assert_interrupt_discards_emitted_output(BridgeMode::Terminal(RouterFraming::Packets));
+}
+
+#[test]
+fn output_interrupt_discards_output_the_jump_terminal_already_relayed() {
+    assert_interrupt_discards_emitted_output(BridgeMode::Jumphost);
+}
+
+fn assert_interrupt_discards_emitted_output(mode: BridgeMode) {
+    // Given: a default-buffered session whose terminal lane is full of unsent
+    // flood. More flood and then an exit status wait on the terminal socket,
+    // which the bridge does not read while the lane refuses output.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    let mut client = Connection::new_client(client, &[7; 32]);
+    client.set_io_timeout(Some(TIMEOUT)).unwrap();
+    let (terminal_socket, mut terminal_peer) = et_net::local::wake_pair().unwrap();
+    let session = Arc::new(
+        ActiveSession::new(
+            Connection::new_server(server, &[7; 32]),
+            &terminal_socket,
+            None,
+        )
+        .unwrap(),
+    );
+    session.set_forward_exit_status(true);
+    session.start_output();
+    // Recovery admission holds output in the queue, so the lane stays full
+    // without depending on socket timing.
+    let permit = session.try_begin_recover().unwrap();
+    let queued = terminal(&[b'x'; 16 * 1024]);
+    while session.can_buffer_write(32 * 1024).unwrap() {
+        session
+            .send_packet(queued.header(), queued.payload())
+            .unwrap();
+    }
+    let emitted = terminal(&[b'y'; 16 * 1024]);
+    write_local_packet(&mut terminal_peer, &emitted).unwrap();
+    write_local_packet(&mut terminal_peer, &emitted).unwrap();
+    let exit_status = Packet::new(
+        TerminalPacketType::TerminalExitStatus as u8,
+        TerminalExitStatus {
+            exitcode: Some(130),
+        }
+        .encode_to_vec(),
+    );
+    write_local_packet(&mut terminal_peer, &exit_status).unwrap();
+    let interrupt = terminal(b"\x03");
+    client
+        .write_packet(interrupt.header(), interrupt.payload())
+        .unwrap();
+    let bridge_session = Arc::clone(&session);
+    let bridge = std::thread::spawn(move || {
+        crate::terminal_bridge::run_mode(
+            bridge_session,
+            terminal_socket,
+            Forwarder::start(Vec::new()).unwrap(),
+            mode,
+        )
+    });
+
+    // When: Ctrl+C reaches the terminal, which answers with a prompt once
+    // the client has seen the exit status.
+    let (interrupted_tx, interrupted_rx) = mpsc::sync_channel(1);
+    let (prompt_tx, prompt_rx) = mpsc::sync_channel::<()>(1);
+    let prompt = terminal(b"ET_CTRL_C_OK");
+    let terminal_prompt = prompt.clone();
+    let local = std::thread::spawn(move || {
+        interrupted_tx
+            .send(read_local_packet(&mut terminal_peer).unwrap())
+            .unwrap();
+        prompt_rx.recv_timeout(TIMEOUT).unwrap();
+        write_local_packet(&mut terminal_peer, &terminal_prompt).unwrap();
+        terminal_peer
+    });
+    assert_eq!(interrupted_rx.recv_timeout(TIMEOUT).unwrap(), interrupt);
+    drop(permit);
+    let mut delivered = Vec::new();
+    loop {
+        let packet = client.read_packet().unwrap();
+        let done = packet.header() == TerminalPacketType::TerminalExitStatus as u8;
+        delivered.push(packet);
+        if done {
+            break;
+        }
+    }
+    prompt_tx.send(()).unwrap();
+    delivered.push(client.read_packet().unwrap());
+    let _terminal_peer = local.join().unwrap();
+    session.shutdown().unwrap();
+    bridge.join().unwrap().unwrap();
+
+    // Then: neither the queued nor the already-emitted flood reaches the
+    // client; the exit status and the later prompt do, in order.
+    assert_eq!(
+        delivered,
+        vec![exit_status, prompt],
+        "interrupted flood reached the encrypted client"
+    );
 }
 
 fn control() -> Packet {

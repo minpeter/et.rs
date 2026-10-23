@@ -64,25 +64,22 @@ type ConsoleGate = (
 );
 
 #[test]
-fn output_interrupt_preserves_console_output_below_the_flush_threshold() {
-    // Given unsent output below upstream's 64 KiB interrupt threshold.
+fn output_interrupt_drops_unsent_console_output_of_any_size() {
+    // Given unsent output below the server's 64 KiB interrupt threshold.
     for size in [6, 64 * 1024 - 1] {
         let (output, bytes, release) = gated_output(FlowControlMode::None, b"prefix\n");
-        let pending = vec![b'x'; size];
-        assert!(output
-            .try_write(&pending, &TerminalModeState::default())
-            .unwrap());
-        // When the user interrupts while the writer still owns the prefix.
+        let modes = TerminalModeState::default();
+        assert!(output.try_write(&vec![b'x'; size], &modes).unwrap());
+        // When the user interrupts while the writer still owns the prefix,
+        // and the shell then prints its prompt.
         output.interrupt().unwrap();
+        assert!(output.try_write(b"ET_CTRL_C_OK", &modes).unwrap());
         release.send(()).unwrap();
         output
             .complete(ConsoleCompletion::RemoteSessionEnded)
             .unwrap();
-        // Then small output remains byte-exact.
-        assert_eq!(
-            *bytes.lock().unwrap(),
-            [b"prefix\n".as_slice(), &pending].concat()
-        );
+        // Then, as upstream's client, only the prefix and the prompt paint.
+        assert_eq!(*bytes.lock().unwrap(), b"prefix\nET_CTRL_C_OK");
     }
 }
 

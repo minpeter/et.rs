@@ -4,7 +4,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{self, IsTerminal, Read};
-use std::net::TcpStream;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -14,10 +13,11 @@ use et_cli::client::ClientArgs;
 use et_core::packet::Packet;
 use et_core::proto::{TerminalBuffer, TerminalExitStatus, TerminalPacketType as Kind};
 use et_net::connection::{Connection, WritePacketError};
-use et_net::forward::{is_forward_packet, Forwarder};
+use et_net::forward::{is_forward_packet, FastPollState, Forwarder};
 use prost::Message;
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 
+use crate::delivery_gate::DeliveryGate;
 use crate::error::ClientError;
 use crate::initial_connect::ReconnectOutcome;
 use crate::local_control::{self, Action, Control};
@@ -26,10 +26,22 @@ use crate::local_mux::{self as mux, ExitMarker};
 
 const MAX_CLIENTS: usize = 16;
 const MAX_PENDING: usize = 64;
-/// Longest an idle pump turn waits. The transport and forwarding wake are
-/// polled, so their traffic wakes the loop at once; local IPC, the
-/// passenger, and timers are serviced at least this often.
-const IDLE_WAIT: Duration = Duration::from_millis(5);
+/// Longest a turn waits while a passenger is attached: its terminal size
+/// is sampled, not signalled (a mux passenger's SIGWINCH reaches the mux
+/// client, not this process). Without one, an idle session sleeps until
+/// readiness or its next timer.
+const PASSENGER_WAIT: Duration = Duration::from_millis(5);
+/// Retry cadence for forwarding packets the forwarder could not take yet,
+/// and for forwarding output queued while the transport is down.
+const RETRY_WAIT: Duration = Duration::from_millis(10);
+/// Transport packets read per turn before IPC and writes are serviced.
+const READ_BATCH: usize = 128;
+/// Forwarding packets written per turn. The engine stops reading local
+/// sockets past its outbound backlog, so a turn must drain a full batch.
+const OUTBOUND_BATCH: usize = 128;
+/// Transport packets held for the forwarder, in order, before the
+/// transport stops being read.
+const FORWARD_BACKLOG: usize = 257;
 
 pub fn enabled(args: &ClientArgs) -> bool {
     args.ctl || mux::master(args) || args.no_remote_command
@@ -601,6 +613,54 @@ impl Runtime {
             }
         }
     }
+    /// Local descriptors whose readiness lets [`Runtime::local`] or
+    /// [`Runtime::pump_passenger`] progress: pending connections, peer
+    /// frames, descriptors, closes and reply space, and the passenger.
+    fn poll_descriptors<'a>(&'a self, descriptors: &mut Vec<PollFd<'a>>) {
+        for listener in [&self.mux, &self.ctl].into_iter().flatten() {
+            descriptors.push(PollFd::new(listener, PollFlags::IN));
+        }
+        for peer in self.peers.values() {
+            let mut flags = PollFlags::empty();
+            if !peer.closing {
+                flags |= PollFlags::IN;
+            }
+            if !peer.output.is_empty() {
+                flags |= PollFlags::OUT;
+            }
+            if !flags.is_empty() {
+                descriptors.push(PollFd::new(&peer.socket, flags));
+            }
+        }
+        if let Some(passenger) = self.passenger.as_ref() {
+            if !passenger.queued.is_empty() {
+                descriptors.push(PollFd::new(&passenger.output.file, PollFlags::OUT));
+            }
+            if passenger.read_input
+                && passenger.status.is_none()
+                && self.pending.len() < MAX_PENDING
+            {
+                descriptors.push(PollFd::new(&passenger.input.file, PollFlags::IN));
+            }
+        }
+    }
+    /// The next local timer: peer and shutdown timeouts, ControlPersist
+    /// expiry, and the passenger's terminal size sample.
+    fn deadline(&self, args: &ClientArgs) -> Option<Instant> {
+        let mut deadline = self.stopping.map(|since| since + ipc::TIMEOUT);
+        for peer in self.peers.values().filter(|p| !p.attached || p.closing) {
+            deadline = earliest(deadline, peer.started + ipc::TIMEOUT);
+        }
+        if self.passenger.is_some() {
+            deadline = earliest(deadline, Instant::now() + PASSENGER_WAIT);
+        }
+        if !args.ctl && mux::master(args) && self.passenger.is_none() {
+            if let Some(persist) = args.control_persist.filter(|p| p.enabled && p.seconds > 0) {
+                deadline = earliest(deadline, self.idle + Duration::from_secs(persist.seconds));
+            }
+        }
+        deadline
+    }
 }
 
 pub fn run<F>(
@@ -673,6 +733,12 @@ where
     result
 }
 
+/// Upstream `TerminalClient::run` serves every mode, `-N` included, from one
+/// poll set: the transport, the console and every forwarded socket. This
+/// loop does the same: its first poll takes the forwarding worker over
+/// (as the interactive loop does), and each idle turn sleeps in `poll(2)`
+/// on the transport, local IPC, the passenger, forwarded sockets and a
+/// signal wake until one is ready or its next timer is due.
 fn pump<F>(
     connection: &mut Connection,
     args: &ClientArgs,
@@ -692,6 +758,11 @@ where
             }
         }
     }
+    // Each signal sets the flag, then sends a byte to `signal_wake` from
+    // whichever thread it interrupted, so an idle poll wakes even when
+    // EINTR lands on a resolver or connector thread.
+    let (signal_wake, signal_writer) = UnixStream::pair().map_err(error)?;
+    signal_wake.set_nonblocking(true).map_err(error)?;
     let mut signals = Signals(Vec::new());
     for signal in [
         signal_hook::consts::SIGTERM,
@@ -701,14 +772,26 @@ where
         signals
             .0
             .push(signal_hook::flag::register(signal, stopped.clone()).map_err(error)?);
+        let writer = signal_writer.try_clone().map_err(error)?;
+        signals
+            .0
+            .push(signal_hook::low_level::pipe::register(signal, writer).map_err(error)?);
     }
-    let mut pending_forward = None;
+    drop(signal_writer);
+    let interval = Duration::from_secs(args.keepalive.into());
+    let silence = Duration::from_secs(u64::from(args.keepalive) * 3);
+    let mut pending_forward = VecDeque::with_capacity(FORWARD_BACKLOG);
     let mut stream = connection.try_clone_stream().map_err(error)?;
     let forward_wake = forwarder
         .wake()
         .and_then(|wake| wake.try_clone().map_err(Into::into))
         .map_err(error)?;
+    let mut fast_poll = FastPollState::new();
+    let mut delivery_gate = DeliveryGate::default();
+    let mut bytes_since_ack: usize = 0;
+    let mut inbound_ready = false;
     let mut pending_output: Option<Vec<u8>> = None;
+    let mut transport_ready = true;
     let mut last_received = Instant::now();
     let mut keepalive = Instant::now();
     let mut retry = Instant::now();
@@ -779,6 +862,7 @@ where
                         stream = connection.try_clone_stream().map_err(error)?;
                         last_received = Instant::now();
                         keepalive = Instant::now();
+                        progressed = true;
                     }
                     Ok(ReconnectOutcome::SessionEnded) => return Ok(0),
                     Err(e) if e.is_transient_reconnect() => {
@@ -787,68 +871,86 @@ where
                     Err(e) => return Err(e),
                 }
             }
-            std::thread::sleep(Duration::from_millis(10));
-            continue;
-        }
-        if let Some(packet) = pending_forward.take() {
-            pending_forward = forwarder.try_receive(packet).map_err(error)?;
-        }
-        for _ in 0..32 {
-            if pending_forward.is_some() || pending_output.is_some() {
-                break;
-            }
-            match connection.try_read_packet() {
-                Ok(Some(packet)) => {
-                    progressed = true;
-                    last_received = Instant::now();
-                    if is_forward_packet(packet.header()) {
-                        pending_forward = forwarder.try_receive(packet).map_err(error)?;
-                    } else if packet.header() == Kind::KeepAlive as u8 {
-                        if let Some(ack) = et_core::keepalive::decode_ack(packet.payload()) {
-                            connection.acknowledge_delivery(ack);
-                        }
-                    } else if packet.header() == Kind::TerminalBuffer as u8 {
-                        let bytes = match TerminalBuffer::decode(packet.payload()) {
-                            Ok(message) => message.buffer.unwrap_or_default(),
-                            Err(_) => {
-                                connection.disconnect();
-                                break;
+        } else {
+            // Packets the forwarder could not take yet go first; the queue
+            // keeps their order while further transport packets join it.
+            flush_forwarding(forwarder, &mut pending_forward)?;
+            let mut read_batch = 0;
+            let mut broke_for_credit = false;
+            // Read only on readiness (or packets already decoded), like the
+            // interactive loop: an upload turn otherwise pays an EAGAIN recv.
+            let readable = transport_ready || inbound_ready || connection.has_buffered_read();
+            while readable
+                && pending_forward.len() < FORWARD_BACKLOG
+                && pending_output.is_none()
+                && read_batch < READ_BATCH
+            {
+                read_batch += 1;
+                match connection.try_read_packet() {
+                    Ok(Some(packet)) => {
+                        progressed = true;
+                        last_received = Instant::now();
+                        if packet.header() == Kind::KeepAlive as u8 {
+                            if let Some(ack) = et_core::keepalive::decode_ack(packet.payload()) {
+                                connection.acknowledge_delivery(ack);
                             }
-                        };
-                        if bytes.len() + 128 > ipc::MAX_REPLY {
-                            return Err(error("terminal output packet exceeds local queue limit"));
+                            continue;
                         }
-                        if runtime.output_blocked(bytes.len()) {
-                            pending_output = Some(bytes);
-                        } else {
-                            runtime.output(&bytes);
+                        bytes_since_ack = bytes_since_ack.saturating_add(packet.payload().len());
+                        if is_forward_packet(packet.header()) {
+                            pending_forward.push_back(packet);
+                            if pending_forward.len() >= 4 {
+                                flush_forwarding(forwarder, &mut pending_forward)?;
+                                // Let window credit the engine just queued
+                                // out before reading the next batch.
+                                if !connection.write_pending() && forwarder.has_fast_outbound() {
+                                    broke_for_credit = true;
+                                    break;
+                                }
+                            }
+                        } else if packet.header() == Kind::TerminalBuffer as u8 {
+                            let bytes = match TerminalBuffer::decode(packet.payload()) {
+                                Ok(message) => message.buffer.unwrap_or_default(),
+                                Err(_) => {
+                                    connection.disconnect();
+                                    break;
+                                }
+                            };
+                            if bytes.len() + 128 > ipc::MAX_REPLY {
+                                return Err(error(
+                                    "terminal output packet exceeds local queue limit",
+                                ));
+                            }
+                            if runtime.output_blocked(bytes.len()) {
+                                pending_output = Some(bytes);
+                            } else {
+                                runtime.output(&bytes);
+                            }
+                        } else if packet.header() == Kind::TerminalExitStatus as u8 {
+                            let code = TerminalExitStatus::decode(packet.payload())
+                                .map_err(error)?
+                                .exitcode
+                                .unwrap_or(0);
+                            return Ok(code);
                         }
-                    } else if packet.header() == Kind::TerminalExitStatus as u8 {
-                        let code = TerminalExitStatus::decode(packet.payload())
-                            .map_err(error)?
-                            .exitcode
-                            .unwrap_or(0);
-                        return Ok(code);
                     }
+                    Ok(None) => break,
+                    Err(e) if crate::client_terminal::connection_ended(&e) => break,
+                    Err(e) => return Err(error(e)),
                 }
-                Ok(None) => break,
-                Err(e) if crate::client_terminal::connection_ended(&e) => break,
-                Err(e) => return Err(error(e)),
             }
-        }
-        forwarder.flush_receive();
-        if !connection.connected() {
-            continue;
-        }
-        if let Err(e) = connection.advance_write() {
-            let e = e.into_inner();
-            if !crate::client_terminal::connection_ended(&e) {
-                return Err(error(e));
+            flush_forwarding(forwarder, &mut pending_forward)?;
+            forwarder.flush_receive();
+            inbound_ready = read_batch == READ_BATCH || broke_for_credit;
+            if let Err(e) = connection.advance_write() {
+                let e = e.into_inner();
+                if !crate::client_terminal::connection_ended(&e) {
+                    return Err(error(e));
+                }
             }
-            continue;
-        }
-        if !connection.write_pending() {
-            if keepalive.elapsed() >= Duration::from_secs(args.keepalive.into())
+            if connection.connected()
+                && !connection.write_pending()
+                && keepalive.elapsed() >= interval
                 && runtime.stopping.is_none()
             {
                 runtime.pending.push_front(Packet::new(
@@ -856,79 +958,229 @@ where
                     connection.keepalive_ack().to_vec(),
                 ));
                 keepalive = Instant::now();
+                bytes_since_ack = 0;
             }
-            if runtime.pending.len() < MAX_PENDING && runtime.stopping.is_none() {
-                if let Some(packet) = forwarder.try_outbound().map_err(error)? {
-                    runtime.pending.push_back(packet);
+            // Keepalives and IPC traffic go ahead of forwarding data.
+            while connection.connected() && !connection.write_pending() {
+                let Some(packet) = runtime.pending.pop_front() else {
+                    break;
+                };
+                let counted = counted_bytes(&packet);
+                if let Some(packet) = send(connection, packet)? {
+                    runtime.pending.push_front(packet);
+                    break;
                 }
+                progressed = true;
+                bytes_since_ack = bytes_since_ack.saturating_add(counted);
             }
-            if let Some(packet) = runtime.pending.pop_front() {
-                match connection.start_write_packet_owned(packet.header(), packet.payload()) {
-                    Ok(()) => progressed = true,
-                    Err(WritePacketError::ReplayOwned(e))
-                        if crate::client_terminal::connection_ended(&e) => {}
-                    Err(WritePacketError::BeforeReplay(e))
-                        if crate::client_terminal::connection_ended(&e) =>
+            // The engine pauses its reads past its outbound backlog, so one
+            // turn drains a whole batch, written directly like the
+            // interactive loop. A due acknowledgement and the delivery bound
+            // end the batch.
+            if runtime.stopping.is_none() {
+                for _ in 0..OUTBOUND_BATCH {
+                    if !connection.connected()
+                        || connection.write_pending()
+                        || bytes_since_ack >= et_core::keepalive::ACK_INTERVAL_BYTES
+                        || delivery_gate.blocked(connection, interval)
                     {
-                        runtime.pending.push_front(packet);
-                        connection.disconnect();
+                        break;
                     }
-                    Err(e) => return Err(error(e.into_inner())),
+                    let Some(packet) = forwarder.try_outbound().map_err(error)? else {
+                        break;
+                    };
+                    let counted = counted_bytes(&packet);
+                    if let Some(packet) = send(connection, packet)? {
+                        // Never reached replay: it goes first on recovery.
+                        runtime.pending.push_front(packet);
+                        break;
+                    }
+                    progressed = true;
+                    bytes_since_ack = bytes_since_ack.saturating_add(counted);
                 }
             }
+            // Acknowledge by volume as well as on the keepalive interval, so
+            // the server trims its replay backup and its echo releases the
+            // delivery gate while data flows.
+            if connection.connected()
+                && !connection.write_pending()
+                && runtime.stopping.is_none()
+                && bytes_since_ack >= et_core::keepalive::ACK_INTERVAL_BYTES
+            {
+                bytes_since_ack = 0;
+                keepalive = Instant::now();
+                let ack = Packet::new(Kind::KeepAlive as u8, connection.keepalive_ack().to_vec());
+                if let Some(packet) = send(connection, ack)? {
+                    runtime.pending.push_front(packet);
+                }
+                progressed = true;
+            }
+            if last_received.elapsed() > silence {
+                connection.disconnect();
+            }
+            // A lost transport retries at once rather than after a wait.
+            progressed |= !connection.connected();
         }
-        if last_received.elapsed() > Duration::from_secs(u64::from(args.keepalive) * 3) {
-            connection.disconnect();
+        // All batches above are bounded and service IPC on every turn. Wait
+        // only when nothing could advance, until readiness or the next timer.
+        let connected = connection.connected();
+        let write_pending = connection.write_pending();
+        // While a frame is pending, producers are left out of the poll set:
+        // poll(2) reports HUP/ERR even for an empty event mask. A delivery
+        // backlog parks them the same way until the server acknowledges.
+        let producers_polled = !write_pending
+            && !delivery_gate.blocked(connection, interval)
+            && runtime.stopping.is_none();
+        let reads_transport =
+            connected && pending_output.is_none() && pending_forward.len() < FORWARD_BACKLOG;
+        let now = Instant::now();
+        let mut deadline = if connected {
+            let mut deadline = connection
+                .pending_write_deadline()
+                .unwrap_or(keepalive + interval)
+                .min(last_received + silence);
+            if let Some(release) = delivery_gate.release_at(interval) {
+                deadline = deadline.min(release);
+            }
+            Some(deadline)
+        } else if runtime.stopping.is_none() {
+            Some(retry)
+        } else {
+            None
+        };
+        if let Some(at) = runtime.deadline(args) {
+            deadline = earliest(deadline, at);
         }
-        // All batches above are bounded and service IPC on every turn. A
-        // fixed sleep after progress throttles short PTY packets and partial
-        // pipe writes; wait only when input/output could not advance, and
-        // let transport or forwarding readiness end the wait early.
-        if !progressed {
-            let accepts_outbound = !connection.write_pending()
-                && runtime.pending.len() < MAX_PENDING
-                && runtime.stopping.is_none();
-            let reads_transport = pending_forward.is_none() && pending_output.is_none();
-            wait_idle(
-                &stream,
-                connection.write_pending(),
-                reads_transport,
-                accepts_outbound.then_some(&forward_wake),
-            )?;
+        if progressed || (reads_transport && (inbound_ready || connection.has_buffered_read())) {
+            deadline = Some(now);
+        }
+        if !pending_forward.is_empty() {
+            deadline = earliest(deadline, now + RETRY_WAIT);
+        }
+        if producers_polled {
+            // The first call takes the forwarding worker over, so forwarded
+            // sockets are served by this poll with no thread hop.
+            forwarder.collect_fast_poll_routes(&mut fast_poll);
+            if let Some(mut at) = fast_poll.deadline() {
+                // Output queued while the transport is down cannot drain;
+                // retry at the reconnect cadence instead of spinning.
+                if !connected && forwarder.has_fast_outbound() {
+                    at = at.max(now + RETRY_WAIT);
+                }
+                deadline = earliest(deadline, at);
+            }
+        }
+        let (signalled, readable) = {
+            let mut descriptors = vec![PollFd::new(&signal_wake, PollFlags::IN)];
+            let mut transport = PollFlags::empty();
+            if reads_transport {
+                transport |= PollFlags::IN;
+            }
+            if connected && write_pending {
+                transport |= PollFlags::OUT;
+            }
+            let transport_index = descriptors.len();
+            if !transport.is_empty() {
+                descriptors.push(PollFd::new(&stream, transport));
+            }
+            runtime.poll_descriptors(&mut descriptors);
+            // A worker thread that could not be taken over still signals
+            // outbound packets here; they drain only while connected.
+            if producers_polled && connected {
+                descriptors.push(PollFd::new(&forward_wake, PollFlags::IN));
+            }
+            let fast_offset = descriptors.len();
+            if producers_polled {
+                fast_poll.push_descriptors(&mut descriptors);
+            }
+            let timeout = deadline.map_or(Ok(None), |deadline| {
+                Timespec::try_from(deadline.saturating_duration_since(Instant::now())).map(Some)
+            });
+            let timeout = timeout.map_err(error)?;
+            // Signals arrive through `signal_wake` whichever thread they
+            // interrupt, so EINTR needs no retry here.
+            match poll(&mut descriptors, timeout.as_ref()) {
+                Ok(_) => {}
+                Err(errno) if errno == rustix::io::Errno::INTR => {}
+                Err(errno) => return Err(error(io::Error::from(errno))),
+            }
+            if producers_polled {
+                fast_poll.record_revents(&descriptors[fast_offset..]);
+            }
+            let readable = !transport.is_empty()
+                && descriptors[transport_index]
+                    .revents()
+                    .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR);
+            (!descriptors[0].revents().is_empty(), readable)
+        };
+        transport_ready = readable;
+        if signalled {
+            drain_wake(&signal_wake)?;
+        }
+        if producers_polled {
+            forwarder.service_fast_poll(&mut fast_poll);
         }
     }
 }
 
-/// Upstream `TerminalClient::run` polls the transport and every forwarded
-/// socket with a 10 ms cap instead of sleeping, so forwarding is
-/// event-driven. This loop keeps its IPC cadence but wakes on transport
-/// readability (when it would read), writability (while a frame is
-/// pending), and outbound forwarding packets (when it would send one).
-fn wait_idle(
-    stream: &TcpStream,
-    write_pending: bool,
-    reads_transport: bool,
-    forward_wake: Option<&UnixStream>,
+fn earliest(deadline: Option<Instant>, at: Instant) -> Option<Instant> {
+    Some(deadline.map_or(at, |deadline| deadline.min(at)))
+}
+
+/// Payload bytes a written packet adds toward the next volume
+/// acknowledgement; keepalives are the acknowledgements themselves.
+fn counted_bytes(packet: &Packet) -> usize {
+    if packet.header() == Kind::KeepAlive as u8 {
+        0
+    } else {
+        packet.payload().len()
+    }
+}
+
+fn flush_forwarding(
+    forwarder: &Forwarder,
+    queue: &mut VecDeque<Packet>,
 ) -> Result<(), ClientError> {
-    let mut transport = PollFlags::empty();
-    if reads_transport {
-        transport |= PollFlags::IN;
+    forwarder.try_receive_queue(queue).map_err(error)
+}
+
+/// Admit one packet to replay and start its live write. Returns the packet
+/// when the transport ended before replay owned it, so it goes first on the
+/// recovered connection.
+fn send(connection: &mut Connection, packet: Packet) -> Result<Option<Packet>, ClientError> {
+    // Data skips the MSG_PEEK connectivity probe, as in the interactive
+    // loop: a dead peer fails the live write instead and replay owns the
+    // frame either way.
+    let result = if packet.header() == Kind::PortForwardData as u8
+        || packet.header() == Kind::TerminalBuffer as u8
+    {
+        connection.start_write_packet_owned_unprobed(packet.header(), packet.payload())
+    } else {
+        connection.start_write_packet_owned(packet.header(), packet.payload())
+    };
+    match result {
+        Ok(()) => Ok(None),
+        Err(WritePacketError::ReplayOwned(e)) if crate::client_terminal::connection_ended(&e) => {
+            Ok(None)
+        }
+        Err(WritePacketError::BeforeReplay(e)) if crate::client_terminal::connection_ended(&e) => {
+            connection.disconnect();
+            Ok(Some(packet))
+        }
+        Err(e) => Err(error(e.into_inner())),
     }
-    if write_pending {
-        transport |= PollFlags::OUT;
-    }
-    let mut descriptors = Vec::with_capacity(2);
-    if !transport.is_empty() {
-        descriptors.push(PollFd::new(stream, transport));
-    }
-    if let Some(wake) = forward_wake {
-        descriptors.push(PollFd::new(wake, PollFlags::IN));
-    }
-    let timeout = Timespec::try_from(IDLE_WAIT).map_err(error)?;
-    match poll(&mut descriptors, Some(&timeout)) {
-        Ok(_) => Ok(()),
-        Err(errno) if errno == rustix::io::Errno::INTR => Ok(()),
-        Err(errno) => Err(error(io::Error::from(errno))),
+}
+
+fn drain_wake(wake: &UnixStream) -> Result<(), ClientError> {
+    let mut buffer = [0u8; 64];
+    loop {
+        match (&*wake).read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(error(e)),
+        }
     }
 }
 

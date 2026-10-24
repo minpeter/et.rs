@@ -23,7 +23,11 @@ use sysinfo::{
     Pid as SystemPid, ProcessRefreshKind, ProcessesToUpdate, Signal as SystemSignal, System,
 };
 
-const MAX_OUTPUT_CHUNK: usize = 32 * 1024;
+/// Terminal output per router packet, upstream's `BUF_SIZE`
+/// (`UserTerminalHandlerUnix.cpp`). etserver sends each packet as one frame
+/// once the client transport has room, below the 32 KiB unsent low-water
+/// mark, so the kernel takes the whole frame and Ctrl+C can drop the rest.
+const MAX_OUTPUT_CHUNK: usize = 16 * 1024;
 const FINAL_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[path = "terminal_tmux_filter.rs"]

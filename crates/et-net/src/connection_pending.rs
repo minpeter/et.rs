@@ -151,6 +151,40 @@ impl Connection {
         self.pending_live.is_some()
     }
 
+    /// Whether the transport has room to start another live frame: the
+    /// kernel reports the socket writable, which under `TCP_NOTSENT_LOWAT`
+    /// means unsent bytes below half the low-water mark. Upstream
+    /// `drainWriteBufferToClient` (`TerminalServer.cpp`) checks
+    /// `isSocketWritable` before every packet for the same reason: a frame
+    /// started without room stays mostly unsent, where an interrupt can no
+    /// longer drop it. Errors and hangup count as room, so the write itself
+    /// reports them.
+    #[cfg(unix)]
+    pub fn has_write_room(&self) -> bool {
+        use rustix::event::{poll, PollFd, PollFlags, Timespec};
+        let mut descriptors = [PollFd::new(&*self.stream, PollFlags::OUT)];
+        let now = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        !matches!(poll(&mut descriptors, Some(&now)), Ok(0))
+    }
+
+    /// When output that has waited for transport room since `since` must
+    /// fail like a stuck frame: one live-write timeout later.
+    pub fn live_write_deadline(&self, since: Instant) -> Instant {
+        since + self.live_write_timeout
+    }
+
+    /// Count the retained frame's live-write deadline from `since`: its
+    /// output already waited that long for transport room before it started.
+    pub fn backdate_pending_write(&mut self, since: Instant) {
+        let deadline = self.live_write_deadline(since);
+        if let Some(pending) = self.pending_live.as_mut() {
+            pending.deadline = pending.deadline.min(deadline);
+        }
+    }
+
     /// Block (bounded by the frame's original deadline) until the retained
     /// partial frame is on the wire. For terminal paths such as a final
     /// `TerminalClose`, which must follow that frame rather than be refused.

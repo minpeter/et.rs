@@ -1027,7 +1027,7 @@ where
         // Acknowledge by volume as well as probe on the idle deadline,
         // including under continuous inbound: the server trims its replay
         // backup on the payload and its echo trims ours.
-        let probe = keepalive.probe_due(now);
+        let probe = keepalive_probe_due(&keepalive, now, pending_output.is_some());
         let volume = !remote_exit.session_ended()
             && bytes_since_ack >= et_core::keepalive::ACK_INTERVAL_BYTES;
         if !connection.write_pending() && (probe || volume) {
@@ -1107,6 +1107,22 @@ fn network_poll_flags(output_pending: bool, forwarding_backlog_full: bool) -> Po
         flags |= PollFlags::IN;
     }
     flags
+}
+
+/// Whether a keep-alive probe goes out now. Held console output also holds
+/// transport reads, so an outstanding probe's echo cannot arrive; probe
+/// again each time its reply deadline passes while output is held. The
+/// server keeps a frame stuck on our closed window only while we keep
+/// talking (`et_net::connection::FLOW_CONTROL_PEER_SILENCE`), so a console
+/// paused for longer no longer costs a reconnect. The dead-link verdict
+/// still needs reads, as before.
+#[cfg(unix)]
+fn keepalive_probe_due(
+    keepalive: &crate::keepalive_clock::KeepaliveClock,
+    now: Instant,
+    output_held: bool,
+) -> bool {
+    keepalive.probe_due(now) || (output_held && keepalive.dead(now, true))
 }
 
 #[cfg(unix)]

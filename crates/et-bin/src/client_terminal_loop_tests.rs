@@ -1242,3 +1242,21 @@ fn remote_completion_attempts_retained_output_before_draining() {
         "unexpected error: {error}"
     );
 }
+
+#[test]
+fn held_console_output_keeps_probing_after_an_unanswered_keepalive() {
+    // Given: a probe went out and its echo is stuck behind held output.
+    let interval = Duration::from_secs(1);
+    let start = Instant::now();
+    let keepalive = crate::keepalive_clock::KeepaliveClock::new(interval, start);
+    keepalive.probe_sent(start);
+    let later = start + 2 * interval;
+
+    // When/Then: reading clients wait for the echo (or the dead verdict),
+    // while a client whose console holds its reads probes again so the
+    // server keeps hearing from it.
+    assert!(!keepalive_probe_due(&keepalive, later, false));
+    assert!(keepalive_probe_due(&keepalive, later, true));
+    keepalive.probe_sent(later);
+    assert!(!keepalive_probe_due(&keepalive, later, true));
+}

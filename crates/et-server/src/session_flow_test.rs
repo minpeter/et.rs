@@ -105,14 +105,22 @@ fn exit_status_waits_for_queued_and_in_flight_output() {
             TerminalPacketType::TerminalExitStatus as u8,
             TerminalExitStatus { exitcode: Some(0) }.encode_to_vec(),
         );
+        // `last` is queued while `first` is in flight, so the two are not
+        // merged into one terminal packet.
         flow.enqueue(first.clone()).unwrap();
+        let in_flight = flow.next_packet().unwrap();
+        assert_eq!(in_flight, first);
         flow.enqueue(last.clone()).unwrap();
+        let mut taken = Some(in_flight);
         for expected in [first, last] {
             assert!(matches!(
                 flow.enqueue(status.clone()),
                 Err(SessionError::Connection(ConnError::Backpressure))
             ));
-            let packet = flow.next_packet().unwrap();
+            let packet = match taken.take() {
+                Some(packet) => packet,
+                None => flow.next_packet().unwrap(),
+            };
             assert_eq!(packet, expected);
             // Even with an empty queue, the in-flight final frame still
             // precedes status; an early status would truncate client output.

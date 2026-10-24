@@ -88,6 +88,7 @@ impl Connection {
             writer: self.writer.clone(),
             reader: std::sync::Arc::new(std::sync::Mutex::new(self.reader().clone())),
             live_write_timeout: self.live_write_timeout,
+            peer_silence: self.peer_silence,
             pending_live: None,
             acks: AckSchedule::default(),
         };

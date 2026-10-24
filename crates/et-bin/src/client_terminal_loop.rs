@@ -455,13 +455,13 @@ where
             pending_forward.len() >= FORWARD_BACKLOG_CAPACITY,
         );
         // Wake for the keep-alive probe or verdict; with a probe outstanding
-        // while output is held, just re-check after an interval.
+        // while output is held, just re-check after an interval. The clock's
+        // own wake is not capped by the interval: the idle probe is due later.
         let reading = pending_output.is_none();
-        let mut deadline = Instant::now() + interval;
+        let mut deadline = keepalive
+            .wake_at(reading, !connection.write_pending())
+            .unwrap_or_else(|| Instant::now() + interval);
         if let Some(at) = connection.pending_write_deadline() {
-            deadline = deadline.min(at);
-        }
-        if let Some(at) = keepalive.wake_at(reading, !connection.write_pending()) {
             deadline = deadline.min(at);
         }
         // A stalled delivery gate releases after `interval` without progress.

@@ -567,6 +567,19 @@ impl FlowControl {
         }
     }
 
+    /// The session loop took `packet` but the transport had no room to start
+    /// its frame: put it back at the front, still droppable on interrupt.
+    #[cfg(unix)]
+    fn return_unstarted(&self, packet: Packet) {
+        if let Ok(mut state) = self.state.lock() {
+            state.in_flight = false;
+            state.queue.restore_front(packet);
+            if state.paused {
+                self.wake.notify_all();
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn complete(
         &self,
@@ -719,11 +732,15 @@ pub(crate) struct OutputPump<'a> {
     /// Packet whose frame is partly on the wire. It keeps its queue capacity
     /// and the in-flight state recovery waits on until the frame completes.
     live: Option<Packet>,
+    /// When queued output started waiting for transport room to start its
+    /// next frame; see [`writer::write_nonblocking`].
+    room_wait: Option<Instant>,
 }
 
 #[cfg(unix)]
 pub(crate) struct PumpOutcome {
-    /// Live-write deadline while a frame waits for transport room.
+    /// Live-write deadline while a frame, or queued output that has no
+    /// transport room to start one, waits for the client socket to drain.
     pub(crate) deadline: Option<Instant>,
     /// A completion changed state the loop waits on (lane capacity,
     /// connectivity, stop); re-check before sleeping.
@@ -736,12 +753,13 @@ impl<'a> OutputPump<'a> {
         Self {
             session,
             live: None,
+            room_wait: None,
         }
     }
 
-    /// Write until the queue is empty or paused, or a frame waits for room.
-    /// A partly written frame keeps advancing during a recovery pause, which
-    /// waits for it.
+    /// Write until the queue is empty or paused, or output waits for
+    /// transport room. A partly written frame keeps advancing during a
+    /// recovery pause, which waits for it.
     pub(crate) fn run(&mut self) -> PumpOutcome {
         let mut outcome = PumpOutcome {
             deadline: None,
@@ -755,12 +773,26 @@ impl<'a> OutputPump<'a> {
                 Some(packet) => (packet, true),
                 None => match flow.try_next_item() {
                     Some(item) => item,
-                    None => return outcome,
+                    None => {
+                        self.room_wait = None;
+                        return outcome;
+                    }
                 },
             };
-            match writer::write_nonblocking(self.session, flow, &packet, started) {
+            match writer::write_nonblocking(
+                self.session,
+                flow,
+                &packet,
+                started,
+                &mut self.room_wait,
+            ) {
                 writer::NonblockingWrite::Pending(deadline) => {
                     self.live = Some(packet);
+                    outcome.deadline = Some(deadline);
+                    return outcome;
+                }
+                writer::NonblockingWrite::NoRoom(deadline) => {
+                    flow.return_unstarted(packet);
                     outcome.deadline = Some(deadline);
                     return outcome;
                 }

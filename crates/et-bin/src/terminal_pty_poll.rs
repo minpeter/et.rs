@@ -21,6 +21,7 @@ use portable_pty::{Child, ChildKiller, MasterPty};
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
 use rustix::process::{pidfd_open, Pid, PidfdFlags};
+use rustix::termios::{LocalModes, SpecialCodeIndex, Termios};
 
 use super::{
     kill_process_group, reap_shell, reconnect_router_stream, terminal_close_completion,
@@ -36,6 +37,11 @@ use crate::terminal_protocol::{
 const FRAME_FINISH_TIMEOUT: Duration = Duration::from_secs(1);
 /// Largest Linux PTY master read: `N_TTY_BUF_SIZE - 1`.
 const PTY_FULL_READ: usize = 4095;
+/// Longest pause in PTY output reads after input that interrupts the
+/// foreground job; see [`Session::hold_output_for_interrupt`].
+const INTERRUPT_HOLD: Duration = Duration::from_millis(10);
+/// How often a held session checks whether the shell took the terminal back.
+const INTERRUPT_HOLD_CHECK: Duration = Duration::from_millis(1);
 
 /// A duplicated PTY master for the poll runtime.
 pub(super) struct PollPty {
@@ -118,6 +124,7 @@ where
         completion: CompletionState::default(),
         progress: 0,
         output_start: Instant::now() + output_delay,
+        interrupt_hold: None,
         // This loop is the terminal process's only thread.
         idle: IdleRelease::new(ReleaseScope::Process, Instant::now()),
     };
@@ -190,8 +197,18 @@ struct Session {
     /// Router writes accepted; extends the post-exit drain while it moves.
     progress: usize,
     output_start: Instant,
+    /// PTY output reads paused after an interrupt; see
+    /// [`Session::hold_output_for_interrupt`].
+    interrupt_hold: Option<InterruptHold>,
     /// Returns the allocator memory of a quiet session; see `idle_memory`.
     idle: IdleRelease,
+}
+
+/// Output reads stay paused until `until`, or until the terminal's
+/// foreground process group is no longer `foreground`.
+struct InterruptHold {
+    until: Instant,
+    foreground: Option<Pid>,
 }
 
 struct Ready {
@@ -223,7 +240,8 @@ impl Session {
         loop {
             let backlog = self.output_backlog();
             let input_pending = self.input_sent < self.input.len();
-            let delayed = !self.pty_eof && Instant::now() < self.output_start;
+            let resume_at = self.output_resume_at();
+            let delayed = !self.pty_eof && resume_at.is_some();
             let read_pty = !self.pty_eof && !backlog && !delayed;
             let mut router_flags = PollFlags::empty();
             if !input_pending {
@@ -240,8 +258,8 @@ impl Session {
                 pty_flags |= PollFlags::OUT;
             }
             let mut deadline = self.completion.drain_deadline;
-            if delayed {
-                deadline = Some(deadline.map_or(self.output_start, |d| d.min(self.output_start)));
+            if let Some(resume_at) = resume_at.filter(|_| delayed) {
+                deadline = Some(deadline.map_or(resume_at, |d| d.min(resume_at)));
             }
             if let Some(release_at) = self.idle.deadline() {
                 deadline = Some(deadline.map_or(release_at, |d| d.min(release_at)));
@@ -398,6 +416,7 @@ impl Session {
     }
 
     fn write_input(&mut self, bytes: &[u8]) {
+        self.hold_output_for_interrupt(bytes);
         if self.input_sent < self.input.len() {
             self.input.extend_from_slice(bytes);
             return;
@@ -423,6 +442,61 @@ impl Session {
             self.input.clear();
             self.input_sent = 0;
         }
+    }
+
+    /// Input that makes the line discipline signal the foreground job and
+    /// flush the output it has not delivered pauses PTY output reads while
+    /// output is pending, until the shell takes the terminal back or
+    /// [`INTERRUPT_HOLD`] passes. Reading on would forward what the job keeps
+    /// writing before the kernel applies the interrupt: while this loop keeps
+    /// the PTY drained the job's writes never block, and the line discipline
+    /// applies the signal and flush only between them, so after Ctrl+C a
+    /// `yes` flood forwarded another 25 to 290 KB. Paused, the job fills the
+    /// PTY and blocks, and the kernel discards that tail. Upstream
+    /// `UserTerminalHandler` reads at most one chunk per `select()` pass and
+    /// does not wake for router room, so its PTY stays full and the flush
+    /// takes effect at once.
+    fn hold_output_for_interrupt(&mut self, input: &[u8]) {
+        if self.pty_eof {
+            return;
+        }
+        let Ok(termios) = rustix::termios::tcgetattr(&self.pty) else {
+            return;
+        };
+        if !interrupts_output(&termios, input) || !(self.output_backlog() || self.pty_readable()) {
+            return;
+        }
+        self.interrupt_hold = Some(InterruptHold {
+            until: Instant::now() + INTERRUPT_HOLD,
+            foreground: rustix::termios::tcgetpgrp(&self.pty).ok(),
+        });
+    }
+
+    /// When PTY output reads may resume, or `None` when they may run now:
+    /// after the startup output delay and any interrupt hold.
+    fn output_resume_at(&mut self) -> Option<Instant> {
+        let now = Instant::now();
+        if now < self.output_start {
+            return Some(self.output_start);
+        }
+        let hold = self.interrupt_hold.as_ref()?;
+        let shell_took_terminal = hold
+            .foreground
+            .is_some_and(|job| rustix::termios::tcgetpgrp(&self.pty).ok() != Some(job));
+        if now >= hold.until || shell_took_terminal {
+            self.interrupt_hold = None;
+            return None;
+        }
+        Some(hold.until.min(now + INTERRUPT_HOLD_CHECK))
+    }
+
+    fn pty_readable(&self) -> bool {
+        let mut fds = [PollFd::new(&self.pty, PollFlags::IN)];
+        let now = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        matches!(poll(&mut fds, Some(&now)), Ok(1..))
     }
 
     /// Read and shape PTY output while the producer stays ahead, up to a
@@ -606,6 +680,27 @@ impl Session {
     }
 }
 
+/// Whether `input` makes the line discipline signal the foreground job and
+/// flush its undelivered output: `ISIG` on, `NOFLSH` off, and an INTR, QUIT
+/// or SUSP character that is not disabled.
+fn interrupts_output(termios: &Termios, input: &[u8]) -> bool {
+    if !termios.local_modes.contains(LocalModes::ISIG)
+        || termios.local_modes.contains(LocalModes::NOFLSH)
+    {
+        return false;
+    }
+    let signals = [
+        SpecialCodeIndex::VINTR,
+        SpecialCodeIndex::VQUIT,
+        SpecialCodeIndex::VSUSP,
+    ]
+    .map(|index| termios.special_codes[index]);
+    // `_POSIX_VDISABLE` is NUL on Linux.
+    input
+        .iter()
+        .any(|byte| *byte != 0 && signals.contains(byte))
+}
+
 fn write_nonblocking(pty: &filedescriptor::FileDescriptor, mut bytes: &[u8]) -> io::Result<usize> {
     let mut written = 0;
     while !bytes.is_empty() {
@@ -633,3 +728,7 @@ fn peer_gone(error: &io::Error) -> bool {
         io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset | io::ErrorKind::NotConnected
     )
 }
+
+#[cfg(test)]
+#[path = "terminal_pty_poll_tests.rs"]
+mod tests;

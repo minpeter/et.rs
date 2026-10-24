@@ -317,3 +317,95 @@ fn expired_partial_write_retains_replay_and_the_original_timeout() {
     assert_eq!(sender.writer_sequence(), 1);
     assert_eq!(sender.writer.recover(0).unwrap().len(), 1);
 }
+
+#[test]
+fn stuck_output_write_outlives_its_deadline_while_the_peer_keeps_talking() {
+    // Given: a flow-control output frame stuck behind a peer that does not
+    // read, past its live-write deadline.
+    let (mut sender, mut peer) = pair();
+    sender.peer_silence = Some(super::super::FLOW_CONTROL_PEER_SILENCE);
+    sender
+        .start_write_packet_owned(7, &vec![3; 1024 * 1024])
+        .unwrap();
+    assert!(sender.write_pending());
+    // Last heard a whole silence window ago: without news it would fail.
+    let long_ago = Instant::now() - super::super::FLOW_CONTROL_PEER_SILENCE;
+    let sequence = sender.reader_sequence();
+    let pending = sender.pending_live.as_mut().unwrap();
+    pending.heard = Some(((sequence, 0), long_ago));
+    pending.deadline = Instant::now();
+
+    // When: the peer is still sending (a keep-alive while its reads are held).
+    peer.write_packet(TerminalPacketType::KeepAlive as u8, &[])
+        .unwrap();
+    sender
+        .read_packet_deadline(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    let now = Instant::now();
+    assert!(!sender.advance_write().unwrap());
+
+    // Then: the frame stays live with a fresh deadline, not a soft disconnect.
+    assert!(sender.connected());
+    assert!(sender.write_pending());
+    assert!(sender.pending_write_deadline().unwrap() > now);
+}
+
+#[test]
+fn stuck_output_write_fails_once_the_peer_falls_silent() {
+    // Given: a stuck flow-control frame whose peer was last heard a whole
+    // silence window ago.
+    let (mut sender, _peer) = pair();
+    let silence = super::super::FLOW_CONTROL_PEER_SILENCE;
+    sender.peer_silence = Some(silence);
+    sender
+        .start_write_packet_owned(7, &vec![3; 1024 * 1024])
+        .unwrap();
+    // Its live-write wait began a whole silence window ago.
+    let timeout = sender.live_write_timeout;
+    let pending = sender.pending_live.as_mut().unwrap();
+    pending.deadline = Instant::now() - silence + timeout;
+
+    // When: the deadline is observed without any packet from the peer.
+    let error = sender.advance_write().unwrap_err();
+
+    // Then: a vanished peer is still dropped and replay keeps the frame.
+    assert!(
+        matches!(error, WritePacketError::ReplayOwned(ConnError::Io(ref error))
+        if error.kind() == io::ErrorKind::TimedOut)
+    );
+    assert!(!sender.connected());
+    assert_eq!(sender.writer.recover(0).unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn stuck_output_write_counts_peer_packets_this_side_has_not_read() {
+    // Given: a stuck flow-control frame last heard a silence window ago, on
+    // a session that has stopped reading its peer (its replies are held
+    // behind the stuck frame).
+    let (mut sender, mut peer) = pair();
+    let silence = super::super::FLOW_CONTROL_PEER_SILENCE;
+    sender.peer_silence = Some(silence);
+    sender
+        .start_write_packet_owned(7, &vec![3; 1024 * 1024])
+        .unwrap();
+    let long_ago = Instant::now() - silence;
+    let mark = sender.inbound_mark();
+    let pending = sender.pending_live.as_mut().unwrap();
+    pending.heard = Some((mark, long_ago));
+    pending.deadline = Instant::now();
+
+    // When: the peer's keep-alive reaches the kernel but is not read.
+    peer.write_packet(TerminalPacketType::KeepAlive as u8, &[])
+        .unwrap();
+    let arrived = Instant::now() + Duration::from_secs(2);
+    while sender.inbound_mark() == mark && Instant::now() < arrived {
+        thread::sleep(Duration::from_millis(5));
+    }
+    let now = Instant::now();
+    assert!(!sender.advance_write().unwrap());
+
+    // Then: the unread packet still proves the peer alive.
+    assert!(sender.connected());
+    assert!(sender.pending_write_deadline().unwrap() > now);
+}

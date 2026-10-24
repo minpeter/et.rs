@@ -9,6 +9,11 @@ use crate::proto::{TerminalBuffer, TerminalPacketType};
 
 const FRAME_BYTES: usize = std::mem::size_of::<u32>();
 pub(crate) const MAX_PACKETS_PER_LANE: usize = 4096;
+/// Largest terminal buffer queued output is merged into, upstream
+/// `TerminalServer`'s `BUF_SIZE`: its `drainWriteBufferToClient` sends the
+/// `WriteBuffer` byte stream as `TERMINAL_BUFFER` packets of up to 16 KiB.
+/// See [`OutputQueue::append_terminal`].
+pub(crate) const COALESCED_TERMINAL_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlowControlMode {
@@ -124,9 +129,17 @@ impl OutputQueue {
     }
 
     /// Admit terminal output without the lane bound.
+    ///
+    /// Output the writer has not taken yet is merged into the last queued
+    /// terminal packet, up to [`COALESCED_TERMINAL_BYTES`]. A terminal
+    /// emits a flood in reads of a few lines, and every packet goes to the
+    /// socket as its own segment; a backlog of such segments has a poor
+    /// payload-to-memory ratio in the peer's receive queue, so Linux keeps
+    /// growing that queue (several MB of output ahead of the next keystroke
+    /// echo, out of Ctrl+C's reach) and the bytes on the wire carry a frame
+    /// and an authentication tag every few lines. Output that is written as
+    /// soon as it arrives is never merged, so this adds no latency.
     fn append_terminal(&mut self, packet: Packet) {
-        self.terminal_bytes += packet_cost(&packet);
-        self.terminal_packets += 1;
         let may_contain_control =
             if let Some((bytes, _)) = crate::packet::decode_terminal_buffer(packet.payload()) {
                 self.stream.may_contain_control(bytes)
@@ -139,6 +152,23 @@ impl OutputQueue {
         if may_contain_control {
             self.promotion_pending = true;
         }
+        if let (Some(back), Some((bytes, is_stderr))) = (
+            self.terminal.back_mut(),
+            crate::packet::decode_terminal_buffer(packet.payload()),
+        ) {
+            let before = packet_cost(back);
+            if crate::packet::append_terminal_buffer(
+                back,
+                bytes,
+                is_stderr,
+                COALESCED_TERMINAL_BYTES,
+            ) {
+                self.terminal_bytes = self.terminal_bytes - before + packet_cost(back);
+                return;
+            }
+        }
+        self.terminal_bytes += packet_cost(&packet);
+        self.terminal_packets += 1;
         self.terminal.push_back(packet);
     }
 

@@ -29,6 +29,20 @@ pub use recovery::{RecoveryExchange, DEFAULT_RECOVERY_TIMEOUT, MAX_RECOVERY_PROT
 /// and recovery can proceed.
 pub const DEFAULT_LIVE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const FLOW_CONTROL_LIVE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a live output frame may wait on a closed window while the peer
+/// is silent, once [`Connection::minimize_output_buffering`] applies.
+///
+/// A client whose console stops reading (a slow terminal, XOFF, a paused
+/// pager) stops reading its socket, so the server's window closes although
+/// the client is alive. Upstream `TerminalServer` never times such a write
+/// out (`drainWriteBufferToClient` only writes while the socket is
+/// writable); a soft disconnect here made the stalled client reconnect and
+/// replay its backlog before its next prompt. A stuck frame therefore
+/// survives its deadline while the peer keeps sending packets (keep-alives
+/// continue while its reads are held) and fails once it has been silent for
+/// this long, so a vanished peer is still dropped. Twice the live-write
+/// timeout spans a keep-alive interval, which never exceeds it plus a second.
+pub const FLOW_CONTROL_PEER_SILENCE: Duration = Duration::from_secs(10);
 /// Unsent-byte bound for live output, as upstream
 /// `TcpSocketHandler::minimizeKernelBuffering` (`TcpSocketHandlerUnix.cpp`):
 /// output not yet handed to TCP stays in the session queue, where Ctrl+C
@@ -72,6 +86,8 @@ pub struct Connection {
     /// receives and decrypts without the lock that serializes the writer.
     reader: Arc<Mutex<BackedReader>>,
     live_write_timeout: Duration,
+    /// See [`FLOW_CONTROL_PEER_SILENCE`]; `None` keeps the plain deadline.
+    peer_silence: Option<Duration>,
     pending_live: Option<pending::PendingWrite>,
     /// Which keep-alives on this transport carry the delivery
     /// acknowledgement; a recovered transport starts a fresh schedule.
@@ -188,6 +204,7 @@ impl Connection {
                     .with_max_socket_read(max_socket_read),
             )),
             live_write_timeout: DEFAULT_LIVE_WRITE_TIMEOUT,
+            peer_silence: None,
             pending_live: None,
             acks: AckSchedule::default(),
         }
@@ -594,9 +611,12 @@ impl Connection {
 
     /// Keep live output backlog in the application queue, where Ctrl+C can
     /// drop it, instead of the kernel send queue, and bound data in flight
-    /// (see [`FLOW_CONTROL_SOCKET_BUFFER_BYTES`]).
+    /// (see [`FLOW_CONTROL_SOCKET_BUFFER_BYTES`]). A peer that holds its
+    /// window closed stays connected while it keeps talking (see
+    /// [`FLOW_CONTROL_PEER_SILENCE`]).
     pub fn minimize_output_buffering(&mut self) -> Result<(), ConnError> {
         self.live_write_timeout = FLOW_CONTROL_LIVE_WRITE_TIMEOUT;
+        self.peer_silence = Some(FLOW_CONTROL_PEER_SILENCE);
         let socket = SockRef::from(&*self.stream);
         #[cfg(target_os = "linux")]
         {

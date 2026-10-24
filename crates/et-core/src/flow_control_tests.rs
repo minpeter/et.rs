@@ -1,9 +1,12 @@
 use prost::Message;
 
 use crate::flow_control::{
-    FlowControlMode, OutputLane, OutputQueue, QueuePushError, MAX_PACKETS_PER_LANE,
+    FlowControlMode, OutputLane, OutputQueue, QueuePushError, COALESCED_TERMINAL_BYTES,
+    MAX_PACKETS_PER_LANE,
 };
-use crate::packet::Packet;
+use crate::packet::{
+    append_terminal_buffer, decode_terminal_buffer, encode_terminal_buffer, Packet,
+};
 use crate::proto::{TerminalBuffer, TerminalPacketType};
 
 const LIMIT: usize = 64;
@@ -132,18 +135,16 @@ fn full_control_lane_does_not_prevent_discard_terminal_progress() {
 #[test]
 fn shell_output_and_keepalive_progress_during_sustained_forwarding() {
     let mut queue = OutputQueue::new(FlowControlMode::Backpressure, 1024);
-    let first = terminal(b"shell-one");
-    let second = terminal(b"shell-two");
     queue.push(forwarding(&[0])).unwrap();
     queue.push(forwarding(&[1])).unwrap();
     queue.push(control(b"keepalive")).unwrap();
     queue.push(forwarding(&[2])).unwrap();
-    queue.push(first.clone()).unwrap();
-    queue.push(second.clone()).unwrap();
+    queue.push(terminal(b"shell-one")).unwrap();
+    queue.push(terminal(b"shell-two")).unwrap();
 
-    assert_eq!(queue.pop(), Some(first));
+    // Queued shell output leaves as one packet (see the merge tests).
+    assert_eq!(queue.pop(), Some(terminal(b"shell-oneshell-two")));
     assert_eq!(queue.pop(), Some(forwarding(&[0])));
-    assert_eq!(queue.pop(), Some(second));
     assert_eq!(queue.pop(), Some(forwarding(&[1])));
     assert_eq!(queue.pop(), Some(control(b"keepalive")));
 }
@@ -205,4 +206,95 @@ fn failed_send_restoration_retains_its_capacity_reservation() {
     queue.restore_front(in_flight);
     assert!(queue.bytes() <= LIMIT);
     assert_eq!(queue.pop(), Some(first));
+}
+
+fn stderr(bytes: &[u8]) -> Packet {
+    Packet::new(
+        TerminalPacketType::TerminalBuffer as u8,
+        TerminalBuffer {
+            buffer: Some(bytes.to_vec()),
+            is_stderr: Some(true),
+        }
+        .encode_to_vec(),
+    )
+}
+
+fn body(packet: &Packet) -> Vec<u8> {
+    TerminalBuffer::decode(packet.payload())
+        .unwrap()
+        .buffer
+        .unwrap()
+}
+
+#[test]
+fn queued_terminal_output_merges_into_upstream_sized_packets() {
+    // Given: a flood read from the terminal a line at a time while the
+    // writer is busy.
+    let mut queue = OutputQueue::new(FlowControlMode::Backpressure, 1 << 20);
+    let line = [b'.'; 66];
+    let lines = 2 * COALESCED_TERMINAL_BYTES / line.len() + 3;
+    for _ in 0..lines {
+        queue.push(terminal(&line)).unwrap();
+    }
+
+    // When: the writer takes the backlog.
+    let mut taken = Vec::new();
+    while let Some(packet) = queue.pop() {
+        taken.push(packet);
+    }
+
+    // Then: it leaves in a few packets of at most upstream's BUF_SIZE,
+    // byte for byte, and the lane accounting returns to empty.
+    assert_eq!(taken.len(), 3);
+    let mut bytes = Vec::new();
+    for packet in &taken {
+        let chunk = body(packet);
+        assert!(chunk.len() <= COALESCED_TERMINAL_BYTES);
+        bytes.extend(chunk);
+    }
+    assert_eq!(bytes, line.repeat(lines));
+    assert_eq!(queue.bytes(), 0);
+    assert!(queue.can_resume(OutputLane::Terminal, 1 << 20));
+}
+
+#[test]
+fn merging_keeps_streams_apart_and_never_touches_taken_output() {
+    let mut queue = OutputQueue::new(FlowControlMode::Backpressure, 1 << 20);
+    queue.push(terminal(b"out-1")).unwrap();
+    let in_flight = queue.take().unwrap();
+    queue.push(terminal(b"out-2")).unwrap();
+    queue.push(stderr(b"err-1")).unwrap();
+    queue.push(stderr(b"err-2")).unwrap();
+    queue.push(terminal(b"out-3")).unwrap();
+
+    assert_eq!(in_flight, terminal(b"out-1"));
+    queue.complete(&in_flight);
+    assert_eq!(queue.pop(), Some(terminal(b"out-2")));
+    assert_eq!(queue.pop(), Some(stderr(b"err-1err-2")));
+    assert_eq!(queue.pop(), Some(terminal(b"out-3")));
+    assert_eq!(queue.bytes(), 0);
+}
+
+#[test]
+fn append_terminal_buffer_widens_the_length_prefix_in_place() {
+    let mut packet = Packet::new(0, encode_terminal_buffer(&[1; 100], true));
+    assert!(append_terminal_buffer(
+        &mut packet,
+        &[2; 100],
+        true,
+        16 * 1024
+    ));
+    let mut expected = vec![1; 100];
+    expected.extend([2; 100]);
+    assert_eq!(packet.payload(), encode_terminal_buffer(&expected, true));
+    assert_eq!(
+        decode_terminal_buffer(packet.payload()),
+        Some((&expected[..], true))
+    );
+    // Other stream, over the limit, or already encrypted: untouched.
+    assert!(!append_terminal_buffer(&mut packet, b"x", false, 16 * 1024));
+    assert!(!append_terminal_buffer(&mut packet, &[3; 200], true, 300));
+    let mut sealed = Packet::raw(true, 0, encode_terminal_buffer(b"a", false));
+    assert!(!append_terminal_buffer(&mut sealed, b"b", false, 16 * 1024));
+    assert_eq!(packet.payload(), encode_terminal_buffer(&expected, true));
 }

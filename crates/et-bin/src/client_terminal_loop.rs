@@ -252,6 +252,8 @@ where
     let mut bytes_since_ack: usize = 0;
     let mut delivery_gate = crate::delivery_gate::DeliveryGate::default();
     let mut interrupt_input = et_core::output_interrupt::InterruptInput::default();
+    // Terminal output already in the socket at the last interrupt.
+    let mut stale_output = crate::client_output::StaleOutput::default();
     // `-T` stdin ended; the empty TERMINAL_BUFFER that tells the remote
     // command waits until no frame is pending.
     let mut input_eof_pending = false;
@@ -746,6 +748,7 @@ where
                             }
                         }
                     } else {
+                        let stale = stale_output.read(&packet) && terminal_enabled;
                         match route_server_packet(
                             packet,
                             terminal_enabled,
@@ -793,6 +796,11 @@ where
                                 DisplayOutcome::Displayed { .. } => {}
                                 DisplayOutcome::Pending(packet) => pending_output = Some(packet),
                             },
+                        }
+                        if stale {
+                            console_output.interrupt().map_err(|error| {
+                                terminal_io("dropping output queued before an interrupt", error)
+                            })?;
                         }
                     }
                 }
@@ -973,6 +981,9 @@ where
                 console_output
                     .interrupt()
                     .map_err(|error| terminal_io("interrupting console output", error))?;
+                stale_output.interrupted(
+                    rustix::io::ioctl_fionread(&stream).map_or(0, |unread| unread as usize),
+                );
             }
             let payload = encoded_buffer(&bytes[..count]);
             match write_owned(
@@ -1027,7 +1038,7 @@ where
         // Acknowledge by volume as well as probe on the idle deadline,
         // including under continuous inbound: the server trims its replay
         // backup on the payload and its echo trims ours.
-        let probe = keepalive.probe_due(now);
+        let probe = keepalive_probe_due(&keepalive, now, pending_output.is_some());
         let volume = !remote_exit.session_ended()
             && bytes_since_ack >= et_core::keepalive::ACK_INTERVAL_BYTES;
         if !connection.write_pending() && (probe || volume) {
@@ -1107,6 +1118,22 @@ fn network_poll_flags(output_pending: bool, forwarding_backlog_full: bool) -> Po
         flags |= PollFlags::IN;
     }
     flags
+}
+
+/// Whether a keep-alive probe goes out now. Held console output also holds
+/// transport reads, so an outstanding probe's echo cannot arrive; probe
+/// again each time its reply deadline passes while output is held. The
+/// server keeps a frame stuck on our closed window only while we keep
+/// talking (`et_net::connection::FLOW_CONTROL_PEER_SILENCE`), so a console
+/// paused for longer no longer costs a reconnect. The dead-link verdict
+/// still needs reads, as before.
+#[cfg(unix)]
+fn keepalive_probe_due(
+    keepalive: &crate::keepalive_clock::KeepaliveClock,
+    now: Instant,
+    output_held: bool,
+) -> bool {
+    keepalive.probe_due(now) || (output_held && keepalive.dead(now, true))
 }
 
 #[cfg(unix)]

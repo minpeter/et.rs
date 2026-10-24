@@ -296,7 +296,11 @@ fn output_after_interrupt(bytes: &[u8]) -> Vec<Packet> {
         let mut packets = Vec::new();
         loop {
             let packet = client.read_packet().unwrap();
-            let done = packet == prompt;
+            // Output still queued behind the interrupt may share the
+            // prompt's packet (the queue merges terminal output).
+            let done = packet == prompt
+                || et_core::packet::decode_terminal_buffer(packet.payload())
+                    .is_some_and(|(bytes, _)| bytes.ends_with(b"ET_CTRL_C_OK"));
             packets.push(packet);
             if done {
                 break;

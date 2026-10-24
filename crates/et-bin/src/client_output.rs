@@ -8,6 +8,8 @@
 #[path = "client_output_interrupt.rs"]
 mod output_interrupt;
 
+pub(crate) use output_interrupt::StaleOutput;
+
 use std::collections::VecDeque;
 #[cfg(unix)]
 use std::fs::File;

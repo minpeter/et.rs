@@ -161,15 +161,7 @@ pub fn decode_terminal_buffer(payload: &[u8]) -> Option<(&[u8], bool)> {
 /// without allocating an intermediate `Vec<u8>` for `TerminalBuffer.buffer`.
 pub fn encode_terminal_buffer(bytes: &[u8], is_stderr: bool) -> Vec<u8> {
     let mut len_varint = [0u8; 10];
-    let mut v = bytes.len();
-    let mut v_len = 0;
-    while v >= 0x80 {
-        len_varint[v_len] = (v as u8) | 0x80;
-        v >>= 7;
-        v_len += 1;
-    }
-    len_varint[v_len] = v as u8;
-    v_len += 1;
+    let v_len = encode_varint(bytes.len(), &mut len_varint);
     let stderr_len = if is_stderr { 2 } else { 0 };
     let mut out = Vec::with_capacity(1 + v_len + bytes.len() + stderr_len);
     out.push(0x0a);
@@ -180,6 +172,57 @@ pub fn encode_terminal_buffer(bytes: &[u8], is_stderr: bool) -> Vec<u8> {
         out.push(0x01);
     }
     out
+}
+
+/// Append `bytes` to an unencrypted canonical `TerminalBuffer` packet in
+/// place, when it carries the same stream (`is_stderr`) and the merged
+/// buffer stays within `limit` bytes. Only the length prefix is rewritten,
+/// so growing a packet piece by piece copies each byte once. Returns
+/// whether `bytes` was appended.
+pub fn append_terminal_buffer(
+    packet: &mut Packet,
+    bytes: &[u8],
+    is_stderr: bool,
+    limit: usize,
+) -> bool {
+    if packet.encrypted {
+        return false;
+    }
+    let Some((body, stderr)) = decode_terminal_buffer(&packet.payload) else {
+        return false;
+    };
+    let old_len = body.len();
+    let new_len = old_len + bytes.len();
+    if stderr != is_stderr || new_len > limit {
+        return false;
+    }
+    let mut varint = [0u8; 10];
+    let old_prefix = 1 + encode_varint(old_len, &mut varint);
+    let new_prefix = 1 + encode_varint(new_len, &mut varint);
+    let payload = &mut packet.payload;
+    // Drop the `is_stderr` suffix, then widen the length prefix if needed.
+    payload.truncate(old_prefix + old_len);
+    if new_prefix > old_prefix {
+        payload.splice(1..1, std::iter::repeat_n(0, new_prefix - old_prefix));
+    }
+    payload[1..new_prefix].copy_from_slice(&varint[..new_prefix - 1]);
+    payload.extend_from_slice(bytes);
+    if is_stderr {
+        payload.extend_from_slice(&[0x10, 0x01]);
+    }
+    true
+}
+
+/// Write `value` as a protobuf varint into `out`; returns its length.
+fn encode_varint(mut value: usize, out: &mut [u8; 10]) -> usize {
+    let mut len = 0;
+    while value >= 0x80 {
+        out[len] = (value as u8) | 0x80;
+        value >>= 7;
+        len += 1;
+    }
+    out[len] = value as u8;
+    len + 1
 }
 #[cfg(test)]
 mod tests {

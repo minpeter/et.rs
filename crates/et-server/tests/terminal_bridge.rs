@@ -166,14 +166,20 @@ fn terminal_hup_still_delivers_buffered_final_packet() {
     }
     terminal.shutdown(Shutdown::Both).unwrap();
 
-    for expected in &final_packets {
+    // The server may merge queued output, so compare the bytes delivered.
+    let expected: Vec<u8> = final_packets
+        .iter()
+        .flat_map(|packet| packet.buffer.clone().unwrap())
+        .collect();
+    let mut delivered = Vec::new();
+    while delivered.len() < expected.len() {
         let received = client.read_packet().unwrap();
         assert_eq!(received.header(), TerminalPacketType::TerminalBuffer as u8);
-        assert_eq!(
-            TerminalBuffer::decode(received.payload()).unwrap(),
-            *expected
-        );
+        let message = TerminalBuffer::decode(received.payload()).unwrap();
+        assert_eq!(message.is_stderr, None);
+        delivered.extend(message.buffer.unwrap());
     }
+    assert_eq!(delivered, expected);
 
     server.runtime.shutdown().unwrap();
 }

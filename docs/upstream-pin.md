@@ -1022,6 +1022,113 @@ upstream code. Protocol v6 and the generated wire fixtures are unchanged.
 - Results: on a loaded host, 500 MB `et -T` transfers lost their tail in 40 of 800
   runs before, and in 0 of 800 after.
 
+### Benchmark round 3 (et.rs 0.0.47)
+
+A second run of the same benchmark (et.rs `7b1303f`, the same ET C++ build and
+OpenSSH) still showed et.rs behind ET C++ on echo during a flood, recovery after a
+stalled client, Ctrl-C on 10 Mbit and lossy links, and idle keep-alive bytes. Each
+fix was reviewed against the cited upstream code. Protocol v6 and the generated
+wire fixtures are unchanged. Numbers are same-session 5- or 8-run medians on a
+netns veth pair with `tc netem`.
+
+**Merged terminal output.**
+- `etserver` merges queued terminal output into `TerminalBuffer` packets of up to
+  16 KiB, following upstream `drainWriteBufferToClient` (`TerminalServer.cpp:23-62`,
+  `BUF_SIZE` at `TerminalServer.cpp:15`).
+  - Before: each short terminal read went out as its own segment (73% under
+    1448 B during a `yes` flood, against 4% for ET C++). Linux grew the client's
+    receive buffer to about 9 MB, and every keystroke echo waited behind it.
+  - Packets already being written are never merged, and stdout and stderr stay
+    in separate packets.
+- Echo during a flood, p50/p95: 21.4/55.2 → 6.4/49.1 ms (ET C++ 7.1/149.3).
+
+**Paused clients stay connected.**
+- With flow-control output buffering, a frame stuck on a closed TCP window now
+  outlives its 5 s live-write deadline for as long as the peer keeps sending. That
+  means the reader sequence moves, or unread bytes arrive on the socket. The frame
+  fails after 10 s of silence (`FLOW_CONTROL_PEER_SILENCE`).
+- While console output holds its socket reads, the client re-sends a keep-alive
+  whenever the previous one goes unanswered.
+- Intentional difference: upstream never times out such a write
+  (`TerminalServer.cpp:36`). et.rs keeps a bound so a vanished client is still
+  dropped, now within 10 s instead of 5 s.
+- Recovery after the client stops reading for 10 s: 108.8 → 13.3 ms (ET C++
+  82.9). Server memory growth during the stall: 14.5 → 0.2 MiB.
+
+**Ctrl-C on a flooded client socket.**
+- On Ctrl-C the client applies upstream's server-side `drainDiscardReadableBytes`
+  (`TerminalInterruptDrain.hpp:21-52`) to its own socket. Terminal output in the
+  bytes already queued when the interrupt is typed is filtered like `consoleOut`
+  (`filterDroppable`).
+  - It only applies above upstream's 64 KiB `flushIfLarge` threshold. It keeps
+    non-terminal packets such as exit status, and never touches output sent after
+    the interrupt.
+  - Intentional difference: upstream's client only filters `consoleOut`
+    (`TerminalClient.cpp:574-592`).
+- Output shown after Ctrl-C: 207 → 47 KB (ET C++ 31 KB). The rest is mostly
+  output the client had already written to its local terminal.
+
+**Ctrl-C on slow and lossy links.**
+- `etserver` starts an output frame only when the client socket polls writable,
+  as upstream's `drainWriteBufferToClient` checks `isSocketWritable` before each
+  packet (`TerminalServer.cpp:36`).
+  - A packet without room goes back to the front of the queue unsequenced, so the
+    interrupt flush can still drop it.
+  - Before: the loop wrote until `EAGAIN`. That left 25–65 KB unsent in the
+    kernel, plus one partly written, sequenced frame, behind every Ctrl-C.
+  - Output that waits a whole live-write timeout for room starts its frame with
+    that deadline already due, so a stuck transport is still bounded.
+  - Cost: RTT-50 output 14.8 → 13.8 MB/s (ET C++ 5.5). Without the check, 10 Mbit
+    and lossy Ctrl-C fell behind ET C++.
+- `etterminal` sends 16 KiB packets, upstream's `BUF_SIZE`
+  (`UserTerminalHandlerUnix.cpp:295`).
+- The Linux `etterminal` pauses PTY reads after forwarded input that interrupts
+  the foreground job, while output is pending. That input is VINTR, VQUIT or
+  VSUSP with ISIG on and NOFLSH off. The pause lasts until the foreground process
+  group changes, at most 10 ms.
+  - Upstream gets this implicitly: it reads one chunk per `select()` pass and
+    doesn't wake when the router has room, so its PTY stays full and the kernel's
+    interrupt flush applies at once (`UserTerminalHandlerUnix.cpp:391`).
+  - Without the pause, 25–290 KB of a flood written after Ctrl-C reached
+    `etserver`, against 4.4 KB with the C++ `etterminal`.
+- On an interrupt that flushed queued output, the Unix bridge now reverses
+  upstream's order. This supersedes the round-2 description above for Unix.
+  - It records the bytes waiting on the terminal socket (`FIONREAD`), writes the
+    interrupt, then drops at most those bytes, counting whole packets.
+  - Upstream drains the socket first, then writes the interrupt (`runTerminal`,
+    `TerminalServer.cpp:570-596`).
+  - Everything dropped was emitted before the terminal could read the interrupt.
+    Anything written after it (echo, prompt, exit status) is never dropped, with
+    either `etterminal`.
+  - Windows keeps upstream's order: a safe byte count there would need `peek`.
+- Ctrl-C to prompt, 8 runs: 10 Mbit / 50 ms 535 → 464 ms (ET C++ 465); lossy
+  (`delay 75ms loss 0.5%` each way) about 430 → 162 ms (ET C++ 257).
+- Lossy-link 1 MB output was bimodal for every implementation, ET C++ included
+  (slow in 11 of 25 rounds against 9 of 25 for et.rs). Packet captures show
+  congestion-window collapse after an early loss, not an et.rs stall.
+
+**Keep-alive cadence.**
+- Upstream `TerminalClient::run` sends a probe when `keepaliveTime < time(NULL)`,
+  after setting `keepaliveTime = time(NULL) + keepaliveDuration`
+  (`TerminalClient.cpp:687-688`).
+  - The comparison is strict and in whole seconds. An idle upstream client
+    therefore probes every keepalive + 1 s (6.000 s apart by default) and declares
+    the link dead after two such steps (12 s).
+  - et.rs probed every 5.005 s: 12 instead of 10 identical 242-byte exchanges a
+    minute.
+- `crates/et-bin/src/keepalive_clock.rs` now sends the probe keepalive + 1 s after
+  the last packet read, and keeps the verdict two intervals after that read (10 s).
+  It moves the probe earlier when that would leave the reply less than 1 s, so
+  `--keepalive 1` still probes every second.
+- The interactive loop no longer caps its sleep at one interval when the clock has
+  a later wake.
+- Intentional differences: the verdict is 2 s sooner than upstream's, any packet
+  read answers the probe, and writes never move the deadline.
+- Idle interactive and `-N -L` sessions: 2904 → 2420 B/min, the same as ET C++,
+  measured after a 20 s settle. A shorter settle also counts the one-off teardown
+  of et.rs's private SSH ControlMaster (`ControlPersist=15`). Idle wakeups:
+  0.6 → 0.5/s. Recovery after a 10 s silent outage: 1.13 → 1.10 s.
+
 ## Ledger (classified 2026-10-14)
 
 Twenty commits after [`e02aefa`](https://github.com/MisterTea/EternalTerminal/commit/e02aefa2301a9544fe7a40564e612dcf122291e1).

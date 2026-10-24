@@ -32,6 +32,8 @@ const FORWARD_BACKLOG_CAPACITY: usize = 513;
 /// what the terminal socket, etterminal's read chunk and the bridge's held
 /// packets can contain when the interrupt arrives.
 const INTERRUPT_DRAIN_BYTES: usize = 1024 * 1024;
+/// Length prefix of a router packet on the terminal socket.
+const LOCAL_PACKET_PREFIX: usize = std::mem::size_of::<i64>();
 
 /// One router message for the terminal: its [`RouterHead`] and payload,
 /// resumable across local-stream backpressure without copying the payload.
@@ -441,16 +443,7 @@ fn run_mode_poll(
                     // terminal, which owns the destination connection.
                     Ok(Some(packet)) if mode == BridgeMode::Jumphost => {
                         let packet = jumphost_client_packet(&session, packet)?;
-                        if session.take_interrupt_drain()? {
-                            drain_discard_terminal(
-                                &session,
-                                mode,
-                                &mut terminal,
-                                &mut decoder,
-                                &mut pending_terminal,
-                                &mut held_terminal,
-                            )?;
-                        }
+                        let emitted = interrupt_emitted(&session, &terminal)?;
                         let mut frame =
                             PendingLocalFrame::new(packet, framing).map_err(SessionError::Io)?;
                         match frame.try_write(&mut terminal) {
@@ -460,6 +453,17 @@ fn run_mode_poll(
                                 terminal_input_closed = true;
                             }
                             Err(error) => return Err(SessionError::Io(error)),
+                        }
+                        if let Some(emitted) = emitted {
+                            drain_discard_terminal(
+                                &session,
+                                mode,
+                                &mut terminal,
+                                &mut decoder,
+                                &mut pending_terminal,
+                                &mut held_terminal,
+                                emitted,
+                            )?;
                         }
                         true
                     }
@@ -493,7 +497,20 @@ fn run_mode_poll(
                         if let Some(forwarded) = forwarded {
                             match forwarded {
                                 ClientForward::ToTerminal(packet) => {
-                                    if session.take_interrupt_drain()? {
+                                    let emitted = interrupt_emitted(&session, &terminal)?;
+                                    if !terminal_input_closed {
+                                        let mut frame = PendingLocalFrame::new(packet, framing)
+                                            .map_err(SessionError::Io)?;
+                                        match frame.try_write(&mut terminal) {
+                                            Ok(true) => {}
+                                            Ok(false) => pending_local = Some(frame),
+                                            Err(error) if terminal_input_gone(&error) => {
+                                                terminal_input_closed = true;
+                                            }
+                                            Err(error) => return Err(SessionError::Io(error)),
+                                        }
+                                    }
+                                    if let Some(emitted) = emitted {
                                         drain_discard_terminal(
                                             &session,
                                             mode,
@@ -501,20 +518,11 @@ fn run_mode_poll(
                                             &mut decoder,
                                             &mut pending_terminal,
                                             &mut held_terminal,
+                                            emitted,
                                         )?;
                                     }
                                     if terminal_input_closed {
                                         continue;
-                                    }
-                                    let mut frame = PendingLocalFrame::new(packet, framing)
-                                        .map_err(SessionError::Io)?;
-                                    match frame.try_write(&mut terminal) {
-                                        Ok(true) => {}
-                                        Ok(false) => pending_local = Some(frame),
-                                        Err(error) if terminal_input_gone(&error) => {
-                                            terminal_input_closed = true;
-                                        }
-                                        Err(error) => return Err(SessionError::Io(error)),
                                     }
                                 }
                                 ClientForward::KeepAlive(control) => {
@@ -758,6 +766,7 @@ fn run_mode_windows(
                                     &mut decoder,
                                     &mut pending_terminal,
                                     &mut held_terminal,
+                                    usize::MAX,
                                 )?;
                             }
                             pending_local = Some(
@@ -795,6 +804,7 @@ fn run_mode_windows(
                                             &mut decoder,
                                             &mut pending_terminal,
                                             &mut held_terminal,
+                                            usize::MAX,
                                         )?;
                                     }
                                     if terminal_input_closed {
@@ -1221,13 +1231,38 @@ fn forward_error(error: et_net::forward::ForwardError) -> SessionError {
     SessionError::Io(io::Error::other(error))
 }
 
-/// Client input that flushed queued output on interrupt is about to reach
-/// the terminal. First read the output the terminal already emitted
-/// (including packets this bridge holds) and drop it, so the stale tail of a
-/// flood does not follow the flush to the client. Packets other than
-/// terminal output, such as exit status, are kept in order for normal
-/// dispatch. Upstream `drainDiscardReadableBytes` (`TerminalInterruptDrain.hpp`)
-/// and `drainDiscardJumphostTerminalBuffers` (`TerminalServer.cpp`).
+/// Bytes on the terminal socket when client input that flushed queued
+/// output on interrupt is about to be written to the terminal, or `None`
+/// when the input flushed nothing. The bridge writes the input first and
+/// then drops at most this much output (see [`drain_discard_terminal`]): the
+/// terminal emitted all of it before it could read the interrupt, so it is
+/// stale, while anything it writes after that (the echo, a prompt) is not
+/// read here. Upstream drains before it writes the input
+/// (`TerminalServer.cpp` `runTerminal`, `drainDiscardReadableBytes` then
+/// `writeProto`), so the terminal only sees the interrupt after the drain
+/// and keeps forwarding the flood until then: with et.rs `etterminal` that
+/// was 16 to 40 KB more output ahead of the prompt.
+#[cfg(unix)]
+fn interrupt_emitted(
+    session: &ActiveSession,
+    terminal: &LocalStream,
+) -> Result<Option<usize>, SessionError> {
+    if !session.take_interrupt_drain()? {
+        return Ok(None);
+    }
+    let emitted =
+        rustix::io::ioctl_fionread(terminal).map_err(|error| SessionError::Io(error.into()))?;
+    Ok(Some(usize::try_from(emitted).unwrap_or(usize::MAX)))
+}
+
+/// Client input that flushed queued output on interrupt is reaching the
+/// terminal. Drop the output the terminal emitted before it (including
+/// packets this bridge holds): at most `emitted` bytes of the terminal socket,
+/// so the stale tail of a flood does not follow the flush to the client.
+/// Packets other than terminal output, such as exit status, are kept in
+/// order for normal dispatch. Upstream `drainDiscardReadableBytes`
+/// (`TerminalInterruptDrain.hpp`) and `drainDiscardJumphostTerminalBuffers`
+/// (`TerminalServer.cpp`), which read until the socket is empty.
 fn drain_discard_terminal(
     session: &ActiveSession,
     mode: BridgeMode,
@@ -1235,6 +1270,7 @@ fn drain_discard_terminal(
     decoder: &mut LocalPacketDecoder,
     pending_terminal: &mut Option<Packet>,
     held_terminal: &mut VecDeque<Packet>,
+    emitted: usize,
 ) -> Result<(), SessionError> {
     let mut output = Vec::new();
     let mut preserved = VecDeque::new();
@@ -1250,12 +1286,14 @@ fn drain_discard_terminal(
         .into_iter()
         .chain(held_terminal.drain(..))
         .for_each(&mut sort);
+    // Whole packets are counted, prefix included, so a packet the decoder
+    // had started before counts in full and the drain stops early, never late.
     let mut drained = 0usize;
-    while drained < INTERRUPT_DRAIN_BYTES {
+    while drained < emitted.min(INTERRUPT_DRAIN_BYTES) {
         match read_terminal_packet(terminal, decoder) {
             Ok(Some(packet)) => {
                 *decoder = LocalPacketDecoder::new();
-                drained += packet.payload().len();
+                drained += LOCAL_PACKET_PREFIX + packet.wire_len();
                 if let Some(packet) = accept_terminal_packet(session, mode, packet)? {
                     sort(packet);
                 }

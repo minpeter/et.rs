@@ -188,24 +188,25 @@ fn assert_interrupt_discards_emitted_output(mode: BridgeMode) {
     let (prompt_tx, prompt_rx) = mpsc::sync_channel::<()>(1);
     let prompt = terminal(b"ET_CTRL_C_OK");
     let terminal_prompt = prompt.clone();
+    // The terminal answers the interrupt at once (an echo), before the
+    // bridge can have finished dropping what it emitted earlier.
+    let echo = terminal(b"^C\r\n");
+    let terminal_echo = echo.clone();
     let local = std::thread::spawn(move || {
-        interrupted_tx
-            .send(read_local_packet(&mut terminal_peer).unwrap())
-            .unwrap();
+        let interrupt = read_local_packet(&mut terminal_peer).unwrap();
+        write_local_packet(&mut terminal_peer, &terminal_echo).unwrap();
+        interrupted_tx.send(interrupt).unwrap();
         prompt_rx.recv_timeout(TIMEOUT).unwrap();
         write_local_packet(&mut terminal_peer, &terminal_prompt).unwrap();
         terminal_peer
     });
     assert_eq!(interrupted_rx.recv_timeout(TIMEOUT).unwrap(), interrupt);
     drop(permit);
+    // The exit status the terminal emitted before the interrupt and the echo
+    // it wrote after are independent; either may arrive first.
     let mut delivered = Vec::new();
-    loop {
-        let packet = client.read_packet().unwrap();
-        let done = packet.header() == TerminalPacketType::TerminalExitStatus as u8;
-        delivered.push(packet);
-        if done {
-            break;
-        }
+    while !(delivered.contains(&exit_status) && delivered.contains(&echo)) {
+        delivered.push(client.read_packet().unwrap());
     }
     prompt_tx.send(()).unwrap();
     delivered.push(client.read_packet().unwrap());
@@ -214,12 +215,14 @@ fn assert_interrupt_discards_emitted_output(mode: BridgeMode) {
     bridge.join().unwrap().unwrap();
 
     // Then: neither the queued nor the already-emitted flood reaches the
-    // client; the exit status and the later prompt do, in order.
+    // client; the exit status, the echo written after the interrupt and the
+    // later prompt do, in order.
     assert_eq!(
-        delivered,
-        vec![exit_status, prompt],
+        delivered.len(),
+        3,
         "interrupted flood reached the encrypted client"
     );
+    assert_eq!(delivered.last(), Some(&prompt));
 }
 
 fn control() -> Packet {

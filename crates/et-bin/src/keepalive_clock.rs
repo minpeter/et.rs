@@ -3,9 +3,19 @@
 //! Upstream `TerminalClient::run` keeps one keep-alive deadline and a
 //! `waitingOnKeepalive` flag: when the deadline passes it writes an empty
 //! `KEEP_ALIVE` and marks it outstanding; when the deadline passes again with
-//! the probe still outstanding, it closes the socket and reconnects. A dead
-//! link is declared two keep-alive intervals after the last sign of life.
-//! This clock keeps that two-step state machine with two differences:
+//! the probe still outstanding, it closes the socket and reconnects.
+//! Upstream compares whole seconds strictly (`keepaliveTime < time(NULL)`,
+//! `TerminalClient.cpp:687-688`), so each step fires on the first second
+//! tick after the interval has passed: an idle upstream client probes every
+//! interval + 1 s (6 s by default) and declares the link dead after two such
+//! steps (12 s).
+//!
+//! This clock probes on upstream's cadence, interval + 1 s after the last
+//! packet read, but keeps the verdict two intervals after it (10 s by
+//! default), so the reply gets the rest of the second interval. The probe is
+//! pulled earlier when that would leave the reply less than a second, which
+//! keeps `--keepalive 1` probing every second as before. Two more
+//! differences:
 //!
 //! - Any packet read is a sign of life: it clears an outstanding probe and
 //!   restarts the interval. Upstream restarts the interval on terminal and
@@ -23,8 +33,19 @@
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 
+/// How much later than the interval upstream's whole-second comparison
+/// sends its probe on an idle link.
+const PROBE_LAG: Duration = Duration::from_secs(1);
+
+/// The shortest time a probe gets for its reply when the probe is lagged.
+const MIN_REPLY_WINDOW: Duration = Duration::from_secs(1);
+
 pub(crate) struct KeepaliveClock {
-    interval: Duration,
+    /// Quiet time after the last packet read before the probe goes out.
+    probe_after: Duration,
+    /// Time an outstanding probe gets for its reply: the verdict lands two
+    /// intervals after the last packet read when the probe left on time.
+    reply_window: Duration,
     /// When the next probe is due, or with a probe outstanding, when the
     /// link is declared dead.
     deadline: Cell<Instant>,
@@ -33,22 +54,27 @@ pub(crate) struct KeepaliveClock {
 
 impl KeepaliveClock {
     pub(crate) fn new(interval: Duration, now: Instant) -> Self {
+        let verdict = interval * 2;
+        let probe_after = (interval + PROBE_LAG)
+            .min(verdict.saturating_sub(MIN_REPLY_WINDOW))
+            .max(interval);
         Self {
-            interval,
-            deadline: Cell::new(now + interval),
+            probe_after,
+            reply_window: verdict - probe_after,
+            deadline: Cell::new(now + probe_after),
             probe_outstanding: Cell::new(false),
         }
     }
 
     /// A packet was read, or a recovered transport was installed.
     pub(crate) fn alive(&self, now: Instant) {
-        self.deadline.set(now + self.interval);
+        self.deadline.set(now + self.probe_after);
         self.probe_outstanding.set(false);
     }
 
     /// A probe keep-alive was written at `now`.
     pub(crate) fn probe_sent(&self, now: Instant) {
-        self.deadline.set(now + self.interval);
+        self.deadline.set(now + self.reply_window);
         self.probe_outstanding.set(true);
     }
 
@@ -57,8 +83,8 @@ impl KeepaliveClock {
         !self.probe_outstanding.get() && now >= self.deadline.get()
     }
 
-    /// Whether the link is dead: a probe stayed unanswered for a whole
-    /// interval while the loop was `reading` the transport.
+    /// Whether the link is dead: a probe stayed unanswered for its whole
+    /// reply window while the loop was `reading` the transport.
     pub(crate) fn dead(&self, now: Instant, reading: bool) -> bool {
         reading && self.probe_outstanding.get() && now >= self.deadline.get()
     }

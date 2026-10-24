@@ -903,7 +903,15 @@ where
         // Upstream `TerminalClient::run`: a probe still unanswered when the
         // keep-alive deadline passes again means the link is dead. Held
         // output stops transport reads, so it never yields a verdict.
-        if !reconnect_needed && keepalive.dead(now, pending_output.is_none()) {
+        if !reconnect_needed
+            && keepalive_verdict(
+                &keepalive,
+                now,
+                pending_output.is_none(),
+                connection.has_buffered_read()
+                    || rustix::io::ioctl_fionread(&stream).is_ok_and(|unread| unread > 0),
+            )
+        {
             et_cli::logging::info("missed a keepalive, reconnecting");
             reconnect_needed = true;
         }
@@ -1127,6 +1135,27 @@ fn network_poll_flags(output_pending: bool, forwarding_backlog_full: bool) -> Po
 /// talking (`et_net::connection::FLOW_CONTROL_PEER_SILENCE`), so a console
 /// paused for longer no longer costs a reconnect. The dead-link verdict
 /// still needs reads, as before.
+/// Whether an unanswered keep-alive probe means the link is dead.
+///
+/// Upstream `TerminalClient::run` reconnects when a probe is still
+/// unanswered at the next keep-alive deadline. Held console output stops
+/// transport reads, so it never yields a verdict; but a probe's deadline
+/// that passed while output was held is also no verdict once output
+/// resumes, since this side has not read since. Server data that already
+/// waits unread (in the socket or the reader) proves the peer kept sending,
+/// so the verdict also waits until it has been read: a terminal paused for
+/// longer than the reply window used to reconnect, and the recovery then
+/// timed out behind the still-paused console.
+#[cfg(unix)]
+fn keepalive_verdict(
+    keepalive: &crate::keepalive_clock::KeepaliveClock,
+    now: Instant,
+    reading: bool,
+    peer_data_waiting: bool,
+) -> bool {
+    !peer_data_waiting && keepalive.dead(now, reading)
+}
+
 #[cfg(unix)]
 fn keepalive_probe_due(
     keepalive: &crate::keepalive_clock::KeepaliveClock,

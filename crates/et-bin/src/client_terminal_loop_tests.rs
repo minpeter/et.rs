@@ -1260,3 +1260,20 @@ fn held_console_output_keeps_probing_after_an_unanswered_keepalive() {
     keepalive.probe_sent(later);
     assert!(!keepalive_probe_due(&keepalive, later, true));
 }
+
+#[test]
+fn unread_server_data_after_held_output_is_no_dead_link_verdict() {
+    // Given: a probe went out while console output held transport reads,
+    // and its reply deadline passed during the pause.
+    let interval = Duration::from_secs(1);
+    let start = Instant::now();
+    let keepalive = crate::keepalive_clock::KeepaliveClock::new(interval, start);
+    keepalive.probe_sent(start);
+    let later = start + 3 * interval;
+
+    // When: the console resumes (reads allowed again) with server data
+    // still waiting unread, the link is alive; only a silent socket is dead.
+    assert!(!keepalive_verdict(&keepalive, later, true, true));
+    assert!(keepalive_verdict(&keepalive, later, true, false));
+    assert!(!keepalive_verdict(&keepalive, later, false, false));
+}

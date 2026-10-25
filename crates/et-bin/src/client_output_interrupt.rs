@@ -57,11 +57,13 @@ impl ConsoleOutput {
 /// the bytes queued at the interrupt, and packets the reader had already
 /// buffered count against it first, so nothing the server sends after it
 /// handles the interrupt is filtered.
+#[cfg(any(unix, test))]
 #[derive(Default)]
 pub(crate) struct StaleOutput {
     bytes: usize,
 }
 
+#[cfg(any(unix, test))]
 impl StaleOutput {
     /// An interrupt was typed while `unread` transport bytes were queued.
     pub(crate) fn interrupted(&mut self, unread: usize) {

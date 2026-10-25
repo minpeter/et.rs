@@ -41,6 +41,7 @@ pub enum ReleaseScope {
 /// second event within [`IDLE_RELEASE_DELAY`] of the previous one rebuilds it.
 #[derive(Debug)]
 pub struct IdleRelease {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     scope: ReleaseScope,
     last_activity: Instant,
     released: bool,

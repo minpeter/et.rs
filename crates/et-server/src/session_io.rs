@@ -196,6 +196,27 @@ impl ActiveSession {
         Ok(et_core::keepalive::ack_bytes(&ack).to_vec())
     }
 
+    /// When terminal output must wait for the client to acknowledge (see
+    /// [`et_core::output_window`]): `Some` with the time the bound gives up.
+    #[cfg(unix)]
+    pub(crate) fn output_window_blocked(&self) -> Result<Option<Instant>, SessionError> {
+        Ok(self
+            .connection
+            .lock()
+            .map_err(|_| SessionError::Unavailable)?
+            .output_window_blocked(Instant::now()))
+    }
+
+    /// Size the output bound for the round trip the handshake on the
+    /// current transport measured.
+    pub(crate) fn seed_output_round_trip(&self, rtt: Duration) -> Result<(), SessionError> {
+        self.connection
+            .lock()
+            .map_err(|_| SessionError::Unavailable)?
+            .seed_output_round_trip(rtt);
+        Ok(())
+    }
+
     pub(crate) fn can_buffer_write(&self, bytes: i64) -> Result<bool, SessionError> {
         if let Some(state) = self.output_flow() {
             let bytes = usize::try_from(bytes).map_err(|_| SessionError::Unavailable)?;

@@ -163,7 +163,7 @@ pub(crate) fn handle(
             wants_reset,
             handshake_deadline,
         ) {
-            Ok(challenge) => Some(challenge),
+            Ok(authenticated) => Some(authenticated),
             Err(AuthError::Rejected) => {
                 reject(
                     &mut stream,
@@ -209,9 +209,10 @@ pub(crate) fn handle(
             }
         }
     }
-    let decision = challenge.map(|challenge| ConnectDecision {
+    let decision = challenge.map(|(challenge, round_trip)| ConnectDecision {
         challenge,
         key: registration.key,
+        round_trip,
     });
     let registration_identity = registration.identity();
     #[cfg(test)]
@@ -366,6 +367,9 @@ pub(crate) fn handle(
             };
             match recovered {
                 Ok(()) => {
+                    if let Some(decision) = decision.as_ref() {
+                        let _ = session.seed_output_round_trip(decision.round_trip);
+                    }
                     crate::diag::info(format!("id={id}: session recover accepted from {peer}"))
                 }
                 Err(error) => crate::diag::info(format!(
@@ -504,6 +508,7 @@ fn handle_new(
             &id,
             peer,
             initialization_deadline,
+            decision.map(|decision| decision.round_trip),
         );
         return;
     }
@@ -625,6 +630,9 @@ fn handle_new(
         }
     };
     let active = Arc::new(active);
+    if let Some(decision) = decision {
+        let _ = active.seed_output_round_trip(decision.round_trip);
+    }
     active.set_forward_exit_status(payload.supports_exit_status.unwrap_or(false));
     active.set_disconnect_timeout(Some(
         payload
@@ -651,6 +659,7 @@ fn handle_new(
 /// An et.rs jump terminal that registered with the startup sentinel instead
 /// reports its destination's INITIAL_RESPONSE first, see
 /// [`start_acknowledged_jumphost`].
+#[allow(clippy::too_many_arguments)]
 fn run_jumphost(
     mut connection: Connection,
     start: crate::session_slot::SessionStart,
@@ -659,6 +668,7 @@ fn run_jumphost(
     id: &str,
     peer: &str,
     initialization_deadline: Instant,
+    round_trip: Option<Duration>,
 ) {
     if Instant::now() >= initialization_deadline {
         send_initial_error(&mut connection, "jumphost initialization deadline elapsed");
@@ -715,6 +725,9 @@ fn run_jumphost(
         }
     };
     let active = Arc::new(active);
+    if let Some(round_trip) = round_trip {
+        let _ = active.seed_output_round_trip(round_trip);
+    }
     active.set_forward_exit_status(payload.supports_exit_status.unwrap_or(false));
     active.set_disconnect_timeout(Some(
         payload
@@ -921,6 +934,10 @@ fn send_initial_error(connection: &mut Connection, message: &str) {
 struct ConnectDecision {
     challenge: Vec<u8>,
     key: [u8; KEY_LEN],
+    /// From writing the challenge to reading its reply: a clean round trip
+    /// of this transport for the output window (see
+    /// [`et_core::output_window`]).
+    round_trip: Duration,
 }
 
 enum AuthError {
@@ -934,7 +951,7 @@ fn authenticate_client(
     key: &[u8; KEY_LEN],
     reset_intent: bool,
     deadline: Instant,
-) -> Result<Vec<u8>, AuthError> {
+) -> Result<(Vec<u8>, Duration), AuthError> {
     let challenge = random_bytes::<AUTH_CHALLENGE_BYTES>().to_vec();
     write_response(
         stream,
@@ -948,12 +965,14 @@ fn authenticate_client(
         },
     )
     .map_err(|_| AuthError::Io)?;
+    let sent = Instant::now();
     let auth: ConnectAuth =
         et_net::framing_io::read_proto_limited_deadline(stream, MAX_HANDSHAKE_PROTO_LEN, deadline)
             .map_err(|_| AuthError::Io)?;
+    let round_trip = sent.elapsed();
     let proof = auth.proof.unwrap_or_default();
     if verify_connection_proof(&proof, key, id, PROTOCOL_VERSION, &challenge, reset_intent) {
-        Ok(challenge)
+        Ok((challenge, round_trip))
     } else {
         Err(AuthError::Rejected)
     }
@@ -1098,6 +1117,9 @@ fn resume_pty_session(
         }
     };
     let active = Arc::new(active);
+    if let Some(decision) = decision {
+        let _ = active.seed_output_round_trip(decision.round_trip);
+    }
     active.set_disconnect_timeout(Some(
         registration
             .disconnect_timeout_seconds

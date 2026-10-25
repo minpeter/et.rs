@@ -14,6 +14,7 @@ pub mod framing;
 pub mod keepalive;
 pub mod keys;
 pub mod output_interrupt;
+pub mod output_window;
 pub mod packet;
 pub mod proto;
 

@@ -91,6 +91,10 @@ impl Connection {
             peer_silence: self.peer_silence,
             pending_live: None,
             acks: AckSchedule::default(),
+            output_window: self
+                .output_window
+                .as_ref()
+                .map(et_core::output_window::OutputWindow::for_new_transport),
         };
         candidate.disconnect();
         candidate
@@ -120,6 +124,7 @@ impl Connection {
                 let catchup = if let Some(salt) = exchange.reset_salt.as_ref() {
                     self.reader().reset(salt).map_err(|_| invalid_reset())?;
                     self.writer.reset(salt).map_err(|_| invalid_reset())?;
+                    self.restart_output_window();
                     Vec::new()
                 } else {
                     remote_catchup.buffer
@@ -161,6 +166,7 @@ impl Connection {
                 let salt = exchange.reset_salt.as_ref().unwrap();
                 self.reader().reset(salt).map_err(|_| invalid_reset())?;
                 self.writer.reset(salt).map_err(|_| invalid_reset())?;
+                self.restart_output_window();
                 if !remote_catchup.buffer.is_empty() {
                     return Err(ConnError::Io(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -323,6 +329,14 @@ impl Connection {
                     return Err(ConnError::Io(error));
                 }
             }
+        }
+    }
+
+    /// A writer reset restarts sequences and the client's own record of our
+    /// acknowledgements, so the output bound starts over too.
+    fn restart_output_window(&mut self) {
+        if let Some(window) = self.output_window.as_mut() {
+            *window = et_core::output_window::OutputWindow::default();
         }
     }
 }

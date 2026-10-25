@@ -245,6 +245,12 @@ impl ActiveSession {
         connection
             .minimize_output_buffering()
             .map_err(SessionError::Connection)?;
+        // The Unix session loop holds terminal output back while an
+        // acknowledging client has a whole window of it unacknowledged
+        // ([`OutputPump`]). The Windows writer thread keeps upstream's
+        // unbounded behavior.
+        #[cfg(unix)]
+        connection.bound_unacknowledged_output();
         let control = connection
             .try_clone_stream()
             .map_err(SessionError::Connection)?;

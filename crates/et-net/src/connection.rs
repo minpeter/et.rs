@@ -10,6 +10,7 @@ use et_core::crypto::{
     CryptoHandler, EncryptError, DIR_CLIENT_TO_SERVER, DIR_SERVER_TO_CLIENT, KEY_LEN,
 };
 use et_core::keepalive::{AckSchedule, AckSide};
+use et_core::output_window::{unacknowledged_payload, OutputWindow};
 use et_core::packet::Packet;
 use socket2::SockRef;
 #[path = "connection_pending.rs"]
@@ -92,6 +93,8 @@ pub struct Connection {
     /// Which keep-alives on this transport carry the delivery
     /// acknowledgement; a recovered transport starts a fresh schedule.
     acks: AckSchedule,
+    /// Server output bound; see [`Self::bound_unacknowledged_output`].
+    output_window: Option<OutputWindow>,
 }
 
 /// Receive half of a [`Connection`].
@@ -207,6 +210,7 @@ impl Connection {
             peer_silence: None,
             pending_live: None,
             acks: AckSchedule::default(),
+            output_window: None,
         }
     }
 
@@ -261,12 +265,13 @@ impl Connection {
             return Err(WritePacketError::BeforeReplay(error));
         }
         let live_stream = self.writer.connected().then(|| Arc::clone(&self.stream));
-        match self
+        let outcome = self
             .writer
             .write_packet(header, payload)
             .map_err(ConnError::Encrypt)
-            .map_err(WritePacketError::BeforeReplay)?
-        {
+            .map_err(WritePacketError::BeforeReplay)?;
+        self.note_output(&outcome, header, payload.len());
+        match outcome {
             WriterOutcome::Send(frame) => Ok(PreparedWrite {
                 live: live_stream.map(|stream| (stream, frame, self.live_write_timeout)),
             }),
@@ -284,12 +289,13 @@ impl Connection {
             return Err(WritePacketError::BeforeReplay(ConnError::Backpressure));
         }
         let live_stream = self.writer.connected().then(|| Arc::clone(&self.stream));
-        match self
+        let outcome = self
             .writer
             .write_packet(header, payload)
             .map_err(ConnError::Encrypt)
-            .map_err(WritePacketError::BeforeReplay)?
-        {
+            .map_err(WritePacketError::BeforeReplay)?;
+        self.note_output(&outcome, header, payload.len());
+        match outcome {
             WriterOutcome::Send(frame) => Ok(PreparedWrite {
                 live: live_stream.map(|stream| (stream, frame, self.live_write_timeout)),
             }),
@@ -328,7 +334,10 @@ impl Connection {
         frame: Arc<Vec<u8>>,
     ) -> PreparedWrite {
         let live_stream = self.writer.connected().then(|| Arc::clone(&self.stream));
-        match self.writer.commit_write(reserved, frame) {
+        let (header, payload_len) = (reserved.header(), reserved.payload_len());
+        let outcome = self.writer.commit_write(reserved, frame);
+        self.note_output(&outcome, header, payload_len);
+        match outcome {
             WriterOutcome::Send(frame) => PreparedWrite {
                 live: live_stream.map(|stream| (stream, frame, self.live_write_timeout)),
             },
@@ -375,12 +384,13 @@ impl Connection {
                     .map_err(WritePacketError::BeforeReplay)
             })
             .transpose()?;
-        match self
+        let outcome = self
             .writer
             .write_packet(header, payload)
             .map_err(ConnError::Encrypt)
-            .map_err(WritePacketError::BeforeReplay)?
-        {
+            .map_err(WritePacketError::BeforeReplay)?;
+        self.note_output(&outcome, header, payload.len());
+        match outcome {
             WriterOutcome::Send(frame) => Ok(PreparedWrite {
                 live: live_stream.map(|stream| (stream, frame, self.live_write_timeout)),
             }),
@@ -572,12 +582,68 @@ impl Connection {
     /// replay backup. Implausible values are ignored.
     pub fn acknowledge_delivery(&mut self, sequence: i64) {
         self.writer.acknowledge(sequence);
+        let Some(window) = self.output_window.as_mut() else {
+            return;
+        };
+        if let Some((acknowledged, unacknowledged)) = self.writer.delivery_backlog() {
+            if acknowledged == sequence && self.writer.connected() {
+                let payload =
+                    unacknowledged_payload(acknowledged, unacknowledged, self.writer.sequence());
+                window.on_ack(acknowledged, payload, Instant::now());
+            }
+        }
     }
 
     /// Latest peer acknowledgement and the wire bytes written since; `None`
     /// for a peer that has never acknowledged delivery (legacy peers).
     pub fn delivery_backlog(&self) -> Option<(i64, i64)> {
         self.writer.delivery_backlog()
+    }
+
+    /// Hold queued terminal output back while an acknowledging client has
+    /// a whole window of it unacknowledged (see [`et_core::output_window`]).
+    /// The server's session output enables this; the pump asks
+    /// [`Self::output_window_blocked`] before each terminal frame.
+    pub fn bound_unacknowledged_output(&mut self) {
+        self.output_window.get_or_insert_with(OutputWindow::default);
+    }
+
+    /// Give the output bound this transport's handshake round trip.
+    pub fn seed_output_round_trip(&mut self, rtt: Duration) {
+        if let Some(window) = self.output_window.as_mut() {
+            window.seed_round_trip(rtt);
+        }
+    }
+
+    /// `Some` with the time the bound gives up waiting while terminal output
+    /// must wait for an acknowledgement; `None` while it may go out.
+    pub fn output_window_blocked(&mut self, now: Instant) -> Option<Instant> {
+        let window = self.output_window.as_mut()?;
+        if !self.writer.connected() {
+            return None;
+        }
+        let (acknowledged, unacknowledged) = self.writer.delivery_backlog()?;
+        let payload = unacknowledged_payload(acknowledged, unacknowledged, self.writer.sequence());
+        window.blocked(acknowledged, payload, now)
+    }
+
+    /// Feed a packet the writer committed to the output bound.
+    fn note_output(&mut self, outcome: &WriterOutcome, header: u8, payload_len: usize) {
+        let Some(window) = self.output_window.as_mut() else {
+            return;
+        };
+        if matches!(outcome, WriterOutcome::Skipped) {
+            return;
+        }
+        let carries_ack = header == et_core::proto::TerminalPacketType::KeepAlive as u8
+            && payload_len == et_core::keepalive::ACK_PAYLOAD_LEN;
+        window.on_write(
+            self.writer.sequence(),
+            payload_len,
+            header == et_core::proto::TerminalPacketType::TerminalBuffer as u8,
+            carries_ack,
+            Instant::now(),
+        );
     }
 
     /// Keep-alive payload acknowledging everything read so far.

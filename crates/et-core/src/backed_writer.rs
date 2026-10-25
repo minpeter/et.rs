@@ -83,6 +83,14 @@ impl ReservedWrite {
             &self.key,
         ))
     }
+
+    pub fn header(&self) -> u8 {
+        self.prefix[5]
+    }
+
+    pub fn payload_len(&self) -> usize {
+        self.packet_wire_len - 2 - MAC_LEN
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

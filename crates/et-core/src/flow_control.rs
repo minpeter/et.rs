@@ -12,7 +12,9 @@ pub(crate) const MAX_PACKETS_PER_LANE: usize = 4096;
 /// Largest terminal buffer queued output is merged into, upstream
 /// `TerminalServer`'s `BUF_SIZE`: its `drainWriteBufferToClient` sends the
 /// `WriteBuffer` byte stream as `TERMINAL_BUFFER` packets of up to 16 KiB.
-/// See [`OutputQueue::append_terminal`].
+/// See [`OutputQueue::append_terminal`]. With the client's backlog bounded by
+/// [`crate::output_window`], 32 KiB packets measured the same echo latency
+/// but left about half again as much output on screen after Ctrl+C.
 pub(crate) const COALESCED_TERMINAL_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,6 +211,15 @@ impl OutputQueue {
                     .observe(message.buffer.as_deref().unwrap_or_default());
             }
         }
+        Some(packet)
+    }
+
+    /// Take only from the control lane, while terminal output waits (see
+    /// [`crate::output_window`]). Terminal output stays queued, where an
+    /// interrupt can still drop it, and goes first once it may.
+    pub fn take_control(&mut self) -> Option<Packet> {
+        let packet = self.control.pop_front()?;
+        self.prefer_terminal = true;
         Some(packet)
     }
 

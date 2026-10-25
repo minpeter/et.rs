@@ -196,7 +196,10 @@ fn run_mode_poll(
         }
         // Write queued output before deciding how long to sleep. A frame
         // still waiting for transport room keeps POLLOUT in the poll set.
-        let output_state = output.run();
+        // While client reads are held, its acknowledgements cannot arrive and
+        // terminal input may wait on this output, so the window is lifted.
+        let output_state =
+            output.run(pending_local.is_none() && pending_forward.len() < FORWARD_BACKLOG_CAPACITY);
         if !connected {
             cached_client = None;
         } else if cached_client.as_ref().map(|(_, gen)| *gen) != Some(connection_generation) {
@@ -253,6 +256,11 @@ fn run_mode_poll(
             client_policy.1 = wait_until(client_policy.1, expiry);
         }
         if let Some(release_at) = idle.deadline() {
+            client_policy.1 = wait_until(client_policy.1, release_at);
+        }
+        // Output held for an acknowledgement goes out when the window gives
+        // up waiting; the client socket's readability covers the rest.
+        if let Some(release_at) = output_state.window_release {
             client_policy.1 = wait_until(client_policy.1, release_at);
         }
         let (terminal_events, wake_events, forward_events, client_events, ready) = wait(

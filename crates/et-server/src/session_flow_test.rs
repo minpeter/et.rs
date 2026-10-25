@@ -160,7 +160,7 @@ fn final_in_flight_completion_wakes_bridge_after_control_capacity_reopens() {
     let mut output = OutputPump::new(&session);
     session.send_packet_owned(7, &vec![3; 60 * 1024]).unwrap();
     assert!(
-        output.run().deadline.is_some(),
+        output.run(true).deadline.is_some(),
         "the frame must wait for transport room"
     );
     assert!(matches!(
@@ -185,6 +185,152 @@ fn final_in_flight_completion_wakes_bridge_after_control_capacity_reopens() {
         "final control completion stranded the bridge's retained packet"
     );
     assert_eq!(reader.join().unwrap().payload(), vec![3; 60 * 1024]);
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_output_waits_for_a_client_that_acknowledges_by_volume() {
+    use et_core::keepalive::{ACK_INTERVAL_BYTES, ACK_PAYLOAD_LEN};
+    use et_core::output_window::MIN_PIPE_BYTES;
+    use et_core::packet::{encode_terminal_buffer, Packet};
+    use et_core::proto::TerminalPacketType;
+
+    let window = ACK_INTERVAL_BYTES as u64 + MIN_PIPE_BYTES;
+    let keepalive = TerminalPacketType::KeepAlive as u8;
+    let (server, mut client) = connection_pair();
+    client.set_io_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
+    let session = ActiveSession::new(server, &terminal, None).unwrap();
+    session.start_output();
+    let mut output = OutputPump::new(&session);
+    let flood = Packet::new(
+        TerminalPacketType::TerminalBuffer as u8,
+        encode_terminal_buffer(
+            &[b"y".repeat(63), b"\n".to_vec()].concat().repeat(128),
+            false,
+        ),
+    );
+
+    // Given: a client that announced it acknowledges, read the server's
+    // acknowledgement, then read two windows of output while acknowledging
+    // only the first packet, as a volume-acknowledging client does when its
+    // console falls behind.
+    let echo = session.keepalive_echo(Some(0)).unwrap();
+    assert_eq!(echo.len(), ACK_PAYLOAD_LEN);
+    session.send_packet(keepalive, &echo).unwrap();
+    output.run(true);
+    assert_eq!(client.read_packet().unwrap().header(), keepalive);
+    let first_read = client.reader_sequence();
+    for round in 0.. {
+        assert!(round < 1000, "the transport must take two windows");
+        if unacknowledged(&session) >= 2 * window {
+            break;
+        }
+        flood_until_held(&session, &mut output, &flood);
+        drain(&mut client);
+    }
+    session.acknowledge_delivery(first_read).unwrap();
+
+    // When: the terminal keeps producing and the client keeps reading
+    // without acknowledging more.
+    let held = unacknowledged(&session);
+    for _ in 0..8 {
+        flood_until_held(&session, &mut output, &flood);
+        // Then: no more terminal output reaches the client.
+        assert_eq!(drain(&mut client), 0);
+    }
+    assert_eq!(unacknowledged(&session), held);
+    // Control packets (keep-alive echoes, forwarding) still go out.
+    session.send_packet(keepalive, &[]).unwrap();
+    output.run(true);
+    assert_eq!(client.read_packet().unwrap().header(), keepalive);
+
+    // When: the client acknowledges everything it read, then keeps reading
+    // without acknowledging.
+    session
+        .acknowledge_delivery(client.reader_sequence())
+        .unwrap();
+    let mut released = 0;
+    for _ in 0..64 {
+        flood_until_held(&session, &mut output, &flood);
+        released += drain(&mut client);
+    }
+    // Then: output resumes and stops again one window later.
+    assert!(released > 0);
+    let outstanding = unacknowledged(&session);
+    // Queued output merges into packets of up to 16 KiB.
+    let packet = 17 * 1024;
+    assert!(
+        (window..window + packet).contains(&outstanding),
+        "{outstanding} bytes unacknowledged"
+    );
+
+    // And: output the window holds back is still queued, so an interrupt
+    // drops it.
+    client
+        .write_packet(
+            TerminalPacketType::TerminalBuffer as u8,
+            &encode_terminal_buffer(b"\x03", false),
+        )
+        .unwrap();
+    let deadline = std::time::Instant::now() + TEST_TIMEOUT;
+    while session.try_read_packet().unwrap().is_none() {
+        assert!(std::time::Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(session.take_interrupt_drain().unwrap());
+}
+
+/// Payload bytes the session wrote that its client has not acknowledged.
+#[cfg(unix)]
+fn unacknowledged(session: &ActiveSession) -> u64 {
+    let connection = session.connection.lock().unwrap();
+    let (acknowledged, wire) = connection.delivery_backlog().unwrap();
+    et_core::output_window::unacknowledged_payload(acknowledged, wire, connection.writer_sequence())
+}
+
+/// Queue `flood` and pump until output waits for transport room or for an
+/// acknowledgement.
+#[cfg(unix)]
+fn flood_until_held(
+    session: &ActiveSession,
+    output: &mut OutputPump<'_>,
+    flood: &et_core::packet::Packet,
+) {
+    for _ in 0..256 {
+        if session
+            .can_buffer_write(flood.payload().len() as i64)
+            .unwrap()
+        {
+            session
+                .send_packet(flood.header(), flood.payload())
+                .unwrap();
+        }
+        let outcome = output.run(true);
+        if outcome.deadline.is_some() || outcome.window_release.is_some() {
+            return;
+        }
+    }
+    panic!("output never waited");
+}
+
+/// Read every packet the client has received; how many there were.
+#[cfg(unix)]
+fn drain(client: &mut Connection) -> usize {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+
+    let stream = client.try_clone_stream().unwrap();
+    let mut packets = 0;
+    loop {
+        while client.try_read_packet().unwrap().is_some() {
+            packets += 1;
+        }
+        let mut descriptors = [PollFd::new(&stream, PollFlags::IN)];
+        let timeout = Timespec::try_from(Duration::from_millis(20)).unwrap();
+        if poll(&mut descriptors, Some(&timeout)).unwrap() == 0 {
+            return packets;
+        }
+    }
 }
 
 fn connection_pair() -> (Connection, Connection) {

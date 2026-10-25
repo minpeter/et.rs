@@ -47,7 +47,7 @@ fn pending_terminal_frame_and_synchronous_control_preserve_encrypted_frame_order
         .send_packet(terminal.header(), terminal.payload())
         .unwrap();
     assert!(
-        output.run().deadline.is_some(),
+        output.run(true).deadline.is_some(),
         "the terminal frame must wait for transport room"
     );
 
@@ -61,7 +61,7 @@ fn pending_terminal_frame_and_synchronous_control_preserve_encrypted_frame_order
     let second = client.read_packet();
     sender.join().unwrap().unwrap();
     // The synchronous writer finished the loop's frame; nothing is left.
-    assert!(output.run().deadline.is_none());
+    assert!(output.run(true).deadline.is_none());
     drop(output);
     session.shutdown().unwrap();
 
@@ -286,7 +286,7 @@ fn flood_lines() -> Packet {
 #[cfg(target_os = "linux")]
 fn flood_until_no_room(session: &ActiveSession, output: &mut OutputPump<'_>, flood: &Packet) {
     let mut rounds = 0;
-    while output.run().deadline.is_none() {
+    while output.run(true).deadline.is_none() {
         rounds += 1;
         assert!(
             rounds < 4096,

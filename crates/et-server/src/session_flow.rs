@@ -517,21 +517,22 @@ impl FlowControl {
         state.writer_waiting = true;
         let mut state = self.wake.wait_while(state, writer_must_wait).ok()?;
         state.writer_waiting = false;
-        self.take_item(&mut state)
+        self.take_item(&mut state, true)
     }
 
     /// [`Self::next_item`] for the session loop: `None` wherever a blocking
-    /// writer would wait.
+    /// writer would wait, and while only terminal output is queued and
+    /// `terminal` is false (the client's output window is full).
     #[cfg(unix)]
-    fn try_next_item(&self) -> Option<(Packet, bool)> {
+    fn try_next_item(&self, terminal: bool) -> Option<(Packet, bool)> {
         let mut state = self.state.lock().ok()?;
         if writer_must_wait(&mut state) {
             return None;
         }
-        self.take_item(&mut state)
+        self.take_item(&mut state, terminal)
     }
 
-    fn take_item(&self, state: &mut WriterState) -> Option<(Packet, bool)> {
+    fn take_item(&self, state: &mut WriterState, terminal: bool) -> Option<(Packet, bool)> {
         match state.stop {
             StopMode::Hard => None,
             StopMode::Graceful
@@ -546,7 +547,11 @@ impl FlowControl {
                     self.wake.notify_all();
                     return Some((packet, true));
                 }
-                let packet = state.queue.take()?;
+                let packet = if terminal {
+                    state.queue.take()?
+                } else {
+                    state.queue.take_control()?
+                };
                 state.in_flight = true;
                 #[cfg(test)]
                 self.wake.notify_all();
@@ -745,6 +750,9 @@ pub(crate) struct PumpOutcome {
     /// A completion changed state the loop waits on (lane capacity,
     /// connectivity, stop); re-check before sleeping.
     pub(crate) wake: bool,
+    /// Terminal output waits for the client to acknowledge; the loop must
+    /// run again by then, when the output window gives up waiting.
+    pub(crate) window_release: Option<Instant>,
 }
 
 #[cfg(unix)]
@@ -760,10 +768,17 @@ impl<'a> OutputPump<'a> {
     /// Write until the queue is empty or paused, or output waits for
     /// transport room. A partly written frame keeps advancing during a
     /// recovery pause, which waits for it.
-    pub(crate) fn run(&mut self) -> PumpOutcome {
+    ///
+    /// While `bounded`, terminal output also waits whenever the client has
+    /// a whole output window unacknowledged (see [`et_core::output_window`]);
+    /// control packets still go out. The session loop passes false while it
+    /// is not reading the client: acknowledgements could not arrive, and
+    /// terminal input it cannot deliver may be waiting on this output.
+    pub(crate) fn run(&mut self, bounded: bool) -> PumpOutcome {
         let mut outcome = PumpOutcome {
             deadline: None,
             wake: false,
+            window_release: None,
         };
         let Some(flow) = self.session.output_flow() else {
             return outcome;
@@ -771,13 +786,23 @@ impl<'a> OutputPump<'a> {
         loop {
             let (packet, started) = match self.live.take() {
                 Some(packet) => (packet, true),
-                None => match flow.try_next_item() {
-                    Some(item) => item,
-                    None => {
-                        self.room_wait = None;
-                        return outcome;
+                None => {
+                    outcome.window_release = if bounded {
+                        match self.session.output_window_blocked() {
+                            Ok(release) => release,
+                            Err(_) => return outcome,
+                        }
+                    } else {
+                        None
+                    };
+                    match flow.try_next_item(outcome.window_release.is_none()) {
+                        Some(item) => item,
+                        None => {
+                            self.room_wait = None;
+                            return outcome;
+                        }
                     }
-                },
+                }
             };
             match writer::write_nonblocking(
                 self.session,
@@ -825,7 +850,7 @@ impl OutputPump<'_> {
     pub(crate) fn run_until_idle(&mut self, stream: &std::net::TcpStream) -> PumpOutcome {
         let mut woke = false;
         loop {
-            let mut outcome = self.run();
+            let mut outcome = self.run(true);
             woke |= outcome.wake;
             let Some(deadline) = outcome.deadline else {
                 outcome.wake = woke;

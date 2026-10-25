@@ -1129,6 +1129,69 @@ netns veth pair with `tc netem`.
   of et.rs's private SSH ControlMaster (`ControlPersist=15`). Idle wakeups:
   0.6 → 0.5/s. Recovery after a 10 s silent outage: 1.13 → 1.10 s.
 
+**Output window for acknowledging clients.**
+- When the terminal drains slower than the link, the client stops reading its
+  socket. Linux then autotuned the client's receive queue to 4–20 MB
+  (`TcpExtPruneCalled` 560 per 10 sessions), and every keystroke echo waited
+  behind it: echo during a `yes` flood was at ~40 ms in about 30% of sessions.
+- On Unix, `etserver` now holds queued terminal output while an et.rs client has a
+  whole window of it unacknowledged (`et_core::output_window`).
+  - The window is the client's 512 KiB acknowledgement interval plus twice the
+    path's bandwidth-delay product, at least 512 KiB more (1 MiB on a local
+    link), capped at 16 MiB.
+  - The rate comes from acknowledgement timing. The round trip is the
+    authentication challenge's, and write-to-acknowledgement samples can only
+    lower it.
+  - It reads the keep-alive delivery acknowledgements (et@0.0.8, sent by volume
+    since et@0.0.36). No wire or `PROTOCOL_VERSION` change.
+  - Held output stays unsequenced in the queue, so the interrupt flush still
+    drops it. Control packets and forwarded data never wait and don't count.
+  - It arms only after the client has read one of the server's acknowledgements
+    and then acknowledged with a whole window outstanding. ET C++ clients and
+    et.rs before 0.0.36 keep the previous behavior.
+  - It lifts while the session loop isn't reading the client, and releases
+    after an acknowledgement has been stuck for 10 s, until one advances.
+  - The Windows server is not gated: its writer thread has no wake on an
+    acknowledgement.
+- Intentional difference: upstream has no application-level window.
+  `drainWriteBufferToClient` (`TerminalServer.cpp:23-62`) writes one `BUF_SIZE`
+  (`:15`) packet per `isSocketWritable` check and runs near 5 MB/s, so the
+  client's queue stays short.
+- Echo during a `yes` flood, 30 sessions: sessions with p50 ≥ 15 ms went from
+  5/30 to 0/30; pooled p95 34.1 → 11.9 ms (ET C++ 32.3). Throughput is unchanged
+  at a 50 ms round trip (13.8 MB/s) and at 1 Gbit / 100 ms.
+- Output merging stays at upstream's 16 KiB: 32 KiB gave the same echo with more
+  output after Ctrl-C.
+
+**No dead-link verdict while server data waits unread.**
+- A keep-alive probe whose reply deadline passed while console output held socket
+  reads produced a reconnect on the first loop turn after output resumed, before
+  anything was read. The reconnect then timed out behind the paused terminal and
+  the session ended. With 60 KiB output packets this happened in 4 of 5
+  slow-client runs.
+- Upstream `TerminalClient::run` refreshes its keep-alive deadline only on reads
+  and stops reading while `consoleOut` is full, so it has the same exposure.
+- et.rs treats unread server data, in the socket or already buffered by the
+  reader, as proof the peer is alive. A silent socket still gets a verdict after
+  the same reply window.
+
+**Residual gaps, with cause.**
+- Lossy link (`delay 75ms loss 0.5%`), Ctrl-C to prompt: 8 same-session runs gave
+  a 242 ms median against 190 ms for ET C++, and both had runs at ~300 ms.
+  - The slow runs are TCP head-of-line blocking: a segment lost ahead of the
+    prompt holds it for one retransmission.
+  - et.rs has more in flight at Ctrl-C (cwnd 60–728 against 22–411), which is also
+    why its WAN output is 2.6× faster.
+  - Bounding in-flight data would trade away that throughput, so it is left as is.
+- Output shown after Ctrl-C: the remaining gap is the 6–17 KB already in the local
+  pty. et.rs's output keeps up with the reader; upstream's slower output leaves
+  the pty nearly empty. Upstream's console write path (`TerminalClient.cpp:668-677`)
+  is the same as et.rs's.
+- Idle traffic: the last 70 B/min seen in some benchmark windows was a kernel IPv6
+  router solicitation on the test veth, hitting both implementations. et.rs's
+  only extra idle cost is the 8-byte delivery acknowledgement on one keep-alive
+  exchange in 16, about 10 B/min.
+
 ## Ledger (classified 2026-10-14)
 
 Twenty commits after [`e02aefa`](https://github.com/MisterTea/EternalTerminal/commit/e02aefa2301a9544fe7a40564e612dcf122291e1).

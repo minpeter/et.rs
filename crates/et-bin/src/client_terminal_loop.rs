@@ -496,8 +496,8 @@ where
         }
         if producers_polled {
             forwarder.collect_fast_poll_routes(&mut fast_poll);
-            // Forwarding timers (idle window credit, parked accepts) and
-            // packets it already holds bound how long this poll may sleep.
+            // Forwarding timers (parked accepts) and packets it already
+            // holds bound how long this poll may sleep.
             if let Some(at) = fast_poll.deadline() {
                 deadline = deadline.min(at);
             }

@@ -439,8 +439,8 @@ impl FastPollState {
         revents.extend(slice.iter().map(rustix::event::PollFd::revents));
     }
 
-    /// Latest time the session's poll may sleep: forwarding timers (idle
-    /// window credit, parked accepts) or packets waiting to be drained.
+    /// Latest time the session's poll may sleep: forwarding timers (parked
+    /// accepts) or packets waiting to be drained.
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
     }

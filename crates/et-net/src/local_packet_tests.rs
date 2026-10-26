@@ -530,11 +530,13 @@ fn registration_status_names_the_router_framing() {
 }
 
 /// `Read` that hands out queued chunks and then would block, or reports end
-/// of stream with `eof`. It records the largest buffer it was asked to fill.
+/// of stream with `eof`. It records the largest buffer it was asked to fill
+/// and how often it was read.
 struct ChunkReader {
     chunks: VecDeque<Vec<u8>>,
     eof: bool,
     largest_buffer: usize,
+    reads: usize,
 }
 
 impl ChunkReader {
@@ -543,6 +545,7 @@ impl ChunkReader {
             chunks: chunks.into(),
             eof,
             largest_buffer: 0,
+            reads: 0,
         }
     }
 }
@@ -550,6 +553,7 @@ impl ChunkReader {
 impl Read for ChunkReader {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         self.largest_buffer = self.largest_buffer.max(buffer.len());
+        self.reads += 1;
         let Some(chunk) = self.chunks.front_mut() else {
             return if self.eof {
                 Ok(0)
@@ -702,4 +706,145 @@ fn payload_grows_with_the_bytes_received() {
         assert_eq!(decoded, small, "{via:?}");
         assert_eq!(buffer, Some(decoded.payload().as_ptr()), "{via:?}");
     }
+}
+
+fn local_wire(packets: &[Packet]) -> Vec<u8> {
+    let mut wire = Vec::new();
+    for packet in packets {
+        write_local_packet(&mut wire, packet).unwrap();
+    }
+    wire
+}
+
+fn reader_packets() -> Vec<Packet> {
+    vec![
+        Packet::new(
+            TERMINAL_BUFFER,
+            encode_terminal_buffer(&sample(16 * 1024), false),
+        ),
+        Packet::new(TERMINAL_BUFFER, Vec::new()),
+        Packet::new(TERMINAL_BUFFER, encode_terminal_buffer(b"$ ", false)),
+        // Larger than the read-ahead: finished straight into its payload.
+        Packet::new(TERMINAL_BUFFER, sample(READ_AHEAD + 4099)),
+        Packet::new(12, vec![0x08, 0x00]),
+        Packet::new(
+            TERMINAL_BUFFER,
+            encode_terminal_buffer(&sample(16 * 1024), false),
+        ),
+        Packet::new(
+            TERMINAL_BUFFER,
+            encode_terminal_buffer(&sample(9000), false),
+        ),
+    ]
+}
+
+#[test]
+fn reader_returns_every_packet_however_the_stream_is_cut() {
+    let packets = reader_packets();
+    let wire = local_wire(&packets);
+    for chunk in [
+        1,
+        7,
+        10,
+        4096,
+        16 * 1024 + 13,
+        READ_AHEAD - 1,
+        READ_AHEAD + 1,
+        wire.len(),
+    ] {
+        // Given: the stream arrives `chunk` bytes per read.
+        let mut source = ChunkReader::new([], false);
+        source.chunks = wire.chunks(chunk).map(<[u8]>::to_vec).collect();
+        let mut reader = LocalPacketReader::new();
+        let mut decoded = Vec::new();
+        // When: the caller reads until the source would block.
+        while decoded.len() < packets.len() {
+            let before = source.reads;
+            match reader.read_from(&mut source).unwrap() {
+                Some(packet) => decoded.push(packet),
+                None => assert!(source.reads > before, "chunk {chunk}: None without a read"),
+            }
+            assert!(
+                source.reads <= wire.len() + decoded.len() + 8,
+                "chunk {chunk}"
+            );
+        }
+        // Then: every packet comes back once, in order, and nothing is held.
+        assert_eq!(decoded, packets, "chunk {chunk}");
+        assert!(reader.is_empty(), "chunk {chunk}");
+        assert!(reader.read_from(&mut source).unwrap().is_none());
+        assert!(source.largest_buffer <= READ_AHEAD.max(PAYLOAD_READ_STEP));
+    }
+}
+
+#[test]
+fn reader_reads_once_for_packets_that_already_arrived() {
+    // Given: three frames and half of a fourth in the socket at once.
+    let frame = Packet::new(
+        TERMINAL_BUFFER,
+        encode_terminal_buffer(&sample(16 * 1024), false),
+    );
+    let wire = local_wire(&[frame.clone(), frame.clone(), frame.clone(), frame.clone()]);
+    let cut = wire.len() - 8000;
+    let mut source = ChunkReader::new([wire[..cut].to_vec()], false);
+    let mut reader = LocalPacketReader::new();
+
+    // When / Then: one read returns all three complete frames.
+    for _ in 0..3 {
+        assert!(reader.has_packet() || source.reads == 0);
+        assert_eq!(
+            reader.read_from(&mut source).unwrap().as_ref(),
+            Some(&frame)
+        );
+    }
+    assert_eq!(source.reads, 1);
+    // The short read emptied the socket; the partial frame is counted as
+    // read-ahead but not offered.
+    assert!(!reader.has_packet());
+    assert!(reader.likely_empty());
+    assert_eq!(reader.buffered_len(), cut - 3 * (wire.len() / 4));
+    assert!(!reader.is_empty());
+
+    // And: once the rest arrives, a new call reads it.
+    source.chunks.push_back(wire[cut..].to_vec());
+    assert_eq!(
+        reader.read_from(&mut source).unwrap().as_ref(),
+        Some(&frame)
+    );
+    assert!(reader.is_empty());
+    assert_eq!(reader.buffered_len(), 0);
+}
+
+#[test]
+fn reader_reports_end_of_stream_and_framing_errors() {
+    // A clean end of stream between packets.
+    let packet = Packet::new(TERMINAL_BUFFER, encode_terminal_buffer(b"bye", false));
+    let wire = local_wire(std::slice::from_ref(&packet));
+    let mut source = ChunkReader::new([wire.clone()], true);
+    let mut reader = LocalPacketReader::new();
+    assert_eq!(reader.read_from(&mut source).unwrap(), Some(packet));
+    let error = reader.read_from(&mut source).unwrap_err();
+    assert!(
+        matches!(error, LocalPacketError::Io(ref e) if e.kind() == io::ErrorKind::UnexpectedEof)
+    );
+    assert!(reader.is_empty());
+
+    // An end of stream inside a packet leaves its bytes held.
+    let mut source = ChunkReader::new([wire[..wire.len() - 1].to_vec()], true);
+    let mut reader = LocalPacketReader::new();
+    assert!(reader.read_from(&mut source).unwrap().is_none());
+    assert!(matches!(
+        reader.read_from(&mut source),
+        Err(LocalPacketError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof
+    ));
+    assert!(!reader.is_empty());
+
+    // A bad length is offered as a packet so the caller sees the error.
+    let mut source = ChunkReader::new([(-1i64).to_ne_bytes().to_vec()], false);
+    let mut reader = LocalPacketReader::new();
+    assert!(matches!(
+        reader.read_from(&mut source),
+        Err(LocalPacketError::NegativeLength)
+    ));
+    assert!(reader.has_packet());
 }

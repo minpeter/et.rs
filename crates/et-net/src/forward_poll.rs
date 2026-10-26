@@ -41,13 +41,21 @@ use super::{Command, CommandReceiver, ForwardError, PendingAccept, Role, Worker,
 /// Queued network-to-socket buffers per socket, matching the bound of the
 /// writer channel the threaded model used.
 pub(super) const OUT_QUEUE_PACKETS: usize = 128;
-/// Idle sockets flush sub-threshold window credit after this delay. Liveness
-/// never waits on it: the return thresholds are an eighth of the advertised
-/// window, so a stalled sender always has threshold credit pending. It only
-/// returns the remainder of a stream that paused, so it is long enough that
-/// a request/response exchange does not pay an extra credit packet (and a
-/// peer wake-up) every couple of milliseconds.
-const IDLE_CREDIT_FLUSH: Duration = Duration::from_millis(50);
+
+/// Window credit is returned in batches of an eighth of the window the peer
+/// sends with, never on a timer. An et.rs peer sends with the smaller of our
+/// advertised window and its own, which is the window it advertised to us
+/// (clamped to ours on receipt), so the batch never exceeds an eighth of our
+/// own window. A sender that has filled its window therefore has a whole
+/// batch pending once that window is delivered and never waits on a
+/// remainder. Returning the remainder of a stream that merely paused cost one
+/// extra packet per request/response exchange, which upstream (no per-socket
+/// window) never sends; on a lossy link each one is another chance of a loss
+/// that cuts the transport's congestion window before the next bulk transfer.
+fn credit_batch(window: i64, cap: i64) -> i64 {
+    (window / 8).clamp(1, cap)
+}
+
 /// Reads serviced per socket per poll cycle before moving to the next socket.
 /// Large enough to drain a saturated socket buffer in one cycle, so a bulk
 /// transfer does not return to poll once per handful of packets.
@@ -109,7 +117,6 @@ pub(crate) struct SocketIo {
     /// Local drains not yet returned to the peer as window credit.
     credit_bytes: i64,
     credit_packets: i64,
-    credit_flush_at: Option<Instant>,
     /// The last read filled its whole buffer, so more may still be queued.
     last_read_full: bool,
 }
@@ -163,7 +170,6 @@ impl SocketIo {
             in_flight_packets: 0,
             credit_bytes: 0,
             credit_packets: 0,
-            credit_flush_at: None,
             last_read_full: false,
         })
     }
@@ -388,43 +394,25 @@ impl SocketIo {
                 Err(error) => return Err(error),
             }
         }
-        if self.out.is_empty() && self.credit_bytes > 0 && self.credit_flush_at.is_none() {
-            self.credit_flush_at = Some(Instant::now());
-        }
         Ok(())
     }
 
-    fn credit_due(&self, now: Instant) -> bool {
-        if self.credit_bytes <= 0 || self.credit_packets <= 0 {
-            return false;
-        }
-        if self.credit_bytes >= CREDIT_RETURN_THRESHOLD
-            || self.credit_packets >= PACKET_CREDIT_RETURN_THRESHOLD
-        {
-            return true;
-        }
-        self.out.is_empty()
-            && self
-                .credit_flush_at
-                .is_some_and(|since| now.duration_since(since) >= IDLE_CREDIT_FLUSH)
+    fn credit_due(&self) -> bool {
+        self.credit_bytes > 0
+            && self.credit_packets > 0
+            && (self.credit_bytes >= credit_batch(self.window_bytes, CREDIT_RETURN_THRESHOLD)
+                || self.credit_packets
+                    >= credit_batch(self.window_packets, PACKET_CREDIT_RETURN_THRESHOLD))
     }
 
     fn take_credit(&mut self) -> Option<(i64, i64)> {
         if self.credit_bytes <= 0 || self.credit_packets <= 0 {
             return None;
         }
-        self.credit_flush_at = None;
         Some((
             std::mem::take(&mut self.credit_bytes),
             std::mem::take(&mut self.credit_packets),
         ))
-    }
-
-    fn credit_deadline(&self) -> Option<Instant> {
-        if self.credit_bytes <= 0 || self.credit_packets <= 0 || !self.out.is_empty() {
-            return None;
-        }
-        Some(self.credit_flush_at.unwrap_or_else(Instant::now) + IDLE_CREDIT_FLUSH)
     }
 }
 
@@ -697,14 +685,13 @@ impl Worker {
         )
     }
 
-    /// Return window credit whose batch or idle timer is due.
+    /// Return window credit whose batch is due.
     fn flush_due_credits(&mut self) -> Result<(), ForwardError> {
-        let now = Instant::now();
         for role in [Role::Source, Role::Destination] {
             let due: Vec<i32> = self
                 .map_ref(role)
                 .iter()
-                .filter(|(_, socket)| socket.credit_due(now))
+                .filter(|(_, socket)| socket.credit_due())
                 .map(|(socket_id, _)| *socket_id)
                 .collect();
             for socket_id in due {
@@ -721,22 +708,8 @@ impl Worker {
         Ok(())
     }
 
-    pub(super) fn next_poll_deadline(&self) -> Option<Instant> {
-        let credit = [Role::Source, Role::Destination]
-            .into_iter()
-            .flat_map(|role| self.map_ref(role).values())
-            .filter_map(SocketIo::credit_deadline)
-            .min();
-        match (self.next_park_deadline(), credit) {
-            (Some(park), Some(credit)) => Some(park.min(credit)),
-            (Some(park), None) => Some(park),
-            (None, Some(credit)) => Some(credit),
-            (None, None) => None,
-        }
-    }
-
     fn next_poll_timeout(&self) -> Option<Duration> {
-        self.next_poll_deadline()
+        self.next_park_deadline()
             .map(|deadline| deadline.saturating_duration_since(Instant::now()))
     }
 
@@ -1033,8 +1006,7 @@ impl Worker {
                     self.remove(role, socket_id);
                     continue;
                 }
-                let credit_to_flush = if socket.out.is_empty() && socket.credit_due(Instant::now())
-                {
+                let credit_to_flush = if socket.out.is_empty() && socket.credit_due() {
                     socket.take_credit()
                 } else {
                     None
@@ -1711,7 +1683,7 @@ impl Engine {
         if self.has_outbound() {
             return Some(Instant::now());
         }
-        self.worker.next_poll_deadline()
+        self.worker.next_park_deadline()
     }
 
     /// Service what the session's poll reported for `entries`.
@@ -1990,7 +1962,9 @@ mod tests {
     }
 
     #[test]
-    fn delivered_buffers_batch_credit_and_idle_queues_flush_it() {
+    fn delivered_buffers_return_credit_only_in_eighth_window_batches() {
+        // The smallest window any et.rs release sends with: batches of
+        // 64 KiB or 4 packets.
         let window = FlowWindow {
             bytes: 512 * 1024,
             packets: 32,
@@ -2000,41 +1974,57 @@ mod tests {
         socket.queue_write(vec![7; 100]).unwrap();
         socket.queue_write(vec![8; 100]).unwrap();
 
-        // Delivering both buffers accumulates credit but stays below the
-        // return threshold until the queue goes idle.
+        // A drained queue below the batch holds its credit: no timer returns
+        // the remainder of an exchange that went quiet.
         socket.flush_out().unwrap();
         assert_eq!(peer.read(&mut [0u8; 200]).unwrap(), 200);
         assert_eq!(socket.credit_bytes, 200);
         assert_eq!(socket.credit_packets, 2);
-        assert!(
-            !socket.credit_due(std::time::Instant::now()),
-            "sub-threshold credit flushed before the idle delay"
-        );
+        assert!(!socket.credit_due(), "sub-batch credit returned");
 
-        // Once the queue sits idle past the flush delay the credit is due.
-        socket.credit_flush_at = Some(
-            std::time::Instant::now()
-                - super::IDLE_CREDIT_FLUSH
-                - std::time::Duration::from_millis(1),
-        );
-        assert!(socket.credit_due(std::time::Instant::now()));
-        assert_eq!(socket.take_credit(), Some((200, 2)));
+        socket.queue_write(vec![9; 100]).unwrap();
+        socket.queue_write(vec![10; 100]).unwrap();
+        socket.flush_out().unwrap();
+        assert_eq!(peer.read(&mut [0u8; 200]).unwrap(), 200);
+        assert!(socket.credit_due());
+        assert_eq!(socket.take_credit(), Some((400, 4)));
         assert_eq!(socket.take_credit(), None);
+    }
+
+    #[test]
+    fn credit_batches_follow_a_peer_window_below_our_own() {
+        // A peer sending with a window smaller than our batch still gets its
+        // credit back once an eighth of its window drains.
+        let window = FlowWindow {
+            bytes: 64 * 1024,
+            packets: 127,
+        };
+        let (mut socket, mut peer, _scratch) = socket_pair(Some(window));
+        peer.set_read_timeout(Some(EVENT_TIMEOUT)).unwrap();
+        socket.queue_write(vec![1; 8 * 1024 - 1]).unwrap();
+        socket.flush_out().unwrap();
+        peer.read_exact(&mut vec![0u8; 8 * 1024 - 1]).unwrap();
+        assert!(!socket.credit_due());
+        socket.queue_write(vec![2]).unwrap();
+        socket.flush_out().unwrap();
+        peer.read_exact(&mut [0u8; 1]).unwrap();
+        assert!(socket.credit_due());
+        assert_eq!(socket.take_credit(), Some((8 * 1024, 2)));
     }
 
     #[test]
     fn threshold_credit_is_due_immediately() {
         let window = FlowWindow {
-            bytes: 512 * 1024,
-            packets: 32,
+            bytes: super::super::state::WINDOW_BYTES,
+            packets: super::super::state::WINDOW_PACKETS,
         };
         let (mut socket, mut peer, _scratch) = socket_pair(Some(window));
         for _ in 0..super::PACKET_CREDIT_RETURN_THRESHOLD {
             socket.queue_write(vec![0; 10]).unwrap();
         }
         socket.flush_out().unwrap();
-        let mut buf = [0u8; 80];
+        let mut buf = [0u8; 150];
         peer.read_exact(&mut buf).unwrap();
-        assert!(socket.credit_due(std::time::Instant::now()));
+        assert!(socket.credit_due());
     }
 }

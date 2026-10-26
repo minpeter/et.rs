@@ -1103,8 +1103,8 @@ fn wait(
     fast_poll: Option<&et_net::forward::FastPollState>,
 ) -> Result<(PollFlags, PollFlags, PollFlags, PollFlags, bool), SessionError> {
     let (client_flags, timeout) = client_policy;
-    // Forwarding timers (idle window credit, parked accepts) and packets it
-    // already holds bound the wait as well.
+    // Forwarding timers (parked accepts) and packets it already holds bound
+    // the wait as well.
     let timeout = match fast_poll.and_then(et_net::forward::FastPollState::deadline) {
         Some(at) => {
             let until = at.saturating_duration_since(std::time::Instant::now());

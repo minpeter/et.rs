@@ -83,11 +83,20 @@ fn interrupt_into_a_flood_forwards_little_of_its_tail() {
         flood += flood_lines(&next_output(&mut peer, &mut decoder).unwrap());
     }
 
-    // When: as etserver does on Ctrl+C, drain what is readable, then send the
-    // interrupt.
-    peer.set_nonblocking(true).unwrap();
-    while next_output(&mut peer, &mut decoder).is_some() {}
-    peer.set_nonblocking(false).unwrap();
+    // When: the peer stops reading until etterminal blocks on the full
+    // router socket, then, as etserver does on Ctrl+C, notes what the
+    // terminal already emitted, writes the interrupt and drops that much.
+    // Draining first and then interrupting raced a free-running etterminal:
+    // every frame it wrote in between counted as tail.
+    let mut emitted = rustix::io::ioctl_fionread(&peer).unwrap();
+    loop {
+        thread::sleep(Duration::from_millis(50));
+        let now = rustix::io::ioctl_fionread(&peer).unwrap();
+        if now == emitted {
+            break;
+        }
+        emitted = now;
+    }
     let interrupt = Packet::new(
         TerminalPacketType::TerminalBuffer as u8,
         TerminalBuffer {
@@ -97,9 +106,14 @@ fn interrupt_into_a_flood_forwards_little_of_its_tail() {
         .encode_to_vec(),
     );
     write_router_message(&mut peer, &interrupt, RouterFraming::Upstream).unwrap();
+    let mut dropped = 0;
+    while dropped < emitted as usize {
+        dropped += next_frame(&mut peer, &mut decoder).unwrap().1;
+    }
 
-    // Then: the job's reply to the interrupt arrives behind at most a frame
-    // already read and the line discipline's read buffer of the flood.
+    // Then: the job's reply to the interrupt arrives behind at most the rest
+    // of the frame etterminal was writing: the line discipline flushed what
+    // the PTY held, and etterminal read nothing more before that.
     let mut tail = 0;
     let mut text: Vec<u8> = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
@@ -112,7 +126,10 @@ fn interrupt_into_a_flood_forwards_little_of_its_tail() {
         tail += flood_lines(&output);
         text.extend(output.iter().filter(|byte| **byte != b'y'));
     }
-    assert!(tail < 8 * 1024, "{tail} flood lines followed the interrupt");
+    assert!(
+        tail <= super::MAX_OUTPUT_CHUNK / 2,
+        "{tail} flood lines followed the interrupt"
+    );
     assert_eq!(done_rx.recv_timeout(TIMEOUT).unwrap(), Ok(0));
 }
 
@@ -122,6 +139,14 @@ fn next_output(
     peer: &mut et_net::local::LocalStream,
     decoder: &mut LocalPacketDecoder,
 ) -> Option<Vec<u8>> {
+    next_frame(peer, decoder).map(|(output, _)| output)
+}
+
+/// [`next_output`] and the bytes its packet took on the stream.
+fn next_frame(
+    peer: &mut et_net::local::LocalStream,
+    decoder: &mut LocalPacketDecoder,
+) -> Option<(Vec<u8>, usize)> {
     loop {
         match decoder.read_from(peer) {
             Ok(Some(packet)) => {
@@ -129,12 +154,11 @@ fn next_output(
                 if packet.header() != TerminalPacketType::TerminalBuffer as u8 {
                     continue;
                 }
-                return Some(
-                    TerminalBuffer::decode(packet.payload())
-                        .unwrap()
-                        .buffer
-                        .unwrap_or_default(),
-                );
+                let output = TerminalBuffer::decode(packet.payload())
+                    .unwrap()
+                    .buffer
+                    .unwrap_or_default();
+                return Some((output, std::mem::size_of::<i64>() + packet.wire_len()));
             }
             Ok(None) => return None,
             Err(error) => panic!("reading terminal output failed: {error}"),

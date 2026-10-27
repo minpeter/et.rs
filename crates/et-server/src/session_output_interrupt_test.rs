@@ -311,14 +311,14 @@ fn output_interrupt_discards_output_the_jump_terminal_already_relayed() {
 }
 
 #[test]
-fn output_interrupt_discards_emitted_output_the_bridge_read_ahead() {
+fn output_interrupt_discards_emitted_output_behind_a_queued_frame() {
     assert_interrupt_discards_emitted_output(BridgeMode::Terminal(RouterFraming::Packets), true);
     assert_interrupt_discards_emitted_output(BridgeMode::Jumphost, true);
 }
 
-/// With `read_ahead`, the lane keeps room for one more frame: the bridge's
-/// one socket read takes every emitted packet, it queues the first and holds
-/// the rest read ahead when the interrupt arrives.
+/// With `read_ahead`, the lane keeps room for one more frame: the bridge
+/// reads and queues the first emitted packet before the interrupt arrives,
+/// and the rest still count as emitted.
 fn assert_interrupt_discards_emitted_output(mode: BridgeMode, read_ahead: bool) {
     // Given: a default-buffered session whose terminal lane is full of unsent
     // flood. More flood and then an exit status wait on the terminal socket,

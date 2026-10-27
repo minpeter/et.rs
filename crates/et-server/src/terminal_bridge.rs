@@ -10,7 +10,7 @@ use et_core::packet::Packet;
 use et_core::proto::{TerminalInfo, TerminalPacketType};
 use et_net::connection::ConnError;
 use et_net::forward::{is_forward_packet, Forwarder};
-use et_net::local_packet::{LocalPacketReader, RouterFraming, RouterHead};
+use et_net::local_packet::{LocalPacketDecoder, RouterFraming, RouterHead};
 use prost::Message;
 #[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags};
@@ -139,7 +139,7 @@ fn run_mode_poll(
     terminal.set_nonblocking(true).map_err(SessionError::Io)?;
     let mut wake = session.take_wake_reader()?;
     wake.set_nonblocking(true).map_err(SessionError::Io)?;
-    let mut decoder = LocalPacketReader::new();
+    let mut decoder = LocalPacketDecoder::new();
     let framing = mode.framing();
     let (mut connected, mut connection_generation) = session.connection_state()?;
     session.note_bridge_generation(connection_generation)?;
@@ -245,7 +245,7 @@ fn run_mode_poll(
                 !pending_forward.is_empty() || (cfg!(target_os = "macos") && !connected),
                 client_buffered
                     || (pending_terminal.is_none()
-                        && (!held_terminal.is_empty() || decoder.has_packet())
+                        && !held_terminal.is_empty()
                         && session.can_buffer_write((READ_BUFFER * 2) as i64)?),
             ),
             output_state.deadline,
@@ -313,35 +313,31 @@ fn run_mode_poll(
         }
         if pending_terminal.is_none()
             && (!terminal_eof || !held_terminal.is_empty())
-            && (((!held_terminal.is_empty() || decoder.has_packet())
+            && ((!held_terminal.is_empty()
                 && session.can_buffer_write((READ_BUFFER * 2) as i64)?)
                 || terminal_closing
                 || terminal_events.contains(PollFlags::IN)
                 || (client_events_are_stale
                     && session.can_buffer_write((READ_BUFFER * 2) as i64)?))
         {
-            // A read that found the socket empty ends the batch; poll reports
-            // what arrives next instead of a read that would block.
-            let mut read_once = false;
             for _ in 0..32 {
                 let next = match held_terminal.pop_front() {
                     Some(packet) => Ok(Some(packet)),
-                    None if read_once && decoder.likely_empty() => break,
-                    None => {
-                        read_once = true;
-                        match read_terminal_packet(&mut terminal, &mut decoder) {
-                            Ok(Some(packet)) => accept_terminal_packet(&session, mode, packet),
-                            Ok(None) => break,
-                            Err(SessionError::Io(error))
-                                if (terminal_closing || decoder.is_empty())
-                                    && error.kind() == io::ErrorKind::UnexpectedEof =>
-                            {
-                                terminal_eof = true;
-                                break;
-                            }
-                            Err(error) => return Err(error),
+                    None => match read_terminal_packet(&mut terminal, &mut decoder) {
+                        Ok(Some(packet)) => {
+                            decoder = LocalPacketDecoder::new();
+                            accept_terminal_packet(&session, mode, packet)
                         }
-                    }
+                        Ok(None) => break,
+                        Err(SessionError::Io(error))
+                            if (terminal_closing || decoder.is_empty())
+                                && error.kind() == io::ErrorKind::UnexpectedEof =>
+                        {
+                            terminal_eof = true;
+                            break;
+                        }
+                        Err(error) => return Err(error),
+                    },
                 };
                 let Some(mut packet) = next? else {
                     continue;
@@ -361,10 +357,10 @@ fn run_mode_poll(
                             while coalesced_packets < 8
                                 && coalesced.as_ref().map_or(first_bytes.len(), Vec::len)
                                     < 16 * 1024
-                                && !decoder.likely_empty()
                             {
                                 match read_terminal_packet(&mut terminal, &mut decoder) {
                                     Ok(Some(raw)) => {
+                                        decoder = LocalPacketDecoder::new();
                                         let Some(accepted) =
                                             accept_terminal_packet(&session, mode, raw)?
                                         else {
@@ -455,7 +451,7 @@ fn run_mode_poll(
                     // terminal, which owns the destination connection.
                     Ok(Some(packet)) if mode == BridgeMode::Jumphost => {
                         let packet = jumphost_client_packet(&session, packet)?;
-                        let emitted = interrupt_emitted(&session, &terminal, &decoder)?;
+                        let emitted = interrupt_emitted(&session, &terminal)?;
                         let mut frame =
                             PendingLocalFrame::new(packet, framing).map_err(SessionError::Io)?;
                         match frame.try_write(&mut terminal) {
@@ -509,7 +505,7 @@ fn run_mode_poll(
                         if let Some(forwarded) = forwarded {
                             match forwarded {
                                 ClientForward::ToTerminal(packet) => {
-                                    let emitted = interrupt_emitted(&session, &terminal, &decoder)?;
+                                    let emitted = interrupt_emitted(&session, &terminal)?;
                                     if !terminal_input_closed {
                                         let mut frame = PendingLocalFrame::new(packet, framing)
                                             .map_err(SessionError::Io)?;
@@ -650,7 +646,7 @@ fn run_mode_windows(
     terminal.set_nonblocking(true).map_err(SessionError::Io)?;
     let mut wake = session.take_wake_reader()?;
     wake.set_nonblocking(true).map_err(SessionError::Io)?;
-    let mut decoder = LocalPacketReader::new();
+    let mut decoder = LocalPacketDecoder::new();
     let framing = mode.framing();
     let (mut connected, mut connection_generation) = session.connection_state()?;
     session.note_bridge_generation(connection_generation)?;
@@ -738,6 +734,7 @@ fn run_mode_windows(
                     Ok(Some(packet)) => {
                         // A refused packet still counts as terminal progress.
                         progress = true;
+                        decoder = LocalPacketDecoder::new();
                         accept_terminal_packet(&session, mode, packet)
                     }
                     other => other,
@@ -1242,34 +1239,28 @@ fn forward_error(error: et_net::forward::ForwardError) -> SessionError {
     SessionError::Io(io::Error::other(error))
 }
 
-/// Terminal stream bytes not yet forwarded when client input that flushed
-/// queued output on interrupt is about to be written to the terminal: what
-/// the socket holds plus what `decoder` read ahead, or `None` when the input
-/// flushed nothing. The bridge writes the input first and then drops at most
-/// this much output (see [`drain_discard_terminal`]): the terminal emitted
-/// all of it before it could read the interrupt, so it is stale, while
-/// anything it writes after that (the echo, a prompt) is not read here.
-/// Upstream drains before it writes the input (`TerminalServer.cpp`
-/// `runTerminal`, `drainDiscardReadableBytes` then `writeProto`), so the
-/// terminal only sees the interrupt after the drain and keeps forwarding the
-/// flood until then: with et.rs `etterminal` that was 16 to 40 KB more
-/// output ahead of the prompt.
+/// Bytes on the terminal socket when client input that flushed queued
+/// output on interrupt is about to be written to the terminal, or `None`
+/// when the input flushed nothing. The bridge writes the input first and
+/// then drops at most this much output (see [`drain_discard_terminal`]): the
+/// terminal emitted all of it before it could read the interrupt, so it is
+/// stale, while anything it writes after that (the echo, a prompt) is not
+/// read here. Upstream drains before it writes the input
+/// (`TerminalServer.cpp` `runTerminal`, `drainDiscardReadableBytes` then
+/// `writeProto`), so the terminal only sees the interrupt after the drain
+/// and keeps forwarding the flood until then: with et.rs `etterminal` that
+/// was 16 to 40 KB more output ahead of the prompt.
 #[cfg(unix)]
 fn interrupt_emitted(
     session: &ActiveSession,
     terminal: &LocalStream,
-    decoder: &LocalPacketReader,
 ) -> Result<Option<usize>, SessionError> {
     if !session.take_interrupt_drain()? {
         return Ok(None);
     }
     let emitted =
         rustix::io::ioctl_fionread(terminal).map_err(|error| SessionError::Io(error.into()))?;
-    Ok(Some(
-        usize::try_from(emitted)
-            .unwrap_or(usize::MAX)
-            .saturating_add(decoder.buffered_len()),
-    ))
+    Ok(Some(usize::try_from(emitted).unwrap_or(usize::MAX)))
 }
 
 /// Client input that flushed queued output on interrupt is reaching the
@@ -1284,7 +1275,7 @@ fn drain_discard_terminal(
     session: &ActiveSession,
     mode: BridgeMode,
     terminal: &mut LocalStream,
-    decoder: &mut LocalPacketReader,
+    decoder: &mut LocalPacketDecoder,
     pending_terminal: &mut Option<Packet>,
     held_terminal: &mut VecDeque<Packet>,
     emitted: usize,
@@ -1303,12 +1294,13 @@ fn drain_discard_terminal(
         .into_iter()
         .chain(held_terminal.drain(..))
         .for_each(&mut sort);
-    // Whole packets are counted, prefix included, from the first byte the
-    // decoder holds, which `emitted` counts too.
+    // Whole packets are counted, prefix included, so a packet the decoder
+    // had started before counts in full and the drain stops early, never late.
     let mut drained = 0usize;
     while drained < emitted.min(INTERRUPT_DRAIN_BYTES) {
         match read_terminal_packet(terminal, decoder) {
             Ok(Some(packet)) => {
+                *decoder = LocalPacketDecoder::new();
                 drained += LOCAL_PACKET_PREFIX + packet.wire_len();
                 if let Some(packet) = accept_terminal_packet(session, mode, packet)? {
                     sort(packet);
@@ -1327,7 +1319,7 @@ fn drain_discard_terminal(
 
 fn read_terminal_packet(
     terminal: &mut LocalStream,
-    decoder: &mut LocalPacketReader,
+    decoder: &mut LocalPacketDecoder,
 ) -> Result<Option<Packet>, SessionError> {
     match decoder.read_from(terminal) {
         Ok(packet) => Ok(packet),

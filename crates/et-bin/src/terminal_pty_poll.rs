@@ -5,10 +5,10 @@
 //! over the PTY master and the router socket, but it wakes every 10 ms and
 //! probes `waitpid(WNOHANG)`. Here the shell's exit arrives as pidfd
 //! readiness, so an idle session never wakes, and PTY output is read until
-//! the kernel runs dry or a frame fills (Linux returns at most ~4 KiB per
-//! master read) before one router frame is written, instead of one frame per
-//! read. Kernels without `pidfd_open` (< 5.3, or a sandbox that denies it)
-//! keep the threaded runtime.
+//! the master runs dry or a frame fills (one master read returns what the
+//! line discipline holds, at most ~4 KiB) before one router frame is
+//! written, instead of one frame per read. Kernels without `pidfd_open`
+//! (< 5.3, or a sandbox that denies it) keep the threaded runtime.
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -35,8 +35,6 @@ use crate::terminal_protocol::{
 /// Bound on finishing a frame that the drain timeout cut short, so the exit
 /// status never lands inside a half-written frame.
 const FRAME_FINISH_TIMEOUT: Duration = Duration::from_secs(1);
-/// Largest Linux PTY master read: `N_TTY_BUF_SIZE - 1`.
-const PTY_FULL_READ: usize = 4095;
 /// Longest pause in PTY output reads after input that interrupts the
 /// foreground job; see [`Session::hold_output_for_interrupt`].
 const INTERRUPT_HOLD: Duration = Duration::from_millis(10);
@@ -296,7 +294,10 @@ impl Session {
             {
                 self.flush_input();
             }
+            // Input read above may have interrupted the job; its hold
+            // already applies to this pass.
             if read_pty
+                && self.interrupt_hold.is_none()
                 && ready
                     .pty
                     .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
@@ -499,14 +500,18 @@ impl Session {
         matches!(poll(&mut fds, Some(&now)), Ok(1..))
     }
 
-    /// Read and shape PTY output while the producer stays ahead, up to a
-    /// frame's worth. Only called with no output backlog.
+    /// Read and shape PTY output until the master runs dry (`EAGAIN`) or a
+    /// frame fills. Only called with no output backlog.
     ///
-    /// A Linux master read returns at most `N_TTY_BUF_SIZE - 1` bytes. A read
-    /// of that size means the line discipline was full and more is almost
-    /// always queued; a shorter one means it ran dry, so the loop stops
-    /// instead of paying for an `EAGAIN` probe and lets poll report the next
-    /// batch.
+    /// A short read does not mean the producer stopped: the line discipline
+    /// is refilled by the flip-buffer worker while this loop reads, so a
+    /// flood that outruns the worker arrives in reads of a few hundred bytes
+    /// to a few KiB. Stopping at the first short read framed each of them
+    /// separately: an unloaded host forwarding a 101 MB `cat` wrote about
+    /// 46,000 router frames, mostly under 4 KiB, and etserver read each in
+    /// three or four socket reads before encrypting and sending it. Reading
+    /// on until `EAGAIN` frames the same output as about 6,800 frames, most
+    /// a full [`MAX_OUTPUT_CHUNK`], for one extra read when output pauses.
     fn read_pty(&mut self) -> Result<(), String> {
         while self.filled < MAX_OUTPUT_CHUNK {
             let start = self.filled;
@@ -515,12 +520,7 @@ impl Session {
                     self.finish_output();
                     return Ok(());
                 }
-                Ok(count) => {
-                    self.shape_in_place(start, count);
-                    if count < PTY_FULL_READ {
-                        return Ok(());
-                    }
-                }
+                Ok(count) => self.shape_in_place(start, count),
                 Err(Errno::INTR) => {}
                 Err(Errno::AGAIN) => return Ok(()),
                 Err(error) => return Err(format!("could not read PTY output: {error}")),

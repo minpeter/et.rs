@@ -302,15 +302,24 @@ fn flood_until_no_room(session: &ActiveSession, output: &mut OutputPump<'_>, flo
 
 #[test]
 fn output_interrupt_discards_output_the_terminal_already_emitted() {
-    assert_interrupt_discards_emitted_output(BridgeMode::Terminal(RouterFraming::Packets));
+    assert_interrupt_discards_emitted_output(BridgeMode::Terminal(RouterFraming::Packets), false);
 }
 
 #[test]
 fn output_interrupt_discards_output_the_jump_terminal_already_relayed() {
-    assert_interrupt_discards_emitted_output(BridgeMode::Jumphost);
+    assert_interrupt_discards_emitted_output(BridgeMode::Jumphost, false);
 }
 
-fn assert_interrupt_discards_emitted_output(mode: BridgeMode) {
+#[test]
+fn output_interrupt_discards_emitted_output_behind_a_queued_frame() {
+    assert_interrupt_discards_emitted_output(BridgeMode::Terminal(RouterFraming::Packets), true);
+    assert_interrupt_discards_emitted_output(BridgeMode::Jumphost, true);
+}
+
+/// With `read_ahead`, the lane keeps room for one more frame: the bridge
+/// reads and queues the first emitted packet before the interrupt arrives,
+/// and the rest still count as emitted.
+fn assert_interrupt_discards_emitted_output(mode: BridgeMode, read_ahead: bool) {
     // Given: a default-buffered session whose terminal lane is full of unsent
     // flood. More flood and then an exit status wait on the terminal socket,
     // which the bridge does not read while the lane refuses output.
@@ -334,14 +343,19 @@ fn assert_interrupt_discards_emitted_output(mode: BridgeMode) {
     // without depending on socket timing.
     let permit = session.try_begin_recover().unwrap();
     let queued = terminal(&[b'x'; 16 * 1024]);
-    while session.can_buffer_write(32 * 1024).unwrap() {
+    let room = if read_ahead { 48 * 1024 } else { 32 * 1024 };
+    while session.can_buffer_write(room).unwrap() {
         session
             .send_packet(queued.header(), queued.payload())
             .unwrap();
     }
+    if read_ahead {
+        assert!(session.can_buffer_write(32 * 1024).unwrap());
+    }
     let emitted = terminal(&[b'y'; 16 * 1024]);
-    write_local_packet(&mut terminal_peer, &emitted).unwrap();
-    write_local_packet(&mut terminal_peer, &emitted).unwrap();
+    for _ in 0..3 {
+        write_local_packet(&mut terminal_peer, &emitted).unwrap();
+    }
     let exit_status = Packet::new(
         TerminalPacketType::TerminalExitStatus as u8,
         TerminalExitStatus {

@@ -191,6 +191,67 @@ fn request_response_exchanges_return_no_credit_until_a_batch_drains() {
     echo.join().unwrap();
 }
 
+/// A burst that a stream's destination has drained returns its credit once
+/// drained, without waiting for the eighth-window batch. That packet also
+/// carries the transport's acknowledgement and freed receive window: without
+/// it a new connection's sender waited a round trip on a stale TCP window
+/// after every burst, and an RTT-50 upload ran at 24 instead of 33 MiB/s in
+/// about half the runs.
+#[test]
+fn a_drained_stream_burst_returns_credit_before_a_batch_fills() {
+    /// Well below one 512 KiB credit batch.
+    const BURST: usize = 64 * 1024;
+    const { assert!(BURST < WINDOW_BYTES / 8) };
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let destination_port = listener.local_addr().unwrap().port();
+    let peer = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut received = vec![0_u8; BURST];
+        stream.read_exact(&mut received).unwrap();
+        // Hold the socket open until the other side goes away.
+        let _ = stream.read(&mut [0_u8; 1]);
+    });
+
+    let source_port = reserve_port();
+    let source = Forwarder::start(vec![request(source_port, destination_port)]).unwrap();
+    let destination = Forwarder::start(Vec::new()).unwrap();
+    let mut application = TcpStream::connect((Ipv4Addr::LOCALHOST, source_port)).unwrap();
+    destination
+        .receive(source.wait_outbound(TIMEOUT).unwrap())
+        .unwrap();
+    source
+        .receive(destination.wait_outbound(TIMEOUT).unwrap())
+        .unwrap();
+
+    application.write_all(&[5_u8; BURST]).unwrap();
+    let mut relayed = 0;
+    while relayed < BURST {
+        let packet = source.wait_outbound(TIMEOUT).unwrap();
+        relayed += forwarded_bytes(&packet);
+        destination.receive(packet).unwrap();
+    }
+    // The destination may drain the burst in more than one step; every
+    // credit it returns is for a drained burst, and together they return it
+    // all with no further traffic.
+    let mut credited = 0;
+    while credited < BURST as i64 {
+        let packet = destination
+            .wait_outbound(TIMEOUT)
+            .expect("drained burst returned no credit");
+        let data = PortForwardData::decode(packet.payload()).unwrap();
+        credited += data
+            .window
+            .and_then(|window| window.bytes)
+            .expect("only credit flows back");
+    }
+    assert_eq!(credited, BURST as i64);
+
+    drop(application);
+    source.shutdown().unwrap();
+    destination.shutdown().unwrap();
+    peer.join().unwrap();
+}
+
 fn forwarded_bytes(packet: &Packet) -> usize {
     PortForwardData::decode(packet.payload())
         .unwrap()

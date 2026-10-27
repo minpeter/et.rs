@@ -1198,7 +1198,7 @@ A 5-run mean benchmark of every metric left two gaps with room to improve: the
 lossy-link `-N -L` upload and server CPU while streaming terminal output. Protocol
 v6 and the generated wire fixtures are unchanged.
 
-**Window credit only in batches.**
+**Window credit in batches or per drained burst.**
 - et.rs-only, since upstream has no per-socket window. The Unix forwarding engine
   returned a quiet socket's window credit after 50 ms, so each small
   request/response exchange cost a credit packet each way.
@@ -1207,24 +1207,41 @@ v6 and the generated wire fixtures are unchanged.
   - Upstream returns nothing for delivered data (`PortForwardHandler::handlePacket`,
     `PortForwardHandler.cpp:329-363`; `PortForwardData` has no window field,
     `ETerminal.proto:72-80`).
-- Credit now returns only once an eighth of the window the peer sends with has
-  drained. That is 512 KiB or 15 packets for current peers, and an eighth of a
-  smaller peer window otherwise.
+- Credit now returns in two cases, neither on a timer:
+  - Once an eighth of the window the peer sends with has drained: 512 KiB or 15
+    packets for current peers, an eighth of a smaller peer window otherwise.
+  - As soon as a socket's queue drains after it has written out at least 16 KiB,
+    one full upstream read (`ForwardSourceHandler::update`, 16 KiB buffer).
   - A sender that filled its window always has a whole batch pending once that
-    window is delivered, so no timer is needed for liveness.
+    window is delivered. Thirty 64-byte round trips now send 32 segments each way.
   - The Windows threaded engine keeps its idle return.
-- Lossy link (`delay 75ms loss 0.5%`): a loss among those packets cuts the client's
-  ssthresh to about 7.
+- Why a drained burst still returns credit at once:
+  - The credit packet carries the receiver's TCP ACK and the window freed by
+    reading the burst. Linux announces a window freed by an application read only
+    once it has doubled (`tcp_cleanup_rbuf`).
+  - With batch-only credit, a new connection's sender waited one round trip on the
+    stale window after every burst. Receive autotuning, measuring with the next
+    burst already queued, kept the buffer at 128 KiB for several round trips
+    (bpftrace of `tcp_rcv_space_adjust`).
+  - An RTT-50 32 MiB `-N -L` upload fell to 24–26 MiB/s in about half the runs
+    (15-run mean 28.5 against 33.7). With the drained-burst credit it is 34.5
+    (min 33.1).
+- Lossy link (`delay 75ms loss 0.5%`): a loss among the extra exchange packets cuts
+  the client's ssthresh to about 7.
   - Every 2 MiB upload after such a cut ran at 0.12–0.24 MiB/s, against a 0.90
     median otherwise.
   - The benchmark's 30 forward round trips before its upload cut ssthresh in 33.8%
     of 145 sessions before and 16.2% of 142 after (Fisher p = 0.001). ET C++ and
     OpenSSH: 13.8% of 29.
+  - With the round trips, 20-run 2 MiB medians were 0.59 MiB/s (et.rs), 0.54
+    (ET C++) and 0.66 (OpenSSH).
 - The rest of the lossy upload gap was noise.
   - Without the round trips, 30-run 2 MiB medians were 0.99 MiB/s (et.rs), 1.00
     (ET C++) and 0.75 (OpenSSH). 10-run 32 MiB medians were 0.26, 0.29 and 0.24.
   - The client socket held 0.6–2.4 MB unsent throughout, so CUBIC under loss sets
     the rate, not et.rs.
+- Unshaped 256 MiB `-N` upload (804 against 809 MiB/s) and new-connection, SOCKS
+  and reverse throughput are unchanged.
 
 **PTY reads until empty.**
 - Upstream `UserTerminalHandlerUnix.cpp` reads the PTY master once per `select()`

@@ -1192,6 +1192,55 @@ netns veth pair with `tc netem`.
   only extra idle cost is the 8-byte delivery acknowledgement on one keep-alive
   exchange in 16, about 10 B/min.
 
+### Remaining-gap round (et.rs 0.0.47)
+
+A 5-run mean benchmark of every metric left two gaps with room to improve: the
+lossy-link `-N -L` upload and server CPU while streaming terminal output. Protocol
+v6 and the generated wire fixtures are unchanged.
+
+**Window credit only in batches.**
+- et.rs-only, since upstream has no per-socket window. The Unix forwarding engine
+  returned a quiet socket's window credit after 50 ms, so each small
+  request/response exchange cost a credit packet each way.
+  - Thirty 64-byte round trips sent 61 segments each way, where ET C++ and OpenSSH
+    send 30.
+  - Upstream returns nothing for delivered data (`PortForwardHandler::handlePacket`,
+    `PortForwardHandler.cpp:329-363`; `PortForwardData` has no window field,
+    `ETerminal.proto:72-80`).
+- Credit now returns only once an eighth of the window the peer sends with has
+  drained. That is 512 KiB or 15 packets for current peers, and an eighth of a
+  smaller peer window otherwise.
+  - A sender that filled its window always has a whole batch pending once that
+    window is delivered, so no timer is needed for liveness.
+  - The Windows threaded engine keeps its idle return.
+- Lossy link (`delay 75ms loss 0.5%`): a loss among those packets cuts the client's
+  ssthresh to about 7.
+  - Every 2 MiB upload after such a cut ran at 0.12–0.24 MiB/s, against a 0.90
+    median otherwise.
+  - The benchmark's 30 forward round trips before its upload cut ssthresh in 33.8%
+    of 145 sessions before and 16.2% of 142 after (Fisher p = 0.001). ET C++ and
+    OpenSSH: 13.8% of 29.
+- The rest of the lossy upload gap was noise.
+  - Without the round trips, 30-run 2 MiB medians were 0.99 MiB/s (et.rs), 1.00
+    (ET C++) and 0.75 (OpenSSH). 10-run 32 MiB medians were 0.26, 0.29 and 0.24.
+  - The client socket held 0.6–2.4 MB unsent throughout, so CUBIC under loss sets
+    the rate, not et.rs.
+
+**PTY reads until empty.**
+- Upstream `UserTerminalHandlerUnix.cpp` reads the PTY master once per `select()`
+  pass (`BUF_SIZE` 16 KiB) and sends one `TERMINAL_BUFFER` per read (`:295-296,394`).
+- The Linux `etterminal` now reads until `EAGAIN` or a full 16 KiB frame.
+  - Before, it stopped at the first short read. On an idle host a fast producer
+    arrives in short reads, so a 101 MB `cat` crossed to `etserver` as ~46,000
+    frames (mostly under 4 KiB) instead of ~6,800 mostly full ones.
+  - A loop pass whose input set an interrupt hold does not read the PTY.
+- Server CPU for a 101 MB loopback `cat`: 1.42 → 0.96 s (OpenSSH 1.11, ET C++
+  2.39). Wire bytes per output byte: 1.045 → 1.021 (ET C++ 1.036). Echo during a
+  flood, Ctrl-C and paste are unchanged.
+- A 64 KiB `etserver` read-ahead on the terminal socket was tried and dropped: it
+  raised echo during a flood from ~6 to ~30 ms. The frame size, the per-packet
+  transport-room check and the Ctrl-C drain are unchanged.
+
 ## Ledger (classified 2026-10-14)
 
 Twenty commits after [`e02aefa`](https://github.com/MisterTea/EternalTerminal/commit/e02aefa2301a9544fe7a40564e612dcf122291e1).

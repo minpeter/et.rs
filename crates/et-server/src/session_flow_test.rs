@@ -105,14 +105,22 @@ fn exit_status_waits_for_queued_and_in_flight_output() {
             TerminalPacketType::TerminalExitStatus as u8,
             TerminalExitStatus { exitcode: Some(0) }.encode_to_vec(),
         );
+        // `last` is queued while `first` is in flight, so the two are not
+        // merged into one terminal packet.
         flow.enqueue(first.clone()).unwrap();
+        let in_flight = flow.next_packet().unwrap();
+        assert_eq!(in_flight, first);
         flow.enqueue(last.clone()).unwrap();
+        let mut taken = Some(in_flight);
         for expected in [first, last] {
             assert!(matches!(
                 flow.enqueue(status.clone()),
                 Err(SessionError::Connection(ConnError::Backpressure))
             ));
-            let packet = flow.next_packet().unwrap();
+            let packet = match taken.take() {
+                Some(packet) => packet,
+                None => flow.next_packet().unwrap(),
+            };
             assert_eq!(packet, expected);
             // Even with an empty queue, the in-flight final frame still
             // precedes status; an early status would truncate client output.
@@ -152,7 +160,7 @@ fn final_in_flight_completion_wakes_bridge_after_control_capacity_reopens() {
     let mut output = OutputPump::new(&session);
     session.send_packet_owned(7, &vec![3; 60 * 1024]).unwrap();
     assert!(
-        output.run().deadline.is_some(),
+        output.run(true).deadline.is_some(),
         "the frame must wait for transport room"
     );
     assert!(matches!(
@@ -177,6 +185,162 @@ fn final_in_flight_completion_wakes_bridge_after_control_capacity_reopens() {
         "final control completion stranded the bridge's retained packet"
     );
     assert_eq!(reader.join().unwrap().payload(), vec![3; 60 * 1024]);
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_output_waits_for_a_client_that_acknowledges_by_volume() {
+    use et_core::keepalive::{ACK_INTERVAL_BYTES, ACK_PAYLOAD_LEN};
+    use et_core::output_window::MIN_PIPE_BYTES;
+    use et_core::packet::{encode_terminal_buffer, Packet};
+    use et_core::proto::TerminalPacketType;
+
+    let window = ACK_INTERVAL_BYTES as u64 + MIN_PIPE_BYTES;
+    let keepalive = TerminalPacketType::KeepAlive as u8;
+    let (server, mut client) = connection_pair();
+    client.set_io_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let (terminal, _terminal_peer) = et_net::local::wake_pair().unwrap();
+    let session = ActiveSession::new(server, &terminal, None).unwrap();
+    session.start_output();
+    let mut output = OutputPump::new(&session);
+    let flood = Packet::new(
+        TerminalPacketType::TerminalBuffer as u8,
+        encode_terminal_buffer(
+            &[b"y".repeat(63), b"\n".to_vec()].concat().repeat(128),
+            false,
+        ),
+    );
+
+    // Given: a client that announced it acknowledges, read the server's
+    // acknowledgement, then read two windows of output while acknowledging
+    // only the first packet, as a volume-acknowledging client does when its
+    // console falls behind.
+    let echo = session.keepalive_echo(Some(0)).unwrap();
+    assert_eq!(echo.len(), ACK_PAYLOAD_LEN);
+    session.send_packet(keepalive, &echo).unwrap();
+    output.run(true);
+    assert_eq!(client.read_packet().unwrap().header(), keepalive);
+    let first_read = client.reader_sequence();
+    for round in 0.. {
+        assert!(round < 1000, "the transport must take two windows");
+        if unacknowledged(&session) >= 2 * window {
+            break;
+        }
+        flood_until_held(&session, &mut output, &flood);
+        drain(&mut client);
+    }
+    session.acknowledge_delivery(first_read).unwrap();
+    // A frame the loop above had already started may still finish: smaller
+    // socket buffers (macOS) leave its tail in the server's send queue. Let
+    // whatever is in flight land before measuring what the window holds.
+    for settle in 0.. {
+        assert!(settle < 16, "output never settled behind the window");
+        flood_until_held(&session, &mut output, &flood);
+        if drain(&mut client) == 0 {
+            break;
+        }
+    }
+
+    // When: the terminal keeps producing and the client keeps reading
+    // without acknowledging more.
+    let held = unacknowledged(&session);
+    for _ in 0..8 {
+        flood_until_held(&session, &mut output, &flood);
+        // Then: no more terminal output reaches the client.
+        assert_eq!(drain(&mut client), 0);
+    }
+    assert_eq!(unacknowledged(&session), held);
+    // Control packets (keep-alive echoes, forwarding) still go out.
+    session.send_packet(keepalive, &[]).unwrap();
+    output.run(true);
+    assert_eq!(client.read_packet().unwrap().header(), keepalive);
+
+    // When: the client acknowledges everything it read, then keeps reading
+    // without acknowledging.
+    session
+        .acknowledge_delivery(client.reader_sequence())
+        .unwrap();
+    let mut released = 0;
+    for _ in 0..64 {
+        flood_until_held(&session, &mut output, &flood);
+        released += drain(&mut client);
+    }
+    // Then: output resumes and stops again one window later.
+    assert!(released > 0);
+    let outstanding = unacknowledged(&session);
+    // Queued output merges into packets of up to 16 KiB.
+    let packet = 17 * 1024;
+    assert!(
+        (window..window + packet).contains(&outstanding),
+        "{outstanding} bytes unacknowledged"
+    );
+
+    // And: output the window holds back is still queued, so an interrupt
+    // drops it.
+    client
+        .write_packet(
+            TerminalPacketType::TerminalBuffer as u8,
+            &encode_terminal_buffer(b"\x03", false),
+        )
+        .unwrap();
+    let deadline = std::time::Instant::now() + TEST_TIMEOUT;
+    while session.try_read_packet().unwrap().is_none() {
+        assert!(std::time::Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(session.take_interrupt_drain().unwrap());
+}
+
+/// Payload bytes the session wrote that its client has not acknowledged.
+#[cfg(unix)]
+fn unacknowledged(session: &ActiveSession) -> u64 {
+    let connection = session.connection.lock().unwrap();
+    let (acknowledged, wire) = connection.delivery_backlog().unwrap();
+    et_core::output_window::unacknowledged_payload(acknowledged, wire, connection.writer_sequence())
+}
+
+/// Queue `flood` and pump until output waits for transport room or for an
+/// acknowledgement.
+#[cfg(unix)]
+fn flood_until_held(
+    session: &ActiveSession,
+    output: &mut OutputPump<'_>,
+    flood: &et_core::packet::Packet,
+) {
+    for _ in 0..256 {
+        if session
+            .can_buffer_write(flood.payload().len() as i64)
+            .unwrap()
+        {
+            session
+                .send_packet(flood.header(), flood.payload())
+                .unwrap();
+        }
+        let outcome = output.run(true);
+        if outcome.deadline.is_some() || outcome.window_release.is_some() {
+            return;
+        }
+    }
+    panic!("output never waited");
+}
+
+/// Read every packet the client has received; how many there were.
+#[cfg(unix)]
+fn drain(client: &mut Connection) -> usize {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+
+    let stream = client.try_clone_stream().unwrap();
+    let mut packets = 0;
+    loop {
+        while client.try_read_packet().unwrap().is_some() {
+            packets += 1;
+        }
+        let mut descriptors = [PollFd::new(&stream, PollFlags::IN)];
+        let timeout = Timespec::try_from(Duration::from_millis(20)).unwrap();
+        if poll(&mut descriptors, Some(&timeout)).unwrap() == 0 {
+            return packets;
+        }
+    }
 }
 
 fn connection_pair() -> (Connection, Connection) {
@@ -916,4 +1080,41 @@ fn connected_default_output_bounds_both_lanes_by_one_total() {
     // Then: both lanes staged output, and together stay within the total.
     assert!(terminal_staged > 0 && control_staged > 0);
     assert!(terminal_staged + control_staged <= super::session_flow::CONNECTED_OUTPUT_BYTES);
+}
+
+#[test]
+fn connected_default_output_stops_terminal_reads_long_before_the_lane_is_full() {
+    // Given: connected default buffering, fed the way the bridge reads the
+    // terminal: only while the flow accepts another 32 KiB read.
+    let flow = FlowControl::new_default();
+    let chunk = terminal_output(16 * 1024);
+    let cost = chunk.wire_len() + std::mem::size_of::<u32>();
+    let mut staged = 0;
+    while flow.can_accept_terminal(32 * 1024).unwrap() {
+        flow.enqueue(chunk.clone()).unwrap();
+        staged += cost;
+    }
+
+    // Then: a keystroke echo queues behind well under half the terminal lane.
+    assert!(staged > 0);
+    assert!(staged * 4 <= super::session_flow::CONNECTED_OUTPUT_BYTES);
+
+    // And: the bridge is woken only once delivery drained the read-ahead to
+    // half, so it refills in a batch rather than per packet.
+    let mut completed = 0;
+    loop {
+        let packet = flow.next_packet().unwrap();
+        let (running, signal) =
+            flow.complete_with_signal(packet, &FlowWriteResult::Delivered, true);
+        assert!(running);
+        completed += 1;
+        if signal {
+            break;
+        }
+    }
+    assert!(completed * cost * 2 >= staged);
+    assert!(flow.can_accept_terminal(32 * 1024).unwrap());
+
+    // And: a single packet larger than the read-ahead is still admitted.
+    flow.enqueue(terminal_output(512 * 1024)).unwrap();
 }

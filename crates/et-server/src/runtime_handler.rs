@@ -1,5 +1,6 @@
+use std::io::Read;
 use std::net::TcpStream;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,13 @@ use crate::session_table::SessionClaim;
 // owns one shorter absolute budget so authenticated failures arrive first.
 const INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(8);
 const INITIALIZATION_RESPONSE_MARGIN: Duration = Duration::from_millis(500);
+/// How long an ended session keeps the client transport open for the client
+/// to read the last output and close first. Upstream
+/// `TerminalServer::finishSession` holds the connection up to 1 s after
+/// terminal EOF before `removeClient` closes it. Client traffic does not
+/// extend it: a client behind a relay that does not pass on the half-close
+/// never sees EOF and would otherwise keep the session for good.
+const CLIENT_CLOSE_GRACE: Duration = Duration::from_secs(1);
 
 /// Build the local `TERMINAL_INIT` for etterminal.
 ///
@@ -155,7 +163,7 @@ pub(crate) fn handle(
             wants_reset,
             handshake_deadline,
         ) {
-            Ok(challenge) => Some(challenge),
+            Ok(authenticated) => Some(authenticated),
             Err(AuthError::Rejected) => {
                 reject(
                     &mut stream,
@@ -201,9 +209,10 @@ pub(crate) fn handle(
             }
         }
     }
-    let decision = challenge.map(|challenge| ConnectDecision {
+    let decision = challenge.map(|(challenge, round_trip)| ConnectDecision {
         challenge,
         key: registration.key,
+        round_trip,
     });
     let registration_identity = registration.identity();
     #[cfg(test)]
@@ -358,6 +367,9 @@ pub(crate) fn handle(
             };
             match recovered {
                 Ok(()) => {
+                    if let Some(decision) = decision.as_ref() {
+                        let _ = session.seed_output_round_trip(decision.round_trip);
+                    }
                     crate::diag::info(format!("id={id}: session recover accepted from {peer}"))
                 }
                 Err(error) => crate::diag::info(format!(
@@ -496,6 +508,7 @@ fn handle_new(
             &id,
             peer,
             initialization_deadline,
+            decision.map(|decision| decision.round_trip),
         );
         return;
     }
@@ -617,6 +630,9 @@ fn handle_new(
         }
     };
     let active = Arc::new(active);
+    if let Some(decision) = decision {
+        let _ = active.seed_output_round_trip(decision.round_trip);
+    }
     active.set_forward_exit_status(payload.supports_exit_status.unwrap_or(false));
     active.set_disconnect_timeout(Some(
         payload
@@ -633,8 +649,7 @@ fn handle_new(
     crate::diag::info(format!("id={id}: terminal bridge running for {peer}"));
     let _ = crate::terminal_bridge::run(active.clone(), terminal, forwarder, framing);
     crate::diag::info(format!("id={id}: terminal bridge ended for {peer}"));
-    let _ = active.finish_terminal();
-    retire_ended_terminal(core, &identity);
+    finish_ended_session(core, &active, &identity);
 }
 
 /// Upstream `TerminalServer::runJumpHost`: answer the initial response, hand
@@ -644,6 +659,7 @@ fn handle_new(
 /// An et.rs jump terminal that registered with the startup sentinel instead
 /// reports its destination's INITIAL_RESPONSE first, see
 /// [`start_acknowledged_jumphost`].
+#[allow(clippy::too_many_arguments)]
 fn run_jumphost(
     mut connection: Connection,
     start: crate::session_slot::SessionStart,
@@ -652,6 +668,7 @@ fn run_jumphost(
     id: &str,
     peer: &str,
     initialization_deadline: Instant,
+    round_trip: Option<Duration>,
 ) {
     if Instant::now() >= initialization_deadline {
         send_initial_error(&mut connection, "jumphost initialization deadline elapsed");
@@ -708,6 +725,9 @@ fn run_jumphost(
         }
     };
     let active = Arc::new(active);
+    if let Some(round_trip) = round_trip {
+        let _ = active.seed_output_round_trip(round_trip);
+    }
     active.set_forward_exit_status(payload.supports_exit_status.unwrap_or(false));
     active.set_disconnect_timeout(Some(
         payload
@@ -734,8 +754,7 @@ fn run_jumphost(
         crate::terminal_bridge::BridgeMode::Jumphost,
     );
     crate::diag::info(format!("id={id}: jumphost bridge ended for {peer}"));
-    let _ = active.finish_terminal();
-    retire_ended_terminal(core, &identity);
+    finish_ended_session(core, &active, &identity);
 }
 
 /// Upstream `runJumpHost` with an ET C++ `etterminal --jump`: an empty
@@ -915,6 +934,10 @@ fn send_initial_error(connection: &mut Connection, message: &str) {
 struct ConnectDecision {
     challenge: Vec<u8>,
     key: [u8; KEY_LEN],
+    /// From writing the challenge to reading its reply: a clean round trip
+    /// of this transport for the output window (see
+    /// [`et_core::output_window`]).
+    round_trip: Duration,
 }
 
 enum AuthError {
@@ -928,7 +951,7 @@ fn authenticate_client(
     key: &[u8; KEY_LEN],
     reset_intent: bool,
     deadline: Instant,
-) -> Result<Vec<u8>, AuthError> {
+) -> Result<(Vec<u8>, Duration), AuthError> {
     let challenge = random_bytes::<AUTH_CHALLENGE_BYTES>().to_vec();
     write_response(
         stream,
@@ -942,12 +965,14 @@ fn authenticate_client(
         },
     )
     .map_err(|_| AuthError::Io)?;
+    let sent = Instant::now();
     let auth: ConnectAuth =
         et_net::framing_io::read_proto_limited_deadline(stream, MAX_HANDSHAKE_PROTO_LEN, deadline)
             .map_err(|_| AuthError::Io)?;
+    let round_trip = sent.elapsed();
     let proof = auth.proof.unwrap_or_default();
     if verify_connection_proof(&proof, key, id, PROTOCOL_VERSION, &challenge, reset_intent) {
-        Ok(challenge)
+        Ok((challenge, round_trip))
     } else {
         Err(AuthError::Rejected)
     }
@@ -1092,6 +1117,9 @@ fn resume_pty_session(
         }
     };
     let active = Arc::new(active);
+    if let Some(decision) = decision {
+        let _ = active.seed_output_round_trip(decision.round_trip);
+    }
     active.set_disconnect_timeout(Some(
         registration
             .disconnect_timeout_seconds
@@ -1115,8 +1143,58 @@ fn resume_pty_session(
         forwarder,
         registration.router_framing,
     );
+    finish_ended_session(core, &active, &identity);
+}
+
+/// End a session whose terminal bridge returned: deliver its queued output
+/// and half-close the client transport, retire the terminal, then hold the
+/// transport until the client closes it.
+fn finish_ended_session(
+    core: &RuntimeCore,
+    active: &ActiveSession,
+    identity: &RegistrationIdentity,
+) {
     let _ = active.finish_terminal();
-    retire_ended_terminal(core, &identity);
+    retire_ended_terminal(core, identity);
+    await_client_close(core, active);
+}
+
+/// Keep an ended session's client transport open until the client closes it.
+///
+/// `finish_terminal` hands the last output and `TERMINAL_EXIT_STATUS` to the
+/// kernel and half-closes the socket, but much of that can still wait in the
+/// send queue while the client drains its console. Once the socket is
+/// closed, the kernel answers any byte the client sends, such as the
+/// keep-alive `et` sends per 512 KiB it reads, with RST (RFC 1122 4.2.2.13),
+/// and the RST discards the unsent output and the exit status. Like
+/// upstream `finishSession`, wait up to [`CLIENT_CLOSE_GRACE`] before
+/// closing, but end the wait as soon as the client closes. Client bytes are
+/// read and dropped until EOF, an error, runtime shutdown, or the grace.
+fn await_client_close(core: &RuntimeCore, active: &ActiveSession) {
+    let deadline = Instant::now() + CLIENT_CLOSE_GRACE;
+    let Ok((mut stream, _)) = active.try_clone_stream() else {
+        return;
+    };
+    // Runtime shutdown shuts down every tracked socket, which ends the read.
+    let Ok(_tracked) = core.raw_sockets.track(&stream) else {
+        return;
+    };
+    if core.shutdown.load(Ordering::Acquire) || stream.set_nonblocking(false).is_err() {
+        return;
+    }
+    let mut discarded = [0u8; 16 * 1024];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || stream.set_read_timeout(Some(remaining)).is_err() {
+            return;
+        }
+        match stream.read(&mut discarded) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
 }
 
 /// Drop a terminal generation after its bridge ends.

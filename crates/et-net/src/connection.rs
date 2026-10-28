@@ -9,6 +9,8 @@ use et_core::backed_writer::{BackedWriter, RecoverError, WriterOutcome};
 use et_core::crypto::{
     CryptoHandler, EncryptError, DIR_CLIENT_TO_SERVER, DIR_SERVER_TO_CLIENT, KEY_LEN,
 };
+use et_core::keepalive::{AckSchedule, AckSide};
+use et_core::output_window::{unacknowledged_payload, OutputWindow};
 use et_core::packet::Packet;
 use socket2::SockRef;
 #[path = "connection_pending.rs"]
@@ -28,6 +30,42 @@ pub use recovery::{RecoveryExchange, DEFAULT_RECOVERY_TIMEOUT, MAX_RECOVERY_PROT
 /// and recovery can proceed.
 pub const DEFAULT_LIVE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const FLOW_CONTROL_LIVE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a live output frame may wait on a closed window while the peer
+/// is silent, once [`Connection::minimize_output_buffering`] applies.
+///
+/// A client whose console stops reading (a slow terminal, XOFF, a paused
+/// pager) stops reading its socket, so the server's window closes although
+/// the client is alive. Upstream `TerminalServer` never times such a write
+/// out (`drainWriteBufferToClient` only writes while the socket is
+/// writable); a soft disconnect here made the stalled client reconnect and
+/// replay its backlog before its next prompt. A stuck frame therefore
+/// survives its deadline while the peer keeps sending packets (keep-alives
+/// continue while its reads are held) and fails once it has been silent for
+/// this long, so a vanished peer is still dropped. Twice the live-write
+/// timeout spans a keep-alive interval, which never exceeds it plus a second.
+pub const FLOW_CONTROL_PEER_SILENCE: Duration = Duration::from_secs(10);
+/// Unsent-byte bound for live output, as upstream
+/// `TcpSocketHandler::minimizeKernelBuffering` (`TcpSocketHandlerUnix.cpp`):
+/// output not yet handed to TCP stays in the session queue, where Ctrl+C
+/// can still drop it.
+#[cfg(target_os = "linux")]
+pub const OUTPUT_NOTSENT_LOWAT_BYTES: u32 = 32 * 1024;
+/// Requested `SO_SNDBUF` for live output; the kernel doubles it.
+///
+/// Upstream sets no send buffer and leaves it to autotune. Its own output
+/// loop stays near 5 MB/s, so it never fills a WAN path; et.rs keeps up with
+/// the link, and an autotuned buffer then grows in-flight data, plus the
+/// client's receive backlog behind it, to many megabytes that Ctrl+C cannot
+/// drop (RTT 50 ms: up to 10 MB after Ctrl+C, prompt up to 1.1 s later).
+/// On Linux, 1 MiB still carries about 14 MB/s at RTT 50 ms with the prompt
+/// back in about one RTT; below `TCP_NOTSENT_LOWAT` it only bounds data in
+/// flight. Without `TCP_NOTSENT_LOWAT` (socket2 exposes it on Linux only)
+/// the buffer is also the unsent queue, so it stays at 256 KiB: above one
+/// 64 KiB forwarding frame, so a full packet does not stall the session
+/// loop's write batch on every iteration.
+#[cfg(target_os = "linux")]
+pub const FLOW_CONTROL_SOCKET_BUFFER_BYTES: usize = 1024 * 1024;
+#[cfg(not(target_os = "linux"))]
 pub const FLOW_CONTROL_SOCKET_BUFFER_BYTES: usize = 256 * 1024;
 
 #[derive(Debug)]
@@ -49,7 +87,14 @@ pub struct Connection {
     /// receives and decrypts without the lock that serializes the writer.
     reader: Arc<Mutex<BackedReader>>,
     live_write_timeout: Duration,
+    /// See [`FLOW_CONTROL_PEER_SILENCE`]; `None` keeps the plain deadline.
+    peer_silence: Option<Duration>,
     pending_live: Option<pending::PendingWrite>,
+    /// Which keep-alives on this transport carry the delivery
+    /// acknowledgement; a recovered transport starts a fresh schedule.
+    acks: AckSchedule,
+    /// Server output bound; see [`Self::bound_unacknowledged_output`].
+    output_window: Option<OutputWindow>,
 }
 
 /// Receive half of a [`Connection`].
@@ -79,11 +124,6 @@ impl ConnectionReader {
 
     pub fn has_buffered_read(&self) -> bool {
         lock_reader(&self.reader).has_buffered_data()
-    }
-
-    /// Keep-alive payload acknowledging everything read so far.
-    pub fn keepalive_ack(&self) -> [u8; et_core::keepalive::ACK_PAYLOAD_LEN] {
-        et_core::keepalive::encode_ack(lock_reader(&self.reader).sequence())
     }
 }
 
@@ -135,7 +175,7 @@ impl Connection {
             key,
             DIR_CLIENT_TO_SERVER,
             DIR_SERVER_TO_CLIENT,
-            et_core::backed_reader::MAX_SOCKET_READ,
+            et_core::backed_reader::CLIENT_MAX_SOCKET_READ,
         )
     }
 
@@ -167,7 +207,10 @@ impl Connection {
                     .with_max_socket_read(max_socket_read),
             )),
             live_write_timeout: DEFAULT_LIVE_WRITE_TIMEOUT,
+            peer_silence: None,
             pending_live: None,
+            acks: AckSchedule::default(),
+            output_window: None,
         }
     }
 
@@ -222,12 +265,13 @@ impl Connection {
             return Err(WritePacketError::BeforeReplay(error));
         }
         let live_stream = self.writer.connected().then(|| Arc::clone(&self.stream));
-        match self
+        let outcome = self
             .writer
             .write_packet(header, payload)
             .map_err(ConnError::Encrypt)
-            .map_err(WritePacketError::BeforeReplay)?
-        {
+            .map_err(WritePacketError::BeforeReplay)?;
+        self.note_output(&outcome, header, payload.len());
+        match outcome {
             WriterOutcome::Send(frame) => Ok(PreparedWrite {
                 live: live_stream.map(|stream| (stream, frame, self.live_write_timeout)),
             }),
@@ -245,12 +289,13 @@ impl Connection {
             return Err(WritePacketError::BeforeReplay(ConnError::Backpressure));
         }
         let live_stream = self.writer.connected().then(|| Arc::clone(&self.stream));
-        match self
+        let outcome = self
             .writer
             .write_packet(header, payload)
             .map_err(ConnError::Encrypt)
-            .map_err(WritePacketError::BeforeReplay)?
-        {
+            .map_err(WritePacketError::BeforeReplay)?;
+        self.note_output(&outcome, header, payload.len());
+        match outcome {
             WriterOutcome::Send(frame) => Ok(PreparedWrite {
                 live: live_stream.map(|stream| (stream, frame, self.live_write_timeout)),
             }),
@@ -289,7 +334,10 @@ impl Connection {
         frame: Arc<Vec<u8>>,
     ) -> PreparedWrite {
         let live_stream = self.writer.connected().then(|| Arc::clone(&self.stream));
-        match self.writer.commit_write(reserved, frame) {
+        let (header, payload_len) = (reserved.header(), reserved.payload_len());
+        let outcome = self.writer.commit_write(reserved, frame);
+        self.note_output(&outcome, header, payload_len);
+        match outcome {
             WriterOutcome::Send(frame) => PreparedWrite {
                 live: live_stream.map(|stream| (stream, frame, self.live_write_timeout)),
             },
@@ -336,12 +384,13 @@ impl Connection {
                     .map_err(WritePacketError::BeforeReplay)
             })
             .transpose()?;
-        match self
+        let outcome = self
             .writer
             .write_packet(header, payload)
             .map_err(ConnError::Encrypt)
-            .map_err(WritePacketError::BeforeReplay)?
-        {
+            .map_err(WritePacketError::BeforeReplay)?;
+        self.note_output(&outcome, header, payload.len());
+        match outcome {
             WriterOutcome::Send(frame) => Ok(PreparedWrite {
                 live: live_stream.map(|stream| (stream, frame, self.live_write_timeout)),
             }),
@@ -533,6 +582,16 @@ impl Connection {
     /// replay backup. Implausible values are ignored.
     pub fn acknowledge_delivery(&mut self, sequence: i64) {
         self.writer.acknowledge(sequence);
+        let Some(window) = self.output_window.as_mut() else {
+            return;
+        };
+        if let Some((acknowledged, unacknowledged)) = self.writer.delivery_backlog() {
+            if acknowledged == sequence && self.writer.connected() {
+                let payload =
+                    unacknowledged_payload(acknowledged, unacknowledged, self.writer.sequence());
+                window.on_ack(acknowledged, payload, Instant::now());
+            }
+        }
     }
 
     /// Latest peer acknowledgement and the wire bytes written since; `None`
@@ -541,9 +600,73 @@ impl Connection {
         self.writer.delivery_backlog()
     }
 
+    /// Hold queued terminal output back while an acknowledging client has
+    /// a whole window of it unacknowledged (see [`et_core::output_window`]).
+    /// The server's session output enables this; the pump asks
+    /// [`Self::output_window_blocked`] before each terminal frame.
+    pub fn bound_unacknowledged_output(&mut self) {
+        self.output_window.get_or_insert_with(OutputWindow::default);
+    }
+
+    /// Give the output bound this transport's handshake round trip.
+    pub fn seed_output_round_trip(&mut self, rtt: Duration) {
+        if let Some(window) = self.output_window.as_mut() {
+            window.seed_round_trip(rtt);
+        }
+    }
+
+    /// `Some` with the time the bound gives up waiting while terminal output
+    /// must wait for an acknowledgement; `None` while it may go out.
+    pub fn output_window_blocked(&mut self, now: Instant) -> Option<Instant> {
+        let window = self.output_window.as_mut()?;
+        if !self.writer.connected() {
+            return None;
+        }
+        let (acknowledged, unacknowledged) = self.writer.delivery_backlog()?;
+        let payload = unacknowledged_payload(acknowledged, unacknowledged, self.writer.sequence());
+        window.blocked(acknowledged, payload, now)
+    }
+
+    /// Feed a packet the writer committed to the output bound.
+    fn note_output(&mut self, outcome: &WriterOutcome, header: u8, payload_len: usize) {
+        let Some(window) = self.output_window.as_mut() else {
+            return;
+        };
+        if matches!(outcome, WriterOutcome::Skipped) {
+            return;
+        }
+        let carries_ack = header == et_core::proto::TerminalPacketType::KeepAlive as u8
+            && payload_len == et_core::keepalive::ACK_PAYLOAD_LEN;
+        window.on_write(
+            self.writer.sequence(),
+            payload_len,
+            header == et_core::proto::TerminalPacketType::TerminalBuffer as u8,
+            carries_ack,
+            Instant::now(),
+        );
+    }
+
     /// Keep-alive payload acknowledging everything read so far.
     pub fn keepalive_ack(&self) -> [u8; et_core::keepalive::ACK_PAYLOAD_LEN] {
         et_core::keepalive::encode_ack(self.reader().sequence())
+    }
+
+    /// Acknowledgement for the next keep-alive this side writes, or `None`
+    /// for upstream's empty payload when it would tell the peer nothing new
+    /// (see [`AckSchedule`]). `volume` marks an acknowledgement sent because
+    /// [`et_core::keepalive::ACK_INTERVAL_BYTES`] were read or written.
+    pub fn next_keepalive_ack(
+        &mut self,
+        side: AckSide,
+        volume: bool,
+    ) -> Option<[u8; et_core::keepalive::ACK_PAYLOAD_LEN]> {
+        let (sequence, data_sequence) = {
+            let reader = self.reader();
+            (reader.sequence(), reader.data_sequence())
+        };
+        let peer_acknowledges = self.writer.delivery_backlog().is_some();
+        self.acks
+            .next(side, sequence, data_sequence, peer_acknowledges, volume)
     }
 
     pub fn set_io_timeout(&self, timeout: Option<Duration>) -> Result<(), ConnError> {
@@ -552,19 +675,33 @@ impl Connection {
         Ok(())
     }
 
-    /// Keep opt-in flow-control backlog in the application queue instead of
-    /// letting the kernel send queue autotune to multiple megabytes. The cap
-    /// stays above a single forwarding frame so one full packet does not stall
-    /// the session loop's write batch on every iteration.
+    /// Keep live output backlog in the application queue, where Ctrl+C can
+    /// drop it, instead of the kernel send queue, and bound data in flight
+    /// (see [`FLOW_CONTROL_SOCKET_BUFFER_BYTES`]). A peer that holds its
+    /// window closed stays connected while it keeps talking (see
+    /// [`FLOW_CONTROL_PEER_SILENCE`]).
     pub fn minimize_output_buffering(&mut self) -> Result<(), ConnError> {
         self.live_write_timeout = FLOW_CONTROL_LIVE_WRITE_TIMEOUT;
+        self.peer_silence = Some(FLOW_CONTROL_PEER_SILENCE);
         let socket = SockRef::from(&*self.stream);
+        #[cfg(target_os = "linux")]
+        {
+            socket
+                .set_tcp_notsent_lowat(OUTPUT_NOTSENT_LOWAT_BYTES)
+                .map_err(ConnError::Io)?;
+            // `SO_SNDBUF` is clamped to `net.core.wmem_max`, 208 KiB on stock
+            // kernels; a privileged etserver may exceed it, like autotuning.
+            match rustix::net::sockopt::set_socket_send_buffer_size_force(
+                &*self.stream,
+                FLOW_CONTROL_SOCKET_BUFFER_BYTES,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(rustix::io::Errno::PERM) => {}
+                Err(error) => return Err(ConnError::Io(error.into())),
+            }
+        }
         socket
             .set_send_buffer_size(FLOW_CONTROL_SOCKET_BUFFER_BYTES)
-            .map_err(ConnError::Io)?;
-        #[cfg(target_os = "linux")]
-        socket
-            .set_tcp_notsent_lowat((FLOW_CONTROL_SOCKET_BUFFER_BYTES / 4) as u32)
             .map_err(ConnError::Io)?;
         Ok(())
     }
@@ -594,6 +731,11 @@ impl Connection {
         self.reader().sequence()
     }
 
+    /// Before a live write, find out whether the peer is gone so the frame
+    /// goes to replay only. A peer close or reset ends live writes, but the
+    /// reader keeps the packets it already received: a peer that ends a
+    /// session sends its last output and closes, and the read path reports
+    /// that EOF only after those packets, as upstream's reader does.
     fn refresh_connectivity(&mut self) -> Result<(), ConnError> {
         if !self.writer.connected() {
             return Ok(());
@@ -616,7 +758,7 @@ impl Connection {
             self.stream.peek(&mut byte)
         };
         match probe {
-            Ok(0) => self.disconnect(),
+            Ok(0) => self.writer.invalidate(),
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -629,7 +771,7 @@ impl Connection {
                         | io::ErrorKind::NotConnected
                 ) =>
             {
-                self.disconnect();
+                self.writer.invalidate();
             }
             Err(error) => {
                 self.disconnect();

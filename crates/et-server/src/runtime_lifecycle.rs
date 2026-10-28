@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 use et_net::local::LocalStream;
 
+#[cfg(target_os = "linux")]
+use crate::idle_memory::{release_idle_memory, restore_active_decay};
 use crate::registry::{RegistrationError, RegistrationIdentity};
 use crate::runtime_error::RuntimeError;
 use crate::runtime_state::RuntimeCore;
@@ -25,77 +27,6 @@ pub(crate) enum LifecycleEvent {
 /// registered, a one-second pass keeps expiry prompt without churning the
 /// registry lock at 10 Hz.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
-
-#[cfg(target_os = "linux")]
-#[derive(Debug, PartialEq, Eq)]
-struct IdleMemoryAccounting {
-    applied_arenas: u32,
-    dirty_decay_ms: isize,
-    muzzy_decay_ms: isize,
-}
-
-/// Return pages freed by finished sessions to the kernel.
-///
-/// Two steps are both required. `arenas.*_decay_ms` governs arenas created
-/// later, and each arena that already holds session buffers is updated through
-/// its own index.
-///
-/// jemalloc's `MALLCTL_ARENAS_ALL` pseudo-index is deliberately not used: it is
-/// rejected with `EFAULT` on some builds, which silently left this policy
-/// unapplied at runtime while a future-arena read-back still looked correct.
-/// `arenas.narenas` is an upper limit rather than a count of live arenas, so an
-/// index that was never initialized also answers `EFAULT`; those arenas hold
-/// nothing and inherit the future-arena setting when they are created, so they
-/// are skipped instead of failing the release.
-#[cfg(target_os = "linux")]
-fn release_idle_memory() -> Result<IdleMemoryAccounting, tikv_jemalloc_ctl::Error> {
-    use tikv_jemalloc_ctl::{Access, AsName};
-
-    b"arenas.dirty_decay_ms\0".name().write(0_isize)?;
-    b"arenas.muzzy_decay_ms\0".name().write(0_isize)?;
-    let limit: u32 = b"arenas.narenas\0".name().read()?;
-    let mut applied_arenas = 0;
-    for index in 0..limit {
-        let dirty = format!("arena.{index}.dirty_decay_ms\0");
-        if dirty.as_bytes().name().write(0_isize).is_err() {
-            continue;
-        }
-        let muzzy = format!("arena.{index}.muzzy_decay_ms\0");
-        let _ = muzzy.as_bytes().name().write(0_isize);
-        applied_arenas += 1;
-    }
-    Ok(IdleMemoryAccounting {
-        applied_arenas,
-        dirty_decay_ms: b"arenas.dirty_decay_ms\0".name().read()?,
-        muzzy_decay_ms: b"arenas.muzzy_decay_ms\0".name().read()?,
-    })
-}
-
-/// Active-session decay: dirty pages return to the kernel after 1 s (the
-/// build-time default, see `.cargo/config.toml`, restated here so builds
-/// without that config keep it), and purged pages skip jemalloc's lazy
-/// `MADV_FREE` stage (`muzzy_decay_ms` 0, jemalloc's own default): lazily
-/// freed pages stay resident until the kernel is under memory pressure.
-#[cfg(target_os = "linux")]
-fn restore_active_decay() {
-    use tikv_jemalloc_ctl::{Access, AsName};
-
-    const DIRTY_DECAY_MS: isize = 1000;
-    const MUZZY_DECAY_MS: isize = 0;
-    let _ = b"arenas.dirty_decay_ms\0".name().write(DIRTY_DECAY_MS);
-    let _ = b"arenas.muzzy_decay_ms\0".name().write(MUZZY_DECAY_MS);
-    if let Ok(limit) = b"arenas.narenas\0".name().read() {
-        let limit: u32 = limit;
-        for index in 0..limit {
-            let dirty = format!("arena.{index}.dirty_decay_ms\0");
-            if dirty.as_bytes().name().write(DIRTY_DECAY_MS).is_err() {
-                continue;
-            }
-            let muzzy = format!("arena.{index}.muzzy_decay_ms\0");
-            let _ = muzzy.as_bytes().name().write(MUZZY_DECAY_MS);
-        }
-    }
-}
 
 /// Sends lifecycle events to the runtime control thread and wakes its poll.
 #[derive(Clone)]
@@ -415,29 +346,5 @@ pub(crate) fn install_raw_scan_hook(id: &str, complete: std::sync::mpsc::SyncSen
 fn notify_raw_scan_complete(id: &str) {
     if let Some(complete) = raw_scan_hooks().lock().unwrap().remove(id) {
         let _ = complete.send(());
-    }
-}
-
-#[cfg(all(test, target_os = "linux"))]
-#[global_allocator]
-static TEST_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use super::release_idle_memory;
-
-    /// A real server run applied this policy to zero arenas while still
-    /// reading back a configured future-arena value, so the release looked
-    /// successful and reclaimed nothing. Assert the live-arena count it
-    /// actually reached.
-    #[test]
-    fn idle_release_reaches_at_least_one_live_arena() {
-        let accounting = release_idle_memory().expect("release must succeed under jemalloc");
-        assert_eq!(accounting.dirty_decay_ms, 0);
-        assert_eq!(accounting.muzzy_decay_ms, 0);
-        assert!(
-            accounting.applied_arenas >= 1,
-            "release applied to no live arena: {accounting:?}"
-        );
     }
 }

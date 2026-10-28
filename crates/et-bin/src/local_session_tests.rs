@@ -418,3 +418,167 @@ fn local_reply_progress_distinguishes_draining_from_idle_and_backpressure() {
     }
     panic!("a blocked local reply must stop reporting progress");
 }
+
+/// Forwarding data and keepalives the fake server reads until `until`.
+fn read_upload(
+    peer: &mut Connection,
+    stream: &std::net::TcpStream,
+    until: Instant,
+) -> (usize, usize) {
+    let (mut data, mut keepalives) = (0, 0);
+    while Instant::now() < until {
+        match peer.try_read_packet().unwrap() {
+            Some(packet) if packet.header() == Kind::PortForwardData as u8 => {
+                data += packet.payload().len();
+            }
+            Some(packet) if packet.header() == Kind::KeepAlive as u8 => keepalives += 1,
+            Some(_) => {}
+            None => {
+                let mut descriptors = [PollFd::new(stream, PollFlags::IN)];
+                let timeout = Timespec::try_from(Duration::from_millis(20)).unwrap();
+                let _ = poll(&mut descriptors, Some(&timeout));
+            }
+        }
+    }
+    (data, keepalives)
+}
+
+#[test]
+fn no_shell_pump_acknowledges_by_volume_and_bounds_unacknowledged_forwarding() {
+    use et_core::proto::{PortForwardDestinationRequest, SocketEndpoint};
+    use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
+
+    // Given: an `-N` session whose server has proven it acknowledges
+    // delivery, and a forwarded application uploading far more than the
+    // delivery bound (a legacy, unwindowed socket, so only the gate limits).
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let server = listener.accept().unwrap().0;
+    let control = server.try_clone().unwrap();
+    let readiness = server.try_clone().unwrap();
+    let connection = Connection::new_client(client, &[23; 32]);
+    let mut peer = Connection::new_server(server, &[23; 32]);
+    let forwarder = Forwarder::start(Vec::new()).unwrap();
+    let destination = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    forwarder
+        .receive(Packet::new(
+            Kind::PortForwardDestinationRequest as u8,
+            PortForwardDestinationRequest {
+                destination: Some(SocketEndpoint {
+                    name: Some(Ipv4Addr::LOCALHOST.to_string()),
+                    port: Some(i32::from(destination.local_addr().unwrap().port())),
+                }),
+                fd: Some(7),
+                window: None,
+            }
+            .encode_to_vec(),
+        ))
+        .unwrap();
+    let (mut application, _) = destination.accept().unwrap();
+    let uploader = std::thread::spawn(move || {
+        let _ = application.write_all(&vec![5; 32 * 1024 * 1024]);
+    });
+    peer.write_packet(Kind::KeepAlive as u8, &peer.keepalive_ack())
+        .unwrap();
+    let session = std::thread::spawn(move || {
+        let mut connection = connection;
+        let mut forwarder = forwarder;
+        let args = ClientArgs::try_parse_from(["et", "-N", "-k", "5", "host"]).unwrap();
+        let mut runtime = Runtime::new(
+            &args,
+            Prepared {
+                mux: None,
+                ctl: None,
+            },
+        )
+        .unwrap();
+        pump(
+            &mut connection,
+            &args,
+            &mut forwarder,
+            &mut runtime,
+            &mut |_: &mut Connection| Ok(ReconnectOutcome::SessionEnded),
+        )
+    });
+
+    // When: the server reads everything but stops acknowledging.
+    let (stalled, keepalives) = read_upload(
+        &mut peer,
+        &readiness,
+        Instant::now() + Duration::from_secs(2),
+    );
+
+    // Then: the client acknowledged by volume and paused its producers at
+    // the bound instead of pushing the whole upload into replay.
+    let bound = et_core::backed_writer::MAX_UNACKNOWLEDGED_BYTES as usize;
+    assert!(
+        keepalives >= 2,
+        "only {keepalives} keepalives in {stalled} forwarded bytes"
+    );
+    assert!(
+        (bound / 2..2 * bound).contains(&stalled),
+        "{stalled} bytes forwarded past an unacknowledged bound of {bound}"
+    );
+    // An acknowledgement releases the gate again.
+    peer.write_packet(Kind::KeepAlive as u8, &peer.keepalive_ack())
+        .unwrap();
+    let (resumed, _) = read_upload(
+        &mut peer,
+        &readiness,
+        Instant::now() + Duration::from_secs(1),
+    );
+    assert!(
+        resumed >= bound / 2,
+        "only {resumed} bytes after the acknowledgement"
+    );
+
+    control.shutdown(Shutdown::Both).unwrap();
+    assert_eq!(session.join().unwrap().unwrap(), 0);
+    uploader.join().unwrap();
+}
+
+#[test]
+fn no_shell_pump_declares_a_silent_link_dead_after_two_keepalive_intervals() {
+    use std::net::{Ipv4Addr, TcpListener, TcpStream};
+
+    // Given: an `-N` session whose server stays connected but never answers.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let _silent_server = listener.accept().unwrap().0;
+    let started = Instant::now();
+    let session = std::thread::spawn(move || {
+        let mut connection = Connection::new_client(client, &[29; 32]);
+        let mut forwarder = Forwarder::start(Vec::new()).unwrap();
+        let args = ClientArgs::try_parse_from(["et", "-N", "-k", "1", "host"]).unwrap();
+        let mut runtime = Runtime::new(
+            &args,
+            Prepared {
+                mux: None,
+                ctl: None,
+            },
+        )
+        .unwrap();
+        let mut reconnect_at = None;
+        let result = pump(
+            &mut connection,
+            &args,
+            &mut forwarder,
+            &mut runtime,
+            &mut |_: &mut Connection| {
+                reconnect_at.get_or_insert_with(Instant::now);
+                Ok(ReconnectOutcome::SessionEnded)
+            },
+        );
+        (result, reconnect_at)
+    });
+
+    // Then: like upstream, one interval to the probe and one more for the
+    // verdict (the former three-interval rule waited 3 s).
+    let (result, reconnect_at) = session.join().unwrap();
+    assert_eq!(result.unwrap(), 0);
+    let waited = reconnect_at.expect("pump never reconnected") - started;
+    assert!(
+        (Duration::from_millis(1900)..Duration::from_millis(2700)).contains(&waited),
+        "reconnected after {waited:?}"
+    );
+}

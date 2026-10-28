@@ -3,6 +3,8 @@ use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use et_core::packet::Packet;
 use et_core::proto::{TerminalInfo, TerminalPacketType};
@@ -16,12 +18,22 @@ use rustix::event::{poll, PollFd, PollFlags};
 use rustix::time::Timespec;
 
 #[cfg(unix)]
+use crate::idle_memory::{IdleRelease, ReleaseScope};
+#[cfg(unix)]
 use crate::session::OutputPump;
 use crate::session::{ActiveSession, SessionError, SessionWriteError};
 
 const READ_BUFFER: usize = 16 * 1024;
 const CLIENT_READ_BATCH: usize = 128;
 const FORWARD_BACKLOG_CAPACITY: usize = 513;
+/// Terminal payload one interrupt drain reads at most. Upstream reads until
+/// the terminal socket is empty; a producer that refills it as fast as the
+/// bridge reads would then hold client input forever. This is several times
+/// what the terminal socket, etterminal's read chunk and the bridge's held
+/// packets can contain when the interrupt arrives.
+const INTERRUPT_DRAIN_BYTES: usize = 1024 * 1024;
+/// Length prefix of a router packet on the terminal socket.
+const LOCAL_PACKET_PREFIX: usize = std::mem::size_of::<i64>();
 
 /// One router message for the terminal: its [`RouterHead`] and payload,
 /// resumable across local-stream backpressure without copying the payload.
@@ -141,7 +153,10 @@ fn run_mode_poll(
     // A complete terminal packet already read from the local stream. Retain
     // ownership across backpressure instead of dropping it or reading ahead.
     let mut pending_terminal: Option<Packet> = None;
-    let mut lookahead_terminal: Option<Packet> = None;
+    // Terminal packets read but not yet offered to the queue, oldest first:
+    // the packet that ended a coalesced batch, or what an interrupt drain
+    // preserved (exit status, jumphost control packets).
+    let mut held_terminal: VecDeque<Packet> = VecDeque::new();
     // A partially written client packet. Its frame and offset must survive
     // local-stream backpressure, and ordered client reads pause behind it.
     let mut pending_local: Option<PendingLocalFrame> = None;
@@ -155,6 +170,8 @@ fn run_mode_poll(
     // This loop writes the client transport too; nothing else touches it
     // while the bridge runs.
     let mut output = OutputPump::new(&session);
+    // A quiet session returns its thread cache; see `idle_memory`.
+    let mut idle = IdleRelease::new(ReleaseScope::Thread, Instant::now());
     loop {
         if session.is_shutting_down() || session.retire_if_unreachable()? {
             return Ok(());
@@ -179,7 +196,10 @@ fn run_mode_poll(
         }
         // Write queued output before deciding how long to sleep. A frame
         // still waiting for transport room keeps POLLOUT in the poll set.
-        let output_state = output.run();
+        // While client reads are held, its acknowledgements cannot arrive and
+        // terminal input may wait on this output, so the window is lifted.
+        let output_state =
+            output.run(pending_local.is_none() && pending_forward.len() < FORWARD_BACKLOG_CAPACITY);
         if !connected {
             cached_client = None;
         } else if cached_client.as_ref().map(|(_, gen)| *gen) != Some(connection_generation) {
@@ -204,7 +224,7 @@ fn run_mode_poll(
         let polled_generation = cached_client.as_ref().map(|(_, gen)| *gen);
         let terminal_flags = terminal_poll_flags(
             pending_terminal.is_none()
-                && lookahead_terminal.is_none()
+                && held_terminal.is_empty()
                 && session.can_buffer_write((READ_BUFFER * 2) as i64)?,
             pending_local.is_some(),
             terminal_closing,
@@ -225,7 +245,7 @@ fn run_mode_poll(
                 !pending_forward.is_empty() || (cfg!(target_os = "macos") && !connected),
                 client_buffered
                     || (pending_terminal.is_none()
-                        && lookahead_terminal.is_some()
+                        && !held_terminal.is_empty()
                         && session.can_buffer_write((READ_BUFFER * 2) as i64)?),
             ),
             output_state.deadline,
@@ -235,7 +255,15 @@ fn run_mode_poll(
         if let Some(expiry) = session.disconnect_deadline(connected) {
             client_policy.1 = wait_until(client_policy.1, expiry);
         }
-        let (terminal_events, wake_events, forward_events, client_events) = wait(
+        if let Some(release_at) = idle.deadline() {
+            client_policy.1 = wait_until(client_policy.1, release_at);
+        }
+        // Output held for an acknowledgement goes out when the window gives
+        // up waiting; the client socket's readability covers the rest.
+        if let Some(release_at) = output_state.window_release {
+            client_policy.1 = wait_until(client_policy.1, release_at);
+        }
+        let (terminal_events, wake_events, forward_events, client_events, ready) = wait(
             &terminal,
             &wake,
             forwarder.wake().map_err(forward_error)?,
@@ -244,6 +272,7 @@ fn run_mode_poll(
             client_policy,
             pending_outbound.is_empty().then_some(&fast_poll),
         )?;
+        idle.after_wait(ready, Instant::now());
         let woken = wake_events.intersects(PollFlags::IN | PollFlags::HUP);
         if woken {
             drain(&mut wake)?;
@@ -283,8 +312,8 @@ fn run_mode_poll(
             }
         }
         if pending_terminal.is_none()
-            && (!terminal_eof || lookahead_terminal.is_some())
-            && ((lookahead_terminal.is_some()
+            && (!terminal_eof || !held_terminal.is_empty())
+            && ((!held_terminal.is_empty()
                 && session.can_buffer_write((READ_BUFFER * 2) as i64)?)
                 || terminal_closing
                 || terminal_events.contains(PollFlags::IN)
@@ -292,7 +321,7 @@ fn run_mode_poll(
                     && session.can_buffer_write((READ_BUFFER * 2) as i64)?))
         {
             for _ in 0..32 {
-                let next = match lookahead_terminal.take() {
+                let next = match held_terminal.pop_front() {
                     Some(packet) => Ok(Some(packet)),
                     None => match read_terminal_packet(&mut terminal, &mut decoder) {
                         Ok(Some(packet)) => {
@@ -313,7 +342,10 @@ fn run_mode_poll(
                 let Some(mut packet) = next? else {
                     continue;
                 };
+                // Coalescing reads on from the socket, so it must not pass
+                // packets still held from an earlier read.
                 if matches!(mode, BridgeMode::Terminal(_))
+                    && held_terminal.is_empty()
                     && packet.header() == TerminalPacketType::TerminalBuffer as u8
                 {
                     if let Some((first_bytes, false)) =
@@ -356,7 +388,7 @@ fn run_mode_poll(
                                                 }
                                             }
                                         }
-                                        lookahead_terminal = Some(accepted);
+                                        held_terminal.push_back(accepted);
                                         break;
                                     }
                                     Ok(None) => break,
@@ -388,7 +420,7 @@ fn run_mode_poll(
                 }
             }
         }
-        if terminal_eof && pending_terminal.is_none() && lookahead_terminal.is_none() {
+        if terminal_eof && pending_terminal.is_none() && held_terminal.is_empty() {
             finish_killed_session(&session);
             return Ok(());
         }
@@ -419,6 +451,7 @@ fn run_mode_poll(
                     // terminal, which owns the destination connection.
                     Ok(Some(packet)) if mode == BridgeMode::Jumphost => {
                         let packet = jumphost_client_packet(&session, packet)?;
+                        let emitted = interrupt_emitted(&session, &terminal)?;
                         let mut frame =
                             PendingLocalFrame::new(packet, framing).map_err(SessionError::Io)?;
                         match frame.try_write(&mut terminal) {
@@ -428,6 +461,17 @@ fn run_mode_poll(
                                 terminal_input_closed = true;
                             }
                             Err(error) => return Err(SessionError::Io(error)),
+                        }
+                        if let Some(emitted) = emitted {
+                            drain_discard_terminal(
+                                &session,
+                                mode,
+                                &mut terminal,
+                                &mut decoder,
+                                &mut pending_terminal,
+                                &mut held_terminal,
+                                emitted,
+                            )?;
                         }
                         true
                     }
@@ -461,18 +505,32 @@ fn run_mode_poll(
                         if let Some(forwarded) = forwarded {
                             match forwarded {
                                 ClientForward::ToTerminal(packet) => {
+                                    let emitted = interrupt_emitted(&session, &terminal)?;
+                                    if !terminal_input_closed {
+                                        let mut frame = PendingLocalFrame::new(packet, framing)
+                                            .map_err(SessionError::Io)?;
+                                        match frame.try_write(&mut terminal) {
+                                            Ok(true) => {}
+                                            Ok(false) => pending_local = Some(frame),
+                                            Err(error) if terminal_input_gone(&error) => {
+                                                terminal_input_closed = true;
+                                            }
+                                            Err(error) => return Err(SessionError::Io(error)),
+                                        }
+                                    }
+                                    if let Some(emitted) = emitted {
+                                        drain_discard_terminal(
+                                            &session,
+                                            mode,
+                                            &mut terminal,
+                                            &mut decoder,
+                                            &mut pending_terminal,
+                                            &mut held_terminal,
+                                            emitted,
+                                        )?;
+                                    }
                                     if terminal_input_closed {
                                         continue;
-                                    }
-                                    let mut frame = PendingLocalFrame::new(packet, framing)
-                                        .map_err(SessionError::Io)?;
-                                    match frame.try_write(&mut terminal) {
-                                        Ok(true) => {}
-                                        Ok(false) => pending_local = Some(frame),
-                                        Err(error) if terminal_input_gone(&error) => {
-                                            terminal_input_closed = true;
-                                        }
-                                        Err(error) => return Err(SessionError::Io(error)),
                                     }
                                 }
                                 ClientForward::KeepAlive(control) => {
@@ -595,6 +653,9 @@ fn run_mode_windows(
     let mut pending_forward = VecDeque::with_capacity(FORWARD_BACKLOG_CAPACITY);
     let mut pending_outbound = VecDeque::with_capacity(FORWARD_BACKLOG_CAPACITY);
     let mut pending_terminal: Option<Packet> = None;
+    // Packets an interrupt drain preserved (exit status, jumphost control
+    // packets), offered to the queue before the terminal is read again.
+    let mut held_terminal: VecDeque<Packet> = VecDeque::new();
     let mut pending_local: Option<PendingLocalFrame> = None;
     let mut close_after_local = false;
     let mut terminal_input_closed = false;
@@ -667,14 +728,21 @@ fn run_mode_windows(
 
         // Terminal -> client, honouring the same write-buffer backpressure.
         if pending_terminal.is_none() && session.can_buffer_write((READ_BUFFER * 2) as i64)? {
-            match read_terminal_packet(&mut terminal, &mut decoder) {
+            let next = match held_terminal.pop_front() {
+                Some(packet) => Ok(Some(packet)),
+                None => match read_terminal_packet(&mut terminal, &mut decoder) {
+                    Ok(Some(packet)) => {
+                        // A refused packet still counts as terminal progress.
+                        progress = true;
+                        decoder = LocalPacketDecoder::new();
+                        accept_terminal_packet(&session, mode, packet)
+                    }
+                    other => other,
+                },
+            };
+            match next {
                 Ok(Some(packet)) => {
                     progress = true;
-                    let Some(packet) = accept_terminal_packet(&session, mode, packet)? else {
-                        decoder = LocalPacketDecoder::new();
-                        continue;
-                    };
-                    decoder = LocalPacketDecoder::new();
                     pending_terminal =
                         send_or_hold(&session, packet, &mut connected, &mut connection_generation)?;
                 }
@@ -698,6 +766,17 @@ fn run_mode_windows(
                         progress = true;
                         if mode == BridgeMode::Jumphost {
                             let packet = jumphost_client_packet(&session, packet)?;
+                            if session.take_interrupt_drain()? {
+                                drain_discard_terminal(
+                                    &session,
+                                    mode,
+                                    &mut terminal,
+                                    &mut decoder,
+                                    &mut pending_terminal,
+                                    &mut held_terminal,
+                                    usize::MAX,
+                                )?;
+                            }
                             pending_local = Some(
                                 PendingLocalFrame::new(packet, framing)
                                     .map_err(SessionError::Io)?,
@@ -725,6 +804,17 @@ fn run_mode_windows(
                             };
                             match forwarded {
                                 ClientForward::ToTerminal(packet) => {
+                                    if session.take_interrupt_drain()? {
+                                        drain_discard_terminal(
+                                            &session,
+                                            mode,
+                                            &mut terminal,
+                                            &mut decoder,
+                                            &mut pending_terminal,
+                                            &mut held_terminal,
+                                            usize::MAX,
+                                        )?;
+                                    }
                                     if terminal_input_closed {
                                         continue;
                                     }
@@ -871,8 +961,11 @@ fn enqueue_outbound(
             .is_some_and(|queued| queued.header() == TerminalPacketType::KeepAlive as u8)
     {
         // Keep-alive acknowledgements are cumulative, so the newest response
-        // supersedes an older unsent response without growing the queue.
-        *pending.back_mut().expect("checked above") = packet;
+        // supersedes an older unsent response without growing the queue. An
+        // empty response says nothing the queued one does not.
+        if !packet.payload().is_empty() {
+            *pending.back_mut().expect("checked above") = packet;
+        }
     } else {
         debug_assert!(pending.len() < FORWARD_BACKLOG_CAPACITY);
         pending.push_back(packet);
@@ -997,6 +1090,8 @@ fn connection_ended(error: &io::Error) -> bool {
     )
 }
 
+/// One poll; returns the terminal, wake, forwarding wake and client events,
+/// and whether any descriptor (forwarded sockets included) was ready.
 #[cfg(unix)]
 fn wait(
     terminal: &LocalStream,
@@ -1006,10 +1101,10 @@ fn wait(
     terminal_flags: Option<PollFlags>,
     client_policy: (PollFlags, Option<Duration>),
     fast_poll: Option<&et_net::forward::FastPollState>,
-) -> Result<(PollFlags, PollFlags, PollFlags, PollFlags), SessionError> {
+) -> Result<(PollFlags, PollFlags, PollFlags, PollFlags, bool), SessionError> {
     let (client_flags, timeout) = client_policy;
-    // Forwarding timers (idle window credit, parked accepts) and packets it
-    // already holds bound the wait as well.
+    // Forwarding timers (parked accepts) and packets it already holds bound
+    // the wait as well.
     let timeout = match fast_poll.and_then(et_net::forward::FastPollState::deadline) {
         Some(at) => {
             let until = at.saturating_duration_since(std::time::Instant::now());
@@ -1037,13 +1132,13 @@ fn wait(
     }
     // poll() is never restarted by SA_RESTART; retry on EINTR instead of
     // tearing the session down when a signal interrupts the wait.
-    loop {
+    let ready = loop {
         match poll(&mut descriptors, timeout.as_ref()) {
-            Ok(_) => break,
+            Ok(ready) => break ready,
             Err(error) if error == rustix::io::Errno::INTR => {}
             Err(error) => return Err(SessionError::Io(io::Error::from(error))),
         }
-    }
+    };
     if let Some(fast_poll) = fast_poll {
         fast_poll.record_revents(&descriptors[fast_offset..]);
     }
@@ -1060,6 +1155,7 @@ fn wait(
             .filter(|_| client.is_some())
             .map(PollFd::revents)
             .unwrap_or(PollFlags::empty()),
+        ready > 0,
     ))
 }
 
@@ -1143,6 +1239,84 @@ fn forward_error(error: et_net::forward::ForwardError) -> SessionError {
     SessionError::Io(io::Error::other(error))
 }
 
+/// Bytes on the terminal socket when client input that flushed queued
+/// output on interrupt is about to be written to the terminal, or `None`
+/// when the input flushed nothing. The bridge writes the input first and
+/// then drops at most this much output (see [`drain_discard_terminal`]): the
+/// terminal emitted all of it before it could read the interrupt, so it is
+/// stale, while anything it writes after that (the echo, a prompt) is not
+/// read here. Upstream drains before it writes the input
+/// (`TerminalServer.cpp` `runTerminal`, `drainDiscardReadableBytes` then
+/// `writeProto`), so the terminal only sees the interrupt after the drain
+/// and keeps forwarding the flood until then: with et.rs `etterminal` that
+/// was 16 to 40 KB more output ahead of the prompt.
+#[cfg(unix)]
+fn interrupt_emitted(
+    session: &ActiveSession,
+    terminal: &LocalStream,
+) -> Result<Option<usize>, SessionError> {
+    if !session.take_interrupt_drain()? {
+        return Ok(None);
+    }
+    let emitted =
+        rustix::io::ioctl_fionread(terminal).map_err(|error| SessionError::Io(error.into()))?;
+    Ok(Some(usize::try_from(emitted).unwrap_or(usize::MAX)))
+}
+
+/// Client input that flushed queued output on interrupt is reaching the
+/// terminal. Drop the output the terminal emitted before it (including
+/// packets this bridge holds): at most `emitted` bytes of the terminal socket,
+/// so the stale tail of a flood does not follow the flush to the client.
+/// Packets other than terminal output, such as exit status, are kept in
+/// order for normal dispatch. Upstream `drainDiscardReadableBytes`
+/// (`TerminalInterruptDrain.hpp`) and `drainDiscardJumphostTerminalBuffers`
+/// (`TerminalServer.cpp`), which read until the socket is empty.
+fn drain_discard_terminal(
+    session: &ActiveSession,
+    mode: BridgeMode,
+    terminal: &mut LocalStream,
+    decoder: &mut LocalPacketDecoder,
+    pending_terminal: &mut Option<Packet>,
+    held_terminal: &mut VecDeque<Packet>,
+    emitted: usize,
+) -> Result<(), SessionError> {
+    let mut output = Vec::new();
+    let mut preserved = VecDeque::new();
+    let mut sort = |packet: Packet| {
+        if et_core::flow_control::is_terminal_output(&packet) {
+            output.push(packet);
+        } else {
+            preserved.push_back(packet);
+        }
+    };
+    pending_terminal
+        .take()
+        .into_iter()
+        .chain(held_terminal.drain(..))
+        .for_each(&mut sort);
+    // Whole packets are counted, prefix included, so a packet the decoder
+    // had started before counts in full and the drain stops early, never late.
+    let mut drained = 0usize;
+    while drained < emitted.min(INTERRUPT_DRAIN_BYTES) {
+        match read_terminal_packet(terminal, decoder) {
+            Ok(Some(packet)) => {
+                *decoder = LocalPacketDecoder::new();
+                drained += LOCAL_PACKET_PREFIX + packet.wire_len();
+                if let Some(packet) = accept_terminal_packet(session, mode, packet)? {
+                    sort(packet);
+                }
+            }
+            Ok(None) => break,
+            // The bridge loop reads EOF again and ends the session there.
+            Err(SessionError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
+        }
+    }
+    session.discard_drained_terminal(output)?;
+    *held_terminal = preserved;
+    Ok(())
+}
+
 fn read_terminal_packet(
     terminal: &mut LocalStream,
     decoder: &mut LocalPacketDecoder,
@@ -1214,8 +1388,8 @@ fn jumphost_client_packet(session: &ActiveSession, packet: Packet) -> Result<Pac
 /// Normalize a jump-terminal packet relayed towards the client.
 ///
 /// A keep-alive echo returning from the destination acknowledges the previous
-/// hop; replace its payload with this hop's reader sequence so the client can
-/// trim its own replay backup.
+/// hop; replace its payload with this hop's acknowledgement (when it carries
+/// news) so the client can trim its own replay backup.
 fn jumphost_terminal_packet(
     session: &ActiveSession,
     packet: Packet,
@@ -1225,7 +1399,7 @@ fn jumphost_terminal_packet(
     }
     Ok(Packet::new(
         TerminalPacketType::KeepAlive as u8,
-        session.keepalive_ack()?.to_vec(),
+        session.keepalive_echo(None)?,
     ))
 }
 
@@ -1271,15 +1445,13 @@ fn forward_client_packet(
     match client_terminal_disposition(packet.header()) {
         ClientTerminalDisposition::Relay => Ok(ClientForward::ToTerminal(packet)),
         ClientTerminalDisposition::KeepAlive => {
-            if let Some(ack) = et_core::keepalive::decode_ack(packet.payload()) {
-                session.acknowledge_delivery(ack)?;
-            }
-            // The echo acknowledges everything read from the client, letting
-            // an et.rs client trim its own replay backup. Legacy peers
-            // (upstream C++, released et.rs) ignore the payload.
+            // The echo acknowledges everything read from the client when that
+            // is news, letting an et.rs client trim its own replay backup.
+            // Upstream C++ clients never acknowledge and get empty echoes.
+            let echo = session.keepalive_echo(et_core::keepalive::decode_ack(packet.payload()))?;
             Ok(ClientForward::KeepAlive(Packet::new(
                 TerminalPacketType::KeepAlive as u8,
-                session.keepalive_ack()?.to_vec(),
+                echo,
             )))
         }
         ClientTerminalDisposition::CloseSession => Ok(ClientForward::CloseSession),
@@ -1647,5 +1819,55 @@ mod tests {
 
         assert!(!flags.contains(PollFlags::IN));
         assert_eq!(timeout, Some(Duration::from_millis(10)));
+    }
+
+    /// An idle session's thread used to keep every object its last burst
+    /// freed in its allocator cache, ~70 KiB per session in `etserver`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn quiet_bridge_returns_its_thread_cache() {
+        use et_net::connection::Connection;
+        use et_net::local_packet::write_local_packet;
+        use std::net::{Ipv4Addr, TcpListener, TcpStream};
+        use std::thread;
+        use tikv_jemalloc_ctl::{Access, AsName};
+
+        // Given: a bridge that relayed terminal output to its client.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let server = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (client, _) = listener.accept().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let (terminal, mut terminal_peer) = et_net::local::wake_pair().unwrap();
+        let session = Arc::new(
+            ActiveSession::new(Connection::new_server(server, &[23; 32]), &terminal, None).unwrap(),
+        );
+        let mut peer = Connection::new_client(client, &[23; 32]);
+        session.start_output();
+        let bridge_session = Arc::clone(&session);
+        let bridge = thread::spawn(move || {
+            let _ = run_mode(
+                bridge_session,
+                terminal,
+                Forwarder::start(Vec::new()).unwrap(),
+                BridgeMode::Jumphost,
+            );
+            let enabled: bool = b"thread.tcache.enabled\0".name().read().unwrap();
+            enabled
+        });
+        write_local_packet(
+            &mut terminal_peer,
+            &Packet::new(TerminalPacketType::TerminalBuffer as u8, vec![7; 4096]),
+        )
+        .unwrap();
+        assert_eq!(peer.read_packet().unwrap().payload(), &[7; 4096][..]);
+
+        // When: the session stays quiet past the release delay.
+        thread::sleep(crate::idle_memory::IDLE_RELEASE_DELAY + Duration::from_millis(500));
+        session.shutdown().unwrap();
+
+        // Then: the bridge thread had handed its cache back.
+        assert!(!bridge.join().unwrap(), "idle bridge kept its thread cache");
     }
 }

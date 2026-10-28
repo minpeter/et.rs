@@ -8,6 +8,9 @@
 #[path = "client_output_interrupt.rs"]
 mod output_interrupt;
 
+#[cfg(any(unix, test))]
+pub(crate) use output_interrupt::StaleOutput;
+
 use std::collections::VecDeque;
 #[cfg(unix)]
 use std::fs::File;
@@ -408,6 +411,7 @@ impl ConsoleOutput {
     }
 
     /// The session loop writes this console itself (see `poll_descriptors`).
+    #[cfg(unix)]
     pub(crate) fn is_direct(&self) -> bool {
         #[cfg(target_os = "linux")]
         {

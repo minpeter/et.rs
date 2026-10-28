@@ -99,18 +99,32 @@ pub(crate) fn write_packet(
 pub(crate) enum NonblockingWrite {
     /// The frame waits for transport room until this live-write deadline.
     Pending(std::time::Instant),
+    /// The transport has no room to start this packet's frame; nothing was
+    /// written and the packet stays droppable. Wait for writability until
+    /// this deadline, past which the frame starts and fails as a stuck one.
+    NoRoom(std::time::Instant),
     Done(FlowWriteResult, bool),
 }
 
 /// Start `packet`'s frame, or advance it once `started`, without blocking.
 /// Both steps hold `write_serial` and the connection lock, so a synchronous
 /// writer finishes a still-pending frame before it assigns its own.
+///
+/// A frame starts only while the transport has room (see
+/// [`et_net::connection::Connection::has_write_room`]), as upstream
+/// `drainWriteBufferToClient` checks `isSocketWritable` before each packet:
+/// the kernel then takes a whole frame of at most the unsent low-water mark,
+/// and Ctrl+C can still drop everything behind it. `room_wait` is when queued
+/// output started waiting for room; after a live-write timeout without room
+/// the frame starts anyway with the deadline counted from then, so a stuck
+/// transport still fails as it did when every frame started at once.
 #[cfg(unix)]
 pub(crate) fn write_nonblocking(
     session: &ActiveSession,
     flow: &FlowControl,
     packet: &Packet,
     started: bool,
+    room_wait: &mut Option<std::time::Instant>,
 ) -> NonblockingWrite {
     let Ok(_write_serial) = session.write_serial.lock() else {
         return NonblockingWrite::Done(FlowWriteResult::Fatal(SessionError::Unavailable), false);
@@ -124,9 +138,22 @@ pub(crate) fn write_nonblocking(
     let step = if started {
         connection.advance_write()
     } else {
-        connection
+        if connection.has_write_room() {
+            *room_wait = None;
+        } else {
+            let now = std::time::Instant::now();
+            let deadline = connection.live_write_deadline(*room_wait.get_or_insert(now));
+            if now < deadline {
+                return NonblockingWrite::NoRoom(deadline);
+            }
+        }
+        let step = connection
             .start_write_packet_owned_unprobed(packet.header(), packet.payload())
-            .map(|()| !connection.write_pending())
+            .map(|()| !connection.write_pending());
+        if let Some(since) = room_wait.take() {
+            connection.backdate_pending_write(since);
+        }
+        step
     };
     let result = match step {
         Ok(true) => FlowWriteResult::Delivered,

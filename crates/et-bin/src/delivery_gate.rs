@@ -2,8 +2,9 @@
 //!
 //! The replay backup must hold every frame the server has not read. Kernel
 //! socket buffers autotune far past the connected backup cap on fast links,
-//! so without a bound a multi-tunnel upload pins the whole cap and can even
-//! trim frames a recovery would still request. Once the server has proven it
+//! and unacknowledged frames are only trimmed at the 64 MiB hard cap, so
+//! without a bound a multi-tunnel upload pins tens of MiB of replay heap.
+//! Once the server has proven it
 //! acknowledges delivery (an et.rs keep-alive payload, see
 //! [`et_core::keepalive`]), the client pauses its producers (stdin, forwarded
 //! sockets) while [`MAX_UNACKNOWLEDGED_BYTES`] are outstanding; the data waits
@@ -11,9 +12,10 @@
 //! C++ and legacy servers never acknowledge, so they are never gated.
 //!
 //! A client keep-alive goes out after every
-//! [`et_core::keepalive::ACK_INTERVAL_BYTES`] written and the server echoes
-//! each one with its reader sequence, so a gated client is released as soon
-//! as the server reads its most recent keep-alive. If the acknowledgement
+//! [`et_core::keepalive::ACK_INTERVAL_BYTES`] written, and the server's echo
+//! of a keep-alive that follows client data carries its reader sequence, so
+//! a gated client is released as soon as the server reads its most recent
+//! keep-alive. If the acknowledgement
 //! stops advancing for a whole patience window while gated (a relay
 //! delivering another hop's sequence, a saturated reverse direction, or a
 //! stalled link), the gate releases producers so it can never wedge

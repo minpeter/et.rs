@@ -637,7 +637,7 @@ fn spawn_io_inner(
     stream.set_write_timeout(Some(IO_CANCEL_INTERVAL))?;
     let mut reader = stream.try_clone()?;
     let control = stream.try_clone()?;
-    let (writer_tx, writer_rx) = channel::bounded::<Vec<u8>>(64);
+    let (writer_tx, writer_rx) = channel::bounded::<Vec<u8>>(128);
     let reader_commands = commands.clone();
     let reader_cancel = cancel.clone();
     let in_flight = Arc::new(AtomicI64::new(0));
@@ -664,7 +664,7 @@ fn spawn_io_inner(
     let reader_packet_window = packet_window.clone();
     let mut bind_replies = bind_replies;
     let reader_direct = direct.clone();
-    let (committed_tx, commit_received) = channel::bounded::<()>(64);
+    let (committed_tx, commit_received) = channel::bounded::<()>(128);
     let reader_handle = thread::spawn(move || {
         let mut buffer = [0u8; READ_CHUNK];
         let mut uncommitted = 0usize;

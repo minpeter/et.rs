@@ -10,10 +10,12 @@
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::process::{Child, ChildStdin};
+use std::time::Instant;
 
 use et_net::local::LocalStream;
 use et_net::local_packet::{RouterFraming, RouterStreamDecoder, TerminalBufferFrame};
-use rustix::event::{poll, PollFd, PollFlags};
+use et_server::idle_memory::{IdleRelease, ReleaseScope};
+use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
 use rustix::process::{pidfd_open, Pid, PidfdFlags};
 
@@ -82,6 +84,8 @@ where
         frame: None,
         pidfd: Some(pidfd),
         child_status: None,
+        // This loop is the terminal process's only thread.
+        idle: IdleRelease::new(ReleaseScope::Process, Instant::now()),
     };
     let result = session
         .router
@@ -127,6 +131,8 @@ struct PipeSession {
     frame: Option<(TerminalBufferFrame, usize)>,
     pidfd: Option<OwnedFd>,
     child_status: Option<i32>,
+    /// Returns the allocator memory of a quiet session; see `idle_memory`.
+    idle: IdleRelease,
 }
 
 const STDOUT: usize = 0;
@@ -203,13 +209,18 @@ impl PipeSession {
                 PollFd::from_borrowed_fd(stderr_fd, stderr_wanted),
                 PollFd::from_borrowed_fd(child_fd, child_wanted),
             ];
-            loop {
-                match poll(&mut fds, None) {
-                    Ok(_) => break,
+            let timeout = self.idle.deadline().map(|release_at| {
+                Timespec::try_from(release_at.saturating_duration_since(Instant::now()))
+                    .expect("idle release delay fits timespec")
+            });
+            let ready = loop {
+                match poll(&mut fds, timeout.as_ref()) {
+                    Ok(ready) => break ready,
                     Err(Errno::INTR) => {}
                     Err(error) => return Err(format!("could not poll pipe session: {error}")),
                 }
-            }
+            };
+            self.idle.after_wait(ready > 0, Instant::now());
             let ready = |index: usize, wanted: PollFlags| {
                 !wanted.is_empty() && !fds[index].revents().is_empty()
             };

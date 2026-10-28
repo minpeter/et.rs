@@ -16,19 +16,27 @@ use super::{ActiveSession, SessionError, FLOW_CONTROL_BUFFER_BYTES};
 
 /// Unsent output staged while the client is connected, summed over both
 /// output lanes. Upstream's `TerminalServer` WriteBuffer caps this at 16 MB,
-/// but the queue only has to keep the bounded (256 KiB, `TCP_NOTSENT_LOWAT`)
-/// transport send buffer fed; anything beyond that is resident memory that
-/// only grows when the client is slower than the producer, and stale output
-/// Ctrl+C must discard. The producer is held back by terminal/pipe
-/// backpressure instead of the daemon heap. This bounds admission: output
-/// staged while disconnected drains after reconnection rather than being
-/// evicted.
+/// but the queue only has to keep the transport fed between writes (its
+/// unsent bytes are bounded by `TCP_NOTSENT_LOWAT` on Linux); anything beyond
+/// that is resident memory that only grows when the client is slower than
+/// the producer, and stale output Ctrl+C must discard. The producer is held
+/// back by terminal/pipe backpressure instead of the daemon heap. This bounds
+/// admission: output staged while disconnected drains after reconnection
+/// rather than being evicted.
 pub(super) const CONNECTED_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 /// `OutputQueue` bounds its terminal and control lanes independently, so
 /// terminal floods never starve keepalives or forwarding. Each connected lane
 /// gets half of [`CONNECTED_OUTPUT_BYTES`]; 1 MiB still spans several
-/// transport send-buffer refills.
+/// transport send-buffer refills and admits the largest single packet a
+/// terminal or jump terminal relays.
 const CONNECTED_LANE_BYTES: usize = CONNECTED_OUTPUT_BYTES / 2;
+/// Terminal output the bridge reads ahead while a default-buffered client is
+/// connected. Admission still takes one packet up to the whole lane, but
+/// the bridge stops reading the terminal past this, so a keystroke echo
+/// waits behind less flood: during a `yes` flood, echo dropped from about
+/// 25 to 15 ms against reading up to the 1 MiB lane, throughput unchanged.
+/// Eight times the unsent-byte bound still keeps the transport fed.
+const CONNECTED_TERMINAL_READ_AHEAD: usize = 256 * 1024;
 /// Per-lane bound while no client is connected; both lanes together may
 /// stage twice this until reconnection.
 const DISCONNECTED_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
@@ -59,6 +67,10 @@ struct WriterState {
     unrecoverable: bool,
     default_buffering: bool,
     input: et_core::output_interrupt::InterruptInput,
+    /// An interrupt flush dropped output, so the bridge must drain and
+    /// discard what the terminal already emitted before it delivers that
+    /// input (upstream `drainDiscardReadableBytes`).
+    interrupt_drain: bool,
     /// A blocking writer is parked in [`FlowControl::next_item`]. Only it
     /// needs an enqueue wake: the Unix session loop pumps output itself, and
     /// an unconditional notify costs a futex syscall per packet.
@@ -97,6 +109,12 @@ impl WriterState {
         }
     }
 
+    /// Terminal bytes past which the bridge stops reading the terminal, if
+    /// that is below the lane bound.
+    fn terminal_read_ahead(&self) -> Option<usize> {
+        (self.default_buffering && self.connected).then_some(CONNECTED_TERMINAL_READ_AHEAD)
+    }
+
     /// Clears the bridge waits whose refusal has cleared and reports whether
     /// any did. Each refused lane resumes on its own occupancy: half of its
     /// byte budget and packet slots free, so a saturated stream refills in
@@ -106,7 +124,11 @@ impl WriterState {
         let drained = self.queue.is_empty();
         let mut ready = false;
         if self.bridge_waiting.terminal
-            && (drained || self.queue.can_resume(OutputLane::Terminal, resume_bytes))
+            && (drained
+                || (self.queue.can_resume(OutputLane::Terminal, resume_bytes)
+                    && self
+                        .terminal_read_ahead()
+                        .is_none_or(|ahead| self.queue.terminal_bytes() <= ahead / 2)))
         {
             self.bridge_waiting.terminal = false;
             ready = true;
@@ -154,6 +176,7 @@ impl FlowControl {
                 unrecoverable: false,
                 default_buffering: limit == CONNECTED_LANE_BYTES,
                 input: et_core::output_interrupt::InterruptInput::default(),
+                interrupt_drain: false,
                 writer_waiting: false,
             }),
             wake: Condvar::new(),
@@ -347,20 +370,41 @@ impl FlowControl {
         }
     }
 
-    pub(super) fn observe_input(&self, bytes: &[u8]) -> Result<usize, SessionError> {
+    pub(super) fn observe_input(&self, bytes: &[u8]) -> Result<(), SessionError> {
         let mut state = self.state.lock().map_err(|_| SessionError::Unavailable)?;
-        let dropped = if state.input.feed(bytes) {
-            state.queue.flush_terminal_on_interrupt()
-        } else {
-            0
-        };
+        if state.input.feed(bytes) && state.queue.flush_terminal_on_interrupt() > 0 {
+            state.interrupt_drain = true;
+        }
         self.wake.notify_all();
-        Ok(dropped)
+        Ok(())
+    }
+
+    /// Whether input observed since the last call flushed output on
+    /// interrupt, so the bridge must drain the terminal before writing it.
+    pub(super) fn take_interrupt_drain(&self) -> Result<bool, SessionError> {
+        let mut state = self.state.lock().map_err(|_| SessionError::Unavailable)?;
+        Ok(std::mem::take(&mut state.interrupt_drain))
+    }
+
+    /// Queue terminal output drained after an interrupt flush and drop
+    /// every droppable terminal byte; see
+    /// [`OutputQueue::discard_drained_terminal`].
+    pub(super) fn discard_drained_terminal(
+        &self,
+        drained: Vec<Packet>,
+    ) -> Result<(), SessionError> {
+        let mut state = self.state.lock().map_err(|_| SessionError::Unavailable)?;
+        state.queue.discard_drained_terminal(drained);
+        Ok(())
     }
 
     pub(super) fn can_accept_terminal(&self, bytes: usize) -> Result<bool, SessionError> {
         let mut state = self.state.lock().map_err(|_| SessionError::Unavailable)?;
-        let ok = state.stop == StopMode::Running && state.queue.can_accept_terminal(bytes);
+        let ok = state.stop == StopMode::Running
+            && state.queue.can_accept_terminal(bytes)
+            && state
+                .terminal_read_ahead()
+                .is_none_or(|ahead| state.queue.terminal_bytes().saturating_add(bytes) <= ahead);
         if !ok {
             state.bridge_waiting.terminal = true;
         }
@@ -473,21 +517,22 @@ impl FlowControl {
         state.writer_waiting = true;
         let mut state = self.wake.wait_while(state, writer_must_wait).ok()?;
         state.writer_waiting = false;
-        self.take_item(&mut state)
+        self.take_item(&mut state, true)
     }
 
     /// [`Self::next_item`] for the session loop: `None` wherever a blocking
-    /// writer would wait.
+    /// writer would wait, and while only terminal output is queued and
+    /// `terminal` is false (the client's output window is full).
     #[cfg(unix)]
-    fn try_next_item(&self) -> Option<(Packet, bool)> {
+    fn try_next_item(&self, terminal: bool) -> Option<(Packet, bool)> {
         let mut state = self.state.lock().ok()?;
         if writer_must_wait(&mut state) {
             return None;
         }
-        self.take_item(&mut state)
+        self.take_item(&mut state, terminal)
     }
 
-    fn take_item(&self, state: &mut WriterState) -> Option<(Packet, bool)> {
+    fn take_item(&self, state: &mut WriterState, terminal: bool) -> Option<(Packet, bool)> {
         match state.stop {
             StopMode::Hard => None,
             StopMode::Graceful
@@ -502,7 +547,11 @@ impl FlowControl {
                     self.wake.notify_all();
                     return Some((packet, true));
                 }
-                let packet = state.queue.take()?;
+                let packet = if terminal {
+                    state.queue.take()?
+                } else {
+                    state.queue.take_control()?
+                };
                 state.in_flight = true;
                 #[cfg(test)]
                 self.wake.notify_all();
@@ -520,6 +569,19 @@ impl FlowControl {
             state.pending_live_in_flight = Some(packet);
             state.in_flight = false;
             self.wake.notify_all();
+        }
+    }
+
+    /// The session loop took `packet` but the transport had no room to start
+    /// its frame: put it back at the front, still droppable on interrupt.
+    #[cfg(unix)]
+    fn return_unstarted(&self, packet: Packet) {
+        if let Ok(mut state) = self.state.lock() {
+            state.in_flight = false;
+            state.queue.restore_front(packet);
+            if state.paused {
+                self.wake.notify_all();
+            }
         }
     }
 
@@ -675,15 +737,22 @@ pub(crate) struct OutputPump<'a> {
     /// Packet whose frame is partly on the wire. It keeps its queue capacity
     /// and the in-flight state recovery waits on until the frame completes.
     live: Option<Packet>,
+    /// When queued output started waiting for transport room to start its
+    /// next frame; see [`writer::write_nonblocking`].
+    room_wait: Option<Instant>,
 }
 
 #[cfg(unix)]
 pub(crate) struct PumpOutcome {
-    /// Live-write deadline while a frame waits for transport room.
+    /// Live-write deadline while a frame, or queued output that has no
+    /// transport room to start one, waits for the client socket to drain.
     pub(crate) deadline: Option<Instant>,
     /// A completion changed state the loop waits on (lane capacity,
     /// connectivity, stop); re-check before sleeping.
     pub(crate) wake: bool,
+    /// Terminal output waits for the client to acknowledge; the loop must
+    /// run again by then, when the output window gives up waiting.
+    pub(crate) window_release: Option<Instant>,
 }
 
 #[cfg(unix)]
@@ -692,16 +761,24 @@ impl<'a> OutputPump<'a> {
         Self {
             session,
             live: None,
+            room_wait: None,
         }
     }
 
-    /// Write until the queue is empty or paused, or a frame waits for room.
-    /// A partly written frame keeps advancing during a recovery pause, which
-    /// waits for it.
-    pub(crate) fn run(&mut self) -> PumpOutcome {
+    /// Write until the queue is empty or paused, or output waits for
+    /// transport room. A partly written frame keeps advancing during a
+    /// recovery pause, which waits for it.
+    ///
+    /// While `bounded`, terminal output also waits whenever the client has
+    /// a whole output window unacknowledged (see [`et_core::output_window`]);
+    /// control packets still go out. The session loop passes false while it
+    /// is not reading the client: acknowledgements could not arrive, and
+    /// terminal input it cannot deliver may be waiting on this output.
+    pub(crate) fn run(&mut self, bounded: bool) -> PumpOutcome {
         let mut outcome = PumpOutcome {
             deadline: None,
             wake: false,
+            window_release: None,
         };
         let Some(flow) = self.session.output_flow() else {
             return outcome;
@@ -709,14 +786,38 @@ impl<'a> OutputPump<'a> {
         loop {
             let (packet, started) = match self.live.take() {
                 Some(packet) => (packet, true),
-                None => match flow.try_next_item() {
-                    Some(item) => item,
-                    None => return outcome,
-                },
+                None => {
+                    outcome.window_release = if bounded {
+                        match self.session.output_window_blocked() {
+                            Ok(release) => release,
+                            Err(_) => return outcome,
+                        }
+                    } else {
+                        None
+                    };
+                    match flow.try_next_item(outcome.window_release.is_none()) {
+                        Some(item) => item,
+                        None => {
+                            self.room_wait = None;
+                            return outcome;
+                        }
+                    }
+                }
             };
-            match writer::write_nonblocking(self.session, flow, &packet, started) {
+            match writer::write_nonblocking(
+                self.session,
+                flow,
+                &packet,
+                started,
+                &mut self.room_wait,
+            ) {
                 writer::NonblockingWrite::Pending(deadline) => {
                     self.live = Some(packet);
+                    outcome.deadline = Some(deadline);
+                    return outcome;
+                }
+                writer::NonblockingWrite::NoRoom(deadline) => {
+                    flow.return_unstarted(packet);
                     outcome.deadline = Some(deadline);
                     return outcome;
                 }
@@ -749,7 +850,7 @@ impl OutputPump<'_> {
     pub(crate) fn run_until_idle(&mut self, stream: &std::net::TcpStream) -> PumpOutcome {
         let mut woke = false;
         loop {
-            let mut outcome = self.run();
+            let mut outcome = self.run(true);
             woke |= outcome.wake;
             let Some(deadline) = outcome.deadline else {
                 outcome.wake = woke;

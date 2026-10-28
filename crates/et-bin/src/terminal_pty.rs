@@ -23,7 +23,11 @@ use sysinfo::{
     Pid as SystemPid, ProcessRefreshKind, ProcessesToUpdate, Signal as SystemSignal, System,
 };
 
-const MAX_OUTPUT_CHUNK: usize = 32 * 1024;
+/// Terminal output per router packet, upstream's `BUF_SIZE`
+/// (`UserTerminalHandlerUnix.cpp`). etserver sends each packet as one frame
+/// once the client transport has room, below the 32 KiB unsent low-water
+/// mark, so the kernel takes the whole frame and Ctrl+C can drop the rest.
+const MAX_OUTPUT_CHUNK: usize = 16 * 1024;
 const FINAL_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[path = "terminal_tmux_filter.rs"]
@@ -1239,6 +1243,69 @@ mod tests {
         );
         assert_eq!(output, b"\x1bP1000p%output %0 hi\nwall\n\x1b\\\0\xff");
         assert_eq!(std::env::var_os("SSH_TTY"), inherited);
+    }
+
+    /// An idle `etterminal` used to keep its allocator cache and the dirty
+    /// pages its last output burst freed for the rest of the session.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn quiet_pty_session_returns_its_allocator_cache() {
+        use tikv_jemalloc_ctl::{Access, AsName};
+
+        // Given: a PTY session that forwarded its shell's output.
+        let (router, mut peer) = et_net::local::wake_pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        write_local_packet(
+            &mut peer,
+            &Packet::new(
+                TerminalPacketType::TerminalInit as u8,
+                TermInit::default().encode_to_vec(),
+            ),
+        )
+        .unwrap();
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "printf QUIET-SESSION-READY; exec sleep 30"]);
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = run_with_command(
+                router,
+                "xterm",
+                command,
+                Duration::ZERO,
+                RouterFraming::Upstream,
+                None,
+                |_| Ok(()),
+            );
+            let enabled: bool = b"thread.tcache.enabled\0".name().read().unwrap();
+            let _ = done_tx.send((result, enabled));
+        });
+        let mut output = Vec::new();
+        while !output
+            .windows(b"QUIET-SESSION-READY".len())
+            .any(|part| part == b"QUIET-SESSION-READY")
+        {
+            let packet = read_local_packet(&mut peer).unwrap();
+            assert_eq!(packet.header(), TerminalPacketType::TerminalBuffer as u8);
+            output.extend(
+                TerminalBuffer::decode(packet.payload())
+                    .unwrap()
+                    .buffer
+                    .unwrap(),
+            );
+        }
+
+        // When: the session stays quiet past the release delay, then closes.
+        thread::sleep(et_server::idle_memory::IDLE_RELEASE_DELAY + Duration::from_millis(500));
+        write_local_packet(
+            &mut peer,
+            &Packet::new(TerminalPacketType::TerminalClose as u8, Vec::new()),
+        )
+        .unwrap();
+
+        // Then: the session loop had handed its cache back.
+        let (result, enabled) = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        result.unwrap();
+        assert!(!enabled, "idle terminal kept its thread cache");
     }
 
     #[test]

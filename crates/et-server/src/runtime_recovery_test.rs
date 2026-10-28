@@ -242,12 +242,25 @@ fn read_upstream(terminal: &mut et_net::local::LocalStream) -> Packet {
 }
 
 fn handshake(address: SocketAddr) -> (TcpStream, ConnectResponse) {
-    let mut stream = TcpStream::connect(address).unwrap();
+    handshake_on(TcpStream::connect(address).unwrap())
+}
+
+fn handshake_on(mut stream: TcpStream) -> (TcpStream, ConnectResponse) {
     stream.set_read_timeout(Some(TIMEOUT)).unwrap();
     stream.set_write_timeout(Some(TIMEOUT)).unwrap();
     write_proto(&mut stream, &client_request(ID)).unwrap();
     let response = read_proto_limited(&mut stream, 64 * 1024).unwrap();
     (stream, response)
+}
+
+/// A client socket whose receive window is fixed at `bytes` from the SYN, so
+/// output beyond it stays in the server's send queue until the client reads.
+fn connect_with_receive_buffer(address: SocketAddr, bytes: usize) -> TcpStream {
+    use rustix::net::{connect, socket, sockopt, AddressFamily, SocketType};
+    let socket = socket(AddressFamily::INET, SocketType::STREAM, None).unwrap();
+    sockopt::set_socket_recv_buffer_size(&socket, bytes).unwrap();
+    connect(&socket, &address).unwrap();
+    TcpStream::from(socket)
 }
 
 #[test]
@@ -536,4 +549,127 @@ fn terminal_hup_releases_session_whose_held_output_no_client_can_recover() {
         }
         runtime.shutdown().unwrap();
     }
+}
+
+#[test]
+fn ended_terminal_keeps_the_transport_open_until_the_client_reads_its_last_output() {
+    // Given: an `et -T` session whose client window is smaller than the
+    // command's last output, so most of it waits in etserver's send queue.
+    // What waits unsent stays below the 32 KiB unsent-data low-water mark,
+    // so the bridge can still queue the exit status after it and end.
+    const OUTPUT: usize = 36 * 1024;
+    let directory = TestDirectory::new();
+    let router_path = select_router_path_for(
+        rustix::process::getuid().as_raw(),
+        Some(&directory.socket()),
+        None,
+        None,
+    )
+    .unwrap();
+    let mut runtime = Runtime::start(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, router_path).unwrap();
+    let address = runtime.tcp_addresses()[0];
+    let mut terminal = register(&directory.socket(), &runtime.handle());
+    let (stream, response) = handshake_on(connect_with_receive_buffer(address, 4 * 1024));
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let mut client = Connection::new_client(stream, &passkey_to_key(KEY).unwrap());
+    let payload = InitialPayload {
+        jumphost: Some(false),
+        reversetunnels: Vec::new(),
+        environmentvariables: HashMap::new(),
+        flowcontrol: None,
+        no_pty: Some(true),
+        command: Some(format!("head -c {OUTPUT} /dev/zero")),
+        supports_exit_status: Some(true),
+        no_shell: None,
+        disconnect_timeout_seconds: None,
+    };
+    client.write_packet(253, &payload.encode_to_vec()).unwrap();
+    let initial = client.read_packet().unwrap();
+    assert_eq!(
+        InitialResponse::decode(initial.payload()).unwrap().error,
+        None
+    );
+    assert_eq!(
+        read_local_packet(&mut terminal).unwrap().header(),
+        TerminalPacketType::TerminalInit as u8
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    let session = loop {
+        if let Some(session) = runtime.core.sessions.active(ID).unwrap() {
+            break std::sync::Arc::downgrade(&session);
+        }
+        assert!(Instant::now() < deadline, "session never became active");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+
+    // When: the command writes that output and exits, and after the bridge
+    // has ended the client sends the keep-alive `et` sends per 512 KiB read.
+    let output = TerminalBuffer {
+        buffer: Some(vec![b'x'; OUTPUT]),
+        is_stderr: None,
+    };
+    write_local_packet(
+        &mut terminal,
+        &Packet::new(
+            TerminalPacketType::TerminalBuffer as u8,
+            output.encode_to_vec(),
+        ),
+    )
+    .unwrap();
+    let status = et_core::proto::TerminalExitStatus { exitcode: Some(3) };
+    write_local_packet(
+        &mut terminal,
+        &Packet::new(
+            TerminalPacketType::TerminalExitStatus as u8,
+            status.encode_to_vec(),
+        ),
+    )
+    .unwrap();
+    drop(terminal);
+    while session
+        .upgrade()
+        .is_some_and(|session| !session.is_shutting_down())
+    {
+        assert!(Instant::now() < deadline, "the terminal bridge never ended");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    client
+        .write_packet(TerminalPacketType::KeepAlive as u8, &[])
+        .unwrap();
+
+    // Then: the client still reads all of the output, the exit status, and
+    // EOF, instead of a connection reset that discarded the queued tail.
+    let mut received = 0;
+    let exitcode = loop {
+        let packet = client.read_packet().unwrap_or_else(|error| {
+            panic!("lost the session tail after {received} bytes: {error:?}")
+        });
+        match packet.header() {
+            header if header == TerminalPacketType::TerminalBuffer as u8 => {
+                received += et_core::packet::decode_terminal_buffer(packet.payload())
+                    .map(|(bytes, _)| bytes.len())
+                    .unwrap_or_else(|| {
+                        TerminalBuffer::decode(packet.payload())
+                            .unwrap()
+                            .buffer
+                            .unwrap_or_default()
+                            .len()
+                    });
+            }
+            header if header == TerminalPacketType::TerminalExitStatus as u8 => {
+                break et_core::proto::TerminalExitStatus::decode(packet.payload())
+                    .unwrap()
+                    .exitcode;
+            }
+            header => assert_eq!(header, TerminalPacketType::KeepAlive as u8),
+        }
+    };
+    assert_eq!(received, OUTPUT);
+    assert_eq!(exitcode, Some(3));
+    assert!(
+        client.read_packet().is_err(),
+        "EOF must follow the exit status"
+    );
+    drop(client);
+    runtime.shutdown().unwrap();
 }

@@ -4,7 +4,7 @@ use std::io;
 use std::io::Write;
 use std::net::{Shutdown, TcpStream};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::{ConnError, Connection, PreparedWrite, WritePacketError};
 use crate::connection_nonblocking::wait_writable;
@@ -14,11 +14,18 @@ use crate::connection_nonblocking::wait_writable;
 // data packet never spills 22 leftover bytes across an extra poll/advance cycle.
 const WRITE_QUANTUM: usize = 256 * 1024;
 
+/// What the peer has sent so far: packets this side read (reader sequence)
+/// and bytes still queued unread in the kernel.
+type InboundMark = (i64, u64);
+
 pub(super) struct PendingWrite {
     stream: Arc<TcpStream>,
     frame: Arc<Vec<u8>>,
     offset: usize,
     pub(super) deadline: Instant,
+    /// What the peer had sent at the last elapsed deadline, and when it was
+    /// last known to be sending (see [`Self::defer_while_peer_talks`]).
+    heard: Option<(InboundMark, Instant)>,
 }
 
 impl PreparedWrite {
@@ -28,11 +35,38 @@ impl PreparedWrite {
             frame,
             offset: 0,
             deadline: Instant::now() + timeout,
+            heard: None,
         })
     }
 }
 
 impl PendingWrite {
+    /// Moves an elapsed deadline while the peer is still sending, for at
+    /// most `silence` after it was last heard, `timeout` at a time. `inbound`
+    /// marks what the peer has sent so far (see [`Connection::inbound_mark`]):
+    /// it changes iff bytes arrived since the previous check, whether or not
+    /// this side has read them. The start of the live-write wait (one
+    /// `timeout` before the first deadline) counts as hearing the peer, so a
+    /// peer that never speaks fails `silence` after it.
+    fn defer_while_peer_talks(
+        &mut self,
+        inbound: InboundMark,
+        now: Instant,
+        silence: Duration,
+        timeout: Duration,
+    ) {
+        let heard_at = match self.heard {
+            Some((seen, at)) if seen == inbound => at,
+            Some(_) => now,
+            None => self.deadline.checked_sub(timeout).unwrap_or(now),
+        };
+        self.heard = Some((inbound, heard_at));
+        let limit = heard_at + silence;
+        if now < limit {
+            self.deadline = limit.min(now + timeout);
+        }
+    }
+
     fn advance(&mut self) -> io::Result<bool> {
         if Instant::now() >= self.deadline {
             return Err(io::Error::new(
@@ -151,6 +185,40 @@ impl Connection {
         self.pending_live.is_some()
     }
 
+    /// Whether the transport has room to start another live frame: the
+    /// kernel reports the socket writable, which under `TCP_NOTSENT_LOWAT`
+    /// means unsent bytes below half the low-water mark. Upstream
+    /// `drainWriteBufferToClient` (`TerminalServer.cpp`) checks
+    /// `isSocketWritable` before every packet for the same reason: a frame
+    /// started without room stays mostly unsent, where an interrupt can no
+    /// longer drop it. Errors and hangup count as room, so the write itself
+    /// reports them.
+    #[cfg(unix)]
+    pub fn has_write_room(&self) -> bool {
+        use rustix::event::{poll, PollFd, PollFlags, Timespec};
+        let mut descriptors = [PollFd::new(&*self.stream, PollFlags::OUT)];
+        let now = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        !matches!(poll(&mut descriptors, Some(&now)), Ok(0))
+    }
+
+    /// When output that has waited for transport room since `since` must
+    /// fail like a stuck frame: one live-write timeout later.
+    pub fn live_write_deadline(&self, since: Instant) -> Instant {
+        since + self.live_write_timeout
+    }
+
+    /// Count the retained frame's live-write deadline from `since`: its
+    /// output already waited that long for transport room before it started.
+    pub fn backdate_pending_write(&mut self, since: Instant) {
+        let deadline = self.live_write_deadline(since);
+        if let Some(pending) = self.pending_live.as_mut() {
+            pending.deadline = pending.deadline.min(deadline);
+        }
+    }
+
     /// Block (bounded by the frame's original deadline) until the retained
     /// partial frame is on the wire. For terminal paths such as a final
     /// `TerminalClose`, which must follow that frame rather than be refused.
@@ -172,6 +240,20 @@ impl Connection {
     /// Advance one bounded partial write. Call on writable readiness, or at
     /// its absolute deadline; reads remain independently serviceable.
     pub fn advance_write(&mut self) -> Result<bool, WritePacketError> {
+        if let Some(silence) = self.peer_silence {
+            let now = Instant::now();
+            if self
+                .pending_live
+                .as_ref()
+                .is_some_and(|pending| now >= pending.deadline)
+            {
+                let inbound = self.inbound_mark();
+                let timeout = self.live_write_timeout;
+                if let Some(pending) = self.pending_live.as_mut() {
+                    pending.defer_while_peer_talks(inbound, now, silence, timeout);
+                }
+            }
+        }
         let Some(pending) = self.pending_live.as_mut() else {
             return Ok(true);
         };
@@ -186,6 +268,17 @@ impl Connection {
                 Err(WritePacketError::ReplayOwned(ConnError::Io(error)))
             }
         }
+    }
+
+    /// See [`InboundMark`]. A session can stop reading its client while its
+    /// own replies are held behind a stuck frame, so packets the peer sent
+    /// count whether or not they were read yet.
+    fn inbound_mark(&self) -> InboundMark {
+        #[cfg(unix)]
+        let unread = rustix::io::ioctl_fionread(&*self.stream).unwrap_or(0);
+        #[cfg(not(unix))]
+        let unread = 0;
+        (self.reader().sequence(), unread)
     }
 }
 

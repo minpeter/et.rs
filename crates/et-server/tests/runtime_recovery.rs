@@ -742,7 +742,7 @@ fn failed_recover_leaves_live_session_intact() {
 }
 
 #[test]
-fn keepalive_echo_acknowledges_everything_read_from_the_client() {
+fn keepalive_echo_acknowledges_the_client_only_when_that_is_news() {
     let mut server = TestRuntime::start();
     let _terminal = server.register(ID_A, KEY_A);
     let (stream, response) = server.handshake(ID_A);
@@ -754,28 +754,71 @@ fn keepalive_echo_acknowledges_everything_read_from_the_client() {
         .handle
         .wait_for_state(ID_A, SessionState::Active, TIMEOUT)
         .unwrap();
+    let exchange = |client: &mut et_net::connection::Connection, ack: &[u8]| {
+        client
+            .write_packet(TerminalPacketType::KeepAlive as u8, ack)
+            .unwrap();
+        let echo = client.read_packet().unwrap();
+        assert_eq!(echo.header(), TerminalPacketType::KeepAlive as u8);
+        et_core::keepalive::decode_ack(echo.payload())
+    };
 
     // An acknowledging keep-alive is echoed with the server's own ack: the
     // count of every packet the client has written (the server processes
     // packets in order, so by the time it echoes it has read them all).
     let ack = client.keepalive_ack();
+    assert_eq!(exchange(&mut client, &ack), Some(client.writer_sequence()));
+
+    // Keep-alives alone are not news: upstream's empty echo, until enough
+    // of them accumulate that the client's replay backup should trim.
+    let floor = et_core::backed_writer::ACK_RETAIN_FLOOR_PACKETS;
+    for _ in 1..floor {
+        let ack = client.keepalive_ack();
+        assert_eq!(exchange(&mut client, &ack), None);
+    }
+    let ack = client.keepalive_ack();
+    assert_eq!(exchange(&mut client, &ack), Some(client.writer_sequence()));
+
+    // Terminal input is news.
     client
-        .write_packet(TerminalPacketType::KeepAlive as u8, &ack)
+        .write_packet(TerminalPacketType::TerminalInfo as u8, b"input")
         .unwrap();
-    let written = client.writer_sequence();
-    let echo = client.read_packet().unwrap();
-    assert_eq!(echo.header(), TerminalPacketType::KeepAlive as u8);
-    assert_eq!(
-        et_core::keepalive::decode_ack(echo.payload()),
-        Some(written)
-    );
+    let ack = client.keepalive_ack();
+    assert_eq!(exchange(&mut client, &ack), Some(client.writer_sequence()));
 
     // A legacy empty keep-alive still gets an echo.
-    client
-        .write_packet(TerminalPacketType::KeepAlive as u8, &[])
+    exchange(&mut client, &[]);
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
+fn keepalive_echo_stays_empty_for_a_client_that_never_acknowledges() {
+    let mut server = TestRuntime::start();
+    let _terminal = server.register(ID_A, KEY_A);
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let key = passkey_to_key(KEY_A).unwrap();
+    let (mut client, initial) = initialize(stream, &key, default_payload());
+    assert_eq!(initial.error, None);
+    server
+        .handle
+        .wait_for_state(ID_A, SessionState::Active, TIMEOUT)
         .unwrap();
-    let echo = client.read_packet().unwrap();
-    assert_eq!(echo.header(), TerminalPacketType::KeepAlive as u8);
+    // Upstream C++ clients send empty keep-alives and get upstream's empty
+    // echoes, even after terminal input.
+    for input in [false, true, false] {
+        if input {
+            client
+                .write_packet(TerminalPacketType::TerminalInfo as u8, b"input")
+                .unwrap();
+        }
+        client
+            .write_packet(TerminalPacketType::KeepAlive as u8, &[])
+            .unwrap();
+        let echo = client.read_packet().unwrap();
+        assert_eq!(echo.header(), TerminalPacketType::KeepAlive as u8);
+        assert!(echo.payload().is_empty(), "{:?}", echo.payload());
+    }
     server.runtime.shutdown().unwrap();
 }
 

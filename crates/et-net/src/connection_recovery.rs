@@ -8,6 +8,7 @@ use et_core::backed_writer::{
     MAX_RECOVERY_BACKUP_BYTES,
 };
 use et_core::crypto::EPOCH_SALT_BYTES;
+use et_core::keepalive::AckSchedule;
 use et_core::packet::Packet;
 use et_core::proto::{CatchupBuffer, SequenceHeader};
 use prost::Message;
@@ -87,7 +88,13 @@ impl Connection {
             writer: self.writer.clone(),
             reader: std::sync::Arc::new(std::sync::Mutex::new(self.reader().clone())),
             live_write_timeout: self.live_write_timeout,
+            peer_silence: self.peer_silence,
             pending_live: None,
+            acks: AckSchedule::default(),
+            output_window: self
+                .output_window
+                .as_ref()
+                .map(et_core::output_window::OutputWindow::for_new_transport),
         };
         candidate.disconnect();
         candidate
@@ -117,6 +124,7 @@ impl Connection {
                 let catchup = if let Some(salt) = exchange.reset_salt.as_ref() {
                     self.reader().reset(salt).map_err(|_| invalid_reset())?;
                     self.writer.reset(salt).map_err(|_| invalid_reset())?;
+                    self.restart_output_window();
                     Vec::new()
                 } else {
                     remote_catchup.buffer
@@ -151,12 +159,14 @@ impl Connection {
             )));
         }
         self.disconnect();
+        self.acks = AckSchedule::default();
         let deadline = recovery_deadline(timeout)?;
         match self.exchange_recovery(deadline, exchange) {
             Ok(remote_catchup) => {
                 let salt = exchange.reset_salt.as_ref().unwrap();
                 self.reader().reset(salt).map_err(|_| invalid_reset())?;
                 self.writer.reset(salt).map_err(|_| invalid_reset())?;
+                self.restart_output_window();
                 if !remote_catchup.buffer.is_empty() {
                     return Err(ConnError::Io(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -319,6 +329,14 @@ impl Connection {
                     return Err(ConnError::Io(error));
                 }
             }
+        }
+    }
+
+    /// A writer reset restarts sequences and the client's own record of our
+    /// acknowledgements, so the output bound starts over too.
+    fn restart_output_window(&mut self) {
+        if let Some(window) = self.output_window.as_mut() {
+            *window = et_core::output_window::OutputWindow::default();
         }
     }
 }

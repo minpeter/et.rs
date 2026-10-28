@@ -112,9 +112,14 @@ impl ActiveSession {
                 .minimize_output_buffering()
                 .map_err(SessionError::Connection)?;
         }
-        let ack = candidate.keepalive_ack();
+        // The first keep-alive on the new transport acknowledges what was
+        // read from an et.rs client; an upstream client gets it empty.
+        let ack = candidate.next_keepalive_ack(et_core::keepalive::AckSide::Responder, false);
         candidate
-            .write_packet_live(TerminalPacketType::KeepAlive as u8, &ack)
+            .write_packet_live(
+                TerminalPacketType::KeepAlive as u8,
+                et_core::keepalive::ack_bytes(&ack),
+            )
             .map_err(SessionError::Connection)?;
         let new_control = candidate
             .try_clone_stream()

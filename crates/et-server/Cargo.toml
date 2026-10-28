@@ -20,11 +20,16 @@ prost = "0.13"
 nix = { version = "0.31.3", default-features = false, features = ["socket", "user"] }
 rustix = { version = "1.1.4", features = ["event", "fs", "net", "process", "time"] }
 
+# No `stats` feature in the shipped allocator: nothing reads the statistics,
+# and with them every process pays for their tables (~120 KiB of dirty pages
+# in each terminal once it first calls into the allocator's control API).
 [target.'cfg(target_os = "linux")'.dependencies]
-tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats"] }
+tikv-jemalloc-ctl = "0.7.0"
 
 # The idle-release policy only exists when jemalloc is the active allocator,
-# which the shipped binary installs. The unit test installs it too so it
-# exercises the real control path instead of the system allocator.
+# which the shipped binary installs. The unit tests install it too so they
+# exercise the real control path instead of the system allocator, and read
+# its statistics to check what a release returned.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats"] }
 tikv-jemallocator = "0.7.0"

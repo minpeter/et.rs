@@ -9,6 +9,13 @@ use crate::proto::{TerminalBuffer, TerminalPacketType};
 
 const FRAME_BYTES: usize = std::mem::size_of::<u32>();
 pub(crate) const MAX_PACKETS_PER_LANE: usize = 4096;
+/// Largest terminal buffer queued output is merged into, upstream
+/// `TerminalServer`'s `BUF_SIZE`: its `drainWriteBufferToClient` sends the
+/// `WriteBuffer` byte stream as `TERMINAL_BUFFER` packets of up to 16 KiB.
+/// See [`OutputQueue::append_terminal`]. With the client's backlog bounded by
+/// [`crate::output_window`], 32 KiB packets measured the same echo latency
+/// but left about half again as much output on screen after Ctrl+C.
+pub(crate) const COALESCED_TERMINAL_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlowControlMode {
@@ -72,22 +79,10 @@ impl OutputQueue {
         }
     }
 
-    fn push_terminal(&mut self, mut packet: Packet) -> Result<(), QueuePushError> {
-        if self.skip_until_newline {
-            if let Ok(mut message) = TerminalBuffer::decode(packet.payload()) {
-                if let Some(bytes) = &mut message.buffer {
-                    let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') else {
-                        return Ok(());
-                    };
-                    self.skip_until_newline = false;
-                    bytes.drain(..=newline);
-                    if bytes.is_empty() {
-                        return Ok(());
-                    }
-                    packet = Packet::new(packet.header(), message.encode_to_vec());
-                }
-            }
-        }
+    fn push_terminal(&mut self, packet: Packet) -> Result<(), QueuePushError> {
+        let Some(mut packet) = self.skip_through_newline(packet) else {
+            return Ok(());
+        };
         if packet_cost(&packet) > self.limit {
             if self.mode == FlowControlMode::Backpressure {
                 return Err(QueuePushError::Oversized(packet));
@@ -110,8 +105,43 @@ impl OutputQueue {
             self.terminal_bytes -= packet_cost(&removed);
             self.terminal_packets -= 1;
         }
-        self.terminal_bytes += wanted;
-        self.terminal_packets += 1;
+        self.append_terminal(packet);
+        Ok(())
+    }
+
+    /// After an interrupt flush cut a line short, drop terminal output
+    /// through the next newline. `None` when nothing of `packet` remains.
+    fn skip_through_newline(&mut self, packet: Packet) -> Option<Packet> {
+        if !self.skip_until_newline {
+            return Some(packet);
+        }
+        let Ok(mut message) = TerminalBuffer::decode(packet.payload()) else {
+            return Some(packet);
+        };
+        let Some(bytes) = &mut message.buffer else {
+            return Some(packet);
+        };
+        let newline = bytes.iter().position(|byte| *byte == b'\n')?;
+        self.skip_until_newline = false;
+        bytes.drain(..=newline);
+        if bytes.is_empty() {
+            return None;
+        }
+        Some(Packet::new(packet.header(), message.encode_to_vec()))
+    }
+
+    /// Admit terminal output without the lane bound.
+    ///
+    /// Output the writer has not taken yet is merged into the last queued
+    /// terminal packet, up to [`COALESCED_TERMINAL_BYTES`]. A terminal
+    /// emits a flood in reads of a few lines, and every packet goes to the
+    /// socket as its own segment; a backlog of such segments has a poor
+    /// payload-to-memory ratio in the peer's receive queue, so Linux keeps
+    /// growing that queue (several MB of output ahead of the next keystroke
+    /// echo, out of Ctrl+C's reach) and the bytes on the wire carry a frame
+    /// and an authentication tag every few lines. Output that is written as
+    /// soon as it arrives is never merged, so this adds no latency.
+    fn append_terminal(&mut self, packet: Packet) {
         let may_contain_control =
             if let Some((bytes, _)) = crate::packet::decode_terminal_buffer(packet.payload()) {
                 self.stream.may_contain_control(bytes)
@@ -124,8 +154,24 @@ impl OutputQueue {
         if may_contain_control {
             self.promotion_pending = true;
         }
+        if let (Some(back), Some((bytes, is_stderr))) = (
+            self.terminal.back_mut(),
+            crate::packet::decode_terminal_buffer(packet.payload()),
+        ) {
+            let before = packet_cost(back);
+            if crate::packet::append_terminal_buffer(
+                back,
+                bytes,
+                is_stderr,
+                COALESCED_TERMINAL_BYTES,
+            ) {
+                self.terminal_bytes = self.terminal_bytes - before + packet_cost(back);
+                return;
+            }
+        }
+        self.terminal_bytes += packet_cost(&packet);
+        self.terminal_packets += 1;
         self.terminal.push_back(packet);
-        Ok(())
     }
 
     fn push_control(&mut self, packet: Packet) -> Result<(), QueuePushError> {
@@ -165,6 +211,15 @@ impl OutputQueue {
                     .observe(message.buffer.as_deref().unwrap_or_default());
             }
         }
+        Some(packet)
+    }
+
+    /// Take only from the control lane, while terminal output waits (see
+    /// [`crate::output_window`]). Terminal output stays queued, where an
+    /// interrupt can still drop it, and goes first once it may.
+    pub fn take_control(&mut self) -> Option<Packet> {
+        let packet = self.control.pop_front()?;
+        self.prefer_terminal = true;
         Some(packet)
     }
 
@@ -227,13 +282,45 @@ impl OutputQueue {
         self.terminal.is_empty() && self.control.is_empty()
     }
 
+    /// Queued terminal-lane bytes, framing included.
+    pub fn terminal_bytes(&self) -> usize {
+        self.terminal_bytes
+    }
+
     pub fn bytes(&self) -> usize {
         self.terminal_bytes + self.control_bytes
     }
 
-    /// Drop only unsequenced terminal bytes. In-flight reservations and the
+    /// Drop only unsequenced terminal bytes, once at least
+    /// [`crate::output_interrupt::FLUSH_THRESHOLD`] of them is queued
+    /// (upstream `WriteBuffer::flushIfLarge`). In-flight reservations and the
     /// independent control lane are untouched, so replay stays contiguous.
     pub fn flush_terminal_on_interrupt(&mut self) -> usize {
+        self.filter_terminal(crate::output_interrupt::FLUSH_THRESHOLD)
+    }
+
+    /// Queue terminal output the producer had already emitted when an
+    /// interrupt flush dropped data, then drop every droppable queued
+    /// terminal byte regardless of size: upstream `drainDiscardReadableBytes`
+    /// enqueues into the `WriteBuffer` and calls `filterDroppable`. The lane
+    /// bound is not applied; the filter leaves only bytes a tmux control
+    /// client still needs.
+    pub fn discard_drained_terminal(&mut self, drained: impl IntoIterator<Item = Packet>) -> usize {
+        let mut appended = false;
+        for packet in drained {
+            debug_assert!(is_terminal_output(&packet));
+            appended = true;
+            if let Some(packet) = self.skip_through_newline(packet) {
+                self.append_terminal(packet);
+            }
+        }
+        if !appended {
+            return 0;
+        }
+        self.filter_terminal(0)
+    }
+
+    fn filter_terminal(&mut self, threshold: usize) -> usize {
         let mut bytes = Vec::new();
         let mut lengths = Vec::new();
         let mut stderr_flags = Vec::new();
@@ -247,7 +334,7 @@ impl OutputQueue {
             stderr_flags.push(message.is_stderr);
             bytes.extend(body);
         }
-        if bytes.len() < crate::output_interrupt::FLUSH_THRESHOLD {
+        if bytes.is_empty() || bytes.len() < threshold {
             return 0;
         }
         let result = self.stream.filter(&bytes);

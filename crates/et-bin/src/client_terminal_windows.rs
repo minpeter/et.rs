@@ -32,7 +32,6 @@ use crate::client_terminal_loop::redirected_input;
 use crate::error::ClientError;
 use crate::initial_connect::ReconnectOutcome;
 
-const MISSED_KEEPALIVES: u32 = 3;
 /// Console/socket cadence, matching upstream's 10ms `select()` timeout.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const FORWARD_BACKLOG_CAPACITY: usize = 257;
@@ -41,7 +40,7 @@ pub fn pump<F>(
     connection: &mut Connection,
     options: crate::client_terminal_loop::PumpOptions<'_>,
     forwarder: &mut Forwarder,
-    mut reconnect: F,
+    mut reconnect_transport: F,
 ) -> Result<i32, ClientError>
 where
     F: FnMut(&mut Connection) -> Result<ReconnectOutcome, ClientError>,
@@ -78,9 +77,16 @@ where
     }
     .map_err(|error| terminal_io("starting console output worker", error))?;
     let interval = Duration::from_secs(u64::from(keepalive_seconds.max(1)));
-    let silence = interval.saturating_mul(MISSED_KEEPALIVES);
-    let mut last_received = Instant::now();
-    let mut next_keepalive = last_received + interval;
+    let keepalive = crate::keepalive_clock::KeepaliveClock::new(interval, Instant::now());
+    // Every recovery, whichever write or verdict started it, gives the new
+    // transport a fresh keep-alive interval.
+    let mut reconnect = |connection: &mut Connection| -> Result<ReconnectOutcome, ClientError> {
+        let outcome = reconnect_transport(connection)?;
+        if outcome == ReconnectOutcome::Recovered {
+            keepalive.alive(Instant::now());
+        }
+        Ok(outcome)
+    };
     if let Ok(path) = std::env::var("ET_SSH_READY") {
         let _ = std::fs::write(path, b"ready");
     }
@@ -280,11 +286,7 @@ where
                         OwnedWriteOutcome::Written => {
                             bytes_since_ack = bytes_since_ack.saturating_add(payload.len());
                         }
-                        OwnedWriteOutcome::Recovered => {
-                            reconnect_needed = false;
-                            last_received = Instant::now();
-                            next_keepalive = last_received + interval;
-                        }
+                        OwnedWriteOutcome::Recovered => reconnect_needed = false,
                         OwnedWriteOutcome::SessionEnded => {
                             return finish_remote_completion(
                                 console_output,
@@ -324,11 +326,7 @@ where
                 OwnedWriteOutcome::Written => {
                     bytes_since_ack = bytes_since_ack.saturating_add(payload.len());
                 }
-                OwnedWriteOutcome::Recovered => {
-                    reconnect_needed = false;
-                    last_received = Instant::now();
-                    next_keepalive = last_received + interval;
-                }
+                OwnedWriteOutcome::Recovered => reconnect_needed = false,
                 OwnedWriteOutcome::SessionEnded => {
                     return finish_remote_completion(
                         console_output,
@@ -435,7 +433,7 @@ where
             }
             match connection.try_read_packet() {
                 Ok(Some(packet)) => {
-                    last_received = Instant::now();
+                    keepalive.alive(Instant::now());
                     if packet.header() == TerminalPacketType::KeepAlive as u8 {
                         if let Some(ack) = et_core::keepalive::decode_ack(packet.payload()) {
                             connection.acknowledge_delivery(ack);
@@ -576,7 +574,11 @@ where
         }
 
         let now = Instant::now();
-        if pending_output.is_none() && now.saturating_duration_since(last_received) >= silence {
+        // Upstream `TerminalClient::run`: a probe still unanswered when the
+        // keep-alive deadline passes again means the link is dead. Held
+        // output stops transport reads, so it never yields a verdict.
+        if !reconnect_needed && keepalive.dead(now, pending_output.is_none()) {
+            et_cli::logging::info("missed a keepalive, reconnecting");
             reconnect_needed = true;
         }
         if reconnect_needed {
@@ -596,26 +598,25 @@ where
                     remote_exit,
                 );
             }
-            last_received = Instant::now();
-            next_keepalive = last_received + interval;
             continue;
         }
-        // Acknowledge by volume as well as on the idle interval: the server
-        // trims its replay backup on the payload and its echo trims ours.
-        if !connection.write_pending()
-            && (Instant::now() >= next_keepalive
-                || (!remote_exit.session_ended()
-                    && bytes_since_ack >= et_core::keepalive::ACK_INTERVAL_BYTES))
-        {
+        // Acknowledge by volume as well as probe on the idle deadline: the
+        // server trims its replay backup on the payload and its echo trims
+        // ours.
+        let probe = keepalive.probe_due(Instant::now());
+        let volume = !remote_exit.session_ended()
+            && bytes_since_ack >= et_core::keepalive::ACK_INTERVAL_BYTES;
+        if !connection.write_pending() && (probe || volume) {
             bytes_since_ack = 0;
-            // The payload acknowledges everything read so far, so the server
-            // can trim its replay backup; legacy servers ignore it.
-            let ack = connection.keepalive_ack();
+            // The payload acknowledges everything read so far when that is
+            // news to the server, so it can trim its replay backup; legacy
+            // servers get upstream's empty keep-alive.
+            let ack = connection.next_keepalive_ack(et_core::keepalive::AckSide::Initiator, volume);
             if matches!(
                 write_owned(
                     connection,
                     TerminalPacketType::KeepAlive as u8,
-                    &ack,
+                    et_core::keepalive::ack_bytes(&ack),
                     &mut reconnect,
                     terminal_enabled,
                 )?,
@@ -633,7 +634,9 @@ where
                     remote_exit,
                 );
             }
-            next_keepalive = Instant::now() + interval;
+            if probe {
+                keepalive.probe_sent(Instant::now());
+            }
         }
 
         // 4. Idle wait. Console events wake this immediately; socket data is

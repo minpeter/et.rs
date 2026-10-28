@@ -19,7 +19,6 @@ impl ActiveSession {
             .ok_or(SessionError::Unavailable)
     }
 
-    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn try_clone_stream(&self) -> Result<(TcpStream, u64), SessionError> {
         let connection = self
             .connection
@@ -71,6 +70,28 @@ impl ActiveSession {
             }
         }
         Ok(packet)
+    }
+
+    /// Whether the client input just read flushed output on interrupt. The
+    /// bridge then drains the terminal before writing that input, as
+    /// upstream `TerminalServer::runTerminal` does.
+    pub(crate) fn take_interrupt_drain(&self) -> Result<bool, SessionError> {
+        match self.output_flow() {
+            Some(flow) => flow.take_interrupt_drain(),
+            None => Ok(false),
+        }
+    }
+
+    /// Stage terminal output drained after an interrupt flush and drop it,
+    /// keeping only what a tmux control client still needs.
+    pub(crate) fn discard_drained_terminal(
+        &self,
+        drained: Vec<et_core::packet::Packet>,
+    ) -> Result<(), SessionError> {
+        match self.output_flow() {
+            Some(flow) => flow.discard_drained_terminal(drained),
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn note_bridge_generation(&self, generation: u64) -> Result<(), SessionError> {
@@ -156,15 +177,44 @@ impl ActiveSession {
         Ok(())
     }
 
-    /// Keep-alive payload acknowledging everything read from the client.
-    pub(crate) fn keepalive_ack(
+    /// Apply a client keep-alive's delivery acknowledgement, if any, and
+    /// build the echo's payload: this side's acknowledgement when it tells
+    /// the client something new, otherwise upstream's empty payload (see
+    /// [`et_core::keepalive::AckSchedule`]).
+    pub(crate) fn keepalive_echo(
         &self,
-    ) -> Result<[u8; et_core::keepalive::ACK_PAYLOAD_LEN], SessionError> {
+        acknowledged: Option<i64>,
+    ) -> Result<Vec<u8>, SessionError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| SessionError::Unavailable)?;
+        if let Some(sequence) = acknowledged {
+            connection.acknowledge_delivery(sequence);
+        }
+        let ack = connection.next_keepalive_ack(et_core::keepalive::AckSide::Responder, false);
+        Ok(et_core::keepalive::ack_bytes(&ack).to_vec())
+    }
+
+    /// When terminal output must wait for the client to acknowledge (see
+    /// [`et_core::output_window`]): `Some` with the time the bound gives up.
+    #[cfg(unix)]
+    pub(crate) fn output_window_blocked(&self) -> Result<Option<Instant>, SessionError> {
         Ok(self
-            .reader
+            .connection
             .lock()
             .map_err(|_| SessionError::Unavailable)?
-            .keepalive_ack())
+            .output_window_blocked(Instant::now()))
+    }
+
+    /// Size the output bound for the round trip the handshake on the
+    /// current transport measured.
+    pub(crate) fn seed_output_round_trip(&self, rtt: Duration) -> Result<(), SessionError> {
+        self.connection
+            .lock()
+            .map_err(|_| SessionError::Unavailable)?
+            .seed_output_round_trip(rtt);
+        Ok(())
     }
 
     pub(crate) fn can_buffer_write(&self, bytes: i64) -> Result<bool, SessionError> {

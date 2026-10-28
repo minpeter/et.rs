@@ -928,4 +928,45 @@ mod tests {
             }
         }
     }
+
+    /// An idle `et -T` terminal used to keep its allocator cache for the rest
+    /// of the session.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn quiet_pipe_session_returns_its_allocator_cache() {
+        use tikv_jemalloc_ctl::{Access, AsName};
+
+        // Given: a pipe session that forwarded its command's output.
+        let (router, mut peer) = et_net::local::wake_pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = run_on(
+                Runtime::Poll,
+                router,
+                RouterFraming::Upstream,
+                "printf QUIET-PIPE-READY; exec sleep 30",
+            );
+            let enabled: bool = b"thread.tcache.enabled\0".name().read().unwrap();
+            let _ = done_tx.send((result, enabled));
+        });
+        let packet = read_local_packet(&mut peer).unwrap();
+        assert_eq!(
+            TerminalBuffer::decode(packet.payload()).unwrap().buffer,
+            Some(b"QUIET-PIPE-READY".to_vec())
+        );
+
+        // When: the session stays quiet past the release delay, then closes.
+        thread::sleep(et_server::idle_memory::IDLE_RELEASE_DELAY + Duration::from_millis(500));
+        write_local_packet(
+            &mut peer,
+            &Packet::new(TerminalPacketType::TerminalClose as u8, Vec::new()),
+        )
+        .unwrap();
+
+        // Then: the session loop had handed its cache back.
+        let (result, enabled) = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(result, Ok(0));
+        assert!(!enabled, "idle pipe terminal kept its thread cache");
+    }
 }

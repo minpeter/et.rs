@@ -1138,6 +1138,8 @@ mod tests {
     use crate::forward_endpoint::ForwardStream;
 
     const EVENT_TIMEOUT: Duration = Duration::from_secs(3);
+    /// One-byte buffers that fill a socket's output queue.
+    const QUEUED: u8 = super::poll::OUT_QUEUE_PACKETS as u8;
 
     fn worker() -> (
         Worker,
@@ -1367,7 +1369,7 @@ mod tests {
         });
         worker.stop_sockets(false);
         let received = draining.join().unwrap();
-        let expected: Vec<u8> = (1..=64).collect();
+        let expected: Vec<u8> = (1..=QUEUED).collect();
         assert_eq!(received, expected);
         assert!(!abandoned.load(Ordering::Acquire));
         assert!(worker.destinations.is_empty());
@@ -1398,7 +1400,7 @@ mod tests {
             worker.poll_once(EVENT_TIMEOUT).unwrap();
         }
         let received = draining.join().unwrap();
-        let expected: Vec<u8> = (1..=64).collect();
+        let expected: Vec<u8> = (1..=QUEUED).collect();
         assert_eq!(received, expected);
     }
 
@@ -1420,13 +1422,13 @@ mod tests {
         // Then: queued bytes drain in order and the app sees EOF afterwards,
         // while the socket stays open for the reply direction.
         let mut received = Vec::new();
-        while received.len() < 64 {
+        while received.len() < usize::from(QUEUED) {
             worker.poll_once(EVENT_TIMEOUT).unwrap();
             let mut chunk = [0u8; 64];
             let count = peer.read(&mut chunk).unwrap();
             received.extend_from_slice(&chunk[..count]);
         }
-        let expected: Vec<u8> = (1..=64).collect();
+        let expected: Vec<u8> = (1..=QUEUED).collect();
         assert_eq!(received, expected);
         let mut eof = [0u8; 1];
         assert_eq!(peer.read(&mut eof).unwrap(), 0);
@@ -1447,7 +1449,7 @@ mod tests {
         });
         worker.stop_sockets(false);
         let received = draining.join().unwrap();
-        let expected: Vec<u8> = (1..=65).collect();
+        let expected: Vec<u8> = (1..=QUEUED + 1).collect();
         assert_eq!(received, expected);
         assert!(!abandoned.load(Ordering::Acquire));
     }
@@ -1479,8 +1481,9 @@ mod tests {
             .connected(1, 7, Ok(ForwardStream::Unix(stream)), None)
             .unwrap();
         let _ = outbound.recv_timeout(EVENT_TIMEOUT).unwrap();
-        // 64 buffers fill the per-socket queue; the 65th is held worker-side.
-        for byte in 1..=65u8 {
+        // QUEUED buffers fill the per-socket queue; one more is held
+        // worker-side.
+        for byte in 1..=QUEUED + 1 {
             worker
                 .handle_packet(forward_data(
                     true,

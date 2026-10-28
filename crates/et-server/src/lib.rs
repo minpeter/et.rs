@@ -3,6 +3,7 @@
 //! Secure server listeners, local terminal registration, and encrypted session routing.
 
 pub mod diag;
+pub mod idle_memory;
 pub mod path;
 #[cfg(unix)]
 pub mod private_storage;

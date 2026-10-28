@@ -64,25 +64,22 @@ type ConsoleGate = (
 );
 
 #[test]
-fn output_interrupt_preserves_console_output_below_the_flush_threshold() {
-    // Given unsent output below upstream's 64 KiB interrupt threshold.
+fn output_interrupt_drops_unsent_console_output_of_any_size() {
+    // Given unsent output below the server's 64 KiB interrupt threshold.
     for size in [6, 64 * 1024 - 1] {
         let (output, bytes, release) = gated_output(FlowControlMode::None, b"prefix\n");
-        let pending = vec![b'x'; size];
-        assert!(output
-            .try_write(&pending, &TerminalModeState::default())
-            .unwrap());
-        // When the user interrupts while the writer still owns the prefix.
+        let modes = TerminalModeState::default();
+        assert!(output.try_write(&vec![b'x'; size], &modes).unwrap());
+        // When the user interrupts while the writer still owns the prefix,
+        // and the shell then prints its prompt.
         output.interrupt().unwrap();
+        assert!(output.try_write(b"ET_CTRL_C_OK", &modes).unwrap());
         release.send(()).unwrap();
         output
             .complete(ConsoleCompletion::RemoteSessionEnded)
             .unwrap();
-        // Then small output remains byte-exact.
-        assert_eq!(
-            *bytes.lock().unwrap(),
-            [b"prefix\n".as_slice(), &pending].concat()
-        );
+        // Then, as upstream's client, only the prefix and the prompt paint.
+        assert_eq!(*bytes.lock().unwrap(), b"prefix\nET_CTRL_C_OK");
     }
 }
 
@@ -182,4 +179,40 @@ fn output_interrupt_console_skips_only_the_dropped_tmux_continuation() {
         *bytes.lock().unwrap(),
         b"%session-changed $1 test\n%window-add @2\n"
     );
+}
+
+fn stale_packet(header: u8, payload_len: usize) -> et_core::packet::Packet {
+    et_core::packet::Packet::new(header, vec![b'y'; payload_len])
+}
+
+#[test]
+fn small_socket_backlog_at_interrupt_is_still_painted() {
+    // Like upstream `flushIfLarge`, less than 64 KiB is never dropped.
+    let mut stale = StaleOutput::default();
+    stale.interrupted(et_core::output_interrupt::FLUSH_THRESHOLD - 1);
+    let buffer = et_core::proto::TerminalPacketType::TerminalBuffer as u8;
+    assert!(!stale.read(&stale_packet(buffer, 1024)));
+}
+
+#[test]
+fn socket_backlog_at_interrupt_is_filtered_up_to_its_queued_bytes() {
+    use et_core::proto::TerminalPacketType;
+    let buffer = TerminalPacketType::TerminalBuffer as u8;
+    let mut stale = StaleOutput::default();
+    // Given: four 16 KiB terminal packets were queued when ^C was typed.
+    let packet = stale_packet(buffer, 16 * 1024);
+    let wire = 4 + packet.wire_len() + et_core::crypto::MAC_LEN;
+    stale.interrupted(4 * wire);
+
+    // Then: those four are stale; an exit status among them is never
+    // filtered; whatever follows (the prompt) is painted.
+    for _ in 0..3 {
+        assert!(stale.read(&packet));
+    }
+    assert!(!stale.read(&stale_packet(
+        TerminalPacketType::TerminalExitStatus as u8,
+        2
+    )));
+    assert!(stale.read(&packet));
+    assert!(!stale.read(&stale_packet(buffer, 8)));
 }

@@ -202,10 +202,16 @@ fn assert_destination_clamped(flow_control: Option<i32>) {
             },
         )
         .unwrap();
-        let observed = clamped_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+        let (send_buffer, _unsent_bound) = clamped_rx.recv_timeout(TEST_TIMEOUT).unwrap();
         assert!(
-            observed <= et_net::connection::FLOW_CONTROL_SOCKET_BUFFER_BYTES * 2,
-            "jumphost destination send buffer remained {observed} bytes"
+            send_buffer <= et_net::connection::FLOW_CONTROL_SOCKET_BUFFER_BYTES * 2,
+            "jumphost destination send buffer remained {send_buffer} bytes"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            _unsent_bound,
+            et_net::connection::OUTPUT_NOTSENT_LOWAT_BYTES,
+            "jumphost destination unsent-byte bound was {_unsent_bound} bytes"
         );
         let mut connection = Connection::new_server(stream, &key);
         let packet = connection.read_packet().unwrap();
@@ -232,10 +238,19 @@ fn assert_destination_clamped(flow_control: Option<i32>) {
             let stream = connection
                 .try_clone_stream()
                 .map_err(|error| error.to_string())?;
-            let size = SockRef::from(&stream)
+            let socket = SockRef::from(&stream);
+            let send_buffer = socket
                 .send_buffer_size()
                 .map_err(|error| error.to_string())?;
-            clamped_tx.send(size).map_err(|error| error.to_string())
+            #[cfg(target_os = "linux")]
+            let unsent_bound = socket
+                .tcp_notsent_lowat()
+                .map_err(|error| error.to_string())?;
+            #[cfg(not(target_os = "linux"))]
+            let unsent_bound = 0u32;
+            clamped_tx
+                .send((send_buffer, unsent_bound))
+                .map_err(|error| error.to_string())
         })
         .unwrap();
 

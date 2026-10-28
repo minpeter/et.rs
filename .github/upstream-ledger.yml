@@ -11,9 +11,12 @@
 #   et_pr: optional upstream PR number
 #
 # Classified 2026-10-14. #804 passed independent review in et.rs #100.
+# Baseline moved 2026-10-28 from et-v7.0.0 (7656a32) to et-v7.1.0 (0ea859f).
+# et-v7.1.0 contains master through 59dc173; the rows below are kept as the
+# classification history and no longer fall inside compare(baseline...master).
 
-baseline_sha: 7656a32a5bc15c6746726a27a5a4ba1e468fab6e
-classified: "2026-10-14"
+baseline_sha: 0ea859f331db8b0d7d46e062f3ac99ff96476f78
+classified: "2026-10-28"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032

@@ -17,14 +17,14 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-10-14.
 | Field | Value |
 | --- | --- |
 | Upstream | [MisterTea/EternalTerminal](https://github.com/MisterTea/EternalTerminal) |
-| Baseline / latest release tag | [`et-v7.0.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.0.0) |
-| Baseline / release commit | [`7656a32a5bc15c6746726a27a5a4ba1e468fab6e`](https://github.com/MisterTea/EternalTerminal/commit/7656a32a5bc15c6746726a27a5a4ba1e468fab6e) |
+| Baseline / latest release tag | [`et-v7.1.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.1.0) (moved from `et-v7.0.0` on 2026-10-28) |
+| Baseline / release commit | [`0ea859f331db8b0d7d46e062f3ac99ff96476f78`](https://github.com/MisterTea/EternalTerminal/commit/0ea859f331db8b0d7d46e062f3ac99ff96476f78) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`7ee361a`](https://github.com/MisterTea/EternalTerminal/commit/7ee361a75fbb3e0900445b110188996fbe950823) (merge of #900 plain `%` lines are not tmux -CC, reviewed 2026-10-20) |
+| Pin tip (last classified) | [`59dc173`](https://github.com/MisterTea/EternalTerminal/commit/59dc173f6369411827b748fd3b8baad989b031fe) (merge of #901, the 7.1.0 version bump, reviewed 2026-10-28) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
-| ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.0.0` and `master`) |
+| ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.1.0` and `master`) |
 
-The reviewed baseline-to-tip range contains 131 classified commits. Unclassified commits would be drift. The product-parity ports below passed combined Linux verification: 824 tests passed, none failed, and two existing tests were ignored. Formatting, workspace clippy, Windows GNU/macOS ARM binary cross-checks, and release/AUR packaging checks passed. Real OpenSSH mux clients exercised the Rust master; no live C++ peer, native Windows/macOS runtime, or actual VS Code sleep cycle was tested in this port. `ported` covers the behavior described in each row, including its explicit limitations, not unrestricted product parity. Protocol remains v6.
+No `master` commits fall between the `et-v7.1.0` baseline and the reviewed tip. The ledger keeps all 133 commits classified between `et-v7.0.0` and `59dc173` as history; unclassified commits after the baseline would be drift. The product-parity ports below passed combined Linux verification: 824 tests passed, none failed, and two existing tests were ignored. Formatting, workspace clippy, Windows GNU/macOS ARM binary cross-checks, and release/AUR packaging checks passed. Real OpenSSH mux clients exercised the Rust master; no live C++ peer, native Windows/macOS runtime, or actual VS Code sleep cycle was tested in this port. `ported` covers the behavior described in each row, including its explicit limitations, not unrestricted product parity. Protocol remains v6.
 
 ## Ledger (classified 2026-10-12)
 
@@ -1353,4 +1353,16 @@ Two commits after [`7ee361a`](https://github.com/MisterTea/EternalTerminal/commi
 | [`59dc173`](https://github.com/MisterTea/EternalTerminal/commit/59dc173f6369411827b748fd3b8baad989b031fe) | 2026-10-27 | other | skip | Merge #901 |
 
 Packaging and release-process only. No wire, handshake, or security change.
-The `et-v7.1.0` tag is not published yet; the pinned release stays `et-v7.0.0`.
+
+**Release baseline moved to `et-v7.1.0`.** The tag points at
+[`0ea859f`](https://github.com/MisterTea/EternalTerminal/commit/0ea859f331db8b0d7d46e062f3ac99ff96476f78)
+on upstream's `release` branch, which contains `master` through `59dc173`.
+- Beyond `master` it adds only release-branch merges and the vendored
+  `external_imported/` tree (299 files), plus one `CMakeLists.txt` line pointing
+  `EXTERNAL_DIR` at it. None of this is product code.
+- Every pull request listed in the 7.1.0 release notes (#771–#901) is already a
+  ledger row. That includes the breaking short-option remap (#867), which et.rs
+  ported earlier.
+- `PROTOCOL_VERSION` is still 6 on `et-v7.1.0`.
+- The ledger `baseline_sha` and `.github/upstream-pin.yml` now name
+  `et-v7.1.0` / `0ea859f`. Rows before it stay as classification history.

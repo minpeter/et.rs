@@ -18,7 +18,7 @@ This is a hybrid of three real rewrite factories — not a fourth invention:
 | File | Role |
 | --- | --- |
 | [`.github/upstream-pin.yml`](../.github/upstream-pin.yml) | Last reviewed release tag/SHA, default-branch **name**, protocol versions, last classified tip. **Pin ≠ ported.** |
-| [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml) | Every ET `master` commit after baseline `et-v7.0.0` / `7656a32a5bc15c6746726a27a5a4ba1e468fab6e`. |
+| [`.github/upstream-ledger.yml`](../.github/upstream-ledger.yml) | Every ET `master` commit after baseline `et-v7.1.0` / `0ea859f331db8b0d7d46e062f3ac99ff96476f78`. Rows before the baseline stay as classification history. |
 | [`docs/upstream-pin.md`](upstream-pin.md) | Human record of the pin, implemented behavior, intentional differences, and remaining gaps. |
 
 ## Release

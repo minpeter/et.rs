@@ -791,3 +791,15 @@ commits:
     status: ported
     note: "Merge #900. See 8caa1e8. PROTOCOL_VERSION stays 6."
     et_pr: 900
+  - sha: d43b34844d6bcb22c56a18a8bf6fbbb388c5b7b9
+    date: "2026-10-27"
+    kind: other
+    status: skip
+    note: "#901 vcpkg.json version-string 7.0.0 -> 7.1.0, Debian changelog stanza, and release-process docs. Packaging only; no wire, handshake, or security change. PROTOCOL_VERSION stays 6."
+    et_pr: 901
+  - sha: 59dc173f6369411827b748fd3b8baad989b031fe
+    date: "2026-10-27"
+    kind: other
+    status: skip
+    note: "Merge #901. See d43b348. PROTOCOL_VERSION stays 6."
+    et_pr: 901

@@ -960,3 +960,16 @@ tunnels. Mixing implementations within one host's server pair (et.rs
 `etserver` with C++ `etterminal`, or the reverse) failed there because the
 local router stream used et.rs framing; et.rs 0.0.44 speaks upstream's stream
 (see "Local router stream" above).
+
+## Ledger (classified 2026-10-28)
+
+Two commits after [`7ee361a`](https://github.com/MisterTea/EternalTerminal/commit/7ee361a75fbb3e0900445b110188996fbe950823).
+`PROTOCOL_VERSION` stays **6**.
+
+| sha | date | kind | status | note |
+| --- | --- | --- | --- | --- |
+| [`d43b348`](https://github.com/MisterTea/EternalTerminal/commit/d43b34844d6bcb22c56a18a8bf6fbbb388c5b7b9) | 2026-10-27 | other | skip | #901 project version 7.1.0, Debian changelog, release docs |
+| [`59dc173`](https://github.com/MisterTea/EternalTerminal/commit/59dc173f6369411827b748fd3b8baad989b031fe) | 2026-10-27 | other | skip | Merge #901 |
+
+Packaging and release-process only. No wire, handshake, or security change.
+The `et-v7.1.0` tag is not published yet; the pinned release stays `et-v7.0.0`.

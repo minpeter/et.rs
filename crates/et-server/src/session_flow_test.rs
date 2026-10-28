@@ -230,6 +230,16 @@ fn terminal_output_waits_for_a_client_that_acknowledges_by_volume() {
         drain(&mut client);
     }
     session.acknowledge_delivery(first_read).unwrap();
+    // A frame the loop above had already started may still finish: smaller
+    // socket buffers (macOS) leave its tail in the server's send queue. Let
+    // whatever is in flight land before measuring what the window holds.
+    for settle in 0.. {
+        assert!(settle < 16, "output never settled behind the window");
+        flood_until_held(&session, &mut output, &flood);
+        if drain(&mut client) == 0 {
+            break;
+        }
+    }
 
     // When: the terminal keeps producing and the client keeps reading
     // without acknowledging more.

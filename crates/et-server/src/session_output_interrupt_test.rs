@@ -329,6 +329,13 @@ fn assert_interrupt_discards_emitted_output(mode: BridgeMode, read_ahead: bool) 
     let mut client = Connection::new_client(client, &[7; 32]);
     client.set_io_timeout(Some(TIMEOUT)).unwrap();
     let (terminal_socket, mut terminal_peer) = et_net::local::wake_pair().unwrap();
+    // The emitted flood below must already wait on the terminal socket when
+    // the interrupt arrives. macOS gives a Unix socket pair 8 KiB buffers,
+    // which would block these writes before the bridge starts.
+    for socket in [&terminal_socket, &terminal_peer] {
+        rustix::net::sockopt::set_socket_send_buffer_size(socket, 256 * 1024).unwrap();
+        rustix::net::sockopt::set_socket_recv_buffer_size(socket, 256 * 1024).unwrap();
+    }
     let session = Arc::new(
         ActiveSession::new(
             Connection::new_server(server, &[7; 32]),

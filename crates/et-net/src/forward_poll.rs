@@ -2058,8 +2058,7 @@ mod tests {
         let burst = super::DRAINED_CREDIT_BYTES as usize;
         // Just under the floor: a quiet exchange keeps its credit.
         socket.queue_write(vec![3; burst - 1]).unwrap();
-        socket.flush_out().unwrap();
-        peer.read_exact(&mut vec![0u8; burst - 1]).unwrap();
+        deliver(&mut socket, &mut peer, burst - 1);
         assert!(!socket.credit_due());
         // A drained burst of the floor returns at once, far below the batch.
         socket.queue_write(vec![4; 1]).unwrap();
@@ -2067,5 +2066,18 @@ mod tests {
         peer.read_exact(&mut [0u8; 1]).unwrap();
         assert!(socket.credit_due(), "drained burst kept its credit");
         assert_eq!(socket.take_credit(), Some((burst as i64, 2)));
+    }
+
+    /// Flush `socket` into `peer` until `len` bytes arrive. A Unix socket
+    /// pair buffers only 8 KiB on macOS, so one flush can write part of a
+    /// burst and leave the rest queued until the peer reads.
+    fn deliver(socket: &mut SocketIo, peer: &mut UnixStream, len: usize) {
+        let mut buf = vec![0u8; len];
+        let mut got = 0;
+        while got < len {
+            socket.flush_out().unwrap();
+            got += peer.read(&mut buf[got..]).unwrap();
+        }
+        socket.flush_out().unwrap();
     }
 }

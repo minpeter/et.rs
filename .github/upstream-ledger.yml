@@ -10,13 +10,14 @@
 #   note: short string
 #   et_pr: optional upstream PR number
 #
-# Classified 2026-10-14. #804 passed independent review in et.rs #100.
+# Classified 2026-10-29. #804 passed independent review in et.rs #100.
 # Baseline moved 2026-10-28 from et-v7.0.0 (7656a32) to et-v7.1.0 (0ea859f).
-# et-v7.1.0 contains master through 59dc173; the rows below are kept as the
-# classification history and no longer fall inside compare(baseline...master).
+# et-v7.1.0 contains master through 59dc173. Rows at or before that commit stay
+# as classification history and are outside compare(baseline...master).
+# Rows after 59dc173 are the classified tip through c5e4780.
 
 baseline_sha: 0ea859f331db8b0d7d46e062f3ac99ff96476f78
-classified: "2026-10-28"
+classified: "2026-10-29"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -806,3 +807,93 @@ commits:
     status: skip
     note: "Merge #901. See d43b348. PROTOCOL_VERSION stays 6."
     et_pr: 901
+  - sha: 6af63228a3206a6f373dd2b0c29f7268ffde8380
+    date: "2026-10-28"
+    kind: ci
+    status: skip
+    note: "#902 Debian QEMU binfmt: write register entries as raw bytes so the ELF NUL bytes are not shell escapes. CI/packaging only. PROTOCOL_VERSION stays 6."
+    et_pr: 902
+  - sha: db59cd95967b052c0a16feafdd9dc7d0169a51e3
+    date: "2026-10-28"
+    kind: ci
+    status: skip
+    note: "#902 keep the QEMU binfmt script indented so the workflow YAML parses. CI only. PROTOCOL_VERSION stays 6."
+    et_pr: 902
+  - sha: 8434e3dc4c893e3828c48152d7446170454aeb54
+    date: "2026-10-28"
+    kind: ci
+    status: skip
+    note: "#902 import Debian qemu-user-static binfmt instead of a hand-written register string. CI only. PROTOCOL_VERSION stays 6."
+    et_pr: 902
+  - sha: 79d66561605685b42455b76d275457f1a372e656
+    date: "2026-10-28"
+    kind: ci
+    status: skip
+    note: "#902 copy qemu-user-binfmt's register string, which already includes the fix-binary flag. CI only. PROTOCOL_VERSION stays 6."
+    et_pr: 902
+  - sha: 10d839c38677f8f0c383c6795a7e838da22ab7dd
+    date: "2026-10-28"
+    kind: product
+    status: skip
+    note: "#904 unquote SetEnv like OpenSSH argv_split. et.rs does not parse ssh_config: file SetEnv comes from ssh -G, which already removes a quote that starts mid-word (TERM=xterm-256color, GREETING=hello world, NAME=a bc, QUOTE=say"hi") and stops at an unquoted hash. -o SetEnv is applied afterwards by split_quoted_words, which already strips those quotes. Differences kept: an unterminated -o quote is rejected, matching OpenSSH invalid quotes and unlike upstream's splitter; a backslash on -o SetEnv escapes the next character, not only quote, backslash, and space, and a leading hash is not a comment (file comments stay OpenSSH's); a trailing backslash is rejected. OpenSSH 9.6 ssh -G still keeps only the first SetEnv directive; every -o SetEnv is still applied. That predates #904. No Rust parser port. PROTOCOL_VERSION stays 6."
+    et_pr: 904
+  - sha: 5453afa4afe521f244be2162c4c2868aa1325129
+    date: "2026-10-28"
+    kind: ci
+    status: skip
+    note: "Merge #902 Debian QEMU binfmt CI. Not an et.rs change. PROTOCOL_VERSION stays 6."
+    et_pr: 902
+  - sha: c87d204f8ada58bdf846c0154bed88e8a7bb2feb
+    date: "2026-10-28"
+    kind: product
+    status: skip
+    note: "Merge #904. See 10d839c. File SetEnv is already unquoted by OpenSSH ssh -G, and -o SetEnv is already unquoted by split_quoted_words. PROTOCOL_VERSION stays 6."
+    et_pr: 904
+  - sha: 0abbc16f6738c40a229397e5f3132f1bd330610c
+    date: "2026-10-28"
+    kind: ci
+    status: skip
+    note: "#905 stop publishing et-dbgsym so the PPA stays under its quota. Packaging only. PROTOCOL_VERSION stays 6."
+    et_pr: 905
+  - sha: 816e0527fcf8fa4cd29f85143eab8ae2e9b92a8d
+    date: "2026-10-28"
+    kind: ci
+    status: skip
+    note: "Merge #905. See 0abbc16. PROTOCOL_VERSION stays 6."
+    et_pr: 905
+  - sha: 7fb9bd58a822fb1b10c33e9594ab29b167fc613f
+    date: "2026-10-28"
+    kind: ci
+    status: skip
+    note: "#906 copy debian/ from the workflow ref so PPA packaging is not inside the upstream tarball. Packaging only. PROTOCOL_VERSION stays 6."
+    et_pr: 906
+  - sha: 9a8e6256518ac6580ed0ae278dded4df6185e683
+    date: "2026-10-28"
+    kind: ci
+    status: skip
+    note: "Merge #906. See 7fb9bd5. PROTOCOL_VERSION stays 6."
+    et_pr: 906
+  - sha: 0a3eeeaf0d7ada3384bd90ca2853d06d6d8c7d2f
+    date: "2026-10-28"
+    kind: ci
+    status: skip
+    note: "#907 build each Debian suite and architecture in its own job. CI only. PROTOCOL_VERSION stays 6."
+    et_pr: 907
+  - sha: d34290002f74e7f29839d62d6ceef2630382ad23
+    date: "2026-10-28"
+    kind: ci
+    status: skip
+    note: "Merge #907. See 0a3eeea. PROTOCOL_VERSION stays 6."
+    et_pr: 907
+  - sha: bf334b9d963e4925bcc65a0bb92d7faed7401c8b
+    date: "2026-10-28"
+    kind: ci
+    status: skip
+    note: "#909 Debian publish job if cannot use the env context. Workflow validation only. PROTOCOL_VERSION stays 6."
+    et_pr: 909
+  - sha: c5e478051bb5bf898ba18970ecdaa30509af2fee
+    date: "2026-10-28"
+    kind: ci
+    status: skip
+    note: "Merge #909. See bf334b9. PROTOCOL_VERSION stays 6."
+    et_pr: 909

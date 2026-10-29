@@ -1980,6 +1980,75 @@ mod tests {
             .is_err());
     }
 
+    /// Upstream #904 / OpenSSH `argv_split`: a quote may start mid-word and is
+    /// removed. `-o SetEnv` never reaches `ssh -G`; this is the parser that
+    /// owns it. Config-file `SetEnv` is covered by the OpenSSH test below.
+    #[test]
+    fn setenv_session_options_unquote_like_openssh() {
+        let mut config = ResolvedSshConfig::default();
+        config
+            .apply_session_options(&[
+                "SetEnv=TERM=\"xterm-256color\"".into(),
+                "SetEnv \"GREETING=hello world\"".into(),
+                "SetEnv=NAME='a b'c QUOTE=say\\\"hi\\\" ESC=one\\ two".into(),
+                "SetEnv=FOO=\"bar baz\"".into(),
+            ])
+            .unwrap();
+        assert_eq!(
+            config.set_env,
+            [
+                ("TERM".into(), "xterm-256color".into()),
+                ("GREETING".into(), "hello world".into()),
+                ("NAME".into(), "a bc".into()),
+                ("QUOTE".into(), "say\"hi\"".into()),
+                ("ESC".into(), "one two".into()),
+                ("FOO".into(), "bar baz".into()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn openssh_config_file_setenv_quotes_are_removed_before_parse() {
+        let directory =
+            std::env::temp_dir().join(format!("et-setenv-unquote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let cases = [
+            (
+                "Host demo\n  SetEnv TERM=\"xterm-256color\" \"GREETING=hello world\"\n",
+                vec![("TERM", "xterm-256color"), ("GREETING", "hello world")],
+            ),
+            (
+                "Host demo\n  SetEnv NAME='a b'c QUOTE=say\\\"hi\\\" # trailing comment\n",
+                vec![("NAME", "a bc"), ("QUOTE", "say\"hi\"")],
+            ),
+        ];
+        for (text, expected) in cases {
+            let config = directory.join("config");
+            std::fs::write(&config, text).unwrap();
+            let output = Command::new("ssh")
+                .args(["-G", "-T", "-F"])
+                .arg(&config)
+                .arg("demo")
+                .output()
+                .expect("OpenSSH is required for this contract test");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let resolved = parse_ssh_config(&output.stdout, true).unwrap();
+            let found: Vec<(&str, &str)> = resolved
+                .set_env
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            assert_eq!(found, expected);
+        }
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
     fn request(
         source_name: &str,
         source_port: Option<i32>,

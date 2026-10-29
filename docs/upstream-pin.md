@@ -20,11 +20,11 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-10-14.
 | Baseline / latest release tag | [`et-v7.1.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.1.0) (moved from `et-v7.0.0` on 2026-10-28) |
 | Baseline / release commit | [`0ea859f331db8b0d7d46e062f3ac99ff96476f78`](https://github.com/MisterTea/EternalTerminal/commit/0ea859f331db8b0d7d46e062f3ac99ff96476f78) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`59dc173`](https://github.com/MisterTea/EternalTerminal/commit/59dc173f6369411827b748fd3b8baad989b031fe) (merge of #901, the 7.1.0 version bump, reviewed 2026-10-28) |
+| Pin tip (last classified) | [`c5e4780`](https://github.com/MisterTea/EternalTerminal/commit/c5e478051bb5bf898ba18970ecdaa30509af2fee) (merge of #909, Debian publish workflow validation, reviewed 2026-10-29) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
 | ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.1.0` and `master`) |
 
-No `master` commits fall between the `et-v7.1.0` baseline and the reviewed tip. The ledger keeps all 133 commits classified between `et-v7.0.0` and `59dc173` as history; unclassified commits after the baseline would be drift. The product-parity ports below passed combined Linux verification: 824 tests passed, none failed, and two existing tests were ignored. Formatting, workspace clippy, Windows GNU/macOS ARM binary cross-checks, and release/AUR packaging checks passed. Real OpenSSH mux clients exercised the Rust master; no live C++ peer, native Windows/macOS runtime, or actual VS Code sleep cycle was tested in this port. `ported` covers the behavior described in each row, including its explicit limitations, not unrestricted product parity. Protocol remains v6.
+The `et-v7.1.0` baseline contains `master` through `59dc173`. The reviewed tip is 15 commits later (`#902`–`#909`); those commits are classified below. The ledger keeps all 133 commits classified between `et-v7.0.0` and `59dc173` as history; unclassified commits after the baseline would be drift. The product-parity ports below passed combined Linux verification: 824 tests passed, none failed, and two existing tests were ignored. Formatting, workspace clippy, Windows GNU/macOS ARM binary cross-checks, and release/AUR packaging checks passed. Real OpenSSH mux clients exercised the Rust master; no live C++ peer, native Windows/macOS runtime, or actual VS Code sleep cycle was tested in this port. `ported` covers the behavior described in each row, including its explicit limitations, not unrestricted product parity. Protocol remains v6.
 
 ## Ledger (classified 2026-10-12)
 
@@ -1366,3 +1366,55 @@ on upstream's `release` branch, which contains `master` through `59dc173`.
 - `PROTOCOL_VERSION` is still 6 on `et-v7.1.0`.
 - The ledger `baseline_sha` and `.github/upstream-pin.yml` now name
   `et-v7.1.0` / `0ea859f`. Rows before it stay as classification history.
+
+## Ledger (classified 2026-10-29)
+
+Fifteen commits after [`59dc173`](https://github.com/MisterTea/EternalTerminal/commit/59dc173f6369411827b748fd3b8baad989b031fe).
+`PROTOCOL_VERSION` stays **6**. No wire, handshake, or security change.
+Fourteen are Debian/PPA/CI packaging. `#904` is the only product commit, and
+et.rs already unquotes `SetEnv` the way that fix describes, so it is `skip`.
+
+| sha | date | kind | status | note |
+| --- | --- | --- | --- | --- |
+| [`6af6322`](https://github.com/MisterTea/EternalTerminal/commit/6af63228a3206a6f373dd2b0c29f7268ffde8380) | 2026-10-28 | ci | skip | #902 QEMU binfmt raw bytes |
+| [`db59cd9`](https://github.com/MisterTea/EternalTerminal/commit/db59cd95967b052c0a16feafdd9dc7d0169a51e3) | 2026-10-28 | ci | skip | #902 workflow YAML indentation |
+| [`8434e3d`](https://github.com/MisterTea/EternalTerminal/commit/8434e3dc4c893e3828c48152d7446170454aeb54) | 2026-10-28 | ci | skip | #902 Debian qemu-user-static binfmt |
+| [`79d6656`](https://github.com/MisterTea/EternalTerminal/commit/79d66561605685b42455b76d275457f1a372e656) | 2026-10-28 | ci | skip | #902 qemu-user-binfmt register string |
+| [`10d839c`](https://github.com/MisterTea/EternalTerminal/commit/10d839c38677f8f0c383c6795a7e838da22ab7dd) | 2026-10-28 | product | skip | #904 SetEnv unquote already matches; see below |
+| [`5453afa`](https://github.com/MisterTea/EternalTerminal/commit/5453afa4afe521f244be2162c4c2868aa1325129) | 2026-10-28 | ci | skip | Merge #902 |
+| [`c87d204`](https://github.com/MisterTea/EternalTerminal/commit/c87d204f8ada58bdf846c0154bed88e8a7bb2feb) | 2026-10-28 | product | skip | Merge #904 |
+| [`0abbc16`](https://github.com/MisterTea/EternalTerminal/commit/0abbc16f6738c40a229397e5f3132f1bd330610c) | 2026-10-28 | ci | skip | #905 no dbgsym packages |
+| [`816e052`](https://github.com/MisterTea/EternalTerminal/commit/816e0527fcf8fa4cd29f85143eab8ae2e9b92a8d) | 2026-10-28 | ci | skip | Merge #905 |
+| [`7fb9bd5`](https://github.com/MisterTea/EternalTerminal/commit/7fb9bd58a822fb1b10c33e9594ab29b167fc613f) | 2026-10-28 | ci | skip | #906 PPA packaging overlay |
+| [`9a8e625`](https://github.com/MisterTea/EternalTerminal/commit/9a8e6256518ac6580ed0ae278dded4df6185e683) | 2026-10-28 | ci | skip | Merge #906 |
+| [`0a3eeea`](https://github.com/MisterTea/EternalTerminal/commit/0a3eeeaf0d7ada3384bd90ca2853d06d6d8c7d2f) | 2026-10-28 | ci | skip | #907 Debian parallel jobs |
+| [`d342900`](https://github.com/MisterTea/EternalTerminal/commit/d34290002f74e7f29839d62d6ceef2630382ad23) | 2026-10-28 | ci | skip | Merge #907 |
+| [`bf334b9`](https://github.com/MisterTea/EternalTerminal/commit/bf334b9d963e4925bcc65a0bb92d7faed7401c8b) | 2026-10-28 | ci | skip | #909 Debian publish `if` |
+| [`c5e4780`](https://github.com/MisterTea/EternalTerminal/commit/c5e478051bb5bf898ba18970ecdaa30509af2fee) | 2026-10-28 | ci | skip | Merge #909 |
+
+`#904` stopped upstream's C++ config parser from leaving quotes in `SetEnv`
+values (`TERM="xterm-256color"` became `TERM` = `"xterm-256color"`, which broke
+tmux). et.rs never had that parser.
+
+- A config file is expanded by real OpenSSH `ssh -G`. OpenSSH `argv_split`
+  already removes a quote that starts anywhere in a word, keeps
+  `NAME='a b'c` as `a bc` and `QUOTE=say\"hi\"` as `say"hi"`, and treats a
+  leading `#` as a comment. `parse_ssh_config` then takes the `setenv` line
+  after the first `=` verbatim.
+- `-o SetEnv` is not passed to `ssh -G` (the first `SetEnv` would hide the
+  file list on OpenSSH 9.6). `split_quoted_words` already removes those same
+  quotes, including `FOO="bar baz"` and `SetEnv "GREETING=hello world"`.
+
+Differences kept, not ported:
+
+- An unterminated `-o` quote is rejected. That matches OpenSSH's `invalid
+  quotes`. Upstream's new splitter accepts the rest of the string.
+- On `-o SetEnv` only, a backslash escapes the next character, not only a
+  quote, a backslash, or a space, and a word that starts with `#` is not a
+  comment. Config-file comments and escapes stay OpenSSH's.
+- A trailing backslash on `-o SetEnv` is rejected. OpenSSH keeps it.
+- OpenSSH 9.6 `ssh -G` still returns only the first `SetEnv` directive.
+  et.rs still applies every `-o SetEnv`. Both predate `#904`.
+
+No `.tegami` entry: nothing user-visible changed. Release pin stays
+`et-v7.1.0`.

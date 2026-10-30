@@ -396,6 +396,29 @@ fn client_close_before_initial_payload_rolls_back_the_session_claim() {
 }
 
 #[test]
+fn client_close_before_any_handshake_bytes_keeps_serving() {
+    // Upstream #903 / #908: a connect-and-close probe (`nc -z`) crashed Linux
+    // etserver while it unwound the failed handshake read.
+    let mut server = TestRuntime::start();
+    let _terminal = server.register(ID_A, KEY_A);
+    let key = passkey_to_key(KEY_A).unwrap();
+    for _ in 0..2 {
+        drop(TcpStream::connect(server.address).unwrap());
+    }
+
+    let (stream, response) = server.handshake(ID_A);
+    assert_eq!(response.status, Some(ConnectStatus::NewClient as i32));
+    let (_client, initial) = runtime_support::initialize(stream, &key, default_payload());
+    assert_eq!(initial.error, None);
+    server
+        .handle
+        .wait_for_state(ID_A, SessionState::Active, TIMEOUT)
+        .unwrap();
+    // Shutdown joins every handler, so a panic in a probe's handler fails here.
+    server.runtime.shutdown().unwrap();
+}
+
+#[test]
 fn reverse_bind_failure_never_activates_the_session() {
     let mut server = TestRuntime::start();
     let _terminal = server.register(ID_A, KEY_A);

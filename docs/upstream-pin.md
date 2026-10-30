@@ -17,14 +17,14 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-10-14.
 | Field | Value |
 | --- | --- |
 | Upstream | [MisterTea/EternalTerminal](https://github.com/MisterTea/EternalTerminal) |
-| Baseline / latest release tag | [`et-v7.1.0`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.1.0) (moved from `et-v7.0.0` on 2026-10-28) |
-| Baseline / release commit | [`0ea859f331db8b0d7d46e062f3ac99ff96476f78`](https://github.com/MisterTea/EternalTerminal/commit/0ea859f331db8b0d7d46e062f3ac99ff96476f78) |
+| Baseline / latest release tag | [`et-v7.1.1`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.1.1) (moved from `et-v7.1.0` on 2026-10-30, from `et-v7.0.0` on 2026-10-28) |
+| Baseline / release commit | [`a8318ca4598756ca3c5f4711cce12a65faeff57d`](https://github.com/MisterTea/EternalTerminal/commit/a8318ca4598756ca3c5f4711cce12a65faeff57d) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`c5e4780`](https://github.com/MisterTea/EternalTerminal/commit/c5e478051bb5bf898ba18970ecdaa30509af2fee) (merge of #909, Debian publish workflow validation, reviewed 2026-10-29) |
+| Pin tip (last classified) | [`b0fa5ef`](https://github.com/MisterTea/EternalTerminal/commit/b0fa5efba7623933a374c3825fac41c909cc0f68) (merge of #914, Debian native arm64 runners, reviewed 2026-10-30) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
-| ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.1.0` and `master`) |
+| ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.1.1` and `master`) |
 
-The `et-v7.1.0` baseline contains `master` through `59dc173`. The reviewed tip is 15 commits later (`#902`–`#909`); those commits are classified below. The ledger keeps all 133 commits classified between `et-v7.0.0` and `59dc173` as history; unclassified commits after the baseline would be drift. The product-parity ports below passed combined Linux verification: 824 tests passed, none failed, and two existing tests were ignored. Formatting, workspace clippy, Windows GNU/macOS ARM binary cross-checks, and release/AUR packaging checks passed. Real OpenSSH mux clients exercised the Rust master; no live C++ peer, native Windows/macOS runtime, or actual VS Code sleep cycle was tested in this port. `ported` covers the behavior described in each row, including its explicit limitations, not unrestricted product parity. Protocol remains v6.
+The `et-v7.1.1` baseline contains `master` through `c3bd31b`. The reviewed tip is 2 commits later (`#914`); those commits are classified below. The ledger keeps all commits classified between `et-v7.0.0` and `c3bd31b` as history; unclassified commits after the baseline would be drift. The product-parity ports below passed combined Linux verification: 824 tests passed, none failed, and two existing tests were ignored. Formatting, workspace clippy, Windows GNU/macOS ARM binary cross-checks, and release/AUR packaging checks passed. Real OpenSSH mux clients exercised the Rust master; no live C++ peer, native Windows/macOS runtime, or actual VS Code sleep cycle was tested in this port. `ported` covers the behavior described in each row, including its explicit limitations, not unrestricted product parity. Protocol remains v6.
 
 ## Ledger (classified 2026-10-12)
 
@@ -1418,3 +1418,52 @@ Differences kept, not ported:
 
 No `.tegami` entry: nothing user-visible changed. Release pin stays
 `et-v7.1.0`.
+
+## Ledger (classified 2026-10-30)
+
+Seven commits after [`c5e4780`](https://github.com/MisterTea/EternalTerminal/commit/c5e478051bb5bf898ba18970ecdaa30509af2fee).
+`PROTOCOL_VERSION` stays **6** on `et-v7.1.1` and `master`. No wire,
+handshake, or security change.
+
+| sha | date | kind | status | note |
+| --- | --- | --- | --- | --- |
+| [`be65906`](https://github.com/MisterTea/EternalTerminal/commit/be65906628154accbbdacfbf0f9186af31721271) | 2026-10-29 | ci | skip | #908 C++ link order: libgcc_s ahead of libunwind; see below |
+| [`c03dd64`](https://github.com/MisterTea/EternalTerminal/commit/c03dd644c997269980c51407e2d526367c0cd3ba) | 2026-10-29 | ci | backlog | #912 AUR restarts etserver on upgrade; see below |
+| [`c6bbb7e`](https://github.com/MisterTea/EternalTerminal/commit/c6bbb7ec49cfa440e49a6a17685e15d61326348c) | 2026-10-29 | ci | backlog | Merge #912 |
+| [`01c6333`](https://github.com/MisterTea/EternalTerminal/commit/01c6333fe9bf715a87b3b7128a69a5d17efc9e2c) | 2026-10-29 | other | skip | #913 project version 7.1.1 |
+| [`c3bd31b`](https://github.com/MisterTea/EternalTerminal/commit/c3bd31b2627b725cea2c21668a2ea388fed64ee9) | 2026-10-29 | other | skip | Merge #913 |
+| [`b255ebf`](https://github.com/MisterTea/EternalTerminal/commit/b255ebff53e9522cd2a0cb37830c22549244ef5b) | 2026-10-29 | ci | skip | #914 Debian arm64 on native runners |
+| [`b0fa5ef`](https://github.com/MisterTea/EternalTerminal/commit/b0fa5efba7623933a374c3825fac41c909cc0f68) | 2026-10-29 | ci | skip | Merge #914 |
+
+`#908` fixed Linux `etserver` crashing (#903) when a client connects and
+closes before sending anything, such as `nc -z`. The handshake read threw,
+and Ubuntu's libunwind, linked ahead of libgcc_s, segfaulted unwinding it. The
+fix is CMake link order plus a CTest e2e. et.rs has no C++ exceptions or
+libunwind: a peer that closes before any `ConnectRequest` byte fails
+`read_request_deadline`, gets a malformed-request reject, and its handler
+returns. `client_close_before_any_handshake_bytes_keeps_serving` in
+`crates/et-server/tests/runtime_adversarial.rs` now pins that: two
+connect-and-close probes, then a real client still initializes, and shutdown
+reports no handler panic.
+
+`#912` adds a pacman `post_upgrade` hook (`daemon-reload`, `try-restart
+et.service`) to upstream's `eternalterminal` AUR package, because the old
+daemon kept running after an upgrade and a new C++ `etterminal` then spoke a
+mismatched IPC protocol (#911). That corruption does not apply to et.rs:
+mixed-version et.rs `etserver`/`etterminal` pairs negotiate the router stream
+(see "Local router stream" above). The restart itself is not ported: et.rs's
+own `et-rs-bin` package (`scripts/generate-pkgbuild.sh`) has no install script,
+so the previous `etserver` keeps running until the documented manual
+`sudo systemctl restart et` (README). Kept as `backlog`.
+
+**Release baseline moved to `et-v7.1.1`.** The tag points at
+[`a8318ca`](https://github.com/MisterTea/EternalTerminal/commit/a8318ca4598756ca3c5f4711cce12a65faeff57d)
+on upstream's `release` branch, which contains `master` through `c3bd31b`
+(`#908`, `#912`, `#913`). Beyond `master` it adds only the existing
+release-branch merges, the vendored `external_imported/` tree, and the
+`CMakeLists.txt` `EXTERNAL_DIR` line. `#914` landed after the tag and is the
+only compare row left after the baseline.
+- The ledger `baseline_sha` and `.github/upstream-pin.yml` now name
+  `et-v7.1.1` / `a8318ca`. Rows before it stay as classification history.
+
+No `.tegami` entry: nothing user-visible changed.

@@ -10,14 +10,15 @@
 #   note: short string
 #   et_pr: optional upstream PR number
 #
-# Classified 2026-10-29. #804 passed independent review in et.rs #100.
-# Baseline moved 2026-10-28 from et-v7.0.0 (7656a32) to et-v7.1.0 (0ea859f).
-# et-v7.1.0 contains master through 59dc173. Rows at or before that commit stay
+# Classified 2026-10-30. #804 passed independent review in et.rs #100.
+# Baseline moved 2026-10-28 from et-v7.0.0 (7656a32) to et-v7.1.0 (0ea859f),
+# and 2026-10-30 to et-v7.1.1 (a8318ca).
+# et-v7.1.1 contains master through c3bd31b. Rows at or before that commit stay
 # as classification history and are outside compare(baseline...master).
-# Rows after 59dc173 are the classified tip through c5e4780.
+# Rows after c3bd31b are the classified tip through b0fa5ef.
 
-baseline_sha: 0ea859f331db8b0d7d46e062f3ac99ff96476f78
-classified: "2026-10-29"
+baseline_sha: a8318ca4598756ca3c5f4711cce12a65faeff57d
+classified: "2026-10-30"
 
 commits:
   - sha: f6cf43707bde07eb6d11495586a35b9f2d64b032
@@ -897,3 +898,45 @@ commits:
     status: skip
     note: "Merge #909. See bf334b9. PROTOCOL_VERSION stays 6."
     et_pr: 909
+  - sha: be65906628154accbbdacfbf0f9186af31721271
+    date: "2026-10-29"
+    kind: ci
+    status: skip
+    note: "#908 put libgcc_s ahead of libunwind in the C++ link line so Linux etserver no longer segfaults unwinding the handshake exception from a connect-and-close probe (#903), plus a CTest e2e. C++ link order only; et.rs has no C++ exceptions or libunwind. A peer that closes before any ConnectRequest byte gets a malformed-request reject and the handler returns; runtime_adversarial covers it (client_close_before_any_handshake_bytes_keeps_serving). PROTOCOL_VERSION stays 6."
+    et_pr: 908
+  - sha: c03dd644c997269980c51407e2d526367c0cd3ba
+    date: "2026-10-29"
+    kind: ci
+    status: backlog
+    note: "#912 upstream's AUR eternalterminal package gains a post_upgrade hook (daemon-reload, try-restart et.service) because pacman leaves the old etserver running and a new C++ etterminal then speaks a mismatched IPC protocol (#911). The corruption does not apply: et.rs etserver and etterminal interoperate across versions (router stream negotiation, see docs/upstream-pin.md). Not ported: et.rs's own AUR package et-rs-bin (scripts/generate-pkgbuild.sh) has no install script, so the old daemon keeps running until the documented manual systemctl restart et. PROTOCOL_VERSION stays 6."
+    et_pr: 912
+  - sha: c6bbb7ec49cfa440e49a6a17685e15d61326348c
+    date: "2026-10-29"
+    kind: ci
+    status: backlog
+    note: "Merge #912. See c03dd64. et-rs-bin restart-on-upgrade not ported. PROTOCOL_VERSION stays 6."
+    et_pr: 912
+  - sha: 01c6333fe9bf715a87b3b7128a69a5d17efc9e2c
+    date: "2026-10-29"
+    kind: other
+    status: skip
+    note: "#913 project version 7.1.1 (vcpkg.json, Debian changelog). Release bookkeeping only. PROTOCOL_VERSION stays 6."
+    et_pr: 913
+  - sha: c3bd31b2627b725cea2c21668a2ea388fed64ee9
+    date: "2026-10-29"
+    kind: other
+    status: skip
+    note: "Merge #913. See 01c6333. et-v7.1.1 contains master through this commit. PROTOCOL_VERSION stays 6."
+    et_pr: 913
+  - sha: b255ebff53e9522cd2a0cb37830c22549244ef5b
+    date: "2026-10-29"
+    kind: ci
+    status: skip
+    note: "#914 build Debian arm64 packages on native ubuntu-24.04-arm runners instead of QEMU. CI only. PROTOCOL_VERSION stays 6."
+    et_pr: 914
+  - sha: b0fa5efba7623933a374c3825fac41c909cc0f68
+    date: "2026-10-29"
+    kind: ci
+    status: skip
+    note: "Merge #914. See b255ebf. PROTOCOL_VERSION stays 6."
+    et_pr: 914

@@ -20,11 +20,11 @@ Recorded 2026-08-21 from GitHub (`gh` / REST). Ledger classified 2026-10-14.
 | Baseline / latest release tag | [`et-v7.1.1`](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.1.1) (moved from `et-v7.1.0` on 2026-10-30, from `et-v7.0.0` on 2026-10-28) |
 | Baseline / release commit | [`a8318ca4598756ca3c5f4711cce12a65faeff57d`](https://github.com/MisterTea/EternalTerminal/commit/a8318ca4598756ca3c5f4711cce12a65faeff57d) |
 | Default branch | `master` |
-| Pin tip (last classified) | [`b0fa5ef`](https://github.com/MisterTea/EternalTerminal/commit/b0fa5efba7623933a374c3825fac41c909cc0f68) (merge of #914, Debian native arm64 runners, reviewed 2026-10-30) |
+| Pin tip (last classified) | [`6c26c3a`](https://github.com/MisterTea/EternalTerminal/commit/6c26c3aa092e2e8888c356dbaf8c76c8945ebe0b) (merge of #919, port-forward fd snapshot lock ordering and portability CI, reviewed 2026-11-04) |
 | et.rs wire version | **protocol v6** (`PROTOCOL_VERSION = 6` in `crates/et-core/src/lib.rs`, README) |
 | ET wire version at this pin | still **protocol v6** (`PROTOCOL_VERSION = 6` in `src/base/Headers.hpp` on both `et-v7.1.1` and `master`) |
 
-The `et-v7.1.1` baseline contains `master` through `c3bd31b`. The reviewed tip is 2 commits later (`#914`); those commits are classified below. The ledger keeps all commits classified between `et-v7.0.0` and `c3bd31b` as history; unclassified commits after the baseline would be drift. The product-parity ports below passed combined Linux verification: 824 tests passed, none failed, and two existing tests were ignored. Formatting, workspace clippy, Windows GNU/macOS ARM binary cross-checks, and release/AUR packaging checks passed. Real OpenSSH mux clients exercised the Rust master; no live C++ peer, native Windows/macOS runtime, or actual VS Code sleep cycle was tested in this port. `ported` covers the behavior described in each row, including its explicit limitations, not unrestricted product parity. Protocol remains v6.
+The `et-v7.1.1` baseline contains `master` through `c3bd31b`. The reviewed tip is 9 commits later (`#914`, `#916`, `#919`); those commits are classified below. The ledger keeps all commits classified between `et-v7.0.0` and `c3bd31b` as history; unclassified commits after the baseline would be drift. The product-parity ports below passed combined Linux verification: 824 tests passed, none failed, and two existing tests were ignored. Formatting, workspace clippy, Windows GNU/macOS ARM binary cross-checks, and release/AUR packaging checks passed. Real OpenSSH mux clients exercised the Rust master; no live C++ peer, native Windows/macOS runtime, or actual VS Code sleep cycle was tested in this port. `ported` covers the behavior described in each row, including its explicit limitations, not unrestricted product parity. Protocol remains v6.
 
 ## Ledger (classified 2026-10-12)
 
@@ -1465,5 +1465,54 @@ release-branch merges, the vendored `external_imported/` tree, and the
 only compare row left after the baseline.
 - The ledger `baseline_sha` and `.github/upstream-pin.yml` now name
   `et-v7.1.1` / `a8318ca`. Rows before it stay as classification history.
+
+No `.tegami` entry: nothing user-visible changed.
+
+## Ledger (classified 2026-11-04)
+
+Seven commits after [`b0fa5ef`](https://github.com/MisterTea/EternalTerminal/commit/b0fa5efba7623933a374c3825fac41c909cc0f68).
+`et-v7.1.1` is still the latest release. `PROTOCOL_VERSION` stays **6** on
+`et-v7.1.1` and `master`. No wire, handshake, or security change.
+
+| sha | date | kind | status | note |
+| --- | --- | --- | --- | --- |
+| [`b11ba53`](https://github.com/MisterTea/EternalTerminal/commit/b11ba534ffc369953ddf1f3d21cbaa85bc781894) | 2026-10-30 | product | skip | #916 fail a pipe destination on EMFILE instead of aborting; see below |
+| [`abaecea`](https://github.com/MisterTea/EternalTerminal/commit/abaecea985cc98f90da0756211fedf4d78354a7c) | 2026-10-30 | product | skip | Merge #916 |
+| [`354d8a2`](https://github.com/MisterTea/EternalTerminal/commit/354d8a22ac2729948137cc68dd985daf36b74126) | 2026-10-31 | other | skip | #919 empty "Initial plan" commit |
+| [`a75a978`](https://github.com/MisterTea/EternalTerminal/commit/a75a97884771a67b6bfa7b4ca67e21e6a1d08685) | 2026-10-31 | product | skip | #919 port-forward fd snapshot lock ordering; see below |
+| [`4331c2d`](https://github.com/MisterTea/EternalTerminal/commit/4331c2d0bb7b0a4de674877639238f01940344cd) | 2026-11-03 | ci | skip | #919 system libstdc++ for GCC 13, Rocky `dnf distro-sync` |
+| [`89ce4e2`](https://github.com/MisterTea/EternalTerminal/commit/89ce4e27cb6c4d577bc248c4dd9df1f2117b0cc8) | 2026-11-03 | ci | skip | #919 stop caching the Gentoo Portage tree |
+| [`6c26c3a`](https://github.com/MisterTea/EternalTerminal/commit/6c26c3aa092e2e8888c356dbaf8c76c8945ebe0b) | 2026-11-03 | product | skip | Merge #919 |
+
+`#916` stops `PipeSocketHandler::connect` from `FATAL_FAIL`ing when
+`socket()` fails (EMFILE/ENFILE), which aborted the process when a reconnect
+replayed a backlog of forwarded ssh-agent requests. The destination now gets a
+`PORT_FORWARD_DESTINATION_RESPONSE` error. et.rs already behaves that way:
+`Endpoint::connect` and `connect_unix_as_user` return `io::Result`, and
+`request_destination`/`connected` in `crates/et-net/src/forward_worker_state.rs`
+turn every `Err` into a destination error response without stopping the
+worker. The new `crates/et-net/tests/forward_descriptor_exhaustion.rs` pins it
+in its own test binary: it caps `RLIMIT_NOFILE` at the lowest free descriptor,
+checks that a Unix destination request is answered with `Too many open files`
+and no socket id, then restores the limit and checks that the same forwarder
+connects the same destination.
+
+`a75a978` fixes a lock-order deadlock in C++ `TerminalServer::runTerminal`:
+it held the connection lock while `getForwardFds` and
+`getForwardFdsGeneration` took `PortForwardHandler::handlerMutex`, while
+packet handling held `handlerMutex` and wrote to the connection. The fix takes
+the fd set and generation in one `handlerMutex` acquisition before locking the
+connection. et.rs has no such lock pair. On Unix the forwarding engine runs on
+the session thread: `collect_fast_poll_routes` and `service_fast_poll` take only
+the engine mutex, once per call, and the engine never touches the connection.
+It queues outbound packets that `crates/et-server/src/terminal_bridge.rs` pops
+with `try_outbound` and writes after the engine lock is released. Descriptors
+are snapshotted as shared handles in one `collect` call, so there is no
+separate generation read to tear. The Windows threaded path only holds the
+fast-route `RwLock` for a map lookup and a non-blocking `try_send`, never
+across a connection write. `forwarding_deadlock.rs` already covers
+mutual queue saturation.
+
+`4331c2d` and `89ce4e2` are C++ link and portability-CI fixes only.
 
 No `.tegami` entry: nothing user-visible changed.

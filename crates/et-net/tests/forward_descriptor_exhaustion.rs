@@ -23,7 +23,7 @@ struct RestoreLimit(Rlimit);
 
 impl Drop for RestoreLimit {
     fn drop(&mut self) {
-        let _ = setrlimit(Resource::Nofile, self.0.clone());
+        let _ = setrlimit(Resource::Nofile, self.0);
     }
 }
 
@@ -72,7 +72,7 @@ fn unix_destination_survives_descriptor_exhaustion() {
     // soft limit there makes the destination's socket() fail with EMFILE.
     let lowest_free = std::fs::File::open("/dev/null").unwrap().as_raw_fd();
     let failed = {
-        let _restore = RestoreLimit(original.clone());
+        let _restore = RestoreLimit(original);
         setrlimit(
             Resource::Nofile,
             Rlimit {

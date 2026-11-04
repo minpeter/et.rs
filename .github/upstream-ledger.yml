@@ -10,12 +10,12 @@
 #   note: short string
 #   et_pr: optional upstream PR number
 #
-# Classified 2026-10-30. #804 passed independent review in et.rs #100.
+# Classified 2026-11-04. #804 passed independent review in et.rs #100.
 # Baseline moved 2026-10-28 from et-v7.0.0 (7656a32) to et-v7.1.0 (0ea859f),
 # and 2026-10-30 to et-v7.1.1 (a8318ca).
 # et-v7.1.1 contains master through c3bd31b. Rows at or before that commit stay
 # as classification history and are outside compare(baseline...master).
-# Rows after c3bd31b are the classified tip through b0fa5ef.
+# Rows after c3bd31b are the classified tip through 6c26c3a.
 
 baseline_sha: a8318ca4598756ca3c5f4711cce12a65faeff57d
 classified: "2026-10-30"
@@ -940,3 +940,45 @@ commits:
     status: skip
     note: "Merge #914. See b255ebf. PROTOCOL_VERSION stays 6."
     et_pr: 914
+  - sha: b11ba534ffc369953ddf1f3d21cbaa85bc781894
+    date: "2026-10-30"
+    kind: product
+    status: skip
+    note: "#916 PipeSocketHandler::connect returns -1 (error response) instead of FATAL_FAIL aborting when socket() hits EMFILE/ENFILE, e.g. a reconnect replaying many forwarded ssh-agent requests. et.rs already equivalent: Endpoint::connect / connect_unix_as_user return io::Result, and request_destination/connected turn any Err into a PORT_FORWARD_DESTINATION_RESPONSE error without stopping the worker. crates/et-net/tests/forward_descriptor_exhaustion.rs now pins it with a real RLIMIT_NOFILE cap (EMFILE reported, same forwarder then connects). PROTOCOL_VERSION stays 6."
+    et_pr: 916
+  - sha: abaecea985cc98f90da0756211fedf4d78354a7c
+    date: "2026-10-30"
+    kind: product
+    status: skip
+    note: "Merge #916. See b11ba53. PROTOCOL_VERSION stays 6."
+    et_pr: 916
+  - sha: 354d8a22ac2729948137cc68dd985daf36b74126
+    date: "2026-10-31"
+    kind: other
+    status: skip
+    note: "#919 empty Copilot 'Initial plan' commit; no tree change. PROTOCOL_VERSION stays 6."
+    et_pr: 919
+  - sha: a75a97884771a67b6bfa7b4ca67e21e6a1d08685
+    date: "2026-10-31"
+    kind: product
+    status: skip
+    note: "#919 TerminalServer::runTerminal took the connection lock and then PortForwardHandler::handlerMutex for getForwardFds/getForwardFdsGeneration, while packet handling holds handlerMutex and writes to the connection (lock-order deadlock); fix snapshots fds and generation under one handlerMutex acquisition before locking the connection. et.rs has no such pair of locks: the Unix forwarding engine runs on the session thread (collect_fast_poll_routes/service_fast_poll take only the engine mutex, per call), it never touches the connection and only queues outbound packets that terminal_bridge pops and writes after releasing it; descriptors are snapshotted with shared handles in one collect call, so no generation counter can tear. forwarding_deadlock.rs covers mutual saturation. PROTOCOL_VERSION stays 6."
+    et_pr: 919
+  - sha: 4331c2d0bb7b0a4de674877639238f01940344cd
+    date: "2026-11-03"
+    kind: ci
+    status: skip
+    note: "#919 CMake links the system libstdc++ when GCC 13's private copy lacks CXXABI_1.3.15 (Ubuntu 26 libprotobuf), and Rocky CI runs dnf distro-sync before install. C++ link/CI only. PROTOCOL_VERSION stays 6."
+    et_pr: 919
+  - sha: 89ce4e27cb6c4d577bc248c4dd9df1f2117b0cc8
+    date: "2026-11-03"
+    kind: ci
+    status: skip
+    note: "#919 Gentoo portability CI stops caching /var/db/repos/gentoo. CI only. PROTOCOL_VERSION stays 6."
+    et_pr: 919
+  - sha: 6c26c3aa092e2e8888c356dbaf8c76c8945ebe0b
+    date: "2026-11-03"
+    kind: product
+    status: skip
+    note: "Merge #919. See a75a978, 4331c2d, 89ce4e2. PROTOCOL_VERSION stays 6."
+    et_pr: 919
